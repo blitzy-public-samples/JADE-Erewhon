@@ -27,7 +27,9 @@ public sealed record TenderProjection(
     /// <summary>
     /// Builds the projection from a tender, copying each value as stored.
     /// Requires <see cref="Tender.Client"/> and <see cref="Tender.TenderItem"/> to be loaded, with everything
-    /// <see cref="ItemProjection.From"/> reads from the tender item.
+    /// <see cref="ItemProjection.From"/> reads from the tender item: its <see cref="Item.ItemCategory"/>, its
+    /// <see cref="Item.Region"/> with the region's <see cref="Region.Country"/>, its <see cref="Item.Agent"/> and its
+    /// <see cref="Item.Sale"/> with the sale's <see cref="Sale.Client"/>; <see cref="Tender.TenderSale"/> is read when loaded.
     /// <see cref="TenderSaleId"/> is the id of <see cref="Tender.TenderSale"/> when it is loaded; otherwise the id of the
     /// tender item's sale when that sale is a <see cref="TenderSale"/> whose <see cref="Domain.TenderSale.TenderId"/> is
     /// the tender's id; otherwise <see langword="null"/>.
