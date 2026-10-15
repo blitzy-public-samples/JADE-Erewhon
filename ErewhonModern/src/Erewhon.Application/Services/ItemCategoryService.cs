@@ -154,6 +154,16 @@ public sealed class ItemCategoryService : TransactionAgent<ItemCategory>
         Db.ItemCategories.FirstOrDefaultAsync(category => category.Id == id, ct);
 
     /// <summary>
+    /// Returns whether a category with internal id <paramref name="id"/> exists, with one scalar query by id alone and
+    /// no bound-company filter.
+    /// </summary>
+    /// <param name="id">The internal id (<c>item_categories.id</c>) of the category.</param>
+    /// <param name="ct">Token that cancels the read.</param>
+    /// <returns><see langword="true"/> when the category exists; otherwise <see langword="false"/>.</returns>
+    public Task<bool> ExistsAsync(long id, CancellationToken ct = default) =>
+        Db.ItemCategories.AnyAsync(category => category.Id == id, ct);
+
+    /// <summary>
     /// Returns the category of the bound company whose name equals <paramref name="name"/> exactly, or
     /// <see langword="null"/> when there is none or <paramref name="name"/> is <see langword="null"/> or empty.
     /// Ports <c>Company.allItemCategoriesByName[name]</c>.

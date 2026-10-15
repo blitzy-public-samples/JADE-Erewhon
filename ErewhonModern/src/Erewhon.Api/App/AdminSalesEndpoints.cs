@@ -94,8 +94,8 @@ public static class AdminSalesEndpoints
             }
 
             bool exists = option == SalesShowFor.Agent
-                ? await agentService.FindByIdAsync(entityId, ct) is not null
-                : await clientService.FindByIdAsync(entityId, ct) is not null;
+                ? await agentService.ExistsAsync(entityId, ct)
+                : await clientService.ExistsAsync(entityId, ct);
 
             if (!exists)
             {

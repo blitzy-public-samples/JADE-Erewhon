@@ -534,6 +534,16 @@ public sealed class ItemService : TransactionAgent<Item>
             .FirstOrDefaultAsync(item => item.Id == id, ct);
 
     /// <summary>
+    /// Returns whether an item of either kind with row id <paramref name="id"/> exists, with one scalar query by id
+    /// alone and no bound-company filter.
+    /// </summary>
+    /// <param name="id">The row id of the item.</param>
+    /// <param name="ct">Token that cancels the read.</param>
+    /// <returns><see langword="true"/> when the item exists; otherwise <see langword="false"/>.</returns>
+    public Task<bool> ExistsAsync(long id, CancellationToken ct = default) =>
+        Db.Items.AnyAsync(item => item.Id == id, ct);
+
+    /// <summary>
     /// Returns the projections of the bound company's items whose price lies between <paramref name="minPrice"/> and
     /// <paramref name="maxPrice"/>, both included, in code-number order; an empty list when there are none. The bounds
     /// are not checked here. Ports the item walk of the REST <c>getItemsByPrice</c> operation.

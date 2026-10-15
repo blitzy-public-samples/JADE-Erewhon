@@ -151,7 +151,7 @@ public static class AdminTenderEndpoints
         [FromServices] TenderService tenderService,
         CancellationToken ct)
     {
-        if (await tenderService.FindByIdAsync(id, ct) is null)
+        if (!await tenderService.ExistsAsync(id, ct))
         {
             return TypedResults.NotFound();
         }

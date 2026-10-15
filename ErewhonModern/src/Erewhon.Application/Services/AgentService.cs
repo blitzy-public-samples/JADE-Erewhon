@@ -231,6 +231,16 @@ public sealed class AgentService : TransactionAgent<Agent>
     }
 
     /// <summary>
+    /// Returns whether an agent with internal id <paramref name="id"/> exists, with one scalar query by id alone and
+    /// no bound-company filter.
+    /// </summary>
+    /// <param name="id">The internal id (<c>agents.id</c>) of the agent.</param>
+    /// <param name="ct">Token that cancels the read.</param>
+    /// <returns><see langword="true"/> when the agent exists; otherwise <see langword="false"/>.</returns>
+    public Task<bool> ExistsAsync(long id, CancellationToken ct = default) =>
+        Db.Agents.AnyAsync(agent => agent.Id == id, ct);
+
+    /// <summary>
     /// Returns the projection of each agent of the bound company, with its address, in name order.
     /// Ports the walk of <c>app.myCompany.allAgents</c> (<c>AgentsByNameDict</c>) that fills <c>DTOAgent</c> values.
     /// </summary>

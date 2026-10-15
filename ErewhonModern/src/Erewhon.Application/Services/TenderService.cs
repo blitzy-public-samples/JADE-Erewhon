@@ -165,6 +165,16 @@ public sealed class TenderService : TransactionAgent<Tender>
             .FirstOrDefaultAsync(t => t.Id == id, ct);
 
     /// <summary>
+    /// Returns whether a tender with row id <paramref name="id"/> exists, with one scalar query by id alone and no
+    /// bound-company filter.
+    /// </summary>
+    /// <param name="id">The row id of the tender.</param>
+    /// <param name="ct">Token that cancels the read.</param>
+    /// <returns><see langword="true"/> when the tender exists; otherwise <see langword="false"/>.</returns>
+    public Task<bool> ExistsAsync(long id, CancellationToken ct = default) =>
+        Db.Tenders.AnyAsync(t => t.Id == id, ct);
+
+    /// <summary>
     /// Returns the projection of the tender with row id <paramref name="id"/>, read without change tracking with every
     /// navigation <see cref="TenderProjection.From"/> reads: the client, the tender sale, and the tender item with its
     /// category, region and country, agent, sale with the sale's client, and tenders; <see langword="null"/> when no

@@ -333,7 +333,7 @@ public static class AdminReferenceEndpoints
         [FromServices] ItemCategoryService itemCategoryService,
         CancellationToken ct)
     {
-        if (category is long categoryId && await itemCategoryService.FindByIdAsync(categoryId, ct) is null)
+        if (category is long categoryId && !await itemCategoryService.ExistsAsync(categoryId, ct))
         {
             return TypedResults.NotFound();
         }
@@ -416,7 +416,7 @@ public static class AdminReferenceEndpoints
         [FromServices] CommissionRateService commissionRateService,
         CancellationToken ct)
     {
-        if (await commissionRateService.FindByIdAsync(id, ct) is null)
+        if (!await commissionRateService.ExistsAsync(id, ct))
         {
             return TypedResults.NotFound();
         }
@@ -502,7 +502,7 @@ public static class AdminReferenceEndpoints
         [FromServices] ItemCategoryService itemCategoryService,
         CancellationToken ct)
     {
-        if (await itemCategoryService.FindByIdAsync(id, ct) is null)
+        if (!await itemCategoryService.ExistsAsync(id, ct))
         {
             return TypedResults.NotFound();
         }
@@ -576,7 +576,7 @@ public static class AdminReferenceEndpoints
         [FromServices] CountryService countryService,
         CancellationToken ct)
     {
-        if (await countryService.FindByIdAsync(id, ct) is null)
+        if (!await countryService.ExistsAsync(id, ct))
         {
             return TypedResults.NotFound();
         }
@@ -595,7 +595,7 @@ public static class AdminReferenceEndpoints
         [FromServices] CountryService countryService,
         CancellationToken ct)
     {
-        if (country is long countryId && await countryService.FindByIdAsync(countryId, ct) is null)
+        if (country is long countryId && !await countryService.ExistsAsync(countryId, ct))
         {
             return TypedResults.NotFound();
         }
@@ -659,7 +659,7 @@ public static class AdminReferenceEndpoints
         [FromServices] RegionService regionService,
         CancellationToken ct)
     {
-        if (await regionService.FindByIdAsync(id, ct) is null)
+        if (!await regionService.ExistsAsync(id, ct))
         {
             return TypedResults.NotFound();
         }

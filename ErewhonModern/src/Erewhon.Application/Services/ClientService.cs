@@ -216,6 +216,16 @@ public sealed class ClientService : TransactionAgent<Client>
     }
 
     /// <summary>
+    /// Returns whether a client with row id <paramref name="id"/> exists, with one scalar query by id alone and no
+    /// bound-company filter.
+    /// </summary>
+    /// <param name="id">The row id of the client.</param>
+    /// <param name="ct">Token that cancels the read.</param>
+    /// <returns><see langword="true"/> when the client exists; otherwise <see langword="false"/>.</returns>
+    public Task<bool> ExistsAsync(long id, CancellationToken ct = default) =>
+        Db.Clients.AnyAsync(candidate => candidate.Id == id, ct);
+
+    /// <summary>
     /// Returns the projections of the clients of the bound company in name order. Ports <c>Company.allClients</c>
     /// (<c>ClientsByNameDict</c>) as <c>DTOClient.populateFromObject</c> reads it.
     /// </summary>

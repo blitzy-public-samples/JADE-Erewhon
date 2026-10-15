@@ -292,7 +292,7 @@ public static class AdminPartyEndpoints
         [FromServices] AgentService agentService,
         CancellationToken ct)
     {
-        if (await agentService.FindByIdAsync(id, ct) is null)
+        if (!await agentService.ExistsAsync(id, ct))
         {
             return TypedResults.NotFound();
         }
@@ -313,7 +313,7 @@ public static class AdminPartyEndpoints
         [FromServices] AgentService agentService,
         CancellationToken ct)
     {
-        if (await itemCategoryService.FindByIdAsync(category, ct) is null)
+        if (!await itemCategoryService.ExistsAsync(category, ct))
         {
             return TypedResults.NotFound();
         }
@@ -349,7 +349,7 @@ public static class AdminPartyEndpoints
             return TypedResults.BadRequest();
         }
 
-        if (await commissionRateService.FindByIdAsync(request.CommissionRateId, ct) is null)
+        if (!await commissionRateService.ExistsAsync(request.CommissionRateId, ct))
         {
             return TypedResults.NotFound();
         }
@@ -439,7 +439,7 @@ public static class AdminPartyEndpoints
         [FromServices] ClientService clientService,
         CancellationToken ct)
     {
-        if (await clientService.FindByIdAsync(id, ct) is null)
+        if (!await clientService.ExistsAsync(id, ct))
         {
             return TypedResults.NotFound();
         }

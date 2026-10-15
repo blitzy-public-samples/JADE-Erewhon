@@ -246,6 +246,16 @@ public sealed class CommissionRateService : TransactionAgent<CommissionRate>
             .FirstOrDefaultAsync(rate => rate.Id == id, ct);
 
     /// <summary>
+    /// Returns whether a commission rate with internal id <paramref name="id"/> exists, with one scalar query by id
+    /// alone and no bound-company filter.
+    /// </summary>
+    /// <param name="id">The internal id (<c>commission_rates.id</c>) of the rate.</param>
+    /// <param name="ct">Token that cancels the read.</param>
+    /// <returns><see langword="true"/> when the rate exists; otherwise <see langword="false"/>.</returns>
+    public Task<bool> ExistsAsync(long id, CancellationToken ct = default) =>
+        Db.CommissionRates.AnyAsync(rate => rate.Id == id, ct);
+
+    /// <summary>
     /// Brings the agents holding <paramref name="rate"/> in line with <see cref="CommissionRateCommand.AgentIds"/>:
     /// first, in agent name order, runs a <see cref="TransactionType.ModifyAddCommissionRateForAgent"/> (1004) modify
     /// for each listed agent that does not hold the rate; then, in agent name order, a

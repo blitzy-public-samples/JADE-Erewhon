@@ -164,6 +164,16 @@ public sealed class RegionService : TransactionAgent<Region>
             .FirstOrDefaultAsync(region => region.Id == id, ct);
 
     /// <summary>
+    /// Returns whether a region with internal id <paramref name="id"/> exists, with one scalar query by id alone and
+    /// no bound-company filter.
+    /// </summary>
+    /// <param name="id">The internal id (<c>regions.id</c>) of the region.</param>
+    /// <param name="ct">Token that cancels the read.</param>
+    /// <returns><see langword="true"/> when the region exists; otherwise <see langword="false"/>.</returns>
+    public Task<bool> ExistsAsync(long id, CancellationToken ct = default) =>
+        Db.Regions.AnyAsync(region => region.Id == id, ct);
+
+    /// <summary>
     /// Checks the command's <see cref="LocationCommand{TLocation}.Name"/> (81), as given and before any trimming, then
     /// the common attributes.
     /// </summary>

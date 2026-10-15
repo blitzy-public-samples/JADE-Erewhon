@@ -23,15 +23,30 @@ public abstract class PersistentModel : IJadeIdentifiable
     public abstract int JadeClassNumber { get; }
 
     /// <summary>True when any session, including the caller's own, holds the soft edit lock.</summary>
-    public bool IsSoftLocked => !JadeValues.IsNull(LockedBySession);
+    public bool IsSoftLocked => IsSoftLockSet(LockedBySession);
 
     /// <summary>
     /// Returns whether the session <paramref name="sessionId"/> holds the soft edit lock.
     /// </summary>
     /// <param name="sessionId">The session id to compare with the lock owner.</param>
     /// <returns><see langword="true"/> when the entity is soft locked and <see cref="LockedBySession"/> equals <paramref name="sessionId"/> by ordinal comparison; otherwise <see langword="false"/>.</returns>
-    public bool IsSoftLockedBy(string sessionId) =>
-        IsSoftLocked && string.Equals(LockedBySession, sessionId, StringComparison.Ordinal);
+    public bool IsSoftLockedBy(string sessionId) => IsSoftLockHeldBy(LockedBySession, sessionId);
+
+    /// <summary>
+    /// Returns whether the stored lock owner <paramref name="lockedBySession"/> sets the soft edit lock, whichever session it names.
+    /// </summary>
+    /// <param name="lockedBySession">The stored <see cref="LockedBySession"/> value of a row.</param>
+    /// <returns><see langword="true"/> when <paramref name="lockedBySession"/> is neither <see langword="null"/> nor empty; otherwise <see langword="false"/>.</returns>
+    public static bool IsSoftLockSet(string? lockedBySession) => !JadeValues.IsNull(lockedBySession);
+
+    /// <summary>
+    /// Returns whether the stored lock owner <paramref name="lockedBySession"/> sets the soft edit lock for the session <paramref name="sessionId"/>.
+    /// </summary>
+    /// <param name="lockedBySession">The stored <see cref="LockedBySession"/> value of a row.</param>
+    /// <param name="sessionId">The session id to compare with the lock owner.</param>
+    /// <returns><see langword="true"/> when <see cref="IsSoftLockSet"/> holds for <paramref name="lockedBySession"/> and it equals <paramref name="sessionId"/> by ordinal comparison; otherwise <see langword="false"/>.</returns>
+    public static bool IsSoftLockHeldBy(string? lockedBySession, string sessionId) =>
+        IsSoftLockSet(lockedBySession) && string.Equals(lockedBySession, sessionId, StringComparison.Ordinal);
 
     /// <summary>
     /// Sets the soft edit lock to the session <paramref name="sessionId"/> at <paramref name="timestamp"/>.

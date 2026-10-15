@@ -206,7 +206,7 @@ public static class AdminItemEndpoints
         [FromServices] IServerClock clock,
         CancellationToken ct)
     {
-        if (await itemCategoryService.FindByIdAsync(category, ct) is null)
+        if (!await itemCategoryService.ExistsAsync(category, ct))
         {
             return TypedResults.NotFound();
         }
@@ -325,7 +325,7 @@ public static class AdminItemEndpoints
         [FromServices] ItemService itemService,
         CancellationToken ct)
     {
-        if (await itemService.FindByIdAsync(id, ct) is null)
+        if (!await itemService.ExistsAsync(id, ct))
         {
             return TypedResults.NotFound();
         }

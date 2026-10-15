@@ -192,6 +192,16 @@ public sealed class CountryService : TransactionAgent<Country>
             .FirstOrDefaultAsync(country => country.Id == id, ct);
 
     /// <summary>
+    /// Returns whether a country with internal id <paramref name="id"/> exists, with one scalar query by id alone and
+    /// no bound-company filter.
+    /// </summary>
+    /// <param name="id">The internal id (<c>countries.id</c>) of the country.</param>
+    /// <param name="ct">Token that cancels the read.</param>
+    /// <returns><see langword="true"/> when the country exists; otherwise <see langword="false"/>.</returns>
+    public Task<bool> ExistsAsync(long id, CancellationToken ct = default) =>
+        Db.Countries.AnyAsync(country => country.Id == id, ct);
+
+    /// <summary>
     /// Returns the country of the bound company whose name equals <paramref name="name"/> exactly, with its regions
     /// loaded in name order, or <see langword="null"/> when there is none or <paramref name="name"/> is
     /// <see langword="null"/> or empty. Ports <c>Company.allCountries[name]</c>.

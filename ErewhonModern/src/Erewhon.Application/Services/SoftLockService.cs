@@ -38,7 +38,8 @@ public sealed record SoftLockStatus(
 /// Reads, sets and clears the soft edit lock of the rows the admin editors open, and sends the save request to the
 /// session editing a locked row. A lock or unlock runs the row's own transaction-agent modify path, with sub-code
 /// <see cref="TransactionType.ModifyLockEntity"/> (1001) or <see cref="TransactionType.ModifyUnlockEntity"/> (1002),
-/// in its own transaction. Ports the soft lock of JADE <c>ErewhonBaseForm</c> (<c>displayObject</c>,
+/// in its own transaction. The status and the save request read only the row's stored lock owner, without change
+/// tracking. Ports the soft lock of JADE <c>ErewhonBaseForm</c> (<c>displayObject</c>,
 /// <c>lockEntity</c>, <c>formUnload</c>, <c>thing</c>) and <c>PersistentModel.isSoftLockedByMe</c>.
 /// </summary>
 /// <remarks>
@@ -150,21 +151,20 @@ public sealed class SoftLockService
     /// </returns>
     public async Task<SoftLockStatus?> GetStatusAsync(string entityType, long id, CancellationToken ct = default)
     {
-        SoftLockTarget? target = await ResolveAsync(entityType, id, ct);
-        if (target is null)
+        SoftLockState? state = await ReadLockStateAsync(entityType, id, ct);
+        if (state is null)
         {
             return null;
         }
 
-        PersistentModel entity = target.Entity;
         string thing = MessageCatalog.Get(MessageKeys.Thing);
 
         return new SoftLockStatus(
-            target.EntityType,
-            entity.Id,
-            entity.IsSoftLocked,
-            IsLockedByCaller(entity),
-            entity.LockedBySession,
+            state.EntityType,
+            state.Id,
+            PersistentModel.IsSoftLockSet(state.LockedBySession),
+            IsLockedByCaller(state.LockedBySession),
+            state.LockedBySession,
             thing,
             MessageCatalog.Get(MessageKeys.ThingCurrentlyEdited, thing),
             MessageCatalog.Get(MessageKeys.ThingAlreadyBeingEdited, thing));
@@ -223,7 +223,7 @@ public sealed class SoftLockService
             return null;
         }
 
-        if (!IsLockedByCaller(target.Entity))
+        if (!IsLockedByCaller(target.Entity.LockedBySession))
         {
             return new OperationResult { Succeeded = true };
         }
@@ -246,30 +246,79 @@ public sealed class SoftLockService
     /// </returns>
     public async Task<bool?> RequestSaveAsync(string entityType, long id, CancellationToken ct = default)
     {
-        SoftLockTarget? target = await ResolveAsync(entityType, id, ct);
-        if (target is null)
+        SoftLockState? state = await ReadLockStateAsync(entityType, id, ct);
+        if (state is null)
         {
             return null;
         }
 
-        PersistentModel entity = target.Entity;
-        if (!entity.IsSoftLocked)
+        if (!PersistentModel.IsSoftLockSet(state.LockedBySession))
         {
             return false;
         }
 
-        await _publisher.PublishSaveOutstandingChangesAsync(entity.LockedBySession!, target.EntityType, entity.Id, ct);
+        await _publisher.PublishSaveOutstandingChangesAsync(state.LockedBySession!, state.EntityType, state.Id, ct);
         return true;
     }
 
     /// <summary>
-    /// Returns whether a session is bound to the scope and holds the soft edit lock of <paramref name="entity"/>.
-    /// Ports <c>PersistentModel.isSoftLockedByMe</c>.
+    /// Returns whether a session is bound to the scope and holds the soft edit lock whose stored owner is
+    /// <paramref name="lockedBySession"/>. Ports <c>PersistentModel.isSoftLockedByMe</c>.
     /// </summary>
-    private bool IsLockedByCaller(PersistentModel entity) =>
+    private bool IsLockedByCaller(string? lockedBySession) =>
         _session.HasSession
         && _session.SessionId is { } sessionId
-        && entity.IsSoftLockedBy(sessionId);
+        && PersistentModel.IsSoftLockHeldBy(lockedBySession, sessionId);
+
+    /// <summary>
+    /// Returns the canonical domain type name that <paramref name="entityType"/> matches case-insensitively, or
+    /// <see langword="null"/> when it matches none.
+    /// </summary>
+    private static string? FindEntityType(string entityType) =>
+        Array.Find(EntityTypes, candidate => string.Equals(candidate, entityType, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// Reads the stored lock owner of the row of the matched entity type, without change tracking, in one query by id;
+    /// returns <see langword="null"/> for an unknown entity type or a missing row.
+    /// </summary>
+    private async Task<SoftLockState?> ReadLockStateAsync(string entityType, long id, CancellationToken ct)
+    {
+        string? name = FindEntityType(entityType);
+
+        return name switch
+        {
+            nameof(Agent) => await ReadLockOwnerAsync(name, _db.Agents, id, ct),
+            nameof(Client) => await ReadLockOwnerAsync(name, _db.Clients, id, ct),
+            nameof(Company) => await ReadLockOwnerAsync(name, _db.Companies, id, ct),
+            nameof(RetailItem) => await ReadLockOwnerAsync(name, _db.Items.OfType<RetailItem>(), id, ct),
+            nameof(TenderItem) => await ReadLockOwnerAsync(name, _db.Items.OfType<TenderItem>(), id, ct),
+            nameof(ItemCategory) => await ReadLockOwnerAsync(name, _db.ItemCategories, id, ct),
+            nameof(CommissionRate) => await ReadLockOwnerAsync(name, _db.CommissionRates, id, ct),
+            nameof(Country) => await ReadLockOwnerAsync(name, _db.Countries, id, ct),
+            nameof(Region) => await ReadLockOwnerAsync(name, _db.Regions, id, ct),
+            _ => null,
+        };
+    }
+
+    /// <summary>
+    /// Reads only the <see cref="PersistentModel.LockedBySession"/> column of the row of <paramref name="rows"/> whose
+    /// id is <paramref name="id"/>, without change tracking; returns <see langword="null"/> when no such row exists.
+    /// </summary>
+    private static async Task<SoftLockState?> ReadLockOwnerAsync<TEntity>(
+        string entityType,
+        IQueryable<TEntity> rows,
+        long id,
+        CancellationToken ct)
+        where TEntity : PersistentModel
+    {
+        var row = await rows
+            .AsNoTracking()
+            .Where(entity => entity.Id == id)
+            .Select(entity => new { entity.LockedBySession })
+            .FirstOrDefaultAsync(ct);
+
+        return row is null ? null : new SoftLockState(entityType, id, row.LockedBySession);
+    }
 
     /// <summary>
     /// Reads the row of the matched entity type with change tracking, together with the navigations its command's
@@ -278,9 +327,7 @@ public sealed class SoftLockService
     /// </summary>
     private async Task<SoftLockTarget?> ResolveAsync(string entityType, long id, CancellationToken ct)
     {
-        string? name = Array.Find(
-            EntityTypes,
-            candidate => string.Equals(candidate, entityType, StringComparison.OrdinalIgnoreCase));
+        string? name = FindEntityType(entityType);
 
         return name switch
         {
@@ -364,4 +411,10 @@ public sealed class SoftLockService
         string EntityType,
         PersistentModel Entity,
         Func<string?, DateTime?, TransactionType, CancellationToken, Task<OperationResult>> ModifyAsync);
+
+    /// <summary>
+    /// The lock state of an existing row: its domain type name, its id and its stored lock owner, which is
+    /// <see langword="null"/> when the column is null.
+    /// </summary>
+    private sealed record SoftLockState(string EntityType, long Id, string? LockedBySession);
 }
