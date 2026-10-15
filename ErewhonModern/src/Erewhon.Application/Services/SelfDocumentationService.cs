@@ -74,18 +74,19 @@ public sealed class SelfDocumentationService(ICompanyContext companyContext, IEr
         Company company = await _companyContext.GetCurrentAsync(ct);
         long companyId = company.Id;
 
-        List<Agent> agents = await _db.Agents
+        var agents = await _db.Agents
             .AsNoTracking()
             .Where(agent => agent.CompanyId == companyId)
             .OrderBy(agent => agent.Name)
+            .Select(agent => new { agent.Id, agent.Name })
             .ToListAsync(ct);
 
-        List<Region> regions = await _db.Regions
+        var regions = await _db.Regions
             .AsNoTracking()
-            .Include(region => region.Country)
             .Where(region => region.Country!.CompanyId == companyId)
             .OrderBy(region => region.Country!.Name)
             .ThenBy(region => region.Name)
+            .Select(region => new { region.Id, region.Name, CountryName = region.Country!.Name })
             .ToListAsync(ct);
 
         var candidates = new List<DocumentationCandidate>(agents.Count + regions.Count + 2)
@@ -94,12 +95,12 @@ public sealed class SelfDocumentationService(ICompanyContext companyContext, IEr
         };
 
         candidates.AddRange(agents.Select(agent =>
-            new DocumentationCandidate(agent.GetNameString(), EntryLevel, AgentEntityType, agent.Id)));
+            new DocumentationCandidate(agent.Name, EntryLevel, AgentEntityType, agent.Id)));
 
         candidates.Add(Heading(MessageKeys.Regions));
 
         candidates.AddRange(regions.Select(region =>
-            new DocumentationCandidate(region.GetCountryAndRegionNames(), EntryLevel, RegionEntityType, region.Id)));
+            new DocumentationCandidate(region.CountryName + " " + region.Name, EntryLevel, RegionEntityType, region.Id)));
 
         return candidates.AsReadOnly();
     }

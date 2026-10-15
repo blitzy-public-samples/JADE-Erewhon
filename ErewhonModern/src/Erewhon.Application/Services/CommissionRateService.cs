@@ -253,6 +253,8 @@ public sealed class CommissionRateService : TransactionAgent<CommissionRate>
     /// that is not listed. Each modify runs through <see cref="AgentService"/> in <see cref="TransactionMode.Ambient"/>
     /// mode with the rate entity itself, and its result is not read; listed ids that match no agent are skipped.
     /// The holders are the rate's agent links as the change tracker sees them once the stored links are loaded.
+    /// Before the 1004 modifies, the stored links of the joining agents for the rate's item category are read in one
+    /// query, and each 1004 modify takes its agent's stored link from that read.
     /// Ports <c>CommissionRate.addOrRemoveAgents</c>.
     /// </summary>
     /// <param name="rate">The rate whose agents change; tracked, and unsaved with id 0 while it is being created.</param>
@@ -271,16 +273,21 @@ public sealed class CommissionRateService : TransactionAgent<CommissionRate>
         var listedIds = new HashSet<long>(command.AgentIds);
         HashSet<long> holderIds = await LoadHolderIdsAsync(rate, ct);
 
-        foreach (Agent agent in await AgentsInNameOrderAsync(listedIds, ct))
+        List<Agent> joiningAgents = (await AgentsInNameOrderAsync(listedIds, ct))
+            .Where(agent => !holderIds.Contains(agent.Id))
+            .ToList();
+        StoredCategoryLinks? joiningLinks = await _agentService.ReadStoredCategoryLinksAsync(
+            rate,
+            joiningAgents.Select(agent => agent.Id).ToList(),
+            ct);
+
+        foreach (Agent agent in joiningAgents)
         {
-            if (!holderIds.Contains(agent.Id))
-            {
-                await _agentService.ExecuteAsync(
-                    RateModifyCommand(agent, rate),
-                    TransactionType.ModifyAddCommissionRateForAgent,
-                    TransactionMode.Ambient,
-                    ct);
-            }
+            await _agentService.ExecuteAsync(
+                RateModifyCommand(agent, rate, joiningLinks),
+                TransactionType.ModifyAddCommissionRateForAgent,
+                TransactionMode.Ambient,
+                ct);
         }
 
         HashSet<long> leavingIds = await LoadHolderIdsAsync(rate, ct);
@@ -289,7 +296,7 @@ public sealed class CommissionRateService : TransactionAgent<CommissionRate>
         foreach (Agent agent in await AgentsInNameOrderAsync(leavingIds, ct))
         {
             await _agentService.ExecuteAsync(
-                RateModifyCommand(agent, rate),
+                RateModifyCommand(agent, rate, null),
                 TransactionType.ModifyRemoveCommissionRateForAgent,
                 TransactionMode.Ambient,
                 ct);
@@ -481,15 +488,18 @@ public sealed class CommissionRateService : TransactionAgent<CommissionRate>
         command.ItemCategoryId != rate.ItemCategoryId || command.Percentage != rate.Percentage;
 
     /// <summary>
-    /// Returns a new agent command whose model object is <paramref name="agent"/> and whose commission rate is
-    /// <paramref name="rate"/>, with its id once the rate has one; the name and address are left unset.
+    /// Returns a new agent command whose model object is <paramref name="agent"/>, whose commission rate is
+    /// <paramref name="rate"/>, with its id once the rate has one, and whose
+    /// <see cref="AgentCommand.StoredCategoryLinks"/> are <paramref name="storedLinks"/>; the name and address are left
+    /// unset.
     /// </summary>
-    private static AgentCommand RateModifyCommand(Agent agent, CommissionRate rate) =>
+    private static AgentCommand RateModifyCommand(Agent agent, CommissionRate rate, StoredCategoryLinks? storedLinks) =>
         new()
         {
             ModelObject = agent,
             CommissionRate = rate,
             CommissionRateId = JadeValues.IsNull(rate.Id) ? null : rate.Id,
+            StoredCategoryLinks = storedLinks,
         };
 
     /// <summary>Returns the internal id of the bound company.</summary>

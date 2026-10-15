@@ -42,8 +42,16 @@ public sealed class AgentCommand : TransactionCommand<Agent>
     public CommissionRate? CommissionRate { get; set; }
 
     /// <summary>
-    /// Resets the common attributes and sets <see cref="Name"/>, <see cref="Address"/>, <see cref="CommissionRateId"/>
-    /// and <see cref="CommissionRate"/> to <see langword="null"/>. Ports <c>AgentTA.initialize</c>.
+    /// The stored links of a set of agents for one item category, read together before their 1004 or 1005 modifies.
+    /// When it covers the agent and the item category of the modify's commission rate, the modify takes the agent's
+    /// stored link from it instead of reading the link; otherwise, or when <see langword="null"/>, the modify reads it.
+    /// </summary>
+    internal StoredCategoryLinks? StoredCategoryLinks { get; set; }
+
+    /// <summary>
+    /// Resets the common attributes and sets <see cref="Name"/>, <see cref="Address"/>, <see cref="CommissionRateId"/>,
+    /// <see cref="CommissionRate"/> and <see cref="StoredCategoryLinks"/> to <see langword="null"/>.
+    /// Ports <c>AgentTA.initialize</c>.
     /// </summary>
     public override void Initialize()
     {
@@ -52,6 +60,7 @@ public sealed class AgentCommand : TransactionCommand<Agent>
         Address = null;
         CommissionRateId = null;
         CommissionRate = null;
+        StoredCategoryLinks = null;
     }
 
     /// <summary>
@@ -185,21 +194,41 @@ public sealed class AgentService : TransactionAgent<Agent>
     /// <summary>
     /// Returns the agent with internal id <paramref name="id"/>, with its address, its commission-rate links each with
     /// its rate and the rate's item category, and its items each with its item category and sale; or
-    /// <see langword="null"/> when no such agent exists.
+    /// <see langword="null"/> when no such agent exists. The agent, its commission-rate links and its items are read
+    /// in three separate queries: the links in commission-rate id order and the items in item id order. Only the
+    /// agent is read when no agent has that id.
     /// </summary>
     /// <param name="id">The internal id (<c>agents.id</c>) of the agent.</param>
-    /// <param name="ct">Token that cancels the read.</param>
+    /// <param name="ct">Token that cancels the reads.</param>
     /// <returns>The tracked agent, or <see langword="null"/>.</returns>
-    public Task<Agent?> FindByIdAsync(long id, CancellationToken ct = default) =>
-        Db.Agents
-            .Include(agent => agent.AgentCommissionRates)
-                .ThenInclude(link => link.CommissionRate)
-                    .ThenInclude(rate => rate!.ItemCategory)
-            .Include(agent => agent.Items)
-                .ThenInclude(item => item.ItemCategory)
-            .Include(agent => agent.Items)
-                .ThenInclude(item => item.Sale)
-            .FirstOrDefaultAsync(agent => agent.Id == id, ct);
+    public async Task<Agent?> FindByIdAsync(long id, CancellationToken ct = default)
+    {
+        Agent? agent = await Db.Agents
+            .FirstOrDefaultAsync(candidate => candidate.Id == id, ct);
+
+        if (agent is null)
+        {
+            return null;
+        }
+
+        await Db.Entry(agent)
+            .Collection(candidate => candidate.AgentCommissionRates)
+            .Query()
+            .Include(link => link.CommissionRate)
+                .ThenInclude(rate => rate!.ItemCategory)
+            .OrderBy(link => link.CommissionRateId)
+            .LoadAsync(ct);
+
+        await Db.Entry(agent)
+            .Collection(candidate => candidate.Items)
+            .Query()
+            .Include(item => item.ItemCategory)
+            .Include(item => item.Sale)
+            .OrderBy(item => item.Id)
+            .LoadAsync(ct);
+
+        return agent;
+    }
 
     /// <summary>
     /// Returns the projection of each agent of the bound company, with its address, in name order.
@@ -249,13 +278,51 @@ public sealed class AgentService : TransactionAgent<Agent>
     {
         long companyId = await CurrentCompanyIdAsync(ct);
 
-        List<Agent> agents = await Db.Agents
+        return await Db.Agents
             .AsNoTracking()
             .Where(agent => agent.CompanyId == companyId)
             .OrderBy(agent => agent.Name)
+            .Select(agent => new NameProjection(agent.Id, agent.Name))
+            .ToListAsync(ct);
+    }
+
+    /// <summary>
+    /// Reads in one tracked query the stored links of the agents <paramref name="agentIds"/> for the item category of
+    /// <paramref name="rate"/>: its <see cref="CommissionRate.ItemCategoryId"/>, or the id of its loaded
+    /// <see cref="CommissionRate.ItemCategory"/> when that is 0. Reads nothing and returns <see langword="null"/> when
+    /// <paramref name="agentIds"/> is empty or the rate has no item category.
+    /// </summary>
+    /// <param name="rate">The commission rate whose item category the links are read for.</param>
+    /// <param name="agentIds">The internal ids (<c>agents.id</c>) of the agents whose links are read.</param>
+    /// <param name="ct">Token that cancels the read.</param>
+    /// <returns>
+    /// The stored links of the agents for the category, covering every id in <paramref name="agentIds"/>; or
+    /// <see langword="null"/>.
+    /// </returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="rate"/> or <paramref name="agentIds"/> is <see langword="null"/>.
+    /// </exception>
+    internal async Task<StoredCategoryLinks?> ReadStoredCategoryLinksAsync(
+        CommissionRate rate,
+        IReadOnlyCollection<long> agentIds,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(rate);
+        ArgumentNullException.ThrowIfNull(agentIds);
+
+        long itemCategoryId = ItemCategoryIdOf(rate);
+        if (JadeValues.IsNull(itemCategoryId) || agentIds.Count == 0)
+        {
+            return null;
+        }
+
+        long[] ids = [.. agentIds];
+
+        List<AgentCommissionRate> links = await Db.AgentCommissionRates
+            .Where(link => ids.Contains(link.AgentId) && link.ItemCategoryId == itemCategoryId)
             .ToListAsync(ct);
 
-        return agents.Select(NameProjection.From).ToList();
+        return new StoredCategoryLinks(itemCategoryId, ids, links);
     }
 
     /// <summary>
@@ -614,12 +681,16 @@ public sealed class AgentService : TransactionAgent<Agent>
     /// <summary>
     /// Makes the command's commission rate the agent's rate for that rate's item category: does nothing when the
     /// agent already holds that rate, otherwise removes the agent's link for the category, if any, and adds a link to
-    /// the rate.
+    /// the rate. The agent's link is found with the command's <see cref="AgentCommand.StoredCategoryLinks"/>.
     /// </summary>
     private async Task AddCommissionRateAsync(Agent agent, AgentCommand command, CancellationToken ct)
     {
         (CommissionRate rate, long itemCategoryId) = await ResolveCommissionRateAsync(command, ct);
-        AgentCommissionRate? existing = await FindCategoryLinkAsync(agent.Id, itemCategoryId, ct);
+        AgentCommissionRate? existing = await FindCategoryLinkAsync(
+            agent.Id,
+            itemCategoryId,
+            command.StoredCategoryLinks,
+            ct);
 
         if (existing is not null
             && (ReferenceEquals(existing.CommissionRate, rate) || (rate.Id != 0 && existing.CommissionRateId == rate.Id)))
@@ -650,11 +721,18 @@ public sealed class AgentService : TransactionAgent<Agent>
         Db.AgentCommissionRates.Add(link);
     }
 
-    /// <summary>Removes the agent's link for the item category of the command's commission rate, if any.</summary>
+    /// <summary>
+    /// Removes the agent's link for the item category of the command's commission rate, if any, found with the
+    /// command's <see cref="AgentCommand.StoredCategoryLinks"/>.
+    /// </summary>
     private async Task RemoveCommissionRateAsync(Agent agent, AgentCommand command, CancellationToken ct)
     {
         (_, long itemCategoryId) = await ResolveCommissionRateAsync(command, ct);
-        AgentCommissionRate? existing = await FindCategoryLinkAsync(agent.Id, itemCategoryId, ct);
+        AgentCommissionRate? existing = await FindCategoryLinkAsync(
+            agent.Id,
+            itemCategoryId,
+            command.StoredCategoryLinks,
+            ct);
 
         if (existing is not null)
         {
@@ -687,7 +765,7 @@ public sealed class AgentService : TransactionAgent<Agent>
             throw new InvalidOperationException("A commission-rate modify of an agent needs a commission rate.");
         }
 
-        long itemCategoryId = JadeValues.IsNull(rate.ItemCategoryId) ? rate.ItemCategory?.Id ?? 0 : rate.ItemCategoryId;
+        long itemCategoryId = ItemCategoryIdOf(rate);
         if (JadeValues.IsNull(itemCategoryId))
         {
             throw new InvalidOperationException("The commission rate has no item category.");
@@ -697,11 +775,23 @@ public sealed class AgentService : TransactionAgent<Agent>
     }
 
     /// <summary>
+    /// Returns the id of the item category of <paramref name="rate"/>: its <see cref="CommissionRate.ItemCategoryId"/>,
+    /// or the id of its loaded <see cref="CommissionRate.ItemCategory"/> when that is 0; 0 when it has neither.
+    /// </summary>
+    private static long ItemCategoryIdOf(CommissionRate rate) =>
+        JadeValues.IsNull(rate.ItemCategoryId) ? rate.ItemCategory?.Id ?? 0 : rate.ItemCategoryId;
+
+    /// <summary>
     /// Returns the link of agent <paramref name="agentId"/> for item category <paramref name="itemCategoryId"/> as the
     /// change tracker sees it: a tracked link that is not deleted, otherwise the stored link unless it is tracked as
-    /// deleted; <see langword="null"/> when there is none.
+    /// deleted; <see langword="null"/> when there is none. The stored link is taken from
+    /// <paramref name="storedLinks"/> when it covers the agent and the category, and is read otherwise.
     /// </summary>
-    private async Task<AgentCommissionRate?> FindCategoryLinkAsync(long agentId, long itemCategoryId, CancellationToken ct)
+    private async Task<AgentCommissionRate?> FindCategoryLinkAsync(
+        long agentId,
+        long itemCategoryId,
+        StoredCategoryLinks? storedLinks,
+        CancellationToken ct)
     {
         AgentCommissionRate? tracked = Db.AgentCommissionRates.Local
             .FirstOrDefault(link => link.AgentId == agentId && link.ItemCategoryId == itemCategoryId);
@@ -710,9 +800,65 @@ public sealed class AgentService : TransactionAgent<Agent>
             return tracked;
         }
 
-        AgentCommissionRate? stored = await Db.AgentCommissionRates
-            .FirstOrDefaultAsync(link => link.AgentId == agentId && link.ItemCategoryId == itemCategoryId, ct);
+        AgentCommissionRate? stored = storedLinks is not null && storedLinks.Covers(agentId, itemCategoryId)
+            ? storedLinks.StoredLinkOf(agentId)
+            : await Db.AgentCommissionRates
+                .FirstOrDefaultAsync(link => link.AgentId == agentId && link.ItemCategoryId == itemCategoryId, ct);
 
         return stored is not null && Db.Entry(stored).State != EntityState.Deleted ? stored : null;
     }
+}
+
+/// <summary>
+/// The stored commission-rate links of a set of agents for one item category, as one read returned them; an agent of
+/// the set with no link here has no stored link for that category.
+/// </summary>
+internal sealed class StoredCategoryLinks
+{
+    private readonly HashSet<long> _agentIds;
+    private readonly Dictionary<long, AgentCommissionRate> _linksByAgentId = [];
+
+    /// <summary>
+    /// Creates the links of the agents <paramref name="agentIds"/> for item category
+    /// <paramref name="itemCategoryId"/>; the first link of each agent in <paramref name="links"/> is kept.
+    /// </summary>
+    /// <param name="itemCategoryId">The internal id (<c>item_categories.id</c>) of the item category.</param>
+    /// <param name="agentIds">The internal ids (<c>agents.id</c>) of the agents whose links were read.</param>
+    /// <param name="links">The links the read returned.</param>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="agentIds"/> or <paramref name="links"/> is <see langword="null"/>.
+    /// </exception>
+    internal StoredCategoryLinks(
+        long itemCategoryId,
+        IEnumerable<long> agentIds,
+        IEnumerable<AgentCommissionRate> links)
+    {
+        ArgumentNullException.ThrowIfNull(agentIds);
+        ArgumentNullException.ThrowIfNull(links);
+
+        ItemCategoryId = itemCategoryId;
+        _agentIds = [.. agentIds];
+        foreach (AgentCommissionRate link in links)
+        {
+            _linksByAgentId.TryAdd(link.AgentId, link);
+        }
+    }
+
+    /// <summary>The internal id (<c>item_categories.id</c>) of the item category the links were read for.</summary>
+    internal long ItemCategoryId { get; }
+
+    /// <summary>
+    /// Returns whether the read covered agent <paramref name="agentId"/> for item category
+    /// <paramref name="itemCategoryId"/>.
+    /// </summary>
+    /// <param name="agentId">The internal id (<c>agents.id</c>) of the agent.</param>
+    /// <param name="itemCategoryId">The internal id (<c>item_categories.id</c>) of the item category.</param>
+    /// <returns><see langword="true"/> when the agent was read for that category.</returns>
+    internal bool Covers(long agentId, long itemCategoryId) =>
+        itemCategoryId == ItemCategoryId && _agentIds.Contains(agentId);
+
+    /// <summary>Returns the stored link of agent <paramref name="agentId"/>, or <see langword="null"/> when it has none.</summary>
+    /// <param name="agentId">The internal id (<c>agents.id</c>) of a covered agent.</param>
+    /// <returns>The link the read returned for the agent, or <see langword="null"/>.</returns>
+    internal AgentCommissionRate? StoredLinkOf(long agentId) => _linksByAgentId.GetValueOrDefault(agentId);
 }
