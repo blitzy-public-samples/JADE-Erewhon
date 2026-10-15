@@ -1,0 +1,6 @@
+bin/
+obj/
+node_modules/
+/src/Erewhon.Api/wwwroot/
+test-results/
+playwright-report/
