@@ -919,7 +919,7 @@ public abstract class TransactionAgent<TEntity>
             TEntity entity = CreateModelObject(command);
             state.CreatedEntity = entity;
             command.ModelObject = entity;
-            Db.Entry(entity).State = EntityState.Added;
+            TrackAsAdded(entity);
             await OnCreateAsync(entity, command, ct);
         }
 
@@ -975,6 +975,19 @@ public abstract class TransactionAgent<TEntity>
 
         return await ModifySubordinateObjectsAsync(command, modification, result, ct);
     }
+
+    /// <summary>
+    /// Tracks a new entity as added together with the owned entities it references, such as its address; entities
+    /// reached through its other navigations are left untracked.
+    /// </summary>
+    private void TrackAsAdded(TEntity entity) =>
+        Db.ChangeTracker.TrackGraph(entity, node =>
+        {
+            if (node.SourceEntry is null || node.Entry.Metadata.IsOwned())
+            {
+                node.Entry.State = EntityState.Added;
+            }
+        });
 
     /// <summary>
     /// Returns the command's model object, attaching it as unchanged when it is not tracked.
