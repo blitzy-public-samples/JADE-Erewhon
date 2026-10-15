@@ -5,6 +5,9 @@ namespace Erewhon.Application.Cart;
 /// </summary>
 public sealed class CartItem
 {
+    private readonly object _dateSoldGate = new();
+    private DateTime? _dateSold;
+
     /// <summary>The internal id of the line's item.</summary>
     public required long ItemId { get; init; }
 
@@ -30,7 +33,46 @@ public sealed class CartItem
     public DateTime? DateTendered { get; init; }
 
     /// <summary>
-    /// Retail lines: null until the first checkout pre-validation of the line assigns the server timestamp, which then stays on the line for every later checkout attempt. Tender lines: null.
+    /// Retail lines: null until <see cref="RetainDateSold(DateTime)"/> first assigns the sale timestamp, which then stays on the line for every later checkout attempt. Tender lines: null.
+    /// Reads are synchronized with <see cref="RetainDateSold(DateTime)"/>.
     /// </summary>
-    public DateTime? DateSold { get; set; }
+    public DateTime? DateSold
+    {
+        get
+        {
+            lock (_dateSoldGate)
+            {
+                return _dateSold;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Assigns <paramref name="dateSold"/> as the line's sale timestamp when the line has none, and returns the line's sale timestamp.
+    /// The check and the assignment are one atomic step, so overlapping calls keep one value and all return it, and a later call never replaces it.
+    /// </summary>
+    /// <param name="dateSold">The candidate sale timestamp, stored exactly as given when the line has no sale timestamp.</param>
+    /// <returns>The line's sale timestamp after the call: the value the first successful call assigned.</returns>
+    /// <exception cref="InvalidOperationException">The line is a tender line; <see cref="DateSold"/> stays null.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="dateSold"/> is <c>default(DateTime)</c>, the null timestamp; <see cref="DateSold"/> is left unchanged.
+    /// </exception>
+    public DateTime RetainDateSold(DateTime dateSold)
+    {
+        if (IsTender)
+        {
+            throw new InvalidOperationException("A tender line has no sale timestamp.");
+        }
+
+        if (dateSold == default)
+        {
+            throw new ArgumentOutOfRangeException(nameof(dateSold), "The sale timestamp must not be the null timestamp.");
+        }
+
+        lock (_dateSoldGate)
+        {
+            _dateSold ??= dateSold;
+            return _dateSold.Value;
+        }
+    }
 }

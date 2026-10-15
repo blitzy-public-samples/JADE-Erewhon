@@ -24,6 +24,7 @@ public sealed class ShoppingCart
 
     /// <summary>
     /// A snapshot of the cart lines in ascending item-id order. Later changes to the cart do not alter a returned snapshot.
+    /// The snapshot holds the cart's own line objects, not copies, so a sale timestamp retained on a snapshot line is retained on the cart's line.
     /// </summary>
     public IReadOnlyList<CartItem> Items
     {
@@ -70,7 +71,7 @@ public sealed class ShoppingCart
         }
     }
 
-    /// <summary>Adds a line for the line's item id.</summary>
+    /// <summary>Adds a line for the line's item id. The cart keeps the given line object itself.</summary>
     /// <param name="item">The line to add.</param>
     /// <exception cref="ArgumentNullException"><paramref name="item"/> is null.</exception>
     /// <exception cref="InvalidOperationException">
