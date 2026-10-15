@@ -85,12 +85,15 @@ public sealed class NotificationQueue(ICartStore cartStore, INotificationPublish
     /// <list type="number">
     /// <item><description>Every <see cref="ChangeKind.Updated"/> event whose entity type and id also have a
     /// <see cref="ChangeKind.Deleted"/> event in the batch is dropped.</description></item>
-    /// <item><description>For each <see cref="ChangeKind.Deleted"/> event of a <see cref="RetailItem"/> or
-    /// <see cref="TenderItem"/>, in queue order, the item is removed from every session cart, then one
-    /// <c>CartItemDeleted</c> notification is sent to each session whose cart held it.</description></item>
+    /// <item><description>Every <see cref="RetailItem"/> or <see cref="TenderItem"/> with a
+    /// <see cref="ChangeKind.Deleted"/> event in the batch is removed from every session cart, in queue order; then,
+    /// in the same order, one <c>CartItemDeleted</c> notification is sent to each session whose cart held the
+    /// item.</description></item>
     /// <item><description>The remaining events are published in queue order as one batch.</description></item>
     /// </list>
-    /// Exceptions from the cart store or the publisher propagate to the caller.
+    /// Exceptions from the cart store or the publisher propagate to the caller. An exception from the publisher
+    /// leaves the notifications after the failing one unsent; every deleted item of the batch is already out of
+    /// every cart by then.
     /// </summary>
     /// <param name="ct">Cancels the publishing.</param>
     /// <returns>A task that completes when every notification has been handed to the publisher.</returns>
@@ -122,6 +125,7 @@ public sealed class NotificationQueue(ICartStore cartStore, INotificationPublish
             }
         }
 
+        var evictions = new List<(long ItemId, IReadOnlyList<string> SessionIds)>();
         foreach (var change in remaining)
         {
             if (change.Kind != ChangeKind.Deleted || !IsItemType(change.EntityType))
@@ -129,10 +133,14 @@ public sealed class NotificationQueue(ICartStore cartStore, INotificationPublish
                 continue;
             }
 
-            var sessionIds = _cartStore.RemoveItemFromAllCarts(change.Id);
+            evictions.Add((change.Id, _cartStore.RemoveItemFromAllCarts(change.Id)));
+        }
+
+        foreach (var (itemId, sessionIds) in evictions)
+        {
             foreach (var sessionId in sessionIds)
             {
-                await _publisher.PublishCartItemDeletedAsync(sessionId, change.Id, ct);
+                await _publisher.PublishCartItemDeletedAsync(sessionId, itemId, ct);
             }
         }
 

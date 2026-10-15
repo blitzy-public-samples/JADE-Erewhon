@@ -429,9 +429,11 @@ public sealed class ItemCategoryService : TransactionAgent<ItemCategory>
     }
 
     /// <summary>
-    /// Records, as deleted, the rows the database deletes with the category: its commission rates in percentage
-    /// order, its items in code-number order, the items' sales in item code-number order and the items' tenders in
-    /// item code-number, time and descending offer order; each sale also records an update of its item and tender.
+    /// Records, as deleted, the rows the database deletes with the category, read in the delete's transaction as
+    /// <see cref="CascadeRow"/> values (type name and id; for a sale, also its item's type name and id and its tender
+    /// id): its commission rates in percentage order, its items in code-number order, the items' sales in item
+    /// code-number order and the items' tenders in item code-number, time and descending offer order; each sale also
+    /// records an update of its item and tender.
     /// </summary>
     /// <param name="entity">The tracked category about to be deleted.</param>
     /// <param name="ct">Token that cancels the reads.</param>
@@ -442,31 +444,30 @@ public sealed class ItemCategoryService : TransactionAgent<ItemCategory>
         ArgumentNullException.ThrowIfNull(entity);
         long categoryId = entity.Id;
 
-        List<CommissionRate> rates = await Db.CommissionRates
-            .AsNoTracking()
+        List<CascadeRow> rates = await Db.CommissionRates
             .Where(rate => rate.ItemCategoryId == categoryId)
             .OrderBy(rate => rate.Percentage)
+            .Select(rate => new CascadeRow(nameof(CommissionRate), rate.Id))
             .ToListAsync(ct);
 
-        List<Item> items = await Db.Items
-            .AsNoTracking()
+        List<CascadeRow> items = await Db.Items
             .Where(item => item.ItemCategoryId == categoryId)
             .OrderBy(item => item.CodeNumber)
+            .Select(CascadeRow.FromItem)
             .ToListAsync(ct);
 
-        List<Sale> sales = await Db.Sales
-            .AsNoTracking()
-            .Include(sale => sale.Item)
+        List<CascadeRow> sales = await Db.Sales
             .Where(sale => sale.Item!.ItemCategoryId == categoryId)
             .OrderBy(sale => sale.Item!.CodeNumber)
+            .Select(CascadeRow.FromSale)
             .ToListAsync(ct);
 
-        List<Tender> tenders = await Db.Tenders
-            .AsNoTracking()
+        List<CascadeRow> tenders = await Db.Tenders
             .Where(tender => tender.TenderItem!.ItemCategoryId == categoryId)
             .OrderBy(tender => tender.TenderItem!.CodeNumber)
             .ThenBy(tender => tender.DateTendered)
             .ThenByDescending(tender => tender.Offer)
+            .Select(tender => new CascadeRow(nameof(Tender), tender.Id))
             .ToListAsync(ct);
 
         _deriver.RecordCascadeDeleted([.. rates, .. items, .. sales, .. tenders]);

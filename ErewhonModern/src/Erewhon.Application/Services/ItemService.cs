@@ -442,7 +442,8 @@ public sealed class ItemService : TransactionAgent<Item>
 
     /// <summary>
     /// Records the deleted-row notifications of the rows the database deletes with the item: its sale, then, for a
-    /// tender item, each of its tenders in id order. The rows are read without change tracking.
+    /// tender item, each of its tenders in id order. The rows are read as <see cref="CascadeRow"/> values (type name
+    /// and id; for the sale, also its item's type name and id and its tender id).
     /// </summary>
     /// <param name="entity">The tracked item about to be deleted.</param>
     /// <param name="ct">Token that cancels the reads.</param>
@@ -452,19 +453,18 @@ public sealed class ItemService : TransactionAgent<Item>
         ArgumentNullException.ThrowIfNull(entity);
         long itemId = entity.Id;
 
-        var removed = new List<PersistentModel>();
+        var removed = new List<CascadeRow>();
         removed.AddRange(await Db.Sales
-            .AsNoTracking()
-            .Include(sale => sale.Item)
             .Where(sale => sale.ItemId == itemId)
+            .Select(CascadeRow.FromSale)
             .ToListAsync(ct));
 
         if (entity is TenderItem)
         {
             removed.AddRange(await Db.Tenders
-                .AsNoTracking()
                 .Where(tender => tender.TenderItemId == itemId)
                 .OrderBy(tender => tender.Id)
+                .Select(tender => new CascadeRow(nameof(Tender), tender.Id))
                 .ToListAsync(ct));
         }
 

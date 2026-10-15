@@ -361,9 +361,9 @@ public sealed class RegionService : TransactionAgent<Region>
     }
 
     /// <summary>
-    /// Records, read in the delete's transaction, an updated notification for each item whose region the database
-    /// clears, in category prefix and code-number order. Ports <c>Region.allItems</c>
-    /// (<c>ItemsByPrefixByNumberDict</c>) and the <c>myRegion</c> peer reference it clears.
+    /// Records, read in the delete's transaction as <see cref="CascadeRow"/> values (type name and id), an updated
+    /// notification for each item whose region the database clears, in category prefix and code-number order. Ports
+    /// <c>Region.allItems</c> (<c>ItemsByPrefixByNumberDict</c>) and the <c>myRegion</c> peer reference it clears.
     /// </summary>
     /// <param name="entity">The tracked region about to be deleted.</param>
     /// <param name="ct">Token that cancels the read.</param>
@@ -374,11 +374,11 @@ public sealed class RegionService : TransactionAgent<Region>
         ArgumentNullException.ThrowIfNull(entity);
         long regionId = entity.Id;
 
-        List<Item> items = await Db.Items
-            .AsNoTracking()
+        List<CascadeRow> items = await Db.Items
             .Where(item => item.RegionId == regionId)
             .OrderBy(item => item.ItemCategory!.Prefix)
             .ThenBy(item => item.CodeNumber)
+            .Select(CascadeRow.FromItem)
             .ToListAsync(ct);
 
         _deriver.RecordPeerCleared(items);

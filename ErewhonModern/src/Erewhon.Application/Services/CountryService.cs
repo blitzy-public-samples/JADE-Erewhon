@@ -432,9 +432,10 @@ public sealed class CountryService : TransactionAgent<Country>
     }
 
     /// <summary>
-    /// Records, read in the delete's transaction, a deleted notification for each region the database deletes with
-    /// the country, in name order, then an updated notification for each item whose region the database clears, in
-    /// region name, category prefix and code-number order.
+    /// Records, read in the delete's transaction as <see cref="CascadeRow"/> values (type name and id), a deleted
+    /// notification for each region the database deletes with the country, in name order, then an updated
+    /// notification for each item whose region the database clears, in region name, category prefix and code-number
+    /// order.
     /// </summary>
     /// <param name="entity">The tracked country about to be deleted.</param>
     /// <param name="ct">Token that cancels the reads.</param>
@@ -445,19 +446,19 @@ public sealed class CountryService : TransactionAgent<Country>
         ArgumentNullException.ThrowIfNull(entity);
         long countryId = entity.Id;
 
-        List<Region> regions = await Db.Regions
-            .AsNoTracking()
+        List<CascadeRow> regions = await Db.Regions
             .Where(region => region.CountryId == countryId)
             .OrderBy(region => region.Name)
             .ThenBy(region => region.Id)
+            .Select(region => new CascadeRow(nameof(Region), region.Id))
             .ToListAsync(ct);
 
-        List<Item> items = await Db.Items
-            .AsNoTracking()
+        List<CascadeRow> items = await Db.Items
             .Where(item => item.Region!.CountryId == countryId)
             .OrderBy(item => item.Region!.Name)
             .ThenBy(item => item.ItemCategory!.Prefix)
             .ThenBy(item => item.CodeNumber)
+            .Select(CascadeRow.FromItem)
             .ToListAsync(ct);
 
         _deriver.RecordCascadeDeleted(regions);

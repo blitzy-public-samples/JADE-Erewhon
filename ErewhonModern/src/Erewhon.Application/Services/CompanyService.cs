@@ -612,8 +612,9 @@ public sealed class CompanyService : TransactionAgent<Company>
 
     /// <summary>
     /// Records a deleted notification for each row the database deletes with the company, read in the delete's
-    /// transaction: its agents, clients, countries, the countries' regions, item categories, the categories'
-    /// commission rates, items, sales (each with its item) and tenders, each group in id order.
+    /// transaction as <see cref="CascadeRow"/> values (type name and id; for a sale, also its item's type name and id
+    /// and its tender id): its agents, clients, countries, the countries' regions, item categories, the categories'
+    /// commission rates, items, sales and tenders, each group in id order.
     /// </summary>
     /// <param name="entity">The tracked company about to be deleted.</param>
     /// <param name="ct">Token that cancels the reads.</param>
@@ -623,44 +624,52 @@ public sealed class CompanyService : TransactionAgent<Company>
     {
         ArgumentNullException.ThrowIfNull(entity);
         long companyId = entity.Id;
-        var rows = new List<PersistentModel>();
+        var rows = new List<CascadeRow>();
 
-        rows.AddRange(await Db.Agents.AsNoTracking()
+        rows.AddRange(await Db.Agents
             .Where(agent => agent.CompanyId == companyId)
             .OrderBy(agent => agent.Id)
+            .Select(agent => new CascadeRow(nameof(Agent), agent.Id))
             .ToListAsync(ct));
-        rows.AddRange(await Db.Clients.AsNoTracking()
+        rows.AddRange(await Db.Clients
             .Where(client => client.CompanyId == companyId)
             .OrderBy(client => client.Id)
+            .Select(client => new CascadeRow(nameof(Client), client.Id))
             .ToListAsync(ct));
-        rows.AddRange(await Db.Countries.AsNoTracking()
+        rows.AddRange(await Db.Countries
             .Where(country => country.CompanyId == companyId)
             .OrderBy(country => country.Id)
+            .Select(country => new CascadeRow(nameof(Country), country.Id))
             .ToListAsync(ct));
-        rows.AddRange(await Db.Regions.AsNoTracking()
+        rows.AddRange(await Db.Regions
             .Where(region => region.Country!.CompanyId == companyId)
             .OrderBy(region => region.Id)
+            .Select(region => new CascadeRow(nameof(Region), region.Id))
             .ToListAsync(ct));
-        rows.AddRange(await Db.ItemCategories.AsNoTracking()
+        rows.AddRange(await Db.ItemCategories
             .Where(category => category.CompanyId == companyId)
             .OrderBy(category => category.Id)
+            .Select(category => new CascadeRow(nameof(ItemCategory), category.Id))
             .ToListAsync(ct));
-        rows.AddRange(await Db.CommissionRates.AsNoTracking()
+        rows.AddRange(await Db.CommissionRates
             .Where(rate => rate.ItemCategory!.CompanyId == companyId)
             .OrderBy(rate => rate.Id)
+            .Select(rate => new CascadeRow(nameof(CommissionRate), rate.Id))
             .ToListAsync(ct));
-        rows.AddRange(await Db.Items.AsNoTracking()
+        rows.AddRange(await Db.Items
             .Where(item => item.CompanyId == companyId)
             .OrderBy(item => item.Id)
+            .Select(CascadeRow.FromItem)
             .ToListAsync(ct));
-        rows.AddRange(await Db.Sales.AsNoTracking()
-            .Include(sale => sale.Item)
+        rows.AddRange(await Db.Sales
             .Where(sale => sale.CompanyId == companyId)
             .OrderBy(sale => sale.Id)
+            .Select(CascadeRow.FromSale)
             .ToListAsync(ct));
-        rows.AddRange(await Db.Tenders.AsNoTracking()
+        rows.AddRange(await Db.Tenders
             .Where(tender => tender.CompanyId == companyId)
             .OrderBy(tender => tender.Id)
+            .Select(tender => new CascadeRow(nameof(Tender), tender.Id))
             .ToListAsync(ct));
 
         _deriver.RecordCascadeDeleted(rows);

@@ -1,3 +1,4 @@
+using System.Linq.Expressions;
 using Erewhon.Application.Domain;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.ChangeTracking;
@@ -8,7 +9,8 @@ namespace Erewhon.Application.Notifications;
 /// Derives the change events of a transaction and adds them to the <see cref="NotificationQueue"/>: one event per
 /// persistent row a save adds, modifies or deletes, an <see cref="ChangeKind.Updated"/> event for the owner of each
 /// changed address, <see cref="ChangeKind.Updated"/> events for the item and the tender of each added or deleted sale,
-/// and the events of the rows the database deletes or changes itself, which callers report.
+/// and the events of the rows the database deletes or changes itself, which callers report as
+/// <see cref="CascadeRow"/> values.
 /// It only enqueues; it never flushes, clears or publishes the queue.
 /// One instance serves one dependency-injection scope; its members are not safe to call from several threads at once.
 /// </summary>
@@ -125,19 +127,23 @@ public sealed class NotificationDeriver(NotificationQueue queue)
     public void DiscardPendingCapture() => _pendingCapture = null;
 
     /// <summary>
-    /// Enqueues, at once and in the given order, a <see cref="ChangeKind.Deleted"/> event for each row the database
-    /// deletes with its parent; then, for each of those rows that is a <see cref="Sale"/>, an
-    /// <see cref="ChangeKind.Updated"/> event for its item (<see cref="Sale.ItemId"/>) and, for a
-    /// <see cref="TenderSale"/> with a tender, an <see cref="ChangeKind.Updated"/> event for that
-    /// <see cref="Tender"/> (<see cref="TenderSale.TenderId"/>).
+    /// Enqueues, at once and in the given order, a <see cref="ChangeKind.Deleted"/> event with the row's
+    /// <see cref="CascadeRow.EntityType"/> and <see cref="CascadeRow.Id"/> for each row the database deletes with its
+    /// parent; then, for each of those rows that has a <see cref="CascadeRow.SaleItemType"/>, an
+    /// <see cref="ChangeKind.Updated"/> event for its item (<see cref="CascadeRow.SaleItemType"/>,
+    /// <see cref="CascadeRow.SaleItemId"/>) and, when <see cref="CascadeRow.SaleTenderId"/> is neither null nor 0, an
+    /// <see cref="ChangeKind.Updated"/> event for that <see cref="Tender"/>.
     /// </summary>
     /// <param name="rows">
-    /// The descendants the delete removes, read in the same transaction before the delete is saved; a sale's
-    /// <see cref="Sale.Item"/> is loaded.
+    /// The descendants the delete removes, read in the same transaction before the delete is saved; a sale's row
+    /// carries its item's type name and id and, for a tender sale, its tender id.
     /// </param>
     /// <exception cref="ArgumentNullException"><paramref name="rows"/> is null.</exception>
-    /// <exception cref="ArgumentException"><paramref name="rows"/> contains a null element; nothing is enqueued.</exception>
-    public void RecordCascadeDeleted(IEnumerable<PersistentModel> rows)
+    /// <exception cref="ArgumentException">
+    /// <paramref name="rows"/> contains a null element, a row whose <see cref="CascadeRow.EntityType"/> is null or
+    /// white space, or a row whose <see cref="CascadeRow.SaleItemType"/> is empty or white space; nothing is enqueued.
+    /// </exception>
+    public void RecordCascadeDeleted(IEnumerable<CascadeRow> rows)
     {
         ArgumentNullException.ThrowIfNull(rows);
 
@@ -145,32 +151,36 @@ public sealed class NotificationDeriver(NotificationQueue queue)
 
         foreach (var row in deleted)
         {
-            _queue.Enqueue(new ChangeEvent(EntityTypeName(row), row.Id, ChangeKind.Deleted));
+            _queue.Enqueue(new ChangeEvent(row.EntityType, row.Id, ChangeKind.Deleted));
         }
 
         foreach (var row in deleted)
         {
-            if (row is Sale sale)
+            if (row.SaleItemType is { } saleItemType)
             {
-                EnqueueRelationshipSides(SaleItemTypeName(sale), sale.ItemId, (sale as TenderSale)?.TenderId);
+                EnqueueRelationshipSides(saleItemType, row.SaleItemId, row.SaleTenderId);
             }
         }
     }
 
     /// <summary>
-    /// Enqueues, at once and in the given order, an <see cref="ChangeKind.Updated"/> event for each item whose agent or
-    /// region reference the database clears when that agent or region is deleted.
+    /// Enqueues, at once and in the given order, an <see cref="ChangeKind.Updated"/> event with the row's
+    /// <see cref="CascadeRow.EntityType"/> and <see cref="CascadeRow.Id"/> for each item whose agent or region reference
+    /// the database clears when that agent or region is deleted.
     /// </summary>
     /// <param name="items">The items whose agent or region reference the delete clears.</param>
     /// <exception cref="ArgumentNullException"><paramref name="items"/> is null.</exception>
-    /// <exception cref="ArgumentException"><paramref name="items"/> contains a null element; nothing is enqueued.</exception>
-    public void RecordPeerCleared(IEnumerable<Item> items)
+    /// <exception cref="ArgumentException">
+    /// <paramref name="items"/> contains a null element, a row whose <see cref="CascadeRow.EntityType"/> is null or
+    /// white space, or a row whose <see cref="CascadeRow.SaleItemType"/> is empty or white space; nothing is enqueued.
+    /// </exception>
+    public void RecordPeerCleared(IEnumerable<CascadeRow> items)
     {
         ArgumentNullException.ThrowIfNull(items);
 
         foreach (var item in Materialise(items, nameof(items)))
         {
-            _queue.Enqueue(new ChangeEvent(EntityTypeName(item), item.Id, ChangeKind.Updated));
+            _queue.Enqueue(new ChangeEvent(item.EntityType, item.Id, ChangeKind.Updated));
         }
     }
 
@@ -217,13 +227,22 @@ public sealed class NotificationDeriver(NotificationQueue queue)
         return false;
     }
 
-    private static List<T> Materialise<T>(IEnumerable<T> source, string paramName)
-        where T : class
+    private static List<CascadeRow> Materialise(IEnumerable<CascadeRow> source, string paramName)
     {
         var list = source.ToList();
         if (list.Exists(element => element is null))
         {
             throw new ArgumentException("The sequence contains a null element.", paramName);
+        }
+
+        if (list.Exists(element => string.IsNullOrWhiteSpace(element.EntityType)))
+        {
+            throw new ArgumentException("The sequence contains a row without an entity type name.", paramName);
+        }
+
+        if (list.Exists(element => element.SaleItemType is { } saleItemType && string.IsNullOrWhiteSpace(saleItemType)))
+        {
+            throw new ArgumentException("The sequence contains a row with an empty sale item type name.", paramName);
         }
 
         return list;
@@ -254,4 +273,55 @@ public sealed class NotificationDeriver(NotificationQueue queue)
         string? SaleItemType,
         long CapturedItemId,
         long? CapturedTenderId);
+}
+
+/// <summary>
+/// A row the database deletes or changes itself, reported to <see cref="NotificationDeriver.RecordCascadeDeleted"/>
+/// or <see cref="NotificationDeriver.RecordPeerCleared"/> by its domain type name and id and, for a <see cref="Sale"/>,
+/// its item's type name and id and its tender id.
+/// </summary>
+/// <param name="EntityType">
+/// The domain type name of the row, as carried by <see cref="ChangeEvent.EntityType"/>: for example <c>Agent</c>,
+/// <c>RetailItem</c>, <c>TenderItem</c>, <c>RetailSale</c>, <c>TenderSale</c> or <c>Tender</c>.
+/// </param>
+/// <param name="Id">The row id.</param>
+/// <param name="SaleItemType">
+/// For a sale, the domain type name of its item (<c>RetailItem</c> or <c>TenderItem</c>); <see langword="null"/> for
+/// every other row.
+/// </param>
+/// <param name="SaleItemId">For a sale, the row id of its item (<see cref="Sale.ItemId"/>); 0 for every other row.</param>
+/// <param name="SaleTenderId">
+/// For a <see cref="TenderSale"/>, its <see cref="TenderSale.TenderId"/>; <see langword="null"/> for every other row.
+/// </param>
+public sealed record CascadeRow(string EntityType, long Id, string? SaleItemType, long SaleItemId, long? SaleTenderId)
+{
+    /// <summary>Creates a row that is not a sale: no sale item type, sale item id 0 and no sale tender id.</summary>
+    /// <param name="entityType">The domain type name of the row.</param>
+    /// <param name="id">The row id.</param>
+    public CascadeRow(string entityType, long id)
+        : this(entityType, id, null, 0, null)
+    {
+    }
+
+    /// <summary>
+    /// Projects an item to its row: type name <c>TenderItem</c> for a <see cref="TenderItem"/> and <c>RetailItem</c>
+    /// otherwise, and the item's id. EF Core translates the projection to SQL over the item type discriminator.
+    /// </summary>
+    public static Expression<Func<Item, CascadeRow>> FromItem { get; } =
+        item => new CascadeRow(item is TenderItem ? nameof(TenderItem) : nameof(RetailItem), item.Id);
+
+    /// <summary>
+    /// Projects a sale to its row: type name <c>TenderSale</c> for a <see cref="TenderSale"/> and <c>RetailSale</c>
+    /// otherwise; the sale's id; sale item type <c>TenderItem</c> when <see cref="Sale.Item"/> is a
+    /// <see cref="TenderItem"/> and <c>RetailItem</c> otherwise; <see cref="Sale.ItemId"/>; and, for a tender sale,
+    /// <see cref="TenderSale.TenderId"/>. EF Core translates the projection to SQL over the sale and item type
+    /// discriminators, joining each sale to its item.
+    /// </summary>
+    public static Expression<Func<Sale, CascadeRow>> FromSale { get; } =
+        sale => new CascadeRow(
+            sale is TenderSale ? nameof(TenderSale) : nameof(RetailSale),
+            sale.Id,
+            sale.Item is TenderItem ? nameof(TenderItem) : nameof(RetailItem),
+            sale.ItemId,
+            sale is TenderSale ? ((TenderSale)sale).TenderId : null);
 }

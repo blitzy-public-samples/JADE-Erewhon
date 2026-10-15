@@ -650,9 +650,9 @@ public sealed class AgentService : TransactionAgent<Agent>
     }
 
     /// <summary>
-    /// Records an updated notification for each item of the agent, in id order, read in the delete's transaction;
-    /// the database clears the agent of those items. The agent's commission-rate links are deleted with it and raise
-    /// no notification.
+    /// Records an updated notification for each item of the agent, in id order, read in the delete's transaction as
+    /// <see cref="CascadeRow"/> values (type name and id); the database clears the agent of those items. The agent's
+    /// commission-rate links are deleted with it and raise no notification.
     /// </summary>
     /// <param name="entity">The tracked agent about to be deleted.</param>
     /// <param name="ct">Token that cancels the read.</param>
@@ -663,10 +663,10 @@ public sealed class AgentService : TransactionAgent<Agent>
         ArgumentNullException.ThrowIfNull(entity);
         long agentId = entity.Id;
 
-        List<Item> items = await Db.Items
-            .AsNoTracking()
+        List<CascadeRow> items = await Db.Items
             .Where(item => item.AgentId == agentId)
             .OrderBy(item => item.Id)
+            .Select(CascadeRow.FromItem)
             .ToListAsync(ct);
 
         _deriver.RecordPeerCleared(items);

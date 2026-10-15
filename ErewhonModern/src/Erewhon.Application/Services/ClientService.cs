@@ -579,8 +579,9 @@ public sealed class ClientService : TransactionAgent<Client>
 
     /// <summary>
     /// Records a deleted notification for each row the database deletes with the client, read in the delete's
-    /// transaction: its retail and tender sales, each with its item, in id order, then its tenders in id order. Each
-    /// sale also records an update of its item and, for a tender sale, of its winning tender.
+    /// transaction as <see cref="CascadeRow"/> values (type name and id; for a sale, also its item's type name and id
+    /// and its tender id): its retail and tender sales in id order, then its tenders in id order. Each sale also
+    /// records an update of its item and, for a tender sale, of its winning tender.
     /// </summary>
     /// <param name="entity">The tracked client about to be deleted.</param>
     /// <param name="ct">Token that cancels the reads.</param>
@@ -591,17 +592,16 @@ public sealed class ClientService : TransactionAgent<Client>
         ArgumentNullException.ThrowIfNull(entity);
         long clientId = entity.Id;
 
-        List<Sale> sales = await Db.Sales
-            .AsNoTracking()
-            .Include(sale => sale.Item)
+        List<CascadeRow> sales = await Db.Sales
             .Where(sale => sale.ClientId == clientId)
             .OrderBy(sale => sale.Id)
+            .Select(CascadeRow.FromSale)
             .ToListAsync(ct);
 
-        List<Tender> tenders = await Db.Tenders
-            .AsNoTracking()
+        List<CascadeRow> tenders = await Db.Tenders
             .Where(tender => tender.ClientId == clientId)
             .OrderBy(tender => tender.Id)
+            .Select(tender => new CascadeRow(nameof(Tender), tender.Id))
             .ToListAsync(ct);
 
         _deriver.RecordCascadeDeleted([.. sales, .. tenders]);
