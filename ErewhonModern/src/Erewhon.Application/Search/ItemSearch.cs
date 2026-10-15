@@ -1,3 +1,4 @@
+using System.Linq.Expressions;
 using Erewhon.Application.Abstractions;
 using Erewhon.Application.Cart;
 using Erewhon.Application.Common;
@@ -139,10 +140,16 @@ public sealed class ItemSearch(
     /// with the region's country, its agent, its sale with the sale's client and, for a tender item, its tenders.
     /// When <see cref="ItemSearchCriteria.PriceLow"/> and <see cref="ItemSearchCriteria.PriceHigh"/> are both non-zero
     /// and the low price is above the high price, it throws before the previous results are cleared or any data is read.
-    /// Otherwise it clears the previous results, then reads the bound company, the server date, the cart of
+    /// Otherwise it clears the previous results, then reads the bound company, the server date and the cart of
     /// <paramref name="sessionId"/> when <see cref="ItemSearchCriteria.IncludeItemsInCart"/> is
-    /// <see langword="false"/>, and the company's items, and keeps each item for which
-    /// <see cref="ItemMatchesSearch"/> returns <see langword="true"/>.
+    /// <see langword="false"/>. One query then reads the company's items that pass every check of
+    /// <see cref="ItemMatchesSearch"/> except the cart check and, when <see cref="ItemSearchCriteria.CountryId"/> is
+    /// set, also those with no region that pass the closed-tender, sold, agent and client checks; each comes with its
+    /// category, its region and the region's country, its agent, and its sale with the sale's client. It keeps each of
+    /// those items, in code-number order, for which <see cref="ItemMatchesSearch"/> returns <see langword="true"/>.
+    /// When it keeps a tender item, one further query reads the tenders of the kept tender items; each tender item
+    /// then carries its tenders in date-tendered order, highest offer first at the same time, and a tender sale
+    /// carries its winning tender.
     /// </summary>
     /// <param name="criteria">The criteria to apply; its <see cref="ItemSearchCriteria.ResultItemIds"/> is replaced.</param>
     /// <param name="sessionId">
@@ -180,15 +187,18 @@ public sealed class ItemSearch(
             ? _cartStore.GetCart(sessionId)
             : null;
 
-        // One SQL query loads the items with every included navigation.
-        var items = await _db.Items
-            .AsNoTrackingWithIdentityResolution()
-            .Where(i => i.CompanyId == company.Id)
+        var candidates = WhereCriteriaCanMatch(
+            _db.Items
+                .AsNoTrackingWithIdentityResolution()
+                .Where(i => i.CompanyId == company.Id),
+            criteria,
+            serverDate);
+
+        var items = await candidates
             .Include(i => i.ItemCategory)
             .Include(i => i.Region).ThenInclude(r => r!.Country)
             .Include(i => i.Agent)
             .Include(i => i.Sale).ThenInclude(s => s!.Client)
-            .Include(i => ((TenderItem)i).Tenders)
             .OrderBy(i => i.CodeNumber)
             .ToListAsync(ct);
 
@@ -201,8 +211,172 @@ public sealed class ItemSearch(
             }
         }
 
+        await AttachTendersAsync(matches, ct);
+
         criteria.SetResults(matches.ConvertAll(i => i.Id));
         return matches.AsReadOnly();
+    }
+
+    /// <summary>
+    /// Narrows <paramref name="items"/> to the items that can pass every check of <see cref="ItemMatchesSearch"/>
+    /// except the cart check. The closed-tender, sold, agent and client checks apply to every item. With
+    /// <see cref="ItemSearchCriteria.CountryId"/> set, an item with no region is kept whatever the country, region,
+    /// category, item-kind and price checks give; every other item must pass them.
+    /// </summary>
+    /// <param name="items">The items to narrow.</param>
+    /// <param name="criteria">The criteria to apply.</param>
+    /// <param name="serverDate">The current date on the database server.</param>
+    /// <returns>The query over the items that can match.</returns>
+    private static IQueryable<Item> WhereCriteriaCanMatch(
+        IQueryable<Item> items,
+        ItemSearchCriteria criteria,
+        DateOnly serverDate)
+    {
+        if (!criteria.IncludeClosedTenders)
+        {
+            items = items.Where(i => !(i is TenderItem) || ((TenderItem)i).ClosureDate >= serverDate);
+        }
+
+        if (!criteria.IncludeSoldItems)
+        {
+            items = items.Where(i => i.Sale == null);
+        }
+
+        if (criteria.AgentId is long agentId)
+        {
+            items = items.Where(i => i.AgentId == agentId);
+        }
+
+        if (criteria.ClientId is long clientId)
+        {
+            items = items.Where(i => i.Sale != null && i.Sale.ClientId == clientId);
+        }
+
+        var keepItemsWithoutRegion = criteria.CountryId is not null;
+
+        if (criteria.CountryId is long countryId)
+        {
+            items = WhereOrWithoutRegion(items, keepItemsWithoutRegion, i => i.Region!.CountryId == countryId);
+        }
+
+        if (criteria.RegionId is long regionId)
+        {
+            items = WhereOrWithoutRegion(items, keepItemsWithoutRegion, i => i.RegionId == regionId);
+        }
+
+        if (criteria.ItemCategoryId is long itemCategoryId)
+        {
+            items = WhereOrWithoutRegion(items, keepItemsWithoutRegion, i => i.ItemCategoryId == itemCategoryId);
+        }
+
+        if (criteria.OnlyRetailItems)
+        {
+            items = WhereOrWithoutRegion(items, keepItemsWithoutRegion, i => !(i is TenderItem));
+        }
+
+        if (criteria.OnlyTenderItems)
+        {
+            items = WhereOrWithoutRegion(items, keepItemsWithoutRegion, i => !(i is RetailItem));
+        }
+
+        if (!JadeValues.IsNull(criteria.PriceLow))
+        {
+            var priceLow = criteria.PriceLow;
+            items = WhereOrWithoutRegion(items, keepItemsWithoutRegion, i => i.Price >= priceLow);
+        }
+
+        if (!JadeValues.IsNull(criteria.PriceHigh))
+        {
+            var priceHigh = criteria.PriceHigh;
+            items = WhereOrWithoutRegion(items, keepItemsWithoutRegion, i => i.Price <= priceHigh);
+        }
+
+        return items;
+    }
+
+    /// <summary>
+    /// Narrows <paramref name="items"/> to the items that satisfy <paramref name="predicate"/> or, when
+    /// <paramref name="orWithoutRegion"/> is <see langword="true"/>, have no region.
+    /// </summary>
+    /// <param name="items">The items to narrow.</param>
+    /// <param name="orWithoutRegion">Keeps the items with no region as well.</param>
+    /// <param name="predicate">The condition an item must satisfy.</param>
+    /// <returns>The narrowed query.</returns>
+    private static IQueryable<Item> WhereOrWithoutRegion(
+        IQueryable<Item> items,
+        bool orWithoutRegion,
+        Expression<Func<Item, bool>> predicate)
+    {
+        if (!orWithoutRegion)
+        {
+            return items.Where(predicate);
+        }
+
+        var item = predicate.Parameters[0];
+        var withoutRegion = Expression.Equal(
+            Expression.Property(item, nameof(Item.RegionId)),
+            Expression.Constant(null, typeof(long?)));
+
+        return items.Where(Expression.Lambda<Func<Item, bool>>(Expression.OrElse(withoutRegion, predicate.Body), item));
+    }
+
+    /// <summary>
+    /// Reads, in one query, the tenders of the tender items in <paramref name="items"/> and attaches them: each tender
+    /// item's <see cref="TenderItem.Tenders"/> becomes a new list of its tenders in date-tendered order, highest offer
+    /// first at the same time, and each tender's <see cref="Tender.TenderItem"/> is set to its item. When a tender
+    /// item's sale is a <see cref="TenderSale"/> whose <see cref="TenderSale.TenderId"/> is one of the tenders read,
+    /// the sale's <see cref="TenderSale.Tender"/> and that tender's <see cref="Tender.TenderSale"/> are set to each
+    /// other. Reads nothing when <paramref name="items"/> holds no tender item.
+    /// </summary>
+    /// <param name="items">The items whose tender items receive their tenders.</param>
+    /// <param name="ct">Cancels the read.</param>
+    /// <returns>A task that completes when the tenders are attached.</returns>
+    private async Task AttachTendersAsync(List<Item> items, CancellationToken ct)
+    {
+        var tenderItems = new Dictionary<long, TenderItem>();
+        foreach (var item in items)
+        {
+            if (item is TenderItem tenderItem)
+            {
+                tenderItems.Add(tenderItem.Id, tenderItem);
+            }
+        }
+
+        if (tenderItems.Count == 0)
+        {
+            return;
+        }
+
+        var tenderItemIds = tenderItems.Keys.ToList();
+        var tenders = await _db.Tenders
+            .AsNoTracking()
+            .Where(t => tenderItemIds.Contains(t.TenderItemId))
+            .OrderBy(t => t.DateTendered).ThenByDescending(t => t.Offer)
+            .ToListAsync(ct);
+
+        foreach (var tenderItem in tenderItems.Values)
+        {
+            tenderItem.Tenders = new List<Tender>();
+        }
+
+        var tendersById = new Dictionary<long, Tender>(tenders.Count);
+        foreach (var tender in tenders)
+        {
+            var tenderItem = tenderItems[tender.TenderItemId];
+            tender.TenderItem = tenderItem;
+            tenderItem.Tenders.Add(tender);
+            tendersById.Add(tender.Id, tender);
+        }
+
+        foreach (var tenderItem in tenderItems.Values)
+        {
+            if (tenderItem.Sale is TenderSale { TenderId: long winningTenderId } tenderSale
+                && tendersById.TryGetValue(winningTenderId, out var winningTender))
+            {
+                tenderSale.Tender = winningTender;
+                winningTender.TenderSale = tenderSale;
+            }
+        }
     }
 
     /// <summary>
