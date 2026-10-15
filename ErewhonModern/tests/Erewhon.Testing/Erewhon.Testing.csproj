@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <AssemblyName>Erewhon.Testing</AssemblyName>
+    <RootNamespace>Erewhon.Testing</RootNamespace>
+    <IsTestProject>false</IsTestProject>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Erewhon.Api\Erewhon.Api.csproj" />
+    <ProjectReference Include="..\..\src\Erewhon.Application\Erewhon.Application.csproj" />
+    <ProjectReference Include="..\..\src\Erewhon.Persistence\Erewhon.Persistence.csproj" />
+    <ProjectReference Include="..\..\src\Erewhon.SoapClient\Erewhon.SoapClient.csproj" />
+  </ItemGroup>
+
+</Project>

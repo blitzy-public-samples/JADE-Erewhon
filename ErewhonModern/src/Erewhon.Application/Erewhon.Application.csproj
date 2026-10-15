@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <RootNamespace>Erewhon.Application</RootNamespace>
+    <AssemblyName>Erewhon.Application</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.EntityFrameworkCore" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Message catalogue embedded in Erewhon.Application.dll itself under its logical name; WithCulture="false" keeps the en-NZ file name from producing an en-NZ satellite assembly. -->
+    <EmbeddedResource Include="Messages/messages.en-NZ.json" LogicalName="Erewhon.Application.Messages.messages.en-NZ.json" WithCulture="false" />
+  </ItemGroup>
+
+</Project>
