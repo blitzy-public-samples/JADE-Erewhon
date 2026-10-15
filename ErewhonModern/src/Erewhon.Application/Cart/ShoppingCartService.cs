@@ -233,8 +233,23 @@ public sealed class ShoppingCartService : TransactionAgent<ShoppingCart>
             long id = itemId!.Value;
             item = await Db.Items
                 .AsNoTracking()
-                .Include(candidate => candidate.ItemCategory)
-                .FirstOrDefaultAsync(candidate => candidate.Id == id, ct);
+                .Where(candidate => candidate.Id == id)
+                .Select(candidate => candidate is TenderItem
+                    ? (Item)new TenderItem
+                    {
+                        Id = candidate.Id,
+                        CodeNumber = candidate.CodeNumber,
+                        Price = candidate.Price,
+                        ItemCategory = new ItemCategory { Prefix = candidate.ItemCategory!.Prefix },
+                    }
+                    : new RetailItem
+                    {
+                        Id = candidate.Id,
+                        CodeNumber = candidate.CodeNumber,
+                        Price = candidate.Price,
+                        ItemCategory = new ItemCategory { Prefix = candidate.ItemCategory!.Prefix },
+                    })
+                .FirstOrDefaultAsync(ct);
         }
 
         if (item is null)
@@ -253,7 +268,7 @@ public sealed class ShoppingCartService : TransactionAgent<ShoppingCart>
 
         if (item is TenderItem)
         {
-            if (offer < item.Price)
+            if (!item.CheckOffer(offer))
             {
                 result.AddError(MessageKeys.TenderOfferLessThanReserve, FocusFields.Tender);
                 result.Succeeded = false;
@@ -374,16 +389,20 @@ public sealed class ShoppingCartService : TransactionAgent<ShoppingCart>
 
 
     /// <summary>
-    /// Checks out the session cart in one transaction of its own: each retail line persists a retail sale at the price
-    /// the line holds, and each tender line persists a tender with the offer and time the line holds; every line
-    /// persists or none does. On success the receipt lists every line in cart order, with the item's name and price
-    /// read after the commit, and the cart is then emptied; on failure the cart is left as it was, its retail lines
-    /// keeping the sale timestamp assigned at pre-validation. An empty cart fails with
-    /// <see cref="MessageKeys.ShoppingCartHasNoItems"/>. Ports <c>ShoppingCartTA.persistEntity(TransactionType_Persist)</c>
-    /// and the confirmation of <c>ShopCheckoutForm.btnProceed_click</c>.
+    /// Checks out the lines the session cart holds when the checkout starts, in one transaction of its own: each retail
+    /// line persists a retail sale at the price the line holds, and each tender line persists a tender with the offer and
+    /// time the line holds; every line persists or none does. On success the receipt lists every checked-out line in
+    /// cart order, with the item's name and price read after the commit, and the checked-out line objects are then
+    /// removed from the cart; a line added during the checkout, or put in place of a checked-out line for the same item,
+    /// stays in the cart. Once the checkout has committed, <paramref name="ct"/> no longer cancels it: the item read for
+    /// the receipt runs to completion, and the checked-out lines are removed even when that read fails, whose exception
+    /// then propagates. On failure the cart is left as it was, its retail lines keeping the sale timestamp assigned at
+    /// pre-validation. An empty cart fails with <see cref="MessageKeys.ShoppingCartHasNoItems"/>.
+    /// Ports <c>ShoppingCartTA.persistEntity(TransactionType_Persist)</c> and the confirmation of
+    /// <c>ShopCheckoutForm.btnProceed_click</c>.
     /// </summary>
     /// <param name="sessionId">The id of the session that owns the cart.</param>
-    /// <param name="ct">Token that cancels the checkout.</param>
+    /// <param name="ct">Token that cancels the checkout until it commits; the item read for the receipt does not observe it.</param>
     /// <returns>The result of the checkout and, on success, its receipt.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="sessionId"/> is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException"><paramref name="sessionId"/> is empty.</exception>
@@ -400,23 +419,29 @@ public sealed class ShoppingCartService : TransactionAgent<ShoppingCart>
         }
 
         IReadOnlyList<CartItem> lines = command.Lines.Select(line => line.Line).ToList();
-        IReadOnlyDictionary<long, ItemSummary> items = await ReadItemSummariesAsync(lines, ct);
-
-        var receiptLines = new List<CheckoutReceiptLine>(lines.Count);
-        foreach (CartItem line in lines)
+        try
         {
-            ItemSummary? item = items.GetValueOrDefault(line.ItemId);
-            receiptLines.Add(new CheckoutReceiptLine(
-                line.Transaction,
-                line.Code,
-                item?.Name ?? string.Empty,
-                item?.Price ?? 0m,
-                line.Offer,
-                line.IsTender));
-        }
+            IReadOnlyDictionary<long, ItemSummary> items = await ReadItemSummariesAsync(lines, CancellationToken.None);
 
-        cart.Clear();
-        return new CheckoutResult(result, new CheckoutReceipt(receiptLines));
+            var receiptLines = new List<CheckoutReceiptLine>(lines.Count);
+            foreach (CartItem line in lines)
+            {
+                ItemSummary? item = items.GetValueOrDefault(line.ItemId);
+                receiptLines.Add(new CheckoutReceiptLine(
+                    line.Transaction,
+                    line.Code,
+                    item?.Name ?? string.Empty,
+                    item?.Price ?? 0m,
+                    line.Offer,
+                    line.IsTender));
+            }
+
+            return new CheckoutResult(result, new CheckoutReceipt(receiptLines));
+        }
+        finally
+        {
+            cart.RemoveLines(lines);
+        }
     }
 
     /// <summary>
@@ -734,4 +759,3 @@ public sealed class ShoppingCartService : TransactionAgent<ShoppingCart>
     /// <summary>The id, name and current price of one item.</summary>
     private sealed record ItemSummary(long Id, string Name, decimal Price);
 }
-

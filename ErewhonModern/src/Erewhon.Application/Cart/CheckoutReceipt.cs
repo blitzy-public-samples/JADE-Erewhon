@@ -1,7 +1,7 @@
 namespace Erewhon.Application.Cart;
 
 /// <summary>
-/// The confirmation of a successful checkout: one line per cart line, captured before the cart is cleared.
+/// The confirmation of a successful checkout: one line per checked-out cart line, captured before those lines are removed from the cart.
 /// </summary>
 /// <param name="Lines">The receipt lines, in cart order (ascending item id).</param>
 public sealed record CheckoutReceipt(IReadOnlyList<CheckoutReceiptLine> Lines);

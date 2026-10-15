@@ -100,6 +100,42 @@ public sealed class ShoppingCart
         }
     }
 
+    /// <summary>
+    /// Removes, in one step, each given line that the cart still holds as that same object for its item id.
+    /// A line the cart holds for the item id of a given line as a different object stays in the cart, as does every line not given.
+    /// </summary>
+    /// <param name="items">The line objects to remove; a line given more than once is removed once.</param>
+    /// <returns>The number of lines removed.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="items"/> is null.</exception>
+    /// <exception cref="ArgumentException"><paramref name="items"/> holds a null line; the cart is left unchanged.</exception>
+    public int RemoveLines(IEnumerable<CartItem> items)
+    {
+        ArgumentNullException.ThrowIfNull(items);
+        CartItem[] lines = items.ToArray();
+        foreach (CartItem line in lines)
+        {
+            if (line is null)
+            {
+                throw new ArgumentException("The lines to remove must not include a null line.", nameof(items));
+            }
+        }
+
+        var removed = 0;
+        lock (_gate)
+        {
+            foreach (CartItem line in lines)
+            {
+                if (_lines.TryGetValue(line.ItemId, out CartItem? held) && ReferenceEquals(held, line))
+                {
+                    _lines.Remove(line.ItemId);
+                    removed++;
+                }
+            }
+        }
+
+        return removed;
+    }
+
     /// <summary>Removes every line from the cart.</summary>
     public void Clear()
     {
