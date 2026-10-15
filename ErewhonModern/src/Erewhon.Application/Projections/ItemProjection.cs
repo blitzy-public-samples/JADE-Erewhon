@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Linq.Expressions;
 using Erewhon.Application.Domain;
 
 namespace Erewhon.Application.Projections;
@@ -114,4 +116,74 @@ public sealed record ItemProjection(
             item.Sale is null ? null : SaleDetailProjection.From(item.Sale),
             tenderItem is not null && tenderItem.Tenders.Count > 0);
     }
+
+    /// <summary>
+    /// The query projection of an item to the values <see cref="From"/> gives for the item read with every navigation
+    /// it reads, with <see cref="Photo"/> <see langword="null"/>. The photo and the tenders of a tender item are not
+    /// read: <see cref="HasTenders"/> is whether any tender is placed on a tender item, and the offer and tender time
+    /// of a tender sale are those of the tender its <see cref="TenderSale.TenderId"/> names, <see langword="null"/>
+    /// when it names none. <see cref="Code"/> is the category prefix followed by the code number in invariant digits;
+    /// a region, country, agent or sale that is absent projects as <see langword="null"/>.
+    /// </summary>
+    public static Expression<Func<Item, ItemProjection>> Metadata { get; } = item => new ItemProjection(
+        item.Id,
+        item.Guid,
+        item is TenderItem,
+        item.CodeNumber,
+        item.ItemCategory!.Prefix,
+        item.ItemCategory.Prefix + item.CodeNumber.ToString(CultureInfo.InvariantCulture),
+        item.Name,
+        item.Description,
+        item.ItemCategoryId,
+        item.ItemCategory.Name,
+        item.ListedDate,
+        null,
+        item.Price,
+        item.RegionId,
+        item.Region == null ? null : item.Region.Name,
+        item.Region == null ? null : (long?)item.Region.CountryId,
+        item.Region == null || item.Region.Country == null ? null : item.Region.Country.Name,
+        item.AgentId,
+        item.Agent == null
+            ? null
+            : new AgentProjection(
+                item.Agent.Id,
+                item.Agent.Guid,
+                item.Agent.Name,
+                item.Agent.Address.Street,
+                item.Agent.Address.City,
+                item.Agent.Address.Country,
+                item.Agent.Address.Phone,
+                item.Agent.Address.Fax,
+                item.Agent.Address.Email,
+                item.Agent.Address.WebSite),
+        item is TenderItem ? (DateOnly?)((TenderItem)item).ClosureDate : null,
+        item.Sale != null,
+        item.Sale == null
+            ? null
+            : new SaleDetailProjection(
+                item.Sale.Id,
+                item.Sale.Guid,
+                item.Sale is TenderSale,
+                item.Sale.AgentCommission,
+                new ClientProjection(
+                    item.Sale.Client!.Id,
+                    item.Sale.Client.Guid,
+                    item.Sale.Client.Name,
+                    item.Sale.Client.Address.Street,
+                    item.Sale.Client.Address.City,
+                    item.Sale.Client.Address.Country,
+                    item.Sale.Client.Address.Phone,
+                    item.Sale.Client.Address.Fax,
+                    item.Sale.Client.Address.Email,
+                    item.Sale.Client.Address.WebSite),
+                item.Sale is RetailSale ? (DateTime?)((RetailSale)item.Sale).DateSold : null,
+                item.Sale is RetailSale ? (decimal?)((RetailSale)item.Sale).SalePrice : null,
+                item.Sale is TenderSale && ((TenderSale)item.Sale).Tender != null
+                    ? (decimal?)((TenderSale)item.Sale).Tender!.Offer
+                    : null,
+                item.Sale is TenderSale && ((TenderSale)item.Sale).Tender != null
+                    ? (DateTime?)((TenderSale)item.Sale).Tender!.DateTendered
+                    : null),
+        item is TenderItem && ((TenderItem)item).Tenders.Any());
 }

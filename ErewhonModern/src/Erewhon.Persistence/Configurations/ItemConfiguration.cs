@@ -18,9 +18,9 @@ public sealed class ItemConfiguration :
 {
     /// <summary>
     /// Configures the <c>items</c> table, its <c>item_type</c> discriminator, the columns shared by both item types,
-    /// the unique <c>(company_id, code_number)</c> index, the indexes on category, agent and region, the cascading
-    /// foreign keys to <c>companies</c> and <c>item_categories</c>, and the set-null foreign keys to <c>agents</c>
-    /// and <c>regions</c>.
+    /// the unique <c>(company_id, code_number)</c> index, the indexes on category, agent and region, the non-unique
+    /// <c>(company_id, price)</c> index, the cascading foreign keys to <c>companies</c> and <c>item_categories</c>,
+    /// and the set-null foreign keys to <c>agents</c> and <c>regions</c>.
     /// </summary>
     /// <param name="builder">The builder for the <see cref="Item"/> entity type.</param>
     public void Configure(EntityTypeBuilder<Item> builder)
@@ -119,6 +119,9 @@ public sealed class ItemConfiguration :
 
         builder.HasIndex(x => new { x.RegionId, x.CodeNumber })
             .HasDatabaseName("ix_items_region_id_code_number");
+
+        builder.HasIndex(x => new { x.CompanyId, x.Price })
+            .HasDatabaseName("ix_items_company_id_price");
 
         builder.HasOne(x => x.Company)
             .WithMany(c => c.Items)

@@ -329,6 +329,33 @@ public sealed class CompanyService : TransactionAgent<Company>
     }
 
     /// <summary>
+    /// Returns the projection of the item of company <paramref name="companyId"/> with code number
+    /// <paramref name="codeNumber"/>, whatever its category, read through <see cref="ItemProjection.Metadata"/> without
+    /// change tracking, so its <see cref="ItemProjection.Photo"/> is <see langword="null"/>. Finds the item
+    /// <see cref="GetItem"/> finds.
+    /// </summary>
+    /// <param name="companyId">The id of the company.</param>
+    /// <param name="codeNumber">The code number; 0 matches no item.</param>
+    /// <param name="ct">Token that cancels the read.</param>
+    /// <returns>The projection, or <see langword="null"/> when the company has no item with that number.</returns>
+    public async Task<ItemProjection?> GetItemProjectionAsync(
+        long companyId,
+        int codeNumber,
+        CancellationToken ct = default)
+    {
+        if (JadeValues.IsNull(codeNumber))
+        {
+            return null;
+        }
+
+        return await Db.Items
+            .AsNoTracking()
+            .Where(item => item.CompanyId == companyId && item.CodeNumber == codeNumber)
+            .Select(ItemProjection.Metadata)
+            .FirstOrDefaultAsync(ct);
+    }
+
+    /// <summary>
     /// Returns the number of locations of company <paramref name="companyId"/>: each country counts once and each of
     /// its regions once more, so one country with one region gives 2. Ports <c>Company.getNumberOfLocations</c>.
     /// </summary>

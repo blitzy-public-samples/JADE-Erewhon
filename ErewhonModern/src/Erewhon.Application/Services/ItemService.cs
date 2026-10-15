@@ -569,21 +569,24 @@ public sealed class ItemService : TransactionAgent<Item>
     }
 
     /// <summary>
-    /// Returns the bound company's items, or only those of the category with row id <paramref name="itemCategoryId"/>
-    /// when it is given, ordered by category name and then by code number, with the navigations
-    /// <see cref="FindByIdAsync"/> loads, read without change tracking. Ports the item lists of
+    /// Returns the projections of the bound company's items, or only those of the category with row id
+    /// <paramref name="itemCategoryId"/> when it is given, ordered by category name and then by code number, each read
+    /// through <see cref="ItemProjection.Metadata"/> without change tracking, so every
+    /// <see cref="ItemProjection.Photo"/> is <see langword="null"/>. Ports the item lists of
     /// <c>ItemsListByCategoryForm</c>.
     /// </summary>
     /// <param name="itemCategoryId">The row id of the category to list, or <see langword="null"/> for every category.</param>
     /// <param name="ct">Token that cancels the read.</param>
-    /// <returns>The items.</returns>
+    /// <returns>The item projections.</returns>
     /// <exception cref="NoCompanyException">No company is bound.</exception>
-    public async Task<IReadOnlyList<Item>> GetItemsByCategoryAsync(long? itemCategoryId, CancellationToken ct = default)
+    public async Task<IReadOnlyList<ItemProjection>> GetItemsByCategoryAsync(
+        long? itemCategoryId,
+        CancellationToken ct = default)
     {
         long companyId = await GetCompanyIdAsync(ct);
 
         IQueryable<Item> items = Db.Items
-            .AsNoTrackingWithIdentityResolution()
+            .AsNoTracking()
             .Where(item => item.CompanyId == companyId);
 
         if (itemCategoryId is long categoryId)
@@ -591,9 +594,10 @@ public sealed class ItemService : TransactionAgent<Item>
             items = items.Where(item => item.ItemCategoryId == categoryId);
         }
 
-        return await IncludeDetails(items)
+        return await items
             .OrderBy(item => item.ItemCategory!.Name)
             .ThenBy(item => item.CodeNumber)
+            .Select(ItemProjection.Metadata)
             .ToListAsync(ct);
     }
 

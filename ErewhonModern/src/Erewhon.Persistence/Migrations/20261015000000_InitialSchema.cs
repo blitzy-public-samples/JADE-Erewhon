@@ -426,6 +426,11 @@ namespace Erewhon.Persistence.Migrations
                 filter: "item_type = 'T'");
 
             migrationBuilder.CreateIndex(
+                name: "ix_items_company_id_price",
+                table: "items",
+                columns: new[] { "company_id", "price" });
+
+            migrationBuilder.CreateIndex(
                 name: "ix_items_item_category_id_code_number",
                 table: "items",
                 columns: new[] { "item_category_id", "code_number" });

@@ -109,7 +109,9 @@ public static class AdminTenderEndpoints
     /// <summary>
     /// Returns the tender with row id <paramref name="id"/>: its projection without photo bytes, its status at the
     /// server date, whether it won its item, whether its item is sold and, for a sold item, the buyer's name and the
-    /// winning offer; 404 when no tender has that id.
+    /// winning offer; 404 when no tender has that id. The status and whether the tender won come from
+    /// <see cref="TenderService.FindForStatusAsync"/>, the projection from
+    /// <see cref="TenderService.GetTenderProjectionAsync"/>.
     /// </summary>
     private static async Task<Results<Ok<TenderDetailsResponse>, NotFound>> GetTenderAsync(
         [FromRoute] long id,
@@ -117,7 +119,7 @@ public static class AdminTenderEndpoints
         [FromServices] IServerClock clock,
         CancellationToken ct)
     {
-        Tender? tender = await tenderService.FindByIdAsync(id, ct);
+        Tender? tender = await tenderService.FindForStatusAsync(id, ct);
         if (tender is null)
         {
             return TypedResults.NotFound();
@@ -134,7 +136,7 @@ public static class AdminTenderEndpoints
 
         return TypedResults.Ok(
             new TenderDetailsResponse(
-                projection with { TenderItem = projection.TenderItem with { Photo = null } },
+                projection,
                 tender.GetStatus(serverDate),
                 tender.TenderSale is not null,
                 sale is not null,

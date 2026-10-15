@@ -39,10 +39,11 @@ public interface IUnitOfWork
 
     /// <summary>
     /// Creates a savepoint with the given name inside the active transaction. Requires an active transaction.
-    /// The names passed are <c>ta_locks</c>, for the Ambient-mode transaction-agent lock and write step, and
-    /// <c>code_alloc</c>, for an item-code allocation attempt inside a caller's transaction.
+    /// The names passed are <c>ta_locks</c>, for the Ambient-mode transaction-agent lock and write step,
+    /// <c>code_alloc</c>, for an item-code allocation attempt inside a caller's transaction, and
+    /// <c>code_alloc_lock</c>, for the section of an allocation attempt from the lock request to the lock release.
     /// </summary>
-    /// <param name="name">Savepoint name: <c>ta_locks</c> or <c>code_alloc</c>.</param>
+    /// <param name="name">Savepoint name: <c>ta_locks</c>, <c>code_alloc</c> or <c>code_alloc_lock</c>.</param>
     /// <param name="ct">Token that cancels the operation.</param>
     /// <returns>A task that completes when the savepoint exists.</returns>
     Task CreateSavepointAsync(string name, CancellationToken ct = default);

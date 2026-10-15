@@ -344,6 +344,9 @@ namespace Erewhon.Persistence.Migrations
                         .IsUnique()
                         .HasDatabaseName("ix_items_company_id_code_number");
 
+                    b.HasIndex("CompanyId", "Price")
+                        .HasDatabaseName("ix_items_company_id_price");
+
                     b.HasIndex("ItemCategoryId", "CodeNumber")
                         .HasDatabaseName("ix_items_item_category_id_code_number");
 

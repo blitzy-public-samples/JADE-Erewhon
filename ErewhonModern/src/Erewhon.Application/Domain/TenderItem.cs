@@ -24,7 +24,17 @@ public class TenderItem : Item
     /// </summary>
     /// <param name="serverDate">The current date on the database server.</param>
     /// <returns><see langword="true"/> when the item is closed; otherwise <see langword="false"/>.</returns>
-    public bool IsClosed(DateOnly serverDate) => ClosureDate < serverDate;
+    public bool IsClosed(DateOnly serverDate) => IsClosedAt(ClosureDate, serverDate);
+
+    /// <summary>
+    /// Returns whether a tender item with closure date <paramref name="closureDate"/> is closed at
+    /// <paramref name="serverDate"/>: whether <paramref name="closureDate"/> is before <paramref name="serverDate"/>;
+    /// a closure date equal to the server date is not closed.
+    /// </summary>
+    /// <param name="closureDate">The date tendering on the item closes.</param>
+    /// <param name="serverDate">The current date on the database server.</param>
+    /// <returns><see langword="true"/> when the item is closed; otherwise <see langword="false"/>.</returns>
+    public static bool IsClosedAt(DateOnly closureDate, DateOnly serverDate) => closureDate < serverDate;
 
     /// <summary>Returns <see cref="Item.Price"/>, the reserve price.</summary>
     /// <returns>The price.</returns>

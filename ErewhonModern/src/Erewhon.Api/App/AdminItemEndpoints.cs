@@ -192,7 +192,8 @@ public static class AdminItemEndpoints
         IReadOnlyList<Item> items = await itemSearch.DoSearchAsync(criteria, session.SessionId, ct);
         DateOnly serverDate = await clock.GetServerDateAsync(ct);
 
-        return TypedResults.Ok(ToRows(items, serverDate));
+        return TypedResults.Ok(
+            ToRows(items.Select(item => ItemProjection.From(item) with { Photo = null }), serverDate));
     }
 
     /// <summary>
@@ -211,7 +212,7 @@ public static class AdminItemEndpoints
             return TypedResults.NotFound();
         }
 
-        IReadOnlyList<Item> items = await itemService.GetItemsByCategoryAsync(category, ct);
+        IReadOnlyList<ItemProjection> items = await itemService.GetItemsByCategoryAsync(category, ct);
         DateOnly serverDate = await clock.GetServerDateAsync(ct);
 
         return TypedResults.Ok(new ItemsByCategoryResponse(category, ToRows(items, serverDate)));
@@ -234,7 +235,7 @@ public static class AdminItemEndpoints
 
         (_, int number) = ParseItemCode(code);
         Company company = await companyService.GetCompanyAsync(ct);
-        Item? item = await companyService.GetItem(company.Id, number, ct);
+        ItemProjection? item = await companyService.GetItemProjectionAsync(company.Id, number, ct);
         if (item is null)
         {
             return TypedResults.NotFound();
@@ -407,11 +408,11 @@ public static class AdminItemEndpoints
             : new byte[] { 0x00 };
     }
 
-    /// <summary>Maps each item to its row, judging tender closure at <paramref name="serverDate"/>.</summary>
-    private static IReadOnlyList<ItemListRow> ToRows(IReadOnlyList<Item> items, DateOnly serverDate)
+    /// <summary>Maps each item projection to its row, judging tender closure at <paramref name="serverDate"/>.</summary>
+    private static IReadOnlyList<ItemListRow> ToRows(IEnumerable<ItemProjection> items, DateOnly serverDate)
     {
-        var rows = new List<ItemListRow>(items.Count);
-        foreach (Item item in items)
+        var rows = new List<ItemListRow>();
+        foreach (ItemProjection item in items)
         {
             rows.Add(ToRow(item, serverDate));
         }
@@ -420,11 +421,13 @@ public static class AdminItemEndpoints
     }
 
     /// <summary>
-    /// Maps an item to its row: its projection without photo bytes, and whether it is a tender item closed at
-    /// <paramref name="serverDate"/>.
+    /// Maps an item projection to its row: the projection as given, and whether it is a tender item whose closure date
+    /// <see cref="TenderItem.IsClosedAt"/> judges closed at <paramref name="serverDate"/>.
     /// </summary>
-    private static ItemListRow ToRow(Item item, DateOnly serverDate) =>
+    private static ItemListRow ToRow(ItemProjection item, DateOnly serverDate) =>
         new(
-            ItemProjection.From(item) with { Photo = null },
-            item is TenderItem tenderItem && tenderItem.IsClosed(serverDate));
+            item,
+            item.IsTender
+                && item.ClosureDate is DateOnly closureDate
+                && TenderItem.IsClosedAt(closureDate, serverDate));
 }

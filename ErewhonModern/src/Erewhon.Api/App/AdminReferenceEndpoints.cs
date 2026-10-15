@@ -431,7 +431,7 @@ public static class AdminReferenceEndpoints
         [FromServices] ItemCategoryService itemCategoryService,
         CancellationToken ct)
     {
-        IReadOnlyList<ItemCategory> categories = await itemCategoryService.GetItemCategoriesAsync(ct);
+        IReadOnlyList<ItemCategory> categories = await itemCategoryService.GetItemCategoryListAsync(ct);
         return TypedResults.Ok(ToRows(categories, ToRow));
     }
 

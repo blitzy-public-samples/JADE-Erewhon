@@ -175,29 +175,103 @@ public sealed class TenderService : TransactionAgent<Tender>
         Db.Tenders.AnyAsync(t => t.Id == id, ct);
 
     /// <summary>
-    /// Returns the projection of the tender with row id <paramref name="id"/>, read without change tracking with every
-    /// navigation <see cref="TenderProjection.From"/> reads: the client, the tender sale, and the tender item with its
-    /// category, region and country, agent, sale with the sale's client, and tenders; <see langword="null"/> when no
-    /// tender has that id. The tender is found by id alone, with no bound-company filter.
-    /// Ports <c>DTOTender.populateFromObject</c> and the tender read of <c>ViewTenderForm</c>.
+    /// Returns the tender with row id <paramref name="id"/>, read without change tracking, holding the tender's own
+    /// values, the tender sale it won and a <see cref="Tender.TenderItem"/> that holds every value of the item's own
+    /// row except its photo; <see langword="null"/> when no tender has that id. Nothing else is loaded: not the
+    /// tender's client, nor any navigation of the tender sale or of the tender item, whose
+    /// <see cref="TenderItem.Tenders"/> is empty and whose <see cref="Item.Photo"/> is <see langword="null"/>. The
+    /// tender is found by id alone, with no bound-company filter.
     /// </summary>
     /// <param name="id">The row id of the tender.</param>
     /// <param name="ct">Token that cancels the read.</param>
+    /// <returns>The tender, or <see langword="null"/>.</returns>
+    public Task<Tender?> FindForStatusAsync(long id, CancellationToken ct = default) =>
+        Db.Tenders
+            .AsNoTracking()
+            .Where(t => t.Id == id)
+            .Select(t => new Tender
+            {
+                Id = t.Id,
+                Guid = t.Guid,
+                LockedBySession = t.LockedBySession,
+                LockedTimestamp = t.LockedTimestamp,
+                CompanyId = t.CompanyId,
+                ClientId = t.ClientId,
+                TenderItemId = t.TenderItemId,
+                Offer = t.Offer,
+                DateTendered = t.DateTendered,
+                TenderSale = t.TenderSale,
+                TenderItem = new TenderItem
+                {
+                    Id = t.TenderItem!.Id,
+                    Guid = t.TenderItem.Guid,
+                    LockedBySession = t.TenderItem.LockedBySession,
+                    LockedTimestamp = t.TenderItem.LockedTimestamp,
+                    CompanyId = t.TenderItem.CompanyId,
+                    CodeNumber = t.TenderItem.CodeNumber,
+                    Name = t.TenderItem.Name,
+                    Description = t.TenderItem.Description,
+                    ListedDate = t.TenderItem.ListedDate,
+                    Price = t.TenderItem.Price,
+                    AgentId = t.TenderItem.AgentId,
+                    ItemCategoryId = t.TenderItem.ItemCategoryId,
+                    RegionId = t.TenderItem.RegionId,
+                    ClosureDate = t.TenderItem.ClosureDate,
+                },
+            })
+            .FirstOrDefaultAsync(ct);
+
+    /// <summary>
+    /// Returns the projection of the tender with row id <paramref name="id"/>, the values
+    /// <see cref="TenderProjection.From"/> gives for the tender read with every navigation it reads, with the tender
+    /// item's <see cref="ItemProjection.Photo"/> <see langword="null"/>. Two reads without change tracking: the
+    /// tender's own values with its client and the row id of the tender sale it won, then its tender item through
+    /// <see cref="ItemProjection.Metadata"/>, which reads neither the item's photo nor its tenders.
+    /// <see langword="null"/> when no tender has that id or no tender item has the tender's item id. The tender is
+    /// found by id alone, with no bound-company filter.
+    /// Ports <c>DTOTender.populateFromObject</c> and the tender read of <c>ViewTenderForm</c>.
+    /// </summary>
+    /// <param name="id">The row id of the tender.</param>
+    /// <param name="ct">Token that cancels the reads.</param>
     /// <returns>The projection, or <see langword="null"/>.</returns>
     public async Task<TenderProjection?> GetTenderProjectionAsync(long id, CancellationToken ct = default)
     {
-        Tender? tender = await Db.Tenders
-            .AsNoTrackingWithIdentityResolution()
-            .Include(t => t.Client)
-            .Include(t => t.TenderSale)
-            .Include(t => t.TenderItem).ThenInclude(i => i!.ItemCategory)
-            .Include(t => t.TenderItem).ThenInclude(i => i!.Region).ThenInclude(r => r!.Country)
-            .Include(t => t.TenderItem).ThenInclude(i => i!.Agent)
-            .Include(t => t.TenderItem).ThenInclude(i => i!.Sale).ThenInclude(s => s!.Client)
-            .Include(t => t.TenderItem).ThenInclude(i => i!.Tenders)
-            .FirstOrDefaultAsync(t => t.Id == id, ct);
+        var tender = await Db.Tenders
+            .AsNoTracking()
+            .Where(t => t.Id == id)
+            .Select(t => new
+            {
+                t.Id,
+                t.Guid,
+                t.Offer,
+                t.DateTendered,
+                Client = t.Client!,
+                t.TenderItemId,
+                TenderSaleId = t.TenderSale == null ? null : (long?)t.TenderSale.Id,
+            })
+            .FirstOrDefaultAsync(ct);
 
-        return tender is null ? null : TenderProjection.From(tender);
+        if (tender is null)
+        {
+            return null;
+        }
+
+        ItemProjection? tenderItem = await Db.Items
+            .AsNoTracking()
+            .Where(item => item.Id == tender.TenderItemId && item is TenderItem)
+            .Select(ItemProjection.Metadata)
+            .FirstOrDefaultAsync(ct);
+
+        return tenderItem is null
+            ? null
+            : new TenderProjection(
+                tender.Id,
+                tender.Guid,
+                tender.Offer,
+                tender.DateTendered,
+                ClientProjection.From(tender.Client),
+                tenderItem,
+                tender.TenderSaleId);
     }
 
     /// <summary>

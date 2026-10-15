@@ -54,7 +54,9 @@ public sealed class TenderClosureService(
     /// and the award is committed before the queued notifications are published. The visit stops at the first item
     /// that is sold or whose closure date is after <paramref name="date"/>; an item whose closure date equals
     /// <paramref name="date"/> is awarded. An item without tenders stays unsold and is not counted. An item counts
-    /// when it has a winning tender, whether or not its tender sale persisted. Ports <c>Company.closeTendersAtDate</c>.
+    /// when it has a winning tender, whether or not its tender sale persisted. The entities the run first tracks are
+    /// detached after each item and when the run ends, and removed from the collections of the entities tracked
+    /// before the run; the entities tracked before the run stay tracked. Ports <c>Company.closeTendersAtDate</c>.
     /// </summary>
     /// <param name="date">The date at or before which tender items close.</param>
     /// <param name="ct">Token that cancels the operation.</param>
@@ -71,27 +73,35 @@ public sealed class TenderClosureService(
     /// </exception>
     public async Task<int> CloseTendersAtDateAsync(DateOnly date, CancellationToken ct = default)
     {
-        Company company = await _companyContext.GetCurrentAsync(ct);
-
-        int numClosed = 0;
-        ClosurePosition? position = null;
-        while (await ReadNextTenderItemAsync(company.Id, position, ct) is { } next)
+        HashSet<object> trackedBefore = TrackedEntities();
+        try
         {
-            ItemOutcome outcome = await CloseTenderItemAsync(next.ItemId, date, ct);
-            if (outcome == ItemOutcome.Stopped)
+            Company company = await _companyContext.GetCurrentAsync(ct);
+
+            int numClosed = 0;
+            ClosurePosition? position = null;
+            while (await ReadNextTenderItemAsync(company.Id, position, ct) is { } next)
             {
-                break;
+                ItemOutcome outcome = await CloseTenderItemAsync(next.ItemId, date, trackedBefore, ct);
+                if (outcome == ItemOutcome.Stopped)
+                {
+                    break;
+                }
+
+                if (outcome == ItemOutcome.Awarded)
+                {
+                    numClosed++;
+                }
+
+                position = next;
             }
 
-            if (outcome == ItemOutcome.Awarded)
-            {
-                numClosed++;
-            }
-
-            position = next;
+            return numClosed;
         }
-
-        return numClosed;
+        finally
+        {
+            DetachEntitiesTrackedSince(trackedBefore);
+        }
     }
 
     /// <summary>
@@ -112,8 +122,18 @@ public sealed class TenderClosureService(
     {
         ArgumentNullException.ThrowIfNull(item);
 
+        return await AwardHighestTenderAsync(item.Id, ct);
+    }
+
+    /// <summary>
+    /// Persists a tender sale that awards the tender item whose row id is <paramref name="itemId"/> to its highest
+    /// tender, and returns that tender, as <see cref="AcceptHighestTenderAsync"/> describes; the tender item is
+    /// identified by its id only.
+    /// </summary>
+    private async Task<Tender?> AwardHighestTenderAsync(long itemId, CancellationToken ct)
+    {
         Tender? highestTender = await _db.Tenders
-            .Where(t => t.TenderItemId == item.Id)
+            .Where(t => t.TenderItemId == itemId)
             .OrderByDescending(t => t.Offer)
             .ThenBy(t => t.DateTendered)
             .FirstOrDefaultAsync(ct);
@@ -126,7 +146,7 @@ public sealed class TenderClosureService(
         var command = new TenderSaleCommand
         {
             TenderId = highestTender.Id,
-            ItemId = item.Id,
+            ItemId = itemId,
             ClientId = highestTender.ClientId,
         };
 
@@ -192,12 +212,17 @@ public sealed class TenderClosureService(
     /// <summary>
     /// Handles one tender item in its own transaction: locks its row, reads its sale and closure date again, then
     /// stops on a sold item or a closure date after <paramref name="date"/>, and otherwise awards the item, commits
-    /// and publishes the queued notifications. An exception rolls the transaction back, discards the queued
-    /// notifications, detaches the entities first tracked while handling the item, and propagates.
+    /// and publishes the queued notifications. Once publishing completes or throws, it detaches the entities first
+    /// tracked since the run began, those not in <paramref name="trackedBefore"/>. An exception raised after the
+    /// transaction begins and before publishing rolls the transaction back, discards the queued notifications,
+    /// detaches the entities first tracked since the run began, and propagates.
     /// </summary>
-    private async Task<ItemOutcome> CloseTenderItemAsync(long itemId, DateOnly date, CancellationToken ct)
+    private async Task<ItemOutcome> CloseTenderItemAsync(
+        long itemId,
+        DateOnly date,
+        HashSet<object> trackedBefore,
+        CancellationToken ct)
     {
-        HashSet<object> trackedBefore = TrackedEntities();
         ItemOutcome outcome;
 
         await _uow.BeginAsync(ct);
@@ -224,11 +249,7 @@ public sealed class TenderClosureService(
                 return ItemOutcome.Stopped;
             }
 
-            TenderItem item = await _db.Items
-                .OfType<TenderItem>()
-                .FirstAsync(i => i.Id == itemId, ct);
-
-            outcome = await AcceptHighestTenderAsync(item, ct) is null ? ItemOutcome.NotAwarded : ItemOutcome.Awarded;
+            outcome = await AwardHighestTenderAsync(itemId, ct) is null ? ItemOutcome.NotAwarded : ItemOutcome.Awarded;
 
             await _uow.CommitAsync(ct);
         }
@@ -240,7 +261,15 @@ public sealed class TenderClosureService(
             throw;
         }
 
-        await _queue.FlushAsync(CancellationToken.None);
+        try
+        {
+            await _queue.FlushAsync(CancellationToken.None);
+        }
+        finally
+        {
+            DetachEntitiesTrackedSince(trackedBefore);
+        }
+
         return outcome;
     }
 
@@ -256,14 +285,59 @@ public sealed class TenderClosureService(
         return tracked;
     }
 
-    /// <summary>Detaches every tracked entity that is not in <paramref name="trackedBefore"/>.</summary>
+    /// <summary>
+    /// Detaches every tracked entity that is not in <paramref name="trackedBefore"/>; the entities in
+    /// <paramref name="trackedBefore"/> stay tracked, including those that depend on a detached entity. The change
+    /// tracker's cascade delete timing is <see cref="CascadeTiming.Never"/> while the entities are detached and is
+    /// restored afterwards. The detached entities are then removed from the collection navigations of the entities
+    /// that stay tracked; their reference navigations are left as they are.
+    /// </summary>
     private void DetachEntitiesTrackedSince(HashSet<object> trackedBefore)
     {
-        foreach (EntityEntry entry in _db.ChangeTracker.Entries().ToList())
+        List<EntityEntry> entries = _db.ChangeTracker.Entries().ToList();
+        var detached = new HashSet<object>(ReferenceEqualityComparer.Instance);
+        CascadeTiming cascadeDeleteTiming = _db.ChangeTracker.CascadeDeleteTiming;
+        _db.ChangeTracker.CascadeDeleteTiming = CascadeTiming.Never;
+        try
         {
-            if (!trackedBefore.Contains(entry.Entity))
+            foreach (EntityEntry entry in entries)
             {
-                entry.State = EntityState.Detached;
+                if (!trackedBefore.Contains(entry.Entity))
+                {
+                    entry.State = EntityState.Detached;
+                    detached.Add(entry.Entity);
+                }
+            }
+        }
+        finally
+        {
+            _db.ChangeTracker.CascadeDeleteTiming = cascadeDeleteTiming;
+        }
+
+        if (detached.Count == 0)
+        {
+            return;
+        }
+
+        foreach (EntityEntry entry in entries)
+        {
+            if (entry.State == EntityState.Detached)
+            {
+                continue;
+            }
+
+            foreach (CollectionEntry collection in entry.Collections)
+            {
+                if (collection.CurrentValue is not { } members)
+                {
+                    continue;
+                }
+
+                List<object> detachedMembers = members.Cast<object>().Where(detached.Contains).ToList();
+                foreach (object member in detachedMembers)
+                {
+                    collection.Metadata.GetCollectionAccessor()!.Remove(entry.Entity, member);
+                }
             }
         }
     }

@@ -146,6 +146,24 @@ public sealed class ItemCategoryService : TransactionAgent<ItemCategory>
             .ToListAsync(ct);
     }
 
+    /// <summary>
+    /// Returns the categories of the bound company in name order, with no related rows loaded: no company, commission
+    /// rates or items. Ports <c>Company.allItemCategoriesByName</c> (<c>ItemCategoriesByNameDict</c>).
+    /// </summary>
+    /// <param name="ct">Token that cancels the read.</param>
+    /// <returns>The untracked categories; empty when the company has no categories.</returns>
+    /// <exception cref="NoCompanyException">The bound company does not exist.</exception>
+    public async Task<IReadOnlyList<ItemCategory>> GetItemCategoryListAsync(CancellationToken ct = default)
+    {
+        long companyId = await CurrentCompanyIdAsync(ct);
+
+        return await Db.ItemCategories
+            .AsNoTracking()
+            .Where(category => category.CompanyId == companyId)
+            .OrderBy(category => category.Name)
+            .ToListAsync(ct);
+    }
+
     /// <summary>Returns the category with internal id <paramref name="id"/>, or <see langword="null"/> when none exists.</summary>
     /// <param name="id">The internal id (<c>item_categories.id</c>) of the category.</param>
     /// <param name="ct">Token that cancels the read.</param>
