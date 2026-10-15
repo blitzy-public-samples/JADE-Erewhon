@@ -34,7 +34,8 @@ public static class AdminReferenceEndpoints
     /// <see cref="CommissionRateRow"/>; 404 when no rate has the id.</description></item>
     /// <item><description><c>POST /admin/commission-rates</c>, <c>PUT /admin/commission-rates/{id}</c> and
     /// <c>DELETE /admin/commission-rates/{id}</c>: create, update or delete a commission rate with the agents holding
-    /// it, and return the <see cref="OperationResult"/>; 404 when no rate has the id.</description></item>
+    /// it, and return the <see cref="OperationResult"/>; 404 when no rate has the id or, for a create or update, when
+    /// an agent id of the request names no agent.</description></item>
     /// <item><description><c>GET /admin/item-categories</c> and <c>GET /admin/item-categories/{id}</c>: the item
     /// categories of the bound company in name order, or one category, as <see cref="ItemCategoryRow"/> values; 404
     /// when no category has the id.</description></item>
@@ -54,6 +55,8 @@ public static class AdminReferenceEndpoints
     /// <c>DELETE /admin/regions/{id}</c>: create, update or delete a region, and return the
     /// <see cref="OperationResult"/>; 404 when no region has the id.</description></item>
     /// </list>
+    /// The routes that read a JSON body or a numeric query value also declare the 400 with an empty body of a request
+    /// whose body or query value cannot be read.
     /// </summary>
     /// <param name="api">The <c>/api/app</c> route group.</param>
     /// <returns><paramref name="api"/>, for chaining.</returns>
@@ -89,6 +92,7 @@ public static class AdminReferenceEndpoints
             .WithTags(Tag)
             .WithSummary("Updates the bound company's name and address and returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
     }
@@ -103,6 +107,7 @@ public static class AdminReferenceEndpoints
                 "Returns the commission rates of one item category in percentage order, or of every category in "
                 + "category name and percentage order, each with its agents in name order.")
             .Produces<IReadOnlyList<CommissionRateRow>>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
@@ -121,6 +126,8 @@ public static class AdminReferenceEndpoints
             .WithTags(Tag)
             .WithSummary("Creates a commission rate held by the listed agents and returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
+            .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
 
@@ -131,6 +138,7 @@ public static class AdminReferenceEndpoints
                 "Updates a commission rate's item category, percentage and, when listed, the agents holding it, and "
                 + "returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
@@ -170,6 +178,7 @@ public static class AdminReferenceEndpoints
             .WithTags(Tag)
             .WithSummary("Creates an item category and returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
 
@@ -178,6 +187,7 @@ public static class AdminReferenceEndpoints
             .WithTags(Tag)
             .WithSummary("Updates an item category's name, prefix and description and returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
@@ -219,6 +229,7 @@ public static class AdminReferenceEndpoints
             .WithTags(Tag)
             .WithSummary("Creates a country and returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
 
@@ -227,6 +238,7 @@ public static class AdminReferenceEndpoints
             .WithTags(Tag)
             .WithSummary("Updates a country's name and returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
@@ -253,6 +265,7 @@ public static class AdminReferenceEndpoints
                 "Returns the regions of one country in name order, or of every country of the bound company in country "
                 + "name and region name order.")
             .Produces<IReadOnlyList<RegionRow>>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
@@ -271,6 +284,7 @@ public static class AdminReferenceEndpoints
             .WithTags(Tag)
             .WithSummary("Creates a region of a country and returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
 
@@ -279,6 +293,7 @@ public static class AdminReferenceEndpoints
             .WithTags(Tag)
             .WithSummary("Updates a region's name and country and returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
@@ -354,13 +369,20 @@ public static class AdminReferenceEndpoints
 
     /// <summary>
     /// Creates a commission rate from the request, held by the listed agents or by none when the request lists no
-    /// agents, and returns the operation result.
+    /// agents, and returns the operation result; 404, with no rate created, when an agent id of the request names no
+    /// agent.
     /// </summary>
-    private static async Task<Ok<OperationResult>> CreateCommissionRateAsync(
+    private static async Task<Results<Ok<OperationResult>, NotFound>> CreateCommissionRateAsync(
         [FromBody] CommissionRateRequest request,
         [FromServices] CommissionRateService commissionRateService,
+        [FromServices] AgentService agentService,
         CancellationToken ct)
     {
+        if (request.AgentIds is not null && !await agentService.AllExistAsync(request.AgentIds, ct))
+        {
+            return TypedResults.NotFound();
+        }
+
         var command = new CommissionRateCommand
         {
             ItemCategoryId = request.ItemCategoryId,
@@ -377,16 +399,24 @@ public static class AdminReferenceEndpoints
 
     /// <summary>
     /// Updates the commission rate with row id <paramref name="id"/> from the request: its item category, its
-    /// percentage and, when the request lists agents, the agents holding it; the agents are kept when the request lists
-    /// none. Returns the operation result, or 404 when no rate has that id.
+    /// percentage and, when the request has an agent id list, the agents holding it; the agents are kept when the
+    /// request has no list, and an empty list removes the rate from every agent holding it. Returns the operation
+    /// result, or 404 when no rate has that id, then 404, with the rate unchanged, when an agent id of the request names
+    /// no agent.
     /// </summary>
     private static async Task<Results<Ok<OperationResult>, NotFound>> UpdateCommissionRateAsync(
         [FromRoute] long id,
         [FromBody] CommissionRateRequest request,
         [FromServices] CommissionRateService commissionRateService,
+        [FromServices] AgentService agentService,
         CancellationToken ct)
     {
         if (await commissionRateService.FindByIdAsync(id, ct) is not { } rate)
+        {
+            return TypedResults.NotFound();
+        }
+
+        if (request.AgentIds is not null && !await agentService.AllExistAsync(request.AgentIds, ct))
         {
             return TypedResults.NotFound();
         }

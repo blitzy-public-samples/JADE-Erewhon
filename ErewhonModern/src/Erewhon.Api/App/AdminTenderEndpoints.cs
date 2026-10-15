@@ -33,7 +33,8 @@ public static class AdminTenderEndpoints
     /// <item><description><c>DELETE /admin/tenders/{id}</c>: delete the tender with that row id and return the
     /// <see cref="OperationResult"/>; 404 when no tender has the id.</description></item>
     /// </list>
-    /// The id routes accept only an integer id.
+    /// The id routes accept only an integer id. The search route, which reads a JSON body, also declares the 400 with an
+    /// empty body of a request whose body cannot be read.
     /// </summary>
     /// <param name="api">The <c>/api/app</c> route group.</param>
     /// <returns><paramref name="api"/>, for chaining.</returns>
@@ -50,6 +51,7 @@ public static class AdminTenderEndpoints
             .WithSummary(
                 "Returns the tenders matching the tenders list filters, ordered by the time placed and then by offer descending.")
             .Produces<IReadOnlyList<TenderListRow>>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
 

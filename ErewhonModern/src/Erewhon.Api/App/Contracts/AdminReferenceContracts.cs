@@ -20,8 +20,10 @@ public sealed record CompanyRequest(string? Name, AddressFields? Address);
 /// </param>
 /// <param name="Percentage">The decimal value of <c>txtPercentage</c>, passed to the service as received.</param>
 /// <param name="AgentIds">
-/// The row ids of the agents to hold the rate, the <c>CommissionRateTA.allAgents</c> collection;
-/// <see langword="null"/> when no agents are chosen.
+/// The row ids of the agents to hold the rate, the <c>CommissionRateTA.allAgents</c> collection; each must name an
+/// agent. On <c>POST</c>, <see langword="null"/> creates the rate with no agents; on <c>PUT</c>,
+/// <see langword="null"/> keeps the agents holding the rate. An empty list holds no agents, so on <c>PUT</c> it removes
+/// every agent holding the rate.
 /// </param>
 public sealed record CommissionRateRequest(long? ItemCategoryId, decimal Percentage, IReadOnlyList<long>? AgentIds);
 

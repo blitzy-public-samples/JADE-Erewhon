@@ -98,7 +98,7 @@ public sealed record AgentCommissionRatesResponse(
 /// <param name="CommissionRateId">The row id of the commission rate selected in <c>lstRates</c>.</param>
 /// <param name="AgentIds">
 /// The row ids of every agent in <c>lstAgentsUsing</c> after the Add, Remove, Add All and Remove All moves: the
-/// complete set of agents the rate is to have.
+/// complete set of agents the rate is to have; each must name an agent.
 /// </param>
 public sealed record ReplaceRateAgentsRequest(long CommissionRateId, IReadOnlyList<long> AgentIds);
 

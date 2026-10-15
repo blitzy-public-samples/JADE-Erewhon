@@ -43,7 +43,7 @@ public static class AdminPartyEndpoints
     /// <item><description><c>PUT /admin/agent-commission-rates</c>: make the agents of a
     /// <see cref="ReplaceRateAgentsRequest"/> the agents holding the rate and return the
     /// <see cref="OperationResult"/>; 400 when the request has no agent id list; 404 when no commission rate has the
-    /// id.</description></item>
+    /// id or an agent id names no agent.</description></item>
     /// <item><description><c>GET /admin/clients</c>: the bound company's clients as <see cref="ClientProjection"/>
     /// values in name order.</description></item>
     /// <item><description><c>GET /admin/clients/{id}</c>: the client with its retail and tender sales as a
@@ -58,7 +58,9 @@ public static class AdminPartyEndpoints
     /// </list>
     /// Every write answers 200 with the service's <see cref="OperationResult"/>, which reports a failed validation
     /// through <see cref="OperationResult.Succeeded"/> and its errors. Every route also declares the 401 of a request
-    /// without a registered session and the 500 <see cref="ErrorOutcome"/>.
+    /// without a registered session and the 500 <see cref="ErrorOutcome"/>. The routes that read a JSON body or a
+    /// numeric query value also declare the 400 with an empty body of a request whose body or query value cannot be
+    /// read.
     /// </summary>
     /// <param name="api">The <c>/api/app</c> route group.</param>
     /// <returns><paramref name="api"/>, for chaining.</returns>
@@ -91,6 +93,7 @@ public static class AdminPartyEndpoints
             .WithTags(AgentsTag)
             .WithSummary("Creates an agent with its address and returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
 
@@ -99,6 +102,7 @@ public static class AdminPartyEndpoints
             .WithTags(AgentsTag)
             .WithSummary("Updates the name and address of an agent and returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
@@ -117,6 +121,7 @@ public static class AdminPartyEndpoints
             .WithTags(AgentsTag)
             .WithSummary("Returns the commission rates of an item category with the agents using each, and every agent of the company.")
             .Produces<AgentCommissionRatesResponse>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
@@ -153,6 +158,7 @@ public static class AdminPartyEndpoints
             .WithTags(ClientsTag)
             .WithSummary("Creates a client with its address and returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
 
@@ -161,6 +167,7 @@ public static class AdminPartyEndpoints
             .WithTags(ClientsTag)
             .WithSummary("Updates the name and address of a client and returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
@@ -327,11 +334,14 @@ public static class AdminPartyEndpoints
     /// <summary>
     /// Makes the agents of the request the agents holding its commission rate, adding the rate to each listed agent
     /// that does not hold it and removing it from each holder not listed, and returns the operation result; 400 when
-    /// the request has no agent id list, 404 when no commission rate has the request's id.
+    /// the request has no agent id list, then 404 when no commission rate has the request's id, then 404 when an agent
+    /// id of the request names no agent, each before any agent of the rate changes. An empty list removes the rate
+    /// from every agent holding it.
     /// </summary>
     private static async Task<Results<Ok<OperationResult>, BadRequest, NotFound>> ReplaceCommissionRateAgentsAsync(
         [FromBody] ReplaceRateAgentsRequest request,
         [FromServices] CommissionRateService commissionRateService,
+        [FromServices] AgentService agentService,
         CancellationToken ct)
     {
         if (request.AgentIds is null)
@@ -340,6 +350,11 @@ public static class AdminPartyEndpoints
         }
 
         if (!await commissionRateService.ExistsAsync(request.CommissionRateId, ct))
+        {
+            return TypedResults.NotFound();
+        }
+
+        if (!await agentService.AllExistAsync(request.AgentIds, ct))
         {
             return TypedResults.NotFound();
         }

@@ -41,6 +41,8 @@ public static class AdminItemEndpoints
     /// <item><description><c>DELETE /admin/items/{id}</c>: delete an item with its sale and tenders and return the
     /// <see cref="OperationResult"/>; 404 when no item has the id.</description></item>
     /// </list>
+    /// The routes that read a JSON body or a numeric query value also declare the 400 with an empty body of a request
+    /// whose body or query value cannot be read.
     /// </summary>
     /// <param name="api">The <c>/api/app</c> route group.</param>
     /// <returns><paramref name="api"/>, for chaining.</returns>
@@ -56,6 +58,7 @@ public static class AdminItemEndpoints
             .WithTags(Tag)
             .WithSummary("Returns the items matching the items list filters, cart items included, in code-number order.")
             .Produces<IReadOnlyList<ItemListRow>>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
 
@@ -64,6 +67,7 @@ public static class AdminItemEndpoints
             .WithTags(Tag)
             .WithSummary("Returns the items of one category in code-number order.")
             .Produces<ItemsByCategoryResponse>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
@@ -82,6 +86,7 @@ public static class AdminItemEndpoints
             .WithTags(Tag)
             .WithSummary("Creates a retail item and returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
 
@@ -90,6 +95,7 @@ public static class AdminItemEndpoints
             .WithTags(Tag)
             .WithSummary("Updates a retail item and returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
@@ -99,6 +105,7 @@ public static class AdminItemEndpoints
             .WithTags(Tag)
             .WithSummary("Creates a tender item and returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);
 
@@ -107,6 +114,7 @@ public static class AdminItemEndpoints
             .WithTags(Tag)
             .WithSummary("Updates a tender item and returns the operation result.")
             .Produces<OperationResult>(StatusCodes.Status200OK)
+            .Produces(StatusCodes.Status400BadRequest)
             .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status401Unauthorized)
             .Produces<ErrorOutcome>(StatusCodes.Status500InternalServerError);

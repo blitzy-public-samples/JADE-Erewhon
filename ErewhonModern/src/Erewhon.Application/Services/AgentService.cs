@@ -241,6 +241,31 @@ public sealed class AgentService : TransactionAgent<Agent>
         Db.Agents.AnyAsync(agent => agent.Id == id, ct);
 
     /// <summary>
+    /// Returns whether every distinct id of <paramref name="ids"/> is the internal id of an existing agent, with one
+    /// scalar query that counts the agents among those ids, by id alone and with no bound-company filter. An empty
+    /// <paramref name="ids"/> runs no query and yields <see langword="true"/>; an id of 0 or less matches no agent.
+    /// </summary>
+    /// <param name="ids">The internal ids (<c>agents.id</c>) to check; repeated ids count once.</param>
+    /// <param name="ct">Token that cancels the read.</param>
+    /// <returns>
+    /// <see langword="true"/> when an agent exists for each distinct id; otherwise <see langword="false"/>.
+    /// </returns>
+    /// <exception cref="ArgumentNullException"><paramref name="ids"/> is <see langword="null"/>.</exception>
+    public async Task<bool> AllExistAsync(IReadOnlyCollection<long> ids, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(ids);
+
+        long[] distinctIds = ids.Distinct().ToArray();
+        if (distinctIds.Length == 0)
+        {
+            return true;
+        }
+
+        int found = await Db.Agents.CountAsync(agent => distinctIds.Contains(agent.Id), ct);
+        return found == distinctIds.Length;
+    }
+
+    /// <summary>
     /// Returns the projection of each agent of the bound company, with its address, in name order.
     /// Ports the walk of <c>app.myCompany.allAgents</c> (<c>AgentsByNameDict</c>) that fills <c>DTOAgent</c> values.
     /// </summary>
