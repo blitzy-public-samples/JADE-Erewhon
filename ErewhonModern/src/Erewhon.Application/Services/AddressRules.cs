@@ -32,8 +32,9 @@ public sealed class AddressCommand
     public string? WebSite { get; set; }
 
     /// <summary>
-    /// GUID text given to a new address, at most 39 characters; when null or empty a new GUID is generated.
-    /// Set only by the seed loader.
+    /// The GUID text given to a new address, at most 39 characters; <see cref="FromAddress"/> copies the address's
+    /// GUID into it. <see cref="AddressRules.Apply"/> writes it only to a target address whose GUID is empty, and
+    /// generates a new GUID instead when this value is <see langword="null"/> or empty; an existing GUID is kept.
     /// </summary>
     public string? Guid { get; set; }
 

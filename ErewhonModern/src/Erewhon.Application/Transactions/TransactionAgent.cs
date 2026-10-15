@@ -1,3 +1,5 @@
+using System.Collections;
+using System.Reflection;
 using Erewhon.Application.Abstractions;
 using Erewhon.Application.Common;
 using Erewhon.Application.Domain;
@@ -5,6 +7,7 @@ using Erewhon.Application.Messages;
 using Erewhon.Application.Notifications;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.ChangeTracking;
+using Microsoft.EntityFrameworkCore.Metadata;
 
 namespace Erewhon.Application.Transactions;
 
@@ -101,7 +104,8 @@ public abstract class TransactionCommand<TEntity>
 /// queued notifications are published after the commit; in <see cref="TransactionMode.Ambient"/> mode they run inside
 /// the caller's transaction under the <c>ta_locks</c> savepoint, or raise
 /// <see cref="NotInTransactionStateException"/> at the first write when no transaction is active. Any operation that
-/// does not complete is rolled back and its tracked changes are detached.
+/// does not complete is rolled back, and the change tracker is returned to the entities, entity states, values and
+/// navigations it held immediately before the apply step.
 /// Ports <c>ModelTA</c>, the <c>PersistentModel.onCreate</c>, <c>onUpdate</c>, <c>onDelete</c>, <c>onModify</c> and
 /// <c>setCommonProperties</c> defaults, and the <c>CommitTransactionTI</c> and <c>NoTransactionTI</c> strategies.
 /// </summary>
@@ -756,7 +760,6 @@ public abstract class TransactionAgent<TEntity>
             outcome = await LockAndApplyAsync(command, state, result, ct);
             if (outcome == StepOutcome.Applied)
             {
-                state.SavedEntities = CaptureSavedEntities();
                 await Db.SaveChangesAsync(ct);
                 await Uow.CommitAsync(ct);
             }
@@ -811,7 +814,6 @@ public abstract class TransactionAgent<TEntity>
             outcome = await LockAndApplyAsync(command, state, result, ct);
             if (outcome == StepOutcome.Applied)
             {
-                state.SavedEntities = CaptureSavedEntities();
                 await Db.SaveChangesAsync(ct);
                 await Uow.ReleaseSavepointAsync(AmbientSavepointName, ct);
             }
@@ -990,17 +992,24 @@ public abstract class TransactionAgent<TEntity>
         });
 
     /// <summary>
-    /// Returns the command's model object, attaching it as unchanged when it is not tracked.
+    /// Returns the command's model object. A model object that is not tracked is attached as unchanged together with
+    /// the owned entities it references, such as its address; entities reached through its other navigations are left
+    /// untracked. A tracked model object is returned as it is.
     /// </summary>
     private TEntity TrackModelObject(TransactionCommand<TEntity> command)
     {
         TEntity model = command.ModelObject
             ?? throw new InvalidOperationException("The transaction agent has no model object to work on.");
 
-        EntityEntry<TEntity> entry = Db.Entry(model);
-        if (entry.State == EntityState.Detached)
+        if (Db.Entry(model).State == EntityState.Detached)
         {
-            entry.State = EntityState.Unchanged;
+            Db.ChangeTracker.TrackGraph(model, node =>
+            {
+                if (node.SourceEntry is null || node.Entry.Metadata.IsOwned())
+                {
+                    node.Entry.State = EntityState.Unchanged;
+                }
+            });
         }
 
         return model;
@@ -1023,56 +1032,24 @@ public abstract class TransactionAgent<TEntity>
         }
     }
 
-    /// <summary>Returns every tracked entity with its current state.</summary>
-    private Dictionary<object, EntityState> TakeTrackingSnapshot()
-    {
-        var snapshot = new Dictionary<object, EntityState>(ReferenceEqualityComparer.Instance);
-        foreach (EntityEntry entry in Db.ChangeTracker.Entries())
-        {
-            snapshot[entry.Entity] = entry.State;
-        }
-
-        return snapshot;
-    }
-
-    /// <summary>Returns every tracked entity that is added, modified or deleted.</summary>
-    private HashSet<object> CaptureSavedEntities()
-    {
-        var saved = new HashSet<object>(ReferenceEqualityComparer.Instance);
-        foreach (EntityEntry entry in Db.ChangeTracker.Entries())
-        {
-            if (entry.State is EntityState.Added or EntityState.Modified or EntityState.Deleted)
-            {
-                saved.Add(entry.Entity);
-            }
-        }
-
-        return saved;
-    }
+    /// <summary>
+    /// Records every entity the change tracker holds, owned entities and link rows included: its entity state, a copy
+    /// of its current and original values, its modified properties, its properties holding temporary values, and the
+    /// entities and loaded state of each of its reference and collection navigations. Reads no rows.
+    /// </summary>
+    private TrackingSnapshot TakeTrackingSnapshot() => TrackingSnapshot.Take(Db.ChangeTracker);
 
     /// <summary>
-    /// Cleans up an operation that did not complete: detaches every tracked entity the operation added, changed or
-    /// saved, keeping the entities tracked before the apply step and left unchanged by it; clears the model object
-    /// when the operation created it or it was never saved; then runs
-    /// <see cref="AbortTransactionCleanupForSubordinateObjects"/>. Ports <c>ModelTA.doAbortTransactionCleanup</c>.
+    /// Cleans up an operation that did not complete. When the apply step was reached, returns the change tracker to
+    /// the snapshot taken immediately before it: every entity tracked then is tracked with the entity state, current
+    /// and original values, modified properties, temporary keys and navigations it had then, and every entity first
+    /// tracked since is no longer tracked. Then clears the model object when the operation created it or its
+    /// <see cref="PersistentModel.Id"/> is 0, and runs <see cref="AbortTransactionCleanupForSubordinateObjects"/>.
+    /// Ports <c>ModelTA.doAbortTransactionCleanup</c>.
     /// </summary>
     private void AbortTransactionCleanup(TransactionCommand<TEntity> command, OperationState state)
     {
-        if (state.Snapshot is { } snapshot)
-        {
-            foreach (EntityEntry entry in Db.ChangeTracker.Entries().ToList())
-            {
-                bool changedByOperation =
-                    !snapshot.TryGetValue(entry.Entity, out EntityState stateBefore)
-                    || stateBefore != entry.State
-                    || (state.SavedEntities?.Contains(entry.Entity) ?? false);
-
-                if (changedByOperation)
-                {
-                    entry.State = EntityState.Detached;
-                }
-            }
-        }
+        state.Snapshot?.Restore(Db);
 
         if (command.ModelObject is { } modelObject
             && (ReferenceEquals(modelObject, state.CreatedEntity) || modelObject is PersistentModel { Id: 0 }))
@@ -1101,17 +1078,873 @@ public abstract class TransactionAgent<TEntity>
         /// <summary>The modify sub-code; 0 for the other operations.</summary>
         public int Modification { get; } = modification;
 
-        /// <summary>The tracked entities and their states immediately before the apply step; null until then.</summary>
-        public Dictionary<object, EntityState>? Snapshot { get; set; }
-
-        /// <summary>The entities added, modified or deleted immediately before the save; null until then.</summary>
-        public HashSet<object>? SavedEntities { get; set; }
+        /// <summary>
+        /// The tracking state of every tracked entity immediately before the apply step, which the cleanup returns the
+        /// change tracker to; null until then.
+        /// </summary>
+        public TrackingSnapshot? Snapshot { get; set; }
 
         /// <summary>The model object the create path made; null until then.</summary>
         public TEntity? CreatedEntity { get; set; }
 
         /// <summary>Whether the operation completed; a completed operation is not cleaned up.</summary>
         public bool Completed { get; set; }
+    }
+
+    /// <summary>
+    /// The tracking state of every entity a change tracker held at one moment, owned entities and link rows included,
+    /// which <see cref="Restore"/> returns the change tracker to.
+    /// </summary>
+    private sealed class TrackingSnapshot
+    {
+        private readonly List<TrackedEntity> _entities;
+
+        private TrackingSnapshot(List<TrackedEntity> entities) => _entities = entities;
+
+        /// <summary>
+        /// Records every entity <paramref name="tracker"/> holds, in the order it lists them, after one change detection
+        /// when automatic change detection is on; automatic change detection is suspended while the entities are
+        /// recorded and then set back as it was. Reads no rows.
+        /// </summary>
+        public static TrackingSnapshot Take(ChangeTracker tracker)
+        {
+            bool autoDetectChanges = tracker.AutoDetectChangesEnabled;
+            if (autoDetectChanges)
+            {
+                tracker.DetectChanges();
+            }
+
+            tracker.AutoDetectChangesEnabled = false;
+            try
+            {
+                var entities = new List<TrackedEntity>();
+                foreach (EntityEntry entry in tracker.Entries())
+                {
+                    entities.Add(new TrackedEntity(entry));
+                }
+
+                return new TrackingSnapshot(entities);
+            }
+            finally
+            {
+                tracker.AutoDetectChangesEnabled = autoDetectChanges;
+            }
+        }
+
+        /// <summary>
+        /// Returns the change tracker of <paramref name="db"/> to this snapshot; reads no rows. Entities that were not
+        /// recorded stop being tracked, and a recorded entity that still has its recorded tracking state is left as it
+        /// is. A recorded entity still tracked as the same entity type with its recorded key and temporary values, and
+        /// added exactly when it was recorded as added, gets back in place its recorded current values, entity state,
+        /// original values, modified properties and loaded navigations. Every other recorded entity is tracked again
+        /// together with the entities of its ownership aggregate and, when any of these held a temporary value, with
+        /// every recorded entity that held one: each stops being tracked, gets back while untracked the recorded current
+        /// values and navigation contents, and is tracked again in its recorded entity state with its recorded original
+        /// values, modified properties and loaded navigations. Owners are tracked again before the entities they own
+        /// and, among entities of one ownership depth, deleted entities come first and added entities last; a key or
+        /// foreign key that held a temporary value holds a new temporary value, which the foreign keys of the entities
+        /// referencing it hold too. Every restored entity's navigations then get back the recorded contents. A restored
+        /// unchanged or modified entity whose CLR member held a value other than its original value without the property
+        /// being marked modified holds that value again without the mark. Automatic change detection, cascade deletes and
+        /// orphan deletes are suspended meanwhile and then set back as they were.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">
+        /// A recorded owned entity has no recorded owner, or the change tracker gives no entry for it.
+        /// </exception>
+        public void Restore(IErewhonDbContext db)
+        {
+            ChangeTracker tracker = db.ChangeTracker;
+            bool autoDetectChanges = tracker.AutoDetectChangesEnabled;
+            CascadeTiming cascadeDeleteTiming = tracker.CascadeDeleteTiming;
+            CascadeTiming deleteOrphansTiming = tracker.DeleteOrphansTiming;
+            tracker.AutoDetectChangesEnabled = false;
+            tracker.CascadeDeleteTiming = CascadeTiming.Never;
+            tracker.DeleteOrphansTiming = CascadeTiming.Never;
+            try
+            {
+                var tracked = new Dictionary<object, EntityEntry>(ReferenceEqualityComparer.Instance);
+                foreach (EntityEntry entry in tracker.Entries())
+                {
+                    tracked.Add(entry.Entity, entry);
+                }
+
+                var restoredInPlace = new List<TrackedEntity>();
+                var retracked = new HashSet<TrackedEntity>();
+                foreach (TrackedEntity entity in _entities)
+                {
+                    switch (entity.Compare(tracked.GetValueOrDefault(entity.Entity)))
+                    {
+                        case TrackingDifference.RestorableInPlace:
+                            restoredInPlace.Add(entity);
+                            break;
+                        case TrackingDifference.RequiresRetracking:
+                            retracked.Add(entity);
+                            break;
+                    }
+                }
+
+                Dictionary<object, (TrackedEntity Owner, INavigationBase Navigation)> owners = OwnersOfOwnedEntities();
+                if (retracked.Count > 0)
+                {
+                    retracked = WithAggregatesAndTemporaryValues(retracked, owners);
+                    restoredInPlace.RemoveAll(retracked.Contains);
+                }
+
+                StopTracking(tracked.Values, retracked);
+
+                List<TrackedEntity> ownersFirst = _entities
+                    .Where(retracked.Contains)
+                    .OrderBy(entity => entity.OwnershipDepth)
+                    .ThenBy(entity => entity.TrackingOrder)
+                    .ToList();
+                var entries = new Dictionary<object, EntityEntry>(ownersFirst.Count, ReferenceEqualityComparer.Instance);
+                foreach (TrackedEntity entity in ownersFirst)
+                {
+                    EntityEntry entry = entity.Ownership is null
+                        ? db.Entry(entity.Entity)
+                        : OwnedEntry(entity, owners, entries);
+                    entity.RestoreUntracked(entry);
+                    entries.Add(entity.Entity, entry);
+                }
+
+                foreach (TrackedEntity entity in ownersFirst)
+                {
+                    entity.Track(entries[entity.Entity]);
+                }
+
+                foreach (TrackedEntity entity in restoredInPlace)
+                {
+                    entity.RestoreInPlace(tracked[entity.Entity]);
+                }
+
+                foreach (TrackedEntity entity in restoredInPlace)
+                {
+                    entity.RestoreNavigations(tracked[entity.Entity]);
+                }
+
+                foreach (TrackedEntity entity in ownersFirst)
+                {
+                    entity.RestoreNavigations(entries[entity.Entity]);
+                }
+            }
+            finally
+            {
+                tracker.AutoDetectChangesEnabled = autoDetectChanges;
+                tracker.CascadeDeleteTiming = cascadeDeleteTiming;
+                tracker.DeleteOrphansTiming = deleteOrphansTiming;
+            }
+        }
+
+        /// <summary>
+        /// Returns the number of owners above an entity of <paramref name="entityType"/>: 0 for an entity type that is
+        /// not owned.
+        /// </summary>
+        public static int OwnershipDepthOf(IEntityType entityType)
+        {
+            int depth = 0;
+            for (IForeignKey? ownership = entityType.FindOwnership(); ownership is not null; ownership = ownership.PrincipalEntityType.FindOwnership())
+            {
+                depth++;
+            }
+
+            return depth;
+        }
+
+        /// <summary>
+        /// Stops tracking every entry of <paramref name="tracked"/> whose entity was not recorded or is in
+        /// <paramref name="retracked"/>, owned entities before their owners. A deleted entry is marked unchanged before
+        /// it stops being tracked; the entities related to it keep their values, entity states and navigations.
+        /// </summary>
+        private void StopTracking(IEnumerable<EntityEntry> tracked, HashSet<TrackedEntity> retracked)
+        {
+            var kept = new HashSet<object>(_entities.Count, ReferenceEqualityComparer.Instance);
+            foreach (TrackedEntity entity in _entities)
+            {
+                if (!retracked.Contains(entity))
+                {
+                    kept.Add(entity.Entity);
+                }
+            }
+
+            List<EntityEntry> untracked = tracked
+                .Where(entry => !kept.Contains(entry.Entity))
+                .OrderByDescending(entry => OwnershipDepthOf(entry.Metadata))
+                .ToList();
+            foreach (EntityEntry entry in untracked)
+            {
+                if (entry.State == EntityState.Deleted)
+                {
+                    entry.State = EntityState.Unchanged;
+                }
+
+                entry.State = EntityState.Detached;
+            }
+        }
+
+        /// <summary>
+        /// Returns <paramref name="retracked"/> with every recorded entity of the ownership aggregate of each of its
+        /// entities and, when any of those holds a temporary value, with every recorded entity holding a temporary value
+        /// and the recorded entities of its ownership aggregate.
+        /// </summary>
+        private HashSet<TrackedEntity> WithAggregatesAndTemporaryValues(
+            HashSet<TrackedEntity> retracked,
+            Dictionary<object, (TrackedEntity Owner, INavigationBase Navigation)> owners)
+        {
+            var rootOf = new Dictionary<TrackedEntity, TrackedEntity>(_entities.Count);
+            foreach (TrackedEntity entity in _entities)
+            {
+                TrackedEntity root = entity;
+                while (root.Ownership is not null)
+                {
+                    root = OwnerOf(root, owners).Owner;
+                }
+
+                rootOf.Add(entity, root);
+            }
+
+            var roots = new HashSet<TrackedEntity>(retracked.Select(entity => rootOf[entity]));
+            if (_entities.Exists(entity => entity.HasTemporaryValues && roots.Contains(rootOf[entity])))
+            {
+                foreach (TrackedEntity entity in _entities)
+                {
+                    if (entity.HasTemporaryValues)
+                    {
+                        roots.Add(rootOf[entity]);
+                    }
+                }
+            }
+
+            return _entities.Where(entity => roots.Contains(rootOf[entity])).ToHashSet();
+        }
+
+        /// <summary>
+        /// Returns, for each owned entity a recorded ownership navigation held, the recorded owner and that navigation.
+        /// </summary>
+        private Dictionary<object, (TrackedEntity Owner, INavigationBase Navigation)> OwnersOfOwnedEntities()
+        {
+            var owners = new Dictionary<object, (TrackedEntity Owner, INavigationBase Navigation)>(
+                ReferenceEqualityComparer.Instance);
+            foreach (TrackedEntity entity in _entities)
+            {
+                foreach (TrackedNavigation navigation in entity.Navigations)
+                {
+                    if (navigation.Navigation is INavigation { ForeignKey.IsOwnership: true, IsOnDependent: false })
+                    {
+                        foreach (object owned in navigation.Targets)
+                        {
+                            owners[owned] = (entity, navigation.Navigation);
+                        }
+                    }
+                }
+            }
+
+            return owners;
+        }
+
+        /// <summary>
+        /// Returns the recorded owner of the recorded owned entity <paramref name="owned"/> and the owner's navigation
+        /// to it: the owner whose recorded ownership navigation held it, otherwise the recorded owner whose key its
+        /// ownership foreign key holds.
+        /// </summary>
+        /// <exception cref="InvalidOperationException"><paramref name="owned"/> has no recorded owner.</exception>
+        private (TrackedEntity Owner, INavigationBase Navigation) OwnerOf(
+            TrackedEntity owned,
+            Dictionary<object, (TrackedEntity Owner, INavigationBase Navigation)> owners)
+        {
+            if (owners.TryGetValue(owned.Entity, out (TrackedEntity Owner, INavigationBase Navigation) owner))
+            {
+                return owner;
+            }
+
+            IForeignKey ownership = owned.Ownership!;
+            TrackedEntity ownerEntity = _entities.Find(candidate => owned.IsOwnedBy(candidate, ownership))
+                ?? throw new InvalidOperationException("A tracked owned entity has no tracked owner.");
+            return (ownerEntity, ownership.PrincipalToDependent!);
+        }
+
+        /// <summary>
+        /// Returns the untracked entry of the recorded owned entity <paramref name="owned"/>, read through the untracked
+        /// entry of its recorded owner. The owner's navigation holds only <paramref name="owned"/> while the entry is
+        /// read, and then gets back the value it held.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">
+        /// <paramref name="owned"/> has no recorded owner, or the change tracker gives no entry for it.
+        /// </exception>
+        private EntityEntry OwnedEntry(
+            TrackedEntity owned,
+            Dictionary<object, (TrackedEntity Owner, INavigationBase Navigation)> owners,
+            Dictionary<object, EntityEntry> entries)
+        {
+            (TrackedEntity Owner, INavigationBase Navigation) owner = OwnerOf(owned, owners);
+            NavigationEntry navigation = entries[owner.Owner.Entity].Navigation(owner.Navigation);
+            object? held = navigation.CurrentValue;
+            EntityEntry? entry;
+            if (owner.Navigation.IsCollection)
+            {
+                IClrCollectionAccessor accessor = owner.Navigation.GetCollectionAccessor()
+                    ?? throw new InvalidOperationException("An owned collection navigation has no collection accessor.");
+                object holder = accessor.Create();
+                accessor.AddStandalone(holder, owned.Entity);
+                navigation.CurrentValue = holder;
+                entry = ((CollectionEntry)navigation).FindEntry(owned.Entity);
+            }
+            else
+            {
+                navigation.CurrentValue = owned.Entity;
+                entry = ((ReferenceEntry)navigation).TargetEntry;
+            }
+
+            navigation.CurrentValue = held;
+            return entry ?? throw new InvalidOperationException("The change tracker gave no entry for a tracked owned entity.");
+        }
+    }
+
+    /// <summary>How the tracking state of a recorded entity differs from the state it was recorded in.</summary>
+    private enum TrackingDifference
+    {
+        /// <summary>The entity still has its recorded tracking state.</summary>
+        None,
+
+        /// <summary>
+        /// The entity is tracked as the recorded entity type with its recorded key and temporary values, added exactly
+        /// when it was recorded as added, and differs in its entity state, values, modified properties or navigations.
+        /// </summary>
+        RestorableInPlace,
+
+        /// <summary>
+        /// The entity is not tracked, is tracked as another entity type, has another key or other temporary values, or
+        /// is added when it was not recorded as added or the reverse.
+        /// </summary>
+        RequiresRetracking,
+    }
+
+    /// <summary>
+    /// The tracking state of one entity: its entity state, a copy of its current values, a copy of its original values
+    /// when not added, its modified properties when modified, its properties holding temporary values when added or
+    /// modified, and its navigations.
+    /// </summary>
+    private sealed class TrackedEntity
+    {
+        private readonly EntityState _state;
+
+        private readonly PropertyValues _currentValues;
+
+        private readonly PropertyValues? _originalValues;
+
+        private readonly IProperty[] _modifiedProperties;
+
+        private readonly IProperty[] _temporaryProperties;
+
+        /// <summary>Records the tracking state of the entity of <paramref name="entry"/>.</summary>
+        public TrackedEntity(EntityEntry entry)
+        {
+            Entity = entry.Entity;
+            EntityType = entry.Metadata;
+            Ownership = entry.Metadata.FindOwnership();
+            OwnershipDepth = TrackingSnapshot.OwnershipDepthOf(entry.Metadata);
+            _state = entry.State;
+            _currentValues = entry.CurrentValues.Clone();
+            _originalValues = _state == EntityState.Added ? null : entry.OriginalValues.Clone();
+            _modifiedProperties = _state == EntityState.Modified
+                ? entry.Properties.Where(property => property.IsModified).Select(property => property.Metadata).ToArray()
+                : [];
+            _temporaryProperties = _state is EntityState.Added or EntityState.Modified
+                ? entry.Properties.Where(property => property.IsTemporary).Select(property => property.Metadata).ToArray()
+                : [];
+            Navigations = entry.Navigations.Select(navigation => new TrackedNavigation(navigation)).ToArray();
+        }
+
+        /// <summary>The entity.</summary>
+        public object Entity { get; }
+
+        /// <summary>The entity type the entity was tracked as.</summary>
+        public IEntityType EntityType { get; }
+
+        /// <summary>The relationship to the entity's owner when the entity is owned; otherwise null.</summary>
+        public IForeignKey? Ownership { get; }
+
+        /// <summary>The number of owners above the entity: 0 for an entity that is not owned.</summary>
+        public int OwnershipDepth { get; }
+
+        /// <summary>
+        /// The position of the entity's state among the entities of one ownership depth when they are tracked again:
+        /// 0 for deleted, 1 for unchanged or modified, 2 for added.
+        /// </summary>
+        public int TrackingOrder => _state switch
+        {
+            EntityState.Deleted => 0,
+            EntityState.Added => 2,
+            _ => 1,
+        };
+
+        /// <summary>Whether any property of the entity held a temporary value.</summary>
+        public bool HasTemporaryValues => _temporaryProperties.Length > 0;
+
+        /// <summary>The entity's reference and collection navigations.</summary>
+        public IReadOnlyList<TrackedNavigation> Navigations { get; }
+
+        /// <summary>
+        /// Returns how the tracking state of the entity, tracked by <paramref name="entry"/> or untracked when it is
+        /// null, differs from the recorded one.
+        /// </summary>
+        public TrackingDifference Compare(EntityEntry? entry)
+        {
+            if (entry is null
+                || entry.Metadata != EntityType
+                || (entry.State == EntityState.Added) != (_state == EntityState.Added))
+            {
+                return TrackingDifference.RequiresRetracking;
+            }
+
+            PropertyValues currentValues = entry.CurrentValues;
+            foreach (IProperty property in EntityType.FindPrimaryKey()!.Properties)
+            {
+                if (!Equals(currentValues[property], _currentValues[property]))
+                {
+                    return TrackingDifference.RequiresRetracking;
+                }
+            }
+
+            if (!HasRecordedTemporaryValues(entry))
+            {
+                return TrackingDifference.RequiresRetracking;
+            }
+
+            bool asRecorded = entry.State == _state
+                && HoldValues(currentValues, _currentValues)
+                && (_originalValues is null || HoldValues(entry.OriginalValues, _originalValues))
+                && HasRecordedModifiedProperties(entry)
+                && Navigations.All(navigation => navigation.IsAsRecorded(entry));
+            return asRecorded ? TrackingDifference.None : TrackingDifference.RestorableInPlace;
+        }
+
+        /// <summary>
+        /// Returns whether this owned entity's foreign key of <paramref name="ownership"/> holds the key of
+        /// <paramref name="candidate"/>, an entity of the owner's entity type.
+        /// </summary>
+        public bool IsOwnedBy(TrackedEntity candidate, IForeignKey ownership)
+        {
+            if (!ownership.PrincipalEntityType.IsAssignableFrom(candidate.EntityType))
+            {
+                return false;
+            }
+
+            for (int i = 0; i < ownership.Properties.Count; i++)
+            {
+                if (!Equals(_currentValues[ownership.Properties[i]], candidate._currentValues[ownership.PrincipalKey.Properties[i]]))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Writes to the untracked <paramref name="entry"/> the recorded current values, the sentinel value of each
+        /// property that held a temporary value, and the recorded contents of each navigation.
+        /// </summary>
+        public void RestoreUntracked(EntityEntry entry)
+        {
+            entry.CurrentValues.SetValues(_currentValues);
+            foreach (IProperty property in _temporaryProperties)
+            {
+                entry.Property(property).CurrentValue = property.Sentinel;
+            }
+
+            RestoreNavigations(entry);
+        }
+
+        /// <summary>
+        /// Tracks the untracked <paramref name="entry"/>, which holds the recorded current values, again in the recorded
+        /// entity state with the recorded original values and modified properties, and gives its navigations the
+        /// recorded loaded state. An entry recorded as added is marked added; one recorded as deleted is marked deleted
+        /// and gets the recorded original values; any other entry is marked unchanged and gets its recorded values and
+        /// modified properties through <see cref="RestoreTrackedValues"/>, a property that held a temporary value
+        /// keeping the value it holds once tracked.
+        /// </summary>
+        public void Track(EntityEntry entry)
+        {
+            switch (_state)
+            {
+                case EntityState.Added:
+                    entry.State = EntityState.Added;
+                    break;
+                case EntityState.Deleted:
+                    entry.State = EntityState.Deleted;
+                    entry.OriginalValues.SetValues(_originalValues!);
+                    break;
+                default:
+                    entry.State = EntityState.Unchanged;
+                    RestoreTrackedValues(entry, keepTemporaryValues: true);
+                    break;
+            }
+
+            RestoreLoaded(entry);
+        }
+
+        /// <summary>
+        /// Gives the tracked <paramref name="entry"/>, whose key, temporary values and added state are the recorded
+        /// ones, the recorded entity state, current values, original values, modified properties and temporary
+        /// markings, and gives its navigations the recorded loaded state. An entry recorded as added gets back each
+        /// recorded current value it no longer holds; any other entry gets them through
+        /// <see cref="RestoreTrackedValues"/>.
+        /// </summary>
+        public void RestoreInPlace(EntityEntry entry)
+        {
+            if (_state == EntityState.Added)
+            {
+                PropertyValues currentValues = entry.CurrentValues;
+                foreach (IProperty property in _currentValues.Properties)
+                {
+                    object? value = _currentValues[property];
+                    if (!Equals(currentValues[property], value))
+                    {
+                        currentValues[property] = value;
+                    }
+                }
+            }
+            else
+            {
+                RestoreTrackedValues(entry, keepTemporaryValues: false);
+            }
+
+            RestoreLoaded(entry);
+        }
+
+        /// <summary>Gives each navigation of <paramref name="entry"/> the recorded contents.</summary>
+        public void RestoreNavigations(EntityEntry entry)
+        {
+            foreach (TrackedNavigation navigation in Navigations)
+            {
+                navigation.RestoreContents(entry);
+            }
+        }
+
+        /// <summary>Returns whether every value of <paramref name="actual"/> equals that of <paramref name="expected"/>.</summary>
+        private static bool HoldValues(PropertyValues actual, PropertyValues expected)
+        {
+            foreach (IProperty property in expected.Properties)
+            {
+                if (!Equals(actual[property], expected[property]))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Returns whether exactly the recorded properties of <paramref name="entry"/> hold temporary values, each the
+        /// recorded value.
+        /// </summary>
+        private bool HasRecordedTemporaryValues(EntityEntry entry)
+        {
+            if (entry.State is not (EntityState.Added or EntityState.Modified))
+            {
+                return _temporaryProperties.Length == 0;
+            }
+
+            int temporary = 0;
+            foreach (PropertyEntry property in entry.Properties)
+            {
+                if (property.IsTemporary)
+                {
+                    if (Array.IndexOf(_temporaryProperties, property.Metadata) < 0
+                        || !Equals(property.CurrentValue, _currentValues[property.Metadata]))
+                    {
+                        return false;
+                    }
+
+                    temporary++;
+                }
+            }
+
+            return temporary == _temporaryProperties.Length;
+        }
+
+        /// <summary>
+        /// Returns whether exactly the recorded modified properties of <paramref name="entry"/> are modified; true for an
+        /// entity not recorded as modified.
+        /// </summary>
+        private bool HasRecordedModifiedProperties(EntityEntry entry)
+        {
+            if (_state != EntityState.Modified)
+            {
+                return true;
+            }
+
+            foreach (PropertyEntry property in entry.Properties)
+            {
+                if (property.IsModified != (Array.IndexOf(_modifiedProperties, property.Metadata) >= 0))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        /// <summary>Gives each navigation of <paramref name="entry"/> the recorded loaded state.</summary>
+        private void RestoreLoaded(EntityEntry entry)
+        {
+            foreach (TrackedNavigation navigation in Navigations)
+            {
+                navigation.RestoreLoaded(entry);
+            }
+        }
+
+        /// <summary>
+        /// Gives the tracked <paramref name="entry"/>, recorded and tracked as not added, the recorded entity state,
+        /// original values, modified properties and current values. Marks it unchanged and sets the recorded original
+        /// values, which marks modified each property not holding its original value. An entry recorded as modified then
+        /// gets back exactly its recorded modified properties, each marked modified with its recorded current value, and
+        /// every other property gets back its original value. Any other entry is marked unchanged again, which gives
+        /// every property back its original value; one recorded as deleted is then marked deleted and gets back its
+        /// recorded current values. Finally, each property of an entry recorded as unchanged or modified that has a CLR
+        /// member and is not a recorded modified property gets its recorded current value written to that member without
+        /// change detection, so it holds that value without being marked modified. With
+        /// <paramref name="keepTemporaryValues"/>, a property that held a temporary value keeps the value it holds and
+        /// stays marked modified; otherwise it is marked temporary again.
+        /// </summary>
+        private void RestoreTrackedValues(EntityEntry entry, bool keepTemporaryValues)
+        {
+            if (entry.State != EntityState.Unchanged)
+            {
+                entry.State = EntityState.Unchanged;
+            }
+
+            entry.OriginalValues.SetValues(_originalValues!);
+            if (_state != EntityState.Modified && entry.State != EntityState.Unchanged)
+            {
+                entry.State = EntityState.Unchanged;
+            }
+
+            PropertyValues currentValues = entry.CurrentValues;
+            if (_state == EntityState.Deleted)
+            {
+                entry.State = EntityState.Deleted;
+                foreach (IProperty property in _currentValues.Properties)
+                {
+                    object? value = _currentValues[property];
+                    if (!Equals(currentValues[property], value))
+                    {
+                        currentValues[property] = value;
+                    }
+                }
+
+                return;
+            }
+
+            if (_state == EntityState.Modified)
+            {
+                RestoreModifiedProperties(entry, keepTemporaryValues);
+            }
+
+            foreach (IProperty property in _currentValues.Properties)
+            {
+                if (property.IsShadowProperty()
+                    || (_state == EntityState.Modified && Array.IndexOf(_modifiedProperties, property) >= 0)
+                    || (keepTemporaryValues && Array.IndexOf(_temporaryProperties, property) >= 0))
+                {
+                    continue;
+                }
+
+                object? value = _currentValues[property];
+                if (!Equals(currentValues[property], value))
+                {
+                    WriteToMember(entry.Entity, property, value);
+                }
+            }
+
+            if (!keepTemporaryValues)
+            {
+                foreach (IProperty property in _temporaryProperties)
+                {
+                    PropertyEntry temporary = entry.Property(property);
+                    if (!temporary.IsTemporary)
+                    {
+                        temporary.IsTemporary = true;
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Marks exactly the recorded modified properties of <paramref name="entry"/> as modified, each holding its
+        /// recorded current value, and every other property as not modified, which gives it back its original value,
+        /// leaving the entry in the modified state. With <paramref name="keepTemporaryValues"/>, a property that held a
+        /// temporary value keeps the value it holds.
+        /// </summary>
+        private void RestoreModifiedProperties(EntityEntry entry, bool keepTemporaryValues)
+        {
+            var modified = new HashSet<IProperty>(_modifiedProperties);
+            foreach (PropertyEntry property in entry.Properties)
+            {
+                if (!modified.Contains(property.Metadata))
+                {
+                    continue;
+                }
+
+                object? value = _currentValues[property.Metadata];
+                if (!(keepTemporaryValues && Array.IndexOf(_temporaryProperties, property.Metadata) >= 0)
+                    && !Equals(property.CurrentValue, value))
+                {
+                    property.CurrentValue = value;
+                }
+
+                if (!property.IsModified)
+                {
+                    property.IsModified = true;
+                }
+            }
+
+            foreach (PropertyEntry property in entry.Properties)
+            {
+                if (!modified.Contains(property.Metadata) && property.IsModified)
+                {
+                    property.IsModified = false;
+                }
+            }
+
+            if (entry.State != EntityState.Modified)
+            {
+                entry.State = EntityState.Modified;
+            }
+        }
+
+        /// <summary>
+        /// Writes <paramref name="value"/> to the CLR member of <paramref name="property"/> on <paramref name="entity"/>:
+        /// the backing field or property setter the change tracker itself writes through, outside the change tracker.
+        /// </summary>
+        private static void WriteToMember(object entity, IProperty property, object? value)
+        {
+            switch (property.GetMemberInfo(forMaterialization: false, forSet: true))
+            {
+                case FieldInfo field:
+                    field.SetValue(entity, value);
+                    break;
+                case PropertyInfo indexer when property.IsIndexerProperty():
+                    indexer.SetValue(entity, value, [property.Name]);
+                    break;
+                case PropertyInfo member:
+                    member.SetValue(entity, value);
+                    break;
+                default:
+                    throw new InvalidOperationException("A property of a tracked entity has no writable CLR member.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// The state of one navigation of a tracked entity: the entity or collection it held, the entities in that
+    /// collection in their order, and whether it was loaded.
+    /// </summary>
+    private sealed class TrackedNavigation
+    {
+        private readonly object? _value;
+
+        private readonly object[]? _items;
+
+        private readonly bool _isLoaded;
+
+        /// <summary>Records the state of the navigation of <paramref name="entry"/>.</summary>
+        public TrackedNavigation(NavigationEntry entry)
+        {
+            Navigation = entry.Metadata;
+            _value = entry.CurrentValue;
+            _items = Navigation.IsCollection && _value is IEnumerable items ? items.Cast<object>().ToArray() : null;
+            _isLoaded = entry.IsLoaded;
+        }
+
+        /// <summary>The navigation.</summary>
+        public INavigationBase Navigation { get; }
+
+        /// <summary>The entities the navigation held: the referenced entity, or the entities in the collection.</summary>
+        public IEnumerable<object> Targets => _items ?? (_value is null ? Array.Empty<object>() : new[] { _value });
+
+        /// <summary>
+        /// Returns whether the navigation of <paramref name="entry"/> holds the recorded entity, or the recorded
+        /// collection with the recorded entities in their order, and has the recorded loaded state.
+        /// </summary>
+        public bool IsAsRecorded(EntityEntry entry)
+        {
+            NavigationEntry navigation = entry.Navigation(Navigation);
+            object? value = navigation.CurrentValue;
+            return navigation.IsLoaded == _isLoaded
+                && ReferenceEquals(value, _value)
+                && (_items is null || value is not IEnumerable collection || HoldsInOrder(collection, _items));
+        }
+
+        /// <summary>
+        /// Makes the navigation of <paramref name="entry"/> hold the recorded entity, or the recorded collection with the
+        /// recorded entities in their order. On a tracked entry, a reference that differs from the recorded one is set
+        /// through the change tracker, which fixes up the relationship.
+        /// </summary>
+        public void RestoreContents(EntityEntry entry)
+        {
+            NavigationEntry navigation = entry.Navigation(Navigation);
+            if (!ReferenceEquals(navigation.CurrentValue, _value))
+            {
+                navigation.CurrentValue = _value;
+            }
+
+            if (_items is null || _value is not IEnumerable collection || HoldsInOrder(collection, _items))
+            {
+                return;
+            }
+
+            if (collection is IList { IsReadOnly: false, IsFixedSize: false } list)
+            {
+                list.Clear();
+                foreach (object item in _items)
+                {
+                    list.Add(item);
+                }
+
+                return;
+            }
+
+            IClrCollectionAccessor accessor = Navigation.GetCollectionAccessor()
+                ?? throw new InvalidOperationException("A collection navigation has no collection accessor.");
+            foreach (object item in collection.Cast<object>().ToList())
+            {
+                accessor.RemoveStandalone(collection, item);
+            }
+
+            foreach (object item in _items)
+            {
+                accessor.AddStandalone(collection, item);
+            }
+        }
+
+        /// <summary>Gives the navigation of <paramref name="entry"/> the recorded loaded state.</summary>
+        public void RestoreLoaded(EntityEntry entry)
+        {
+            NavigationEntry navigation = entry.Navigation(Navigation);
+            if (navigation.IsLoaded != _isLoaded)
+            {
+                navigation.IsLoaded = _isLoaded;
+            }
+        }
+
+        /// <summary>Returns whether <paramref name="collection"/> holds exactly <paramref name="items"/>, in that order.</summary>
+        private static bool HoldsInOrder(IEnumerable collection, object[] items)
+        {
+            int index = 0;
+            foreach (object? item in collection)
+            {
+                if (index == items.Length || !ReferenceEquals(item, items[index]))
+                {
+                    return false;
+                }
+
+                index++;
+            }
+
+            return index == items.Length;
+        }
     }
 }
 
