@@ -645,7 +645,7 @@ public static class TestPhoto
         0xD9
     };
 
-    public static ReadOnlyMemory<byte> Bytes => Data;
+    public static ReadOnlyMemory<byte> Bytes => ToArray();
 
     public static byte[] ToArray() => (byte[])Data.Clone();
 }
