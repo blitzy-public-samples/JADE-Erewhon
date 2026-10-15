@@ -39,6 +39,20 @@ public abstract class SaleCommand<TSale> : TransactionCommand<Sale>
     public long? ItemId { get; set; }
 
     /// <summary>
+    /// The stored state of a checkout's lines read for the validation in progress; the create-time sold check reads
+    /// the item's stored sales from it when it covers the item, and from the database otherwise.
+    /// <see langword="null"/> outside a checkout's validation.
+    /// </summary>
+    public CheckoutValidationSnapshot? ValidationSnapshot { get; set; }
+
+    /// <summary>
+    /// The commission data a checkout loaded for its retail lines' items after taking its locks; the create step reads
+    /// the item's commission data from it without a query when it covers the item, and from the database otherwise.
+    /// <see langword="null"/> outside a checkout's persistence of its lines.
+    /// </summary>
+    public CommissionPreload? CommissionPreload { get; set; }
+
+    /// <summary>
     /// Resets the common attributes, then sets <see cref="AgentCommission"/> to 0 and <see cref="ClientId"/> and
     /// <see cref="ItemId"/> to <see langword="null"/>. Ports <c>SaleTA.initialize</c>.
     /// </summary>
@@ -100,7 +114,9 @@ public static class SaleRules
     /// (<see cref="FocusFields.AgentCommission"/>), a commission of 0 being accepted;
     /// on create, an item that already has a sale → <see cref="MessageKeys.ItemSold"/> (<see cref="FocusFields.Item"/>).
     /// An item has a sale when the database holds one for it that is not marked as deleted in the change tracker, or
-    /// when the change tracker holds an added sale of it. A client or item id of 0 counts as none.
+    /// when the change tracker holds an added sale of it; the stored sales are those of
+    /// <see cref="SaleCommand{TSale}.ValidationSnapshot"/> when it covers the item, and are read from the database
+    /// otherwise. A client or item id of 0 counts as none.
     /// Ports <c>SaleTA.doValidate</c>.
     /// </summary>
     /// <typeparam name="TSale">The kind of sale the command populates from.</typeparam>
@@ -148,7 +164,7 @@ public static class SaleRules
         if (type == ValidationType.Create
             && c.ItemId is long itemId
             && !JadeValues.IsNull(itemId)
-            && await ItemHasSaleAsync(db, itemId, ct))
+            && await ItemHasSaleAsync(db, c.ValidationSnapshot, itemId, ct))
         {
             result.AddError(MessageKeys.ItemSold, FocusFields.Item);
         }
@@ -191,23 +207,50 @@ public static class SaleRules
     }
 
     /// <summary>
-    /// Loads, with change tracking, the sale's item with its category and that category's commission rates, and the
-    /// item's agent with its company and its commission-rate links, each link with its rate and the rate's category;
-    /// then sets <see cref="Sale.Item"/> to the loaded item. After the load, <see cref="Sale.CalculateAgentCommission"/>
-    /// reads the agent's rate for the item's category, or that category's lowest rate.
+    /// Makes the sale's item tracked with the commission data <see cref="Sale.CalculateAgentCommission"/> reads, then
+    /// sets <see cref="Sale.Item"/> to the tracked item. The commission data are the item's category with its
+    /// commission rates and the item's agent with its company and its commission-rate links, each link with its rate
+    /// and the rate's category; when the item's category belongs to another company than the agent, also the item
+    /// category of the agent's company with the same name (ordinal comparison), with its commission rates. After the
+    /// load, <see cref="Sale.CalculateAgentCommission"/> reads the agent's rate for a category of the item category's
+    /// name, or the lowest rate of the agent's company's category of that name.
+    /// When <paramref name="preload"/> covers the item, nothing is read: the item is taken from the change tracker,
+    /// provided it is still tracked with its category and, when it has an agent, with that agent and the agent's
+    /// company, the preload searched that company for the category's name, and a category the search found is still in
+    /// the company's categories. Otherwise every call runs these reads, with change tracking: the item with its category
+    /// and agent; the category's commission rates; the agent's company, through EF Core's navigation load, which reads
+    /// nothing once that navigation is marked as loaded; the agent's commission-rate links with their rates and the
+    /// rates' categories; and, for an agent of another company than the item's category, the category of the agent's
+    /// company with the name, with its commission rates. The rows these reads return join the tracked collections; a
+    /// row already tracked keeps its tracked values, and a tracked row a read no longer finds stays in its collection.
     /// </summary>
     /// <param name="db">The database the item is read from.</param>
     /// <param name="sale">The sale whose <see cref="Sale.ItemId"/> names the item.</param>
+    /// <param name="preload">
+    /// The commission data a checkout loaded with <see cref="PreloadForCommissionAsync"/>; <see langword="null"/> for none.
+    /// </param>
     /// <param name="ct">Token that cancels the reads.</param>
     /// <returns>A task that completes when the item and its commission data are loaded.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="db"/> or <paramref name="sale"/> is <see langword="null"/>.</exception>
-    /// <exception cref="InvalidOperationException">No item has the sale's <see cref="Sale.ItemId"/>.</exception>
-    public static async Task LoadForCommissionAsync(IErewhonDbContext db, Sale sale, CancellationToken ct)
+    /// <exception cref="InvalidOperationException">
+    /// The item is not taken from <paramref name="preload"/> and no item has the sale's <see cref="Sale.ItemId"/>.
+    /// </exception>
+    public static async Task LoadForCommissionAsync(
+        IErewhonDbContext db,
+        Sale sale,
+        CommissionPreload? preload,
+        CancellationToken ct)
     {
         ArgumentNullException.ThrowIfNull(db);
         ArgumentNullException.ThrowIfNull(sale);
 
         long itemId = sale.ItemId;
+        if (FindPreloadedItem(db, preload, itemId) is { } preloadedItem)
+        {
+            sale.Item = preloadedItem;
+            return;
+        }
+
         Item item = await db.Items
             .Include(i => i.ItemCategory)
             .Include(i => i.Agent)
@@ -216,7 +259,7 @@ public static class SaleRules
 
         if (item.ItemCategory is { } category)
         {
-            await db.Entry(category).Collection(c => c.CommissionRates).LoadAsync(ct);
+            await db.Entry(category).Collection(c => c.CommissionRates).Query().LoadAsync(ct);
         }
 
         if (item.Agent is { } agent)
@@ -228,9 +271,130 @@ public static class SaleRules
                 .Include(link => link.CommissionRate)
                 .ThenInclude(rate => rate!.ItemCategory)
                 .LoadAsync(ct);
+
+            if (item.ItemCategory is { } itemCategory && itemCategory.CompanyId != agent.CompanyId)
+            {
+                long agentCompanyId = agent.CompanyId;
+                string categoryName = itemCategory.Name;
+                await db.ItemCategories
+                    .Include(c => c.CommissionRates)
+                    .Where(c => c.CompanyId == agentCompanyId && c.Name == categoryName)
+                    .LoadAsync(ct);
+            }
         }
 
         sale.Item = item;
+    }
+
+    /// <summary>
+    /// Loads, with change tracking and in at most four queries whatever the number of items, the commission data that
+    /// <see cref="LoadForCommissionAsync"/> loads for each item in <paramref name="itemIds"/>: the items with their
+    /// categories and agents; those categories, and the categories of the agents' companies whose names equal theirs,
+    /// each with its commission rates; the agents' companies not yet tracked; and the agents' commission-rate links,
+    /// each with its rate and the rate's category. Returns a <see cref="CommissionPreload"/> that covers each item read
+    /// and records, for each item with an agent, the category of the agent's company with the item category's name
+    /// that the search found, or that it found none. No loaded flag is set on the agents' links. An id that names no
+    /// item is not covered.
+    /// </summary>
+    /// <param name="db">The database the commission data is read from.</param>
+    /// <param name="itemIds">The row ids of the items.</param>
+    /// <param name="ct">Token that cancels the reads.</param>
+    /// <returns>The preload; it covers no item when <paramref name="itemIds"/> names none.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="db"/> or <paramref name="itemIds"/> is <see langword="null"/>.</exception>
+    public static async Task<CommissionPreload> PreloadForCommissionAsync(
+        IErewhonDbContext db,
+        IEnumerable<long> itemIds,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(db);
+        ArgumentNullException.ThrowIfNull(itemIds);
+
+        long[] ids = itemIds.Distinct().ToArray();
+        if (ids.Length == 0)
+        {
+            return new CommissionPreload([], []);
+        }
+
+        List<Item> items = await db.Items
+            .Include(i => i.ItemCategory)
+            .Include(i => i.Agent)
+            .Where(i => ids.Contains(i.Id))
+            .ToListAsync(ct);
+        if (items.Count == 0)
+        {
+            return new CommissionPreload([], []);
+        }
+
+        List<Agent> agents = items
+            .Select(i => i.Agent)
+            .OfType<Agent>()
+            .Distinct<Agent>(ReferenceEqualityComparer.Instance)
+            .ToList();
+        long[] categoryIds = items.Select(i => i.ItemCategoryId).Distinct().ToArray();
+        long[] agentCompanyIds = agents.Select(a => a.CompanyId).Distinct().ToArray();
+        string[] agentCategoryNames = items
+            .Where(i => i.Agent is not null && i.ItemCategory is not null)
+            .Select(i => i.ItemCategory!.Name)
+            .Distinct(StringComparer.Ordinal)
+            .ToArray();
+
+        List<ItemCategory> categories = await db.ItemCategories
+            .Include(c => c.CommissionRates)
+            .Where(c => categoryIds.Contains(c.Id)
+                || (agentCompanyIds.Contains(c.CompanyId) && agentCategoryNames.Contains(c.Name)))
+            .ToListAsync(ct);
+
+        long[] untrackedCompanyIds = agents
+            .Where(a => a.Company is null)
+            .Select(a => a.CompanyId)
+            .Distinct()
+            .ToArray();
+        if (untrackedCompanyIds.Length > 0)
+        {
+            await db.Companies.Where(c => untrackedCompanyIds.Contains(c.Id)).LoadAsync(ct);
+        }
+
+        if (agents.Count > 0)
+        {
+            long[] agentIds = agents.Select(a => a.Id).ToArray();
+            await db.AgentCommissionRates
+                .Include(link => link.CommissionRate)
+                .ThenInclude(rate => rate!.ItemCategory)
+                .Where(link => agentIds.Contains(link.AgentId))
+                .LoadAsync(ct);
+        }
+
+        return new CommissionPreload(items, categories);
+    }
+
+    /// <summary>
+    /// Returns the tracked item with row id <paramref name="itemId"/> when <paramref name="preload"/> covers it and the
+    /// change tracker still holds its commission data: the item with its category and, when it has an agent, that
+    /// agent with its company, whose search by the preload for the category's name is recorded, a category it found
+    /// being among the company's categories. Returns <see langword="null"/> otherwise.
+    /// </summary>
+    private static Item? FindPreloadedItem(IErewhonDbContext db, CommissionPreload? preload, long itemId)
+    {
+        if (preload is null
+            || !preload.CoversItem(itemId)
+            || db.Items.Local.FindEntry(itemId)?.Entity is not { ItemCategory: { } category } item)
+        {
+            return null;
+        }
+
+        if (item.AgentId is null)
+        {
+            return item;
+        }
+
+        if (item.Agent is not { Company: { } agentCompany } agent
+            || !preload.TryGetAgentCompanyCategory(agent.CompanyId, category.Name, out ItemCategory? agentCompanyCategory)
+            || (agentCompanyCategory is not null && !agentCompany.ItemCategories.Contains(agentCompanyCategory)))
+        {
+            return null;
+        }
+
+        return item;
     }
 
     /// <summary>
@@ -243,9 +407,14 @@ public static class SaleRules
 
     /// <summary>
     /// Returns whether the item has a sale: an added sale in the change tracker, or a stored sale not marked as
-    /// deleted in the change tracker.
+    /// deleted in the change tracker. The stored sales are taken from <paramref name="snapshot"/> when it covers the
+    /// item, and are read from the database otherwise.
     /// </summary>
-    private static async Task<bool> ItemHasSaleAsync(IErewhonDbContext db, long itemId, CancellationToken ct)
+    private static async Task<bool> ItemHasSaleAsync(
+        IErewhonDbContext db,
+        CheckoutValidationSnapshot? snapshot,
+        long itemId,
+        CancellationToken ct)
     {
         var trackedSales = db.ChangeTracker.Entries<Sale>().ToList();
         if (trackedSales.Any(entry => entry.State == EntityState.Added && entry.Entity.ItemId == itemId))
@@ -258,14 +427,86 @@ public static class SaleRules
             .Select(entry => entry.Entity.Id)
             .ToHashSet();
 
-        List<long> storedSaleIds = await db.Sales
-            .AsNoTracking()
-            .Where(s => s.ItemId == itemId)
-            .Select(s => s.Id)
-            .ToListAsync(ct);
+        IReadOnlyList<long> storedSaleIds;
+        if (snapshot is null || !snapshot.TryGetStoredSaleIds(itemId, out storedSaleIds))
+        {
+            storedSaleIds = await db.Sales
+                .AsNoTracking()
+                .Where(s => s.ItemId == itemId)
+                .Select(s => s.Id)
+                .ToListAsync(ct);
+        }
 
         return storedSaleIds.Any(id => !deletedSaleIds.Contains(id));
     }
+}
+
+/// <summary>
+/// The commission data <see cref="SaleRules.PreloadForCommissionAsync"/> loaded, with change tracking, for a set of
+/// items: the row ids of the items whose commission data it loaded and, for each pair of an agent's company and an item
+/// category name it searched, the item category of that company with that name (ordinal comparison), or none.
+/// <see cref="SaleRules.LoadForCommissionAsync"/> reads nothing for an item the preload covers.
+/// </summary>
+/// <remarks>
+/// The preload's ids and search results do not change after it is created; the categories it holds are entities
+/// tracked by the context it was loaded from.
+/// </remarks>
+public sealed class CommissionPreload
+{
+    private readonly HashSet<long> _itemIds;
+    private readonly Dictionary<AgentCompanyCategoryKey, ItemCategory?> _agentCompanyCategories = new();
+
+    /// <summary>
+    /// Creates the preload of <paramref name="items"/>, each read with its category and agent, from
+    /// <paramref name="categories"/>, the categories read for them: for each item with an agent, the category of the
+    /// agent's company with the item category's name (ordinal comparison) among <paramref name="categories"/>, or none.
+    /// </summary>
+    /// <param name="items">The items whose commission data were loaded.</param>
+    /// <param name="categories">The item categories read for the items and their agents' companies.</param>
+    internal CommissionPreload(IReadOnlyCollection<Item> items, IReadOnlyCollection<ItemCategory> categories)
+    {
+        _itemIds = items.Select(item => item.Id).ToHashSet();
+        foreach (Item item in items)
+        {
+            if (item.Agent is not { } agent || item.ItemCategory is not { } category)
+            {
+                continue;
+            }
+
+            var key = new AgentCompanyCategoryKey(agent.CompanyId, category.Name);
+            if (!_agentCompanyCategories.ContainsKey(key))
+            {
+                _agentCompanyCategories[key] = categories.FirstOrDefault(candidate =>
+                    candidate.CompanyId == key.CompanyId
+                    && string.Equals(candidate.Name, key.CategoryName, StringComparison.Ordinal));
+            }
+        }
+    }
+
+    /// <summary>Returns whether the preload loaded the commission data of the item with row id <paramref name="itemId"/>.</summary>
+    /// <param name="itemId">The row id of the item.</param>
+    /// <returns><see langword="true"/> when the preload covers the item.</returns>
+    public bool CoversItem(long itemId) => _itemIds.Contains(itemId);
+
+    /// <summary>
+    /// Returns whether the preload searched the company with row id <paramref name="companyId"/> for an item category
+    /// named <paramref name="categoryName"/> (ordinal comparison); when it did, <paramref name="category"/> receives the
+    /// category it found, loaded with its commission rates, or <see langword="null"/> when the company has none of that
+    /// name.
+    /// </summary>
+    /// <param name="companyId">The row id of the agent's company.</param>
+    /// <param name="categoryName">The item category name.</param>
+    /// <param name="category">The category found, or <see langword="null"/>.</param>
+    /// <returns><see langword="true"/> when the preload searched the company for the name.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="categoryName"/> is <see langword="null"/>.</exception>
+    public bool TryGetAgentCompanyCategory(long companyId, string categoryName, out ItemCategory? category)
+    {
+        ArgumentNullException.ThrowIfNull(categoryName);
+        return _agentCompanyCategories.TryGetValue(new AgentCompanyCategoryKey(companyId, categoryName), out category);
+    }
+
+    /// <summary>An agent's company and an item category name searched for in it.</summary>
+    private readonly record struct AgentCompanyCategoryKey(long CompanyId, string CategoryName);
 }
 
 /// <summary>Selects whose sales the sales list shows. Ports the Agent, Client and Company options of <c>SalesListForm</c>.</summary>
@@ -467,11 +708,16 @@ public sealed class RetailSaleService : TransactionAgent<Sale>
     /// <summary>
     /// Returns the sales-list rows of the sales of one agent's items (<see cref="Agent.GetAllSales"/>), of one client
     /// (<see cref="Client.GetAllSales"/>) or of the bound company (<see cref="Company.GetAllSales"/>), in the order
-    /// that method returns. Rows are returned for every sale; no access filter is applied.
+    /// those methods return: by class number, so retail sales precede tender sales, and then by sale row id. Rows are
+    /// returned for every sale; no access filter is applied.
     /// Empty when <paramref name="showFor"/> is <see cref="SalesShowFor.Agent"/> or <see cref="SalesShowFor.Client"/>
     /// and <paramref name="id"/> is <see langword="null"/> or names no agent or client, and when
     /// <paramref name="showFor"/> is <see cref="SalesShowFor.Company"/> and no company is bound;
     /// <paramref name="id"/> is ignored for <see cref="SalesShowFor.Company"/>.
+    /// The sales are read in one query without change tracking, selecting only the values a row holds: the sales whose
+    /// item has the agent, the sales of the client, or the sales of the bound company, the agent and client options with
+    /// no company filter. Each row is built by <see cref="SalesRowProjection.From"/> from an untracked sale holding
+    /// those values.
     /// Ports the sale sets read by <c>SalesListForm.buildSalesTable</c>.
     /// </summary>
     /// <param name="showFor">Whose sales are listed.</param>
@@ -479,20 +725,53 @@ public sealed class RetailSaleService : TransactionAgent<Sale>
     /// <param name="ct">Token that cancels the read.</param>
     /// <returns>The rows.</returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="showFor"/> is not a defined value.</exception>
+    /// <exception cref="InvalidOperationException">A listed tender sale has no winning tender.</exception>
     public async Task<IReadOnlyList<SalesRowProjection>> GetSalesRowsAsync(
         SalesShowFor showFor,
         long? id,
         CancellationToken ct = default)
     {
-        IReadOnlyList<Sale> sales = showFor switch
+        IQueryable<Sale>? sales = showFor switch
         {
-            SalesShowFor.Agent => await AgentSalesAsync(id, ct),
-            SalesShowFor.Client => await ClientSalesAsync(id, ct),
+            SalesShowFor.Agent => AgentSales(id),
+            SalesShowFor.Client => ClientSales(id),
             SalesShowFor.Company => await CompanySalesAsync(ct),
             _ => throw new ArgumentOutOfRangeException(nameof(showFor), showFor, "The sales-list option is not a defined value."),
         };
 
-        return sales.Select(SalesRowProjection.From).ToList();
+        if (sales is null)
+        {
+            return [];
+        }
+
+        List<SalesRowValues> values = await sales
+            .AsNoTracking()
+            .Select(s => new SalesRowValues(
+                s.Id,
+                s is TenderSale,
+                s.ClientId,
+                s.Client!.Name,
+                s.ItemId,
+                s.Item is TenderItem,
+                s.Item!.CodeNumber,
+                s.Item.Name,
+                s.Item.Price,
+                s.Item.AgentId,
+                s.Item.ItemCategory!.Prefix,
+                s.AgentCommission,
+                (decimal?)((RetailSale)s).SalePrice,
+                (DateTime?)((RetailSale)s).DateSold,
+                (long?)((TenderSale)s).Tender!.Id,
+                (DateTime?)((TenderSale)s).Tender!.DateTendered,
+                (decimal?)((TenderSale)s).Tender!.Offer))
+            .ToListAsync(ct);
+
+        return values
+            .Select(ToUntrackedSale)
+            .OrderBy(sale => sale.JadeClassNumber)
+            .ThenBy(sale => sale.Id)
+            .Select(SalesRowProjection.From)
+            .ToList();
     }
 
 
@@ -608,7 +887,8 @@ public sealed class RetailSaleService : TransactionAgent<Sale>
     /// Sets the attributes of the new retail sale: the GUID and cleared soft edit lock of the base; the agent
     /// commission, sale price and time sold of the command; the bound company, the command's client and item; then
     /// the agent commission computed by <see cref="Sale.CalculateAgentCommission"/> on the sale price, after loading
-    /// the commission data with <see cref="SaleRules.LoadForCommissionAsync"/>.
+    /// the commission data with <see cref="SaleRules.LoadForCommissionAsync"/> and the command's
+    /// <see cref="SaleCommand{TSale}.CommissionPreload"/>.
     /// Ports <c>Sale.onCreate</c>, <c>RetailSale.onCreate</c> and <c>RetailSale.setCommonProperties</c>.
     /// </summary>
     /// <param name="entity">The retail sale being created, already tracked as added.</param>
@@ -634,7 +914,7 @@ public sealed class RetailSaleService : TransactionAgent<Sale>
         sale.ClientId = RequireClientId(cmd);
         sale.ItemId = cmd.ItemId ?? throw new InvalidOperationException("The retail sale has no item.");
 
-        await SaleRules.LoadForCommissionAsync(Db, sale, ct);
+        await SaleRules.LoadForCommissionAsync(Db, sale, cmd.CommissionPreload, ct);
         sale.CalculateAgentCommission(sale.SalePrice);
     }
 
@@ -711,70 +991,120 @@ public sealed class RetailSaleService : TransactionAgent<Sale>
             .Include(s => ((TenderSale)s).Tender).ThenInclude(t => t!.TenderItem);
 
     /// <summary>
-    /// Returns <see cref="Agent.GetAllSales"/> of the agent with row id <paramref name="agentId"/>, read without change
-    /// tracking with its items, each item's category and sale, and each sale's client and winning tender; empty when
-    /// <paramref name="agentId"/> is <see langword="null"/> or names no agent.
+    /// The sales whose item has the agent with row id <paramref name="agentId"/>, of any company;
+    /// <see langword="null"/> when <paramref name="agentId"/> is <see langword="null"/>.
     /// </summary>
-    private async Task<IReadOnlyList<Sale>> AgentSalesAsync(long? agentId, CancellationToken ct)
-    {
-        if (agentId is not long id)
-        {
-            return [];
-        }
-
-        Agent? agent = await Db.Agents
-            .AsNoTrackingWithIdentityResolution()
-            .Include(a => a.Items).ThenInclude(i => i.ItemCategory)
-            .Include(a => a.Items).ThenInclude(i => i.Sale).ThenInclude(s => s!.Client)
-            .Include(a => a.Items).ThenInclude(i => i.Sale).ThenInclude(s => ((TenderSale)s!).Tender)
-            .FirstOrDefaultAsync(a => a.Id == id, ct);
-
-        return agent?.GetAllSales() ?? [];
-    }
+    private IQueryable<Sale>? AgentSales(long? agentId) =>
+        agentId is long id ? Db.Sales.Where(s => s.Item!.AgentId == id) : null;
 
     /// <summary>
-    /// Returns <see cref="Client.GetAllSales"/> of the client with row id <paramref name="clientId"/>, read without
-    /// change tracking with its sales, each sale's item with its category and each tender sale's winning tender; empty
-    /// when <paramref name="clientId"/> is <see langword="null"/> or names no client.
+    /// The sales of the client with row id <paramref name="clientId"/>, of any company; <see langword="null"/> when
+    /// <paramref name="clientId"/> is <see langword="null"/>.
     /// </summary>
-    private async Task<IReadOnlyList<Sale>> ClientSalesAsync(long? clientId, CancellationToken ct)
-    {
-        if (clientId is not long id)
-        {
-            return [];
-        }
-
-        Client? client = await Db.Clients
-            .AsNoTrackingWithIdentityResolution()
-            .Include(c => c.Sales).ThenInclude(s => s.Item).ThenInclude(i => i!.ItemCategory)
-            .Include(c => c.Sales).ThenInclude(s => ((TenderSale)s).Tender)
-            .FirstOrDefaultAsync(c => c.Id == id, ct);
-
-        return client?.GetAllSales() ?? [];
-    }
+    private IQueryable<Sale>? ClientSales(long? clientId) =>
+        clientId is long id ? Db.Sales.Where(s => s.ClientId == id) : null;
 
     /// <summary>
-    /// Returns <see cref="Company.GetAllSales"/> of the bound company, read without change tracking with its sales,
-    /// each sale's client, item with its category and each tender sale's winning tender; empty when no company is
-    /// bound.
+    /// The sales of the bound company, read with <see cref="ICompanyContext.FindCurrentAsync"/>; <see langword="null"/>
+    /// when no company is bound.
     /// </summary>
-    private async Task<IReadOnlyList<Sale>> CompanySalesAsync(CancellationToken ct)
+    private async Task<IQueryable<Sale>?> CompanySalesAsync(CancellationToken ct)
     {
         Company? bound = await _companyContext.FindCurrentAsync(ct);
         if (bound is null)
         {
-            return [];
+            return null;
         }
 
         long companyId = bound.Id;
-        Company? company = await Db.Companies
-            .AsNoTrackingWithIdentityResolution()
-            .Include(c => c.Sales).ThenInclude(s => s.Client)
-            .Include(c => c.Sales).ThenInclude(s => s.Item).ThenInclude(i => i!.ItemCategory)
-            .Include(c => c.Sales).ThenInclude(s => ((TenderSale)s).Tender)
-            .FirstOrDefaultAsync(c => c.Id == companyId, ct);
-
-        return company?.GetAllSales() ?? [];
+        return Db.Sales.Where(s => s.CompanyId == companyId);
     }
+
+    /// <summary>
+    /// Returns a new sale, attached to no context, holding the values of <paramref name="values"/>: a
+    /// <see cref="TenderSale"/> with its winning tender when one was read, otherwise a <see cref="RetailSale"/>; its
+    /// client with the client name; and its item, a <see cref="TenderItem"/> or a <see cref="RetailItem"/>, with the
+    /// item's category prefix.
+    /// </summary>
+    private static Sale ToUntrackedSale(SalesRowValues values)
+    {
+        Item item = values.IsTenderItem ? new TenderItem() : new RetailItem();
+        item.Id = values.ItemId;
+        item.CodeNumber = values.ItemCodeNumber;
+        item.Name = values.ItemName;
+        item.Price = values.ItemPrice;
+        item.AgentId = values.ItemAgentId;
+        item.ItemCategory = new ItemCategory { Prefix = values.ItemCategoryPrefix };
+
+        Sale sale = values.IsTenderSale
+            ? new TenderSale
+            {
+                TenderId = values.TenderId,
+                Tender = values.TenderId is long tenderId
+                    ? new Tender
+                    {
+                        Id = tenderId,
+                        DateTendered = values.DateTendered.GetValueOrDefault(),
+                        Offer = values.Offer.GetValueOrDefault(),
+                    }
+                    : null,
+            }
+            : new RetailSale
+            {
+                SalePrice = values.SalePrice.GetValueOrDefault(),
+                DateSold = values.DateSold.GetValueOrDefault(),
+            };
+
+        sale.Id = values.SaleId;
+        sale.ClientId = values.ClientId;
+        sale.Client = new Client { Id = values.ClientId, Name = values.ClientName };
+        sale.ItemId = values.ItemId;
+        sale.Item = item;
+        sale.AgentCommission = values.AgentCommission;
+        return sale;
+    }
+
+    /// <summary>
+    /// The values of one sale that <see cref="SalesRowProjection.From"/> reads, as one row of the query of
+    /// <see cref="GetSalesRowsAsync"/>.
+    /// </summary>
+    /// <param name="SaleId">The row id of the sale.</param>
+    /// <param name="IsTenderSale"><see langword="true"/> for a tender sale.</param>
+    /// <param name="ClientId">The row id of the buying client.</param>
+    /// <param name="ClientName">The name of the buying client.</param>
+    /// <param name="ItemId">The row id of the sold item.</param>
+    /// <param name="IsTenderItem"><see langword="true"/> when the sold item is a tender item.</param>
+    /// <param name="ItemCodeNumber">The code number of the sold item.</param>
+    /// <param name="ItemName">The name of the sold item.</param>
+    /// <param name="ItemPrice">The price of the sold item.</param>
+    /// <param name="ItemAgentId">The row id of the item's agent; <see langword="null"/> when it has none.</param>
+    /// <param name="ItemCategoryPrefix">The prefix of the item's category.</param>
+    /// <param name="AgentCommission">The agent commission of the sale.</param>
+    /// <param name="SalePrice">The sale price of a retail sale; <see langword="null"/> for a tender sale.</param>
+    /// <param name="DateSold">The time sold of a retail sale; <see langword="null"/> for a tender sale.</param>
+    /// <param name="TenderId">
+    /// The row id of the winning tender of a tender sale; <see langword="null"/> for a retail sale and for a tender sale
+    /// with no winning tender.
+    /// </param>
+    /// <param name="DateTendered">The time the winning tender was placed; <see langword="null"/> when there is none.</param>
+    /// <param name="Offer">The offer of the winning tender; <see langword="null"/> when there is none.</param>
+    private sealed record SalesRowValues(
+        long SaleId,
+        bool IsTenderSale,
+        long ClientId,
+        string ClientName,
+        long ItemId,
+        bool IsTenderItem,
+        int ItemCodeNumber,
+        string ItemName,
+        decimal ItemPrice,
+        long? ItemAgentId,
+        string ItemCategoryPrefix,
+        decimal AgentCommission,
+        decimal? SalePrice,
+        DateTime? DateSold,
+        long? TenderId,
+        DateTime? DateTendered,
+        decimal? Offer);
 }
 

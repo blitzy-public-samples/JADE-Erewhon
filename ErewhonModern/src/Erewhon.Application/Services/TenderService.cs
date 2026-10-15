@@ -48,6 +48,14 @@ public sealed class TenderCommand : TransactionCommand<Tender>
     public long? TenderSaleId { get; set; }
 
     /// <summary>
+    /// The stored state of a checkout's lines read for the validation in progress; validation reads the tender item's
+    /// reserve price and closure date, its stored sales, the server date and the matching stored tenders from it when
+    /// it covers the tender item, and from the database otherwise. <see langword="null"/> outside a checkout's
+    /// validation.
+    /// </summary>
+    public CheckoutValidationSnapshot? ValidationSnapshot { get; set; }
+
+    /// <summary>
     /// Resets the common attributes, then sets <see cref="ClientId"/>, <see cref="TenderSaleId"/>,
     /// <see cref="TenderItemId"/> and <see cref="DateTendered"/> to <see langword="null"/> and <see cref="Offer"/> to 0.
     /// Ports <c>TenderTA.initialize</c>.
@@ -310,7 +318,9 @@ public sealed class TenderService : TransactionAgent<Tender>
     /// (<see cref="FocusFields.Timestamp"/>).</description></item>
     /// </list>
     /// A client or tender item id of 0 counts as none. The item, its sale and its tenders are read as stored, with the
-    /// sales and tenders the change tracker holds as added counted and those it holds as deleted left out. A tender
+    /// sales and tenders the change tracker holds as added counted and those it holds as deleted left out; the stored
+    /// item, sales, tenders and server date are those of <see cref="TenderCommand.ValidationSnapshot"/> when it covers
+    /// the tender item, and are read from the database otherwise. A tender
     /// whose time and offer equal those of a tender on another item of the company is not refused here; its save fails
     /// on the database's unique key. Ports <c>TenderTA.doValidate</c>.
     /// </summary>
@@ -342,15 +352,16 @@ public sealed class TenderService : TransactionAgent<Tender>
         else
         {
             long tenderItemId = cmd.TenderItemId!.Value;
-            TenderItem tenderItem = await ReadTenderItemAsync(tenderItemId, ct);
+            CheckoutValidationSnapshot? snapshot = cmd.ValidationSnapshot;
+            TenderItem tenderItem = await ReadTenderItemAsync(snapshot, tenderItemId, ct);
 
-            if (await TenderItemHasSaleAsync(tenderItemId, ct))
+            if (await TenderItemHasSaleAsync(snapshot, tenderItemId, ct))
             {
                 result.AddError(MessageKeys.TenderItemAlreadySold, FocusFields.TenderItem);
                 return;
             }
 
-            if (tenderItem.IsClosed(await Clock.GetServerDateAsync(ct)))
+            if (tenderItem.IsClosed(await ReadServerDateAsync(snapshot, tenderItemId, ct)))
             {
                 result.AddError(MessageKeys.TenderItemAlreadyClosed, FocusFields.TenderItem);
                 return;
@@ -367,7 +378,12 @@ public sealed class TenderService : TransactionAgent<Tender>
 
             if (!JadeValues.IsNull(cmd.ClientId) && !JadeValues.IsNull(cmd.Offer))
             {
-                int matches = await CountSameOfferTendersAsync(tenderItemId, cmd.ClientId!.Value, cmd.Offer, ct);
+                int matches = await CountSameOfferTendersAsync(
+                    snapshot,
+                    tenderItemId,
+                    cmd.ClientId!.Value,
+                    cmd.Offer,
+                    ct);
                 for (int match = 0; match < matches; match++)
                 {
                     result.AddError(MessageKeys.TenderAlreadyPlaced, FocusFields.Offer);
@@ -546,12 +562,21 @@ public sealed class TenderService : TransactionAgent<Tender>
     }
 
     /// <summary>
-    /// Reads, without change tracking, the reserve price and closure date of the tender item with row id
-    /// <paramref name="tenderItemId"/>, returned as an untracked <see cref="TenderItem"/> holding only its id, price and
-    /// closure date. An id that names no tender item raises <see cref="InvalidOperationException"/>.
+    /// Returns the reserve price and closure date of the tender item with row id <paramref name="tenderItemId"/> as an
+    /// untracked <see cref="TenderItem"/> holding only its id, price and closure date: those of
+    /// <paramref name="snapshot"/> when it covers the tender item, otherwise read from the database without change
+    /// tracking. An id that names no tender item raises <see cref="InvalidOperationException"/>.
     /// </summary>
-    private async Task<TenderItem> ReadTenderItemAsync(long tenderItemId, CancellationToken ct)
+    private async Task<TenderItem> ReadTenderItemAsync(
+        CheckoutValidationSnapshot? snapshot,
+        long tenderItemId,
+        CancellationToken ct)
     {
+        if (snapshot is not null && snapshot.TryGetTenderItem(tenderItemId, out TenderItem? snapshotItem))
+        {
+            return snapshotItem ?? throw new InvalidOperationException($"No tender item has the id {tenderItemId}.");
+        }
+
         var stored = await Db.Items
             .OfType<TenderItem>()
             .AsNoTracking()
@@ -564,10 +589,26 @@ public sealed class TenderService : TransactionAgent<Tender>
     }
 
     /// <summary>
-    /// Returns whether the item has a sale: an added sale in the change tracker, or a stored sale not marked as deleted
-    /// in the change tracker.
+    /// Returns the database server's current date: that of <paramref name="snapshot"/> when it covers the tender item,
+    /// otherwise read from the server clock.
     /// </summary>
-    private async Task<bool> TenderItemHasSaleAsync(long tenderItemId, CancellationToken ct)
+    private async Task<DateOnly> ReadServerDateAsync(
+        CheckoutValidationSnapshot? snapshot,
+        long tenderItemId,
+        CancellationToken ct) =>
+        snapshot is not null && snapshot.CoversTenderItem(tenderItemId) && snapshot.ServerDate is DateOnly serverDate
+            ? serverDate
+            : await Clock.GetServerDateAsync(ct);
+
+    /// <summary>
+    /// Returns whether the item has a sale: an added sale in the change tracker, or a stored sale not marked as deleted
+    /// in the change tracker. The stored sales are taken from <paramref name="snapshot"/> when it covers the item, and
+    /// are read from the database otherwise.
+    /// </summary>
+    private async Task<bool> TenderItemHasSaleAsync(
+        CheckoutValidationSnapshot? snapshot,
+        long tenderItemId,
+        CancellationToken ct)
     {
         var trackedSales = Db.ChangeTracker.Entries<Sale>().ToList();
         if (trackedSales.Exists(entry => entry.State == EntityState.Added && entry.Entity.ItemId == tenderItemId))
@@ -580,21 +621,27 @@ public sealed class TenderService : TransactionAgent<Tender>
             .Select(entry => entry.Entity.Id)
             .ToHashSet();
 
-        List<long> storedSaleIds = await Db.Sales
-            .AsNoTracking()
-            .Where(sale => sale.ItemId == tenderItemId)
-            .Select(sale => sale.Id)
-            .ToListAsync(ct);
+        IReadOnlyList<long> storedSaleIds;
+        if (snapshot is null || !snapshot.TryGetStoredSaleIds(tenderItemId, out storedSaleIds))
+        {
+            storedSaleIds = await Db.Sales
+                .AsNoTracking()
+                .Where(sale => sale.ItemId == tenderItemId)
+                .Select(sale => sale.Id)
+                .ToListAsync(ct);
+        }
 
-        return storedSaleIds.Exists(id => !deletedSaleIds.Contains(id));
+        return storedSaleIds.Any(id => !deletedSaleIds.Contains(id));
     }
 
     /// <summary>
     /// Returns the number of tenders on the tender item by the client whose offer equals <paramref name="offer"/>: the
     /// stored tenders not marked as deleted in the change tracker, plus the matching tenders the change tracker holds as
-    /// added.
+    /// added. The stored tenders are taken from <paramref name="snapshot"/> when it covers the tender item, client and
+    /// offer, and are read from the database otherwise.
     /// </summary>
     private async Task<int> CountSameOfferTendersAsync(
+        CheckoutValidationSnapshot? snapshot,
         long tenderItemId,
         long clientId,
         decimal offer,
@@ -612,11 +659,16 @@ public sealed class TenderService : TransactionAgent<Tender>
             .Select(entry => entry.Entity.Id)
             .ToHashSet();
 
-        List<long> storedTenderIds = await Db.Tenders
-            .AsNoTracking()
-            .Where(tender => tender.TenderItemId == tenderItemId && tender.ClientId == clientId && tender.Offer == offer)
-            .Select(tender => tender.Id)
-            .ToListAsync(ct);
+        IReadOnlyList<long> storedTenderIds;
+        if (snapshot is null
+            || !snapshot.TryGetStoredSameOfferTenderIds(tenderItemId, clientId, offer, out storedTenderIds))
+        {
+            storedTenderIds = await Db.Tenders
+                .AsNoTracking()
+                .Where(tender => tender.TenderItemId == tenderItemId && tender.ClientId == clientId && tender.Offer == offer)
+                .Select(tender => tender.Id)
+                .ToListAsync(ct);
+        }
 
         return storedTenderIds.Count(id => !deletedTenderIds.Contains(id)) + added;
     }

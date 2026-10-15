@@ -502,7 +502,9 @@ public sealed class ShoppingCartService : TransactionAgent<ShoppingCart>
     /// Adds nothing for <see cref="ValidationType.Delete"/>. Otherwise adds
     /// <see cref="MessageKeys.ShoppingCartHasNoItems"/> when there are no lines, then validates every line command
     /// through its service into the line's result, in cart order, and copies the errors of each line that fails, the
-    /// first copied focus field becoming the focus field. Ports <c>ShoppingCartTA.doValidate</c>.
+    /// first copied focus field becoming the focus field. The stored state the lines' rules read is read once for
+    /// every line before the first line is validated, as a <see cref="CheckoutValidationSnapshot"/> that each line
+    /// command carries until the last line is validated. Ports <c>ShoppingCartTA.doValidate</c>.
     /// </summary>
     /// <param name="command">The checkout values.</param>
     /// <param name="validationType">The set of rules to apply, passed to each line's service.</param>
@@ -530,22 +532,30 @@ public sealed class ShoppingCartService : TransactionAgent<ShoppingCart>
             result.AddError(MessageKeys.ShoppingCartHasNoItems);
         }
 
-        foreach (ShoppingCartLineCommand line in cart.Lines)
+        SetValidationSnapshot(cart, await ReadValidationSnapshotAsync(cart, ct));
+        try
         {
-            if (line.RetailSale is { } retailSale)
+            foreach (ShoppingCartLineCommand line in cart.Lines)
             {
-                if (!await _retailSales.ValidateAsync(retailSale, validationType, line.Result, ct))
+                if (line.RetailSale is { } retailSale)
+                {
+                    if (!await _retailSales.ValidateAsync(retailSale, validationType, line.Result, ct))
+                    {
+                        result.CopyErrorsFrom(line.Result);
+                    }
+
+                    continue;
+                }
+
+                if (line.Tender is { } tender && !await _tenders.ValidateAsync(tender, validationType, line.Result, ct))
                 {
                     result.CopyErrorsFrom(line.Result);
                 }
-
-                continue;
             }
-
-            if (line.Tender is { } tender && !await _tenders.ValidateAsync(tender, validationType, line.Result, ct))
-            {
-                result.CopyErrorsFrom(line.Result);
-            }
+        }
+        finally
+        {
+            SetValidationSnapshot(cart, null);
         }
     }
 
@@ -602,7 +612,12 @@ public sealed class ShoppingCartService : TransactionAgent<ShoppingCart>
     /// <summary>
     /// Persists every line command through its service inside the checkout transaction, in cart order and without
     /// stopping at a failure: a retail sale for each retail line and a tender for each tender line. Copies the errors
-    /// of each line that fails. Ports <c>ShoppingCartTA.createSubordinateObjects</c>.
+    /// of each line that fails. Before the first line, reads a new <see cref="CheckoutValidationSnapshot"/> of every
+    /// line, which each line command carries for the validation its service repeats until the last line is persisted,
+    /// and loads the commission data of every retail line's item with
+    /// <see cref="SaleRules.PreloadForCommissionAsync"/>, whose <see cref="CommissionPreload"/> each retail line command
+    /// carries for its sale's commission until the last line is persisted. Ports
+    /// <c>ShoppingCartTA.createSubordinateObjects</c>.
     /// </summary>
     /// <param name="command">The checkout values.</param>
     /// <param name="result">The result that receives the errors.</param>
@@ -618,33 +633,52 @@ public sealed class ShoppingCartService : TransactionAgent<ShoppingCart>
         ShoppingCartCommand cart = AsCartCommand(command);
         ArgumentNullException.ThrowIfNull(result);
 
-        foreach (ShoppingCartLineCommand line in cart.Lines)
-        {
-            if (line.RetailSale is { } retailSale)
-            {
-                OperationResult saleResult = await _retailSales.ExecuteAsync(
-                    retailSale,
-                    TransactionType.Persist,
-                    TransactionMode.Ambient,
-                    ct);
-                if (!saleResult.Succeeded)
-                {
-                    result.CopyErrorsFrom(saleResult);
-                }
-            }
+        CheckoutValidationSnapshot snapshot = await ReadValidationSnapshotAsync(cart, ct);
+        CommissionPreload commissionPreload = await SaleRules.PreloadForCommissionAsync(
+            Db,
+            cart.Lines
+                .Select(line => line.RetailSale?.ItemId)
+                .Where(itemId => !JadeValues.IsNull(itemId))
+                .Select(itemId => itemId!.Value),
+            ct);
 
-            if (line.Tender is { } tender)
+        SetCommissionPreload(cart, commissionPreload);
+        SetValidationSnapshot(cart, snapshot);
+        try
+        {
+            foreach (ShoppingCartLineCommand line in cart.Lines)
             {
-                OperationResult tenderResult = await _tenders.ExecuteAsync(
-                    tender,
-                    TransactionType.Persist,
-                    TransactionMode.Ambient,
-                    ct);
-                if (!tenderResult.Succeeded)
+                if (line.RetailSale is { } retailSale)
                 {
-                    result.CopyErrorsFrom(tenderResult);
+                    OperationResult saleResult = await _retailSales.ExecuteAsync(
+                        retailSale,
+                        TransactionType.Persist,
+                        TransactionMode.Ambient,
+                        ct);
+                    if (!saleResult.Succeeded)
+                    {
+                        result.CopyErrorsFrom(saleResult);
+                    }
+                }
+
+                if (line.Tender is { } tender)
+                {
+                    OperationResult tenderResult = await _tenders.ExecuteAsync(
+                        tender,
+                        TransactionType.Persist,
+                        TransactionMode.Ambient,
+                        ct);
+                    if (!tenderResult.Succeeded)
+                    {
+                        result.CopyErrorsFrom(tenderResult);
+                    }
                 }
             }
+        }
+        finally
+        {
+            SetValidationSnapshot(cart, null);
+            SetCommissionPreload(cart, null);
         }
 
         return result.HasNoErrors;
@@ -724,6 +758,50 @@ public sealed class ShoppingCartService : TransactionAgent<ShoppingCart>
 
         return sum;
     }
+
+    /// <summary>
+    /// Sets the <c>ValidationSnapshot</c> of every line's retail sale or tender command to <paramref name="snapshot"/>.
+    /// </summary>
+    private static void SetValidationSnapshot(ShoppingCartCommand cart, CheckoutValidationSnapshot? snapshot)
+    {
+        foreach (ShoppingCartLineCommand line in cart.Lines)
+        {
+            if (line.RetailSale is { } retailSale)
+            {
+                retailSale.ValidationSnapshot = snapshot;
+            }
+            else if (line.Tender is { } tender)
+            {
+                tender.ValidationSnapshot = snapshot;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Sets the <c>CommissionPreload</c> of every line's retail sale command to <paramref name="commissionPreload"/>.
+    /// </summary>
+    private static void SetCommissionPreload(ShoppingCartCommand cart, CommissionPreload? commissionPreload)
+    {
+        foreach (ShoppingCartLineCommand line in cart.Lines)
+        {
+            if (line.RetailSale is { } retailSale)
+            {
+                retailSale.CommissionPreload = commissionPreload;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Reads the <see cref="CheckoutValidationSnapshot"/> of every line: the item of each retail line and the tender
+    /// command of each tender line, in cart order.
+    /// </summary>
+    private Task<CheckoutValidationSnapshot> ReadValidationSnapshotAsync(ShoppingCartCommand cart, CancellationToken ct) =>
+        CheckoutValidationSnapshot.ReadAsync(
+            Db,
+            Clock,
+            cart.Lines.Where(line => line.RetailSale is not null).Select(line => line.RetailSale!.ItemId),
+            cart.Lines.Select(line => line.Tender).OfType<TenderCommand>(),
+            ct);
 
     /// <summary>Returns <paramref name="command"/> as a <see cref="ShoppingCartCommand"/>.</summary>
     private static ShoppingCartCommand AsCartCommand(TransactionCommand<ShoppingCart> command)

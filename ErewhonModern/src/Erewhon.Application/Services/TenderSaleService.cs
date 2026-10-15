@@ -205,7 +205,8 @@ public sealed class TenderSaleService : TransactionAgent<Sale>
     /// Sets the attributes of the new tender sale: the GUID and cleared soft edit lock of the base; the command's
     /// agent commission; the bound company, the command's client and item; the command's winning tender, read with
     /// change tracking; then the agent commission computed by <see cref="Sale.CalculateAgentCommission"/> on the
-    /// tender's offer, after loading the commission data with <see cref="SaleRules.LoadForCommissionAsync"/>.
+    /// tender's offer, after loading the commission data with <see cref="SaleRules.LoadForCommissionAsync"/> and the
+    /// command's <see cref="SaleCommand{TSale}.CommissionPreload"/>.
     /// Ports <c>Sale.onCreate</c>, <c>Sale.setCommonProperties</c> and <c>TenderSale.onCreate</c>.
     /// </summary>
     /// <param name="entity">The tender sale being created, already tracked as added.</param>
@@ -239,7 +240,7 @@ public sealed class TenderSaleService : TransactionAgent<Sale>
         sale.TenderId = tender.Id;
         sale.Tender = tender;
 
-        await SaleRules.LoadForCommissionAsync(Db, sale, ct);
+        await SaleRules.LoadForCommissionAsync(Db, sale, cmd.CommissionPreload, ct);
         sale.CalculateAgentCommission(tender.Offer);
     }
 
