@@ -6,6 +6,7 @@ namespace Erewhon.Application.Projections;
 /// Read model of the JADE <c>DTOItem</c>, <c>DTORetailItem</c> and <c>DTOTenderItem</c> populated by their
 /// <c>populateFromObject</c> methods: the item's row id, source GUID, code, name, description, category, listed date,
 /// photo, price, region and country, agent and sale details, with the closure date and tender presence of a tender item.
+/// Also carries the data read by the item <c>display</c> and <c>getSearchResultString</c> helpers.
 /// </summary>
 /// <param name="Id">The row id of the item.</param>
 /// <param name="Guid">The source GUID text of the item.</param>
@@ -67,9 +68,11 @@ public sealed record ItemProjection(
     /// <summary>
     /// Builds the projection from a retail or tender item, copying each value as stored.
     /// Reads <see cref="Item.ItemCategory"/>, <see cref="Item.Region"/> with its <see cref="Region.Country"/>,
-    /// <see cref="Item.Agent"/>, <see cref="Item.Sale"/> with the sale's <see cref="Domain.Sale.Client"/> and, for a
-    /// tender item, <see cref="TenderItem.Tenders"/>; a category, region, country, agent or sale that is
-    /// <see langword="null"/> projects as <see langword="null"/>.
+    /// <see cref="Item.Agent"/>, <see cref="Item.Sale"/> with the sale's <see cref="Domain.Sale.Client"/> (and, for a
+    /// sold tender item, <see cref="TenderSale.Tender"/>) and, for a tender item, <see cref="TenderItem.Tenders"/>;
+    /// a category, region, country, agent or sale that is <see langword="null"/> projects as <see langword="null"/>,
+    /// a tender sale without its tender projects with a <see langword="null"/> offer and tender time, and a tender
+    /// item whose tenders are not loaded projects with <c>HasTenders</c> <see langword="false"/>.
     /// </summary>
     /// <param name="item">The item to project.</param>
     /// <returns>The projection of <paramref name="item"/>.</returns>
