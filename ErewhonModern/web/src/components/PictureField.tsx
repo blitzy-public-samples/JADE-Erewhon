@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import type { ChangeEvent, CSSProperties, KeyboardEvent } from 'react';
+import type { ChangeEvent, CSSProperties, KeyboardEvent, PointerEvent } from 'react';
 
 interface PictureFieldProps {
   /** Base64 content of the picture chosen in this dialog, or null when none has been chosen. */
@@ -10,6 +10,8 @@ interface PictureFieldProps {
   disabled?: boolean;
   /** Fetches the stored picture shown while `base64` is null. Called once per mount. */
   loadExisting?: () => Promise<Blob | null>;
+  /** Called with a chosen file that cannot be read; the picture stays as it was. */
+  onReadError?: (file: File, error: unknown) => void;
 }
 
 interface Upload {
@@ -30,9 +32,24 @@ const boxStyle: CSSProperties = {
   boxSizing: 'border-box',
   inlineSize: PICTURE_SIZE,
   blockSize: PICTURE_SIZE,
-  border: '1px solid ButtonBorder',
+  borderWidth: '1px',
+  borderStyle: 'solid',
+  borderColor: 'ButtonBorder',
   backgroundColor: 'Canvas',
   overflow: 'hidden',
+};
+
+const imageStyle: CSSProperties = {
+  display: 'block',
+  inlineSize: '100%',
+  blockSize: '100%',
+  objectFit: 'contain',
+};
+
+const captionStyle: CSSProperties = {
+  maxInlineSize: PICTURE_SIZE,
+  textAlign: 'center',
+  overflowWrap: 'break-word',
 };
 
 const styles = {
@@ -44,18 +61,18 @@ const styles = {
     margin: 0,
   },
   box: boxStyle,
-  boxDisabled: { ...boxStyle, pointerEvents: 'none' },
-  image: {
-    display: 'block',
-    inlineSize: '100%',
-    blockSize: '100%',
-    objectFit: 'contain',
+  boxHover: { ...boxStyle, borderColor: 'Highlight' },
+  boxPressed: { ...boxStyle, borderColor: 'Highlight', backgroundColor: 'ButtonFace' },
+  boxDisabled: {
+    ...boxStyle,
+    pointerEvents: 'none',
+    borderColor: 'GrayText',
+    backgroundColor: 'ButtonFace',
   },
-  caption: {
-    maxInlineSize: PICTURE_SIZE,
-    textAlign: 'center',
-    overflowWrap: 'break-word',
-  },
+  image: imageStyle,
+  imageDisabled: { ...imageStyle, opacity: 0.5 },
+  caption: captionStyle,
+  status: captionStyle,
   fileInput: {
     display: 'none',
   },
@@ -94,16 +111,32 @@ function decodeBase64(base64: string): Blob | null {
   }
 }
 
+/** Returns the status text for a chosen file that has been read as the new picture. */
+function loadedStatus(fileName: string): string {
+  return `Picture loaded from ${fileName}.`;
+}
+
+/** Returns the status text for a chosen file that could not be read. */
+function readFailedStatus(fileName: string): string {
+  return `${fileName} could not be read. The picture is unchanged.`;
+}
+
 /**
  * The "Picture" group of the item editors.
  *
  * Shows the picture chosen in this dialog (`base64`) or, while none has been chosen, the stored
  * picture returned by `loadExisting`. Double-clicking the picture box, or pressing Enter or Space
  * on it, opens the file picker. A chosen non-empty file is read as base64 and passed to
- * `onChange`; an empty file leaves the picture unchanged.
+ * `onChange`; an empty file leaves the picture unchanged. A chosen file that cannot be read
+ * leaves the picture and `base64` unchanged and is passed to `onReadError`. The status line
+ * below the caption reports each chosen non-empty file as loaded or unreadable; the stored
+ * picture loads without a report. The box border is highlighted while the pointer is over it,
+ * and the box background also changes while the primary button is pressed on it. While
+ * disabled, the box shows a GrayText border and a ButtonFace background, and the picture is
+ * dimmed.
  */
 export function PictureField(props: PictureFieldProps) {
-  const { base64, onChange, disabled = false, loadExisting } = props;
+  const { base64, onChange, disabled = false, loadExisting, onReadError } = props;
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const readerRef = useRef<FileReader | null>(null);
@@ -112,6 +145,9 @@ export function PictureField(props: PictureFieldProps) {
   const [upload, setUpload] = useState<Upload | null>(null);
   const [decoded, setDecoded] = useState<DecodedPicture | null>(null);
   const [existingUrl, setExistingUrl] = useState<string | null>(null);
+  const [status, setStatus] = useState('');
+  const [hovered, setHovered] = useState(false);
+  const [pressed, setPressed] = useState(false);
 
   const showsUpload = base64 !== null && upload !== null && upload.base64 === base64;
 
@@ -161,6 +197,13 @@ export function PictureField(props: PictureFieldProps) {
     [],
   );
 
+  useEffect(() => {
+    if (disabled) {
+      setHovered(false);
+      setPressed(false);
+    }
+  }, [disabled]);
+
   let previewUrl: string | null = null;
   if (base64 === null) {
     previewUrl = existingUrl;
@@ -183,6 +226,34 @@ export function PictureField(props: PictureFieldProps) {
     }
   }
 
+  function handlePointerEnter(): void {
+    setHovered(true);
+  }
+
+  function handlePointerLeave(): void {
+    setHovered(false);
+    setPressed(false);
+  }
+
+  function handlePointerDown(event: PointerEvent<HTMLDivElement>): void {
+    if (event.button === 0) {
+      setPressed(true);
+    }
+  }
+
+  function handlePointerRelease(): void {
+    setPressed(false);
+  }
+
+  let boxStyleForState: CSSProperties = styles.box;
+  if (disabled) {
+    boxStyleForState = styles.boxDisabled;
+  } else if (pressed) {
+    boxStyleForState = styles.boxPressed;
+  } else if (hovered) {
+    boxStyleForState = styles.boxHover;
+  }
+
   function handleFileChange(event: ChangeEvent<HTMLInputElement>): void {
     const input = event.target;
     const file = input.files?.[0];
@@ -192,27 +263,44 @@ export function PictureField(props: PictureFieldProps) {
     }
 
     readerRef.current?.abort();
+    setStatus('');
     const reader = new FileReader();
     readerRef.current = reader;
-    reader.onload = () => {
+
+    const fail = (error: unknown): void => {
       if (readerRef.current !== reader) {
         return;
       }
       readerRef.current = null;
-      if (typeof reader.result !== 'string') {
+      setStatus(readFailedStatus(file.name));
+      onReadError?.(file, error);
+    };
+
+    reader.onload = () => {
+      if (readerRef.current !== reader) {
         return;
       }
+      if (typeof reader.result !== 'string') {
+        fail(reader.error);
+        return;
+      }
+      readerRef.current = null;
       const dataUrl = reader.result;
       const content = dataUrl.slice(dataUrl.indexOf(',') + 1);
       setUpload({ base64: content, dataUrl });
+      setStatus(loadedStatus(file.name));
       onChange(content);
     };
     reader.onerror = () => {
-      if (readerRef.current === reader) {
-        readerRef.current = null;
-      }
+      fail(reader.error);
     };
-    reader.readAsDataURL(file);
+    try {
+      reader.readAsDataURL(file);
+    } catch (error) {
+      window.setTimeout(() => {
+        fail(error);
+      }, 0);
+    }
   }
 
   return (
@@ -223,9 +311,14 @@ export function PictureField(props: PictureFieldProps) {
         tabIndex={disabled ? undefined : 0}
         aria-disabled={disabled ? true : undefined}
         title={LOAD_CAPTION}
-        style={disabled ? styles.boxDisabled : styles.box}
+        style={boxStyleForState}
         onDoubleClick={openPicker}
         onKeyDown={handleKeyDown}
+        onPointerEnter={handlePointerEnter}
+        onPointerLeave={handlePointerLeave}
+        onPointerDown={handlePointerDown}
+        onPointerUp={handlePointerRelease}
+        onPointerCancel={handlePointerRelease}
       >
         {previewUrl !== null && (
           <img
@@ -233,11 +326,14 @@ export function PictureField(props: PictureFieldProps) {
             alt="Picture"
             width={PICTURE_SIZE_PX}
             height={PICTURE_SIZE_PX}
-            style={styles.image}
+            style={disabled ? styles.imageDisabled : styles.image}
           />
         )}
       </div>
       <span style={styles.caption}>{LOAD_CAPTION}</span>
+      <span role="status" style={styles.status}>
+        {status}
+      </span>
       <input
         ref={fileInputRef}
         type="file"
