@@ -21,6 +21,7 @@ const CURRENCY_SCALE = 2;
 const DEFAULT_SCALE = 2;
 const MAX_SCALE = 28;
 const MAX_EXACT_UNITS = 1e15;
+const DECIMAL_TEXT = /^(\d+)(?:\.(\d+))?(?:e([+-]\d+))?$/;
 
 interface DateTimeParts {
   readonly year: string;
@@ -49,8 +50,11 @@ function daysInMonth(year: number, month: number): number {
 }
 
 /**
- * Returns the date and time fields of a `yyyy-MM-dd` or `yyyy-MM-ddTHH:mm:ss[.fff]` text, with the time
- * `00:00:00` for a date-only text, or `null` when the text is not a valid date or timestamp.
+ * Returns the date and time fields of the `yyyy-MM-dd` at the start of the text and, when `T` or a space and
+ * `HH:mm:ss[.fff]` follow it, of that time, ignoring whatever follows the matched part. When the date is not
+ * followed by `T` or a space and a complete `HH:mm:ss`, the time is `00:00:00`. Returns `null` when the
+ * start of the text does not match or the matched part names an impossible month, day, hour, minute or
+ * second.
  */
 function parseDateTime(iso: string): DateTimeParts | null {
   const match = ISO_DATE_TIME.exec(iso);
@@ -75,8 +79,10 @@ function parseDateTime(iso: string): DateTimeParts | null {
 }
 
 /**
- * Returns `''` for a null, undefined or empty text, the text unchanged when it is not a valid date or
- * timestamp, and otherwise the text that `render` builds from its fields.
+ * Returns `''` for a null, undefined or empty text, and the text unchanged when its start does not match
+ * `yyyy-MM-dd`, optionally followed by `T` or a space and `HH:mm:ss[.fff]`, or the matched part names an
+ * impossible month, day, hour, minute or second. Otherwise returns the text that `render` builds from the
+ * fields of the matched part, ignoring whatever follows it.
  */
 function formatDateTime(
   iso: string | null | undefined,
@@ -95,16 +101,27 @@ function longDate(parts: DateTimeParts): string {
 }
 
 /**
- * Returns `value × 10^scale` rounded to an integer, ties away from zero.
+ * Returns the decimal digits of the value's shortest text, `String(Math.abs(value))`, shifted by `scale`
+ * places and rounded to an integer, ties away from zero, negated when the value is negative,
+ * e.g. `1.005` at scale 2 → `101`, `-0.805` at scale 2 → `-81`, `2.4999999999999996` at scale 0 → `2`.
  *
- * @throws RangeError when the value is not finite or the result has 16 or more digits.
+ * @throws RangeError when the value is not finite or the value shifted by `scale` places has 16 or more
+ * integer digits.
  */
 function roundHalfAwayFromZero(value: number, scale: number): number {
-  const magnitude = Math.abs(value) * 10 ** scale;
-  if (!(magnitude < MAX_EXACT_UNITS)) {
+  const match = Number.isFinite(value) ? DECIMAL_TEXT.exec(String(Math.abs(value))) : null;
+  if (match === null) {
     throw new RangeError(`${value} cannot be formatted with ${scale} decimal places.`);
   }
-  const units = Math.round(Number(magnitude.toPrecision(15)));
+  const [, integerDigits, fractionDigits = '', exponent = '0'] = match;
+  const digits = integerDigits + fractionDigits;
+  const cut = integerDigits.length + Number(exponent) + scale;
+  const truncated = cut > 0 ? Number(digits.slice(0, cut).padEnd(cut, '0')) : 0;
+  if (!(truncated < MAX_EXACT_UNITS)) {
+    throw new RangeError(`${value} cannot be formatted with ${scale} decimal places.`);
+  }
+  const roundsUp = cut >= 0 && digits.charAt(cut) >= '5';
+  const units = roundsUp ? truncated + 1 : truncated;
   return value < 0 ? -units : units;
 }
 
@@ -145,9 +162,11 @@ export function currencyFormat(value: number): string {
 }
 
 /**
- * Returns the date part of a `yyyy-MM-dd` or `yyyy-MM-ddTHH:mm:ss[.fff]` text as `d/MM/yyyy`,
- * e.g. `2024-03-07` → `7/03/2024`. Returns `''` for null, undefined or `''`, and any other text that is
- * not a valid date unchanged.
+ * Returns the date of a text that starts with `yyyy-MM-dd`, optionally followed by `T` or a space and
+ * `HH:mm:ss[.fff]`, as `d/MM/yyyy`, ignoring whatever follows the matched part,
+ * e.g. `2024-03-07` → `7/03/2024`, `2024-03-07oops` → `7/03/2024`. Returns `''` for null, undefined or
+ * `''`, and the text unchanged when its start does not match or the matched part names an impossible
+ * month, day, hour, minute or second, e.g. `x2024-03-07` or `2024-13-01`.
  */
 export function shortFormat(iso: string | null | undefined): string {
   return formatDateTime(iso, (parts) => `${parts.dayNumber}/${parts.month}/${parts.year}`);
@@ -171,19 +190,23 @@ export function decimalString(value: number, scale: number = DEFAULT_SCALE): str
 }
 
 /**
- * Returns the date part of a `yyyy-MM-dd` or `yyyy-MM-ddTHH:mm:ss[.fff]` text as `dd MMMM yyyy` with the
- * English month name, e.g. `2024-03-07` → `07 March 2024`. Returns `''` for null, undefined or `''`, and
- * any other text that is not a valid date unchanged.
+ * Returns the date of a text that starts with `yyyy-MM-dd`, optionally followed by `T` or a space and
+ * `HH:mm:ss[.fff]`, as `dd MMMM yyyy` with the English month name, ignoring whatever follows the matched
+ * part, e.g. `2024-03-07` → `07 March 2024`. Returns `''` for null, undefined or `''`, and the text
+ * unchanged when its start does not match or the matched part names an impossible month, day, hour,
+ * minute or second.
  */
 export function dateString(iso: string | null | undefined): string {
   return formatDateTime(iso, longDate);
 }
 
 /**
- * Returns a `yyyy-MM-ddTHH:mm:ss[.fff]` text as `dd MMMM yyyy, HH:mm:ss` on the 24-hour clock without
- * milliseconds, e.g. `2024-03-07T14:05:09.123` → `07 March 2024, 14:05:09`. A `yyyy-MM-dd` text gives the
- * time `00:00:00`. Returns `''` for null, undefined or `''`, and any other text that is not a valid date or
- * timestamp unchanged.
+ * Returns a text that starts with `yyyy-MM-dd`, optionally followed by `T` or a space and `HH:mm:ss[.fff]`,
+ * as `dd MMMM yyyy, HH:mm:ss` on the 24-hour clock without milliseconds, ignoring whatever follows the
+ * matched part, e.g. `2024-03-07T14:05:09.123` → `07 March 2024, 14:05:09`. A text whose date is not
+ * followed by `T` or a space and a complete `HH:mm:ss`, such as `2024-03-07` or `2024-03-07T14:05`, gives
+ * the time `00:00:00`. Returns `''` for null, undefined or `''`, and the text unchanged when its start does
+ * not match or the matched part names an impossible month, day, hour, minute or second.
  */
 export function timeStampString(iso: string | null | undefined): string {
   return formatDateTime(iso, (parts) => `${longDate(parts)}, ${parts.hour}:${parts.minute}:${parts.second}`);
