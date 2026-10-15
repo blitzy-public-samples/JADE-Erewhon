@@ -1,0 +1,336 @@
+using Erewhon.Application.Abstractions;
+using Erewhon.Application.Cart;
+using Erewhon.Application.Common;
+using Erewhon.Application.Domain;
+using Microsoft.EntityFrameworkCore;
+
+namespace Erewhon.Application.Search;
+
+/// <summary>
+/// The criteria of an item search and the ids of the items the last search found.
+/// A new instance has every flag <see langword="false"/>, both prices 0, every filter id <see langword="null"/>
+/// and no results. A price of 0 sets no bound and a <see langword="null"/> filter id sets no filter.
+/// One instance holds the search state of one session; its members are not safe to call from several threads at once.
+/// </summary>
+public sealed class ItemSearchCriteria
+{
+    private decimal _priceLow;
+    private decimal _priceHigh;
+
+    /// <summary>Includes tender items whose closure date is before the server date.</summary>
+    public bool IncludeClosedTenders { get; set; }
+
+    /// <summary>Includes items that have a line in the searching session's cart.</summary>
+    public bool IncludeItemsInCart { get; set; }
+
+    /// <summary>Includes items that have a sale.</summary>
+    public bool IncludeSoldItems { get; set; }
+
+    /// <summary>Excludes tender items.</summary>
+    public bool OnlyRetailItems { get; set; }
+
+    /// <summary>Excludes retail items.</summary>
+    public bool OnlyTenderItems { get; set; }
+
+    /// <summary>
+    /// The lowest price an item may have, inclusive; 0 sets no lower bound.
+    /// The value is stored rounded to 2 decimal places, ties away from zero.
+    /// </summary>
+    public decimal PriceLow
+    {
+        get => _priceLow;
+        set => _priceLow = DecimalRules.Round2(value);
+    }
+
+    /// <summary>
+    /// The highest price an item may have, inclusive; 0 sets no upper bound.
+    /// The value is stored rounded to 2 decimal places, ties away from zero.
+    /// </summary>
+    public decimal PriceHigh
+    {
+        get => _priceHigh;
+        set => _priceHigh = DecimalRules.Round2(value);
+    }
+
+    /// <summary>The row id of the agent an item must have; <see langword="null"/> for any agent.</summary>
+    public long? AgentId { get; set; }
+
+    /// <summary>
+    /// The row id of the client an item must have been sold to; <see langword="null"/> for sold and unsold items alike.
+    /// </summary>
+    public long? ClientId { get; set; }
+
+    /// <summary>The row id of the country of the region an item must be listed in; <see langword="null"/> for any country.</summary>
+    public long? CountryId { get; set; }
+
+    /// <summary>The row id of the region an item must be listed in; <see langword="null"/> for any region.</summary>
+    public long? RegionId { get; set; }
+
+    /// <summary>The row id of the category an item must belong to; <see langword="null"/> for any category.</summary>
+    public long? ItemCategoryId { get; set; }
+
+    /// <summary>
+    /// The row ids of the items the last search found, in code-number order; empty before the first search and after
+    /// <see cref="Clear"/> or <see cref="Initialize"/>. Each search or reset replaces the list rather than changing it.
+    /// </summary>
+    public IReadOnlyList<long> ResultItemIds { get; private set; } = Array.Empty<long>();
+
+    /// <summary>
+    /// Empties <see cref="ResultItemIds"/>, sets <see cref="CountryId"/>, <see cref="RegionId"/> and
+    /// <see cref="ItemCategoryId"/> to <see langword="null"/>, sets <see cref="OnlyRetailItems"/> and
+    /// <see cref="OnlyTenderItems"/> to <see langword="false"/>, sets <see cref="PriceLow"/> and <see cref="PriceHigh"/>
+    /// to 0, and sets <see cref="IncludeClosedTenders"/> and <see cref="IncludeSoldItems"/> to <see langword="false"/>.
+    /// <see cref="IncludeItemsInCart"/>, <see cref="AgentId"/> and <see cref="ClientId"/> keep their values.
+    /// </summary>
+    public void Initialize()
+    {
+        ResultItemIds = Array.Empty<long>();
+
+        CountryId = null;
+        RegionId = null;
+        ItemCategoryId = null;
+        OnlyRetailItems = false;
+        OnlyTenderItems = false;
+        PriceLow = 0m;
+        PriceHigh = 0m;
+        IncludeClosedTenders = false;
+        IncludeSoldItems = false;
+    }
+
+    /// <summary>Empties <see cref="ResultItemIds"/>; every criterion keeps its value.</summary>
+    public void Clear()
+    {
+        ResultItemIds = Array.Empty<long>();
+    }
+
+    /// <summary>Replaces <see cref="ResultItemIds"/> with a copy of <paramref name="itemIds"/>, in the same order.</summary>
+    /// <param name="itemIds">The row ids of the items found, in code-number order.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="itemIds"/> is <see langword="null"/>.</exception>
+    internal void SetResults(IReadOnlyList<long> itemIds)
+    {
+        ArgumentNullException.ThrowIfNull(itemIds);
+        ResultItemIds = itemIds.ToList().AsReadOnly();
+    }
+}
+
+/// <summary>
+/// Searches the items of the bound company with an <see cref="ItemSearchCriteria"/>.
+/// It only reads: it writes no row and opens no transaction.
+/// One instance serves one dependency-injection scope; its members are not safe to call from several threads at once.
+/// </summary>
+/// <param name="db">The database the items are read from.</param>
+/// <param name="companyContext">The bound company whose items are searched.</param>
+/// <param name="cartStore">The carts whose lines are excluded unless <see cref="ItemSearchCriteria.IncludeItemsInCart"/> is set.</param>
+/// <param name="serverClock">The clock that gives the server date against which tender closure is judged.</param>
+public sealed class ItemSearch(
+    IErewhonDbContext db,
+    ICompanyContext companyContext,
+    ICartStore cartStore,
+    IServerClock serverClock)
+{
+    private readonly IErewhonDbContext _db = db ?? throw new ArgumentNullException(nameof(db));
+    private readonly ICompanyContext _companyContext = companyContext ?? throw new ArgumentNullException(nameof(companyContext));
+    private readonly ICartStore _cartStore = cartStore ?? throw new ArgumentNullException(nameof(cartStore));
+    private readonly IServerClock _serverClock = serverClock ?? throw new ArgumentNullException(nameof(serverClock));
+
+    /// <summary>
+    /// Returns the bound company's items, in code-number order, that match <paramref name="criteria"/>, and stores their
+    /// row ids in <see cref="ItemSearchCriteria.ResultItemIds"/>. Each returned item carries its category, its region
+    /// with the region's country, its agent, its sale with the sale's client and, for a tender item, its tenders.
+    /// When <see cref="ItemSearchCriteria.PriceLow"/> and <see cref="ItemSearchCriteria.PriceHigh"/> are both non-zero
+    /// and the low price is above the high price, it throws before the previous results are cleared or any data is read.
+    /// Otherwise it clears the previous results, then reads the bound company, the server date, the cart of
+    /// <paramref name="sessionId"/> when <see cref="ItemSearchCriteria.IncludeItemsInCart"/> is
+    /// <see langword="false"/>, and the company's items, and keeps each item for which
+    /// <see cref="ItemMatchesSearch"/> returns <see langword="true"/>.
+    /// </summary>
+    /// <param name="criteria">The criteria to apply; its <see cref="ItemSearchCriteria.ResultItemIds"/> is replaced.</param>
+    /// <param name="sessionId">
+    /// The id of the session whose cart lines are excluded; <see langword="null"/> when the search has no session cart.
+    /// </param>
+    /// <param name="ct">Cancels the reads.</param>
+    /// <returns>The matching items, in code-number order.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="criteria"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ErewhonException">
+    /// Error <see cref="ErewhonException.MinHigherThanMax"/>: both prices are non-zero and the low price is above the high price.
+    /// </exception>
+    /// <exception cref="NoCompanyException">No company is bound.</exception>
+    /// <exception cref="NullReferenceException">
+    /// <see cref="ItemSearchCriteria.CountryId"/> is set and an item reaching the country check has no region.
+    /// </exception>
+    public async Task<IReadOnlyList<Item>> DoSearchAsync(
+        ItemSearchCriteria criteria,
+        string? sessionId,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(criteria);
+
+        if (!JadeValues.IsNull(criteria.PriceLow)
+            && !JadeValues.IsNull(criteria.PriceHigh)
+            && criteria.PriceLow > criteria.PriceHigh)
+        {
+            throw new ErewhonException(ErewhonException.MinHigherThanMax);
+        }
+
+        criteria.Clear();
+
+        var company = await _companyContext.GetCurrentAsync(ct);
+        var serverDate = await _serverClock.GetServerDateAsync(ct);
+        var cart = !criteria.IncludeItemsInCart && sessionId is not null
+            ? _cartStore.GetCart(sessionId)
+            : null;
+
+        // One SQL query loads the items with every included navigation.
+        var items = await _db.Items
+            .AsNoTrackingWithIdentityResolution()
+            .Where(i => i.CompanyId == company.Id)
+            .Include(i => i.ItemCategory)
+            .Include(i => i.Region).ThenInclude(r => r!.Country)
+            .Include(i => i.Agent)
+            .Include(i => i.Sale).ThenInclude(s => s!.Client)
+            .Include(i => ((TenderItem)i).Tenders)
+            .OrderBy(i => i.CodeNumber)
+            .ToListAsync(ct);
+
+        var matches = new List<Item>(items.Count);
+        foreach (var item in items)
+        {
+            if (ItemMatchesSearch(criteria, item, serverDate, cart))
+            {
+                matches.Add(item);
+            }
+        }
+
+        criteria.SetResults(matches.ConvertAll(i => i.Id));
+        return matches.AsReadOnly();
+    }
+
+    /// <summary>
+    /// Returns whether <paramref name="item"/> matches <paramref name="criteria"/>. The checks run in this order and the
+    /// first that fails returns <see langword="false"/>:
+    /// <list type="number">
+    /// <item><description>a tender item closed at <paramref name="serverDate"/> fails unless
+    /// <see cref="ItemSearchCriteria.IncludeClosedTenders"/> is set;</description></item>
+    /// <item><description>an item with a line in <paramref name="cart"/> fails unless
+    /// <see cref="ItemSearchCriteria.IncludeItemsInCart"/> is set;</description></item>
+    /// <item><description>a sold item fails unless <see cref="ItemSearchCriteria.IncludeSoldItems"/> is set;</description></item>
+    /// <item><description>with <see cref="ItemSearchCriteria.AgentId"/> set, an item with another agent or no agent fails;</description></item>
+    /// <item><description>with <see cref="ItemSearchCriteria.ClientId"/> set, an unsold item, or an item sold to another
+    /// client, fails;</description></item>
+    /// <item><description>with <see cref="ItemSearchCriteria.CountryId"/> set, an item whose region is in another country
+    /// fails;</description></item>
+    /// <item><description>with <see cref="ItemSearchCriteria.RegionId"/> set, an item in another region or no region fails;</description></item>
+    /// <item><description>with <see cref="ItemSearchCriteria.ItemCategoryId"/> set, an item in another category fails;</description></item>
+    /// <item><description>with <see cref="ItemSearchCriteria.OnlyRetailItems"/> set, a tender item fails;</description></item>
+    /// <item><description>with <see cref="ItemSearchCriteria.OnlyTenderItems"/> set, a retail item fails;</description></item>
+    /// <item><description>with a non-zero <see cref="ItemSearchCriteria.PriceLow"/>, an item priced below it fails;</description></item>
+    /// <item><description>with a non-zero <see cref="ItemSearchCriteria.PriceHigh"/>, an item priced above it fails.</description></item>
+    /// </list>
+    /// An item that passes every check matches; a price equal to a bound passes that bound.
+    /// </summary>
+    /// <param name="criteria">The criteria to apply.</param>
+    /// <param name="item">
+    /// The item to test, with its <see cref="Item.Sale"/> loaded and, when <see cref="ItemSearchCriteria.CountryId"/> is
+    /// set, its <see cref="Item.Region"/>.
+    /// </param>
+    /// <param name="serverDate">The current date on the database server.</param>
+    /// <param name="cart">The cart whose lines are excluded; <see langword="null"/> for no cart lines.</param>
+    /// <returns><see langword="true"/> when <paramref name="item"/> matches; otherwise <see langword="false"/>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="criteria"/> or <paramref name="item"/> is <see langword="null"/>.</exception>
+    /// <exception cref="NullReferenceException">
+    /// <see cref="ItemSearchCriteria.CountryId"/> is set, <paramref name="item"/> passes the checks before the country
+    /// check and has no region.
+    /// </exception>
+    public static bool ItemMatchesSearch(
+        ItemSearchCriteria criteria,
+        Item item,
+        DateOnly serverDate,
+        ShoppingCart? cart)
+    {
+        ArgumentNullException.ThrowIfNull(criteria);
+        ArgumentNullException.ThrowIfNull(item);
+
+        if (item is TenderItem tenderItem
+            && tenderItem.IsClosed(serverDate)
+            && !criteria.IncludeClosedTenders)
+        {
+            return false;
+        }
+
+        if (!criteria.IncludeItemsInCart
+            && cart is not null
+            && cart.Contains(item.Id))
+        {
+            return false;
+        }
+
+        if (!criteria.IncludeSoldItems
+            && item.Sale is not null)
+        {
+            return false;
+        }
+
+        if (criteria.AgentId is not null
+            && item.AgentId != criteria.AgentId)
+        {
+            return false;
+        }
+
+        if (criteria.ClientId is not null)
+        {
+            if (item.Sale is null)
+            {
+                return false;
+            }
+
+            if (item.Sale.ClientId != criteria.ClientId)
+            {
+                return false;
+            }
+        }
+
+        if (criteria.CountryId is not null
+            && item.Region!.CountryId != criteria.CountryId)
+        {
+            return false;
+        }
+
+        if (criteria.RegionId is not null
+            && item.RegionId != criteria.RegionId)
+        {
+            return false;
+        }
+
+        if (criteria.ItemCategoryId is not null
+            && item.ItemCategoryId != criteria.ItemCategoryId)
+        {
+            return false;
+        }
+
+        if (criteria.OnlyRetailItems
+            && item is TenderItem)
+        {
+            return false;
+        }
+
+        if (criteria.OnlyTenderItems
+            && item is RetailItem)
+        {
+            return false;
+        }
+
+        if (!JadeValues.IsNull(criteria.PriceLow)
+            && item.Price < criteria.PriceLow)
+        {
+            return false;
+        }
+
+        if (!JadeValues.IsNull(criteria.PriceHigh)
+            && item.Price > criteria.PriceHigh)
+        {
+            return false;
+        }
+
+        return true;
+    }
+}
