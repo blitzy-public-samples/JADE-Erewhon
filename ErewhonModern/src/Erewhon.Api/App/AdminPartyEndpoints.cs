@@ -186,9 +186,11 @@ public static class AdminPartyEndpoints
     /// <summary>
     /// Returns the agent with row id <paramref name="id"/> with its items, ordered by item category row id, category
     /// prefix and code number, and its commission rates in item category name order; or 404 when no agent has that
-    /// id. Each item carries its category, its agent and, when sold, its sale with the buying client, read with that
-    /// client, and no photo bytes; the item's region name and country and the tenders of an unsold tender item are not
-    /// read.
+    /// id. Each item carries its category, its agent and, when sold, its sale with the buying client and, for a tender
+    /// sale, its winning tender, and no photo bytes. The buying clients of the sold items, the winning tenders and the
+    /// tenders those clients placed on the agent's tender items are read together in at most two queries after the
+    /// agent read; the item's region name and country and the tenders of other clients are not read, so a tender item
+    /// has tenders only when the winning tender or a buying client's tender is on it.
     /// </summary>
     private static async Task<Results<Ok<AgentDetailsResponse>, NotFound>> GetAgentAsync(
         [FromRoute] long id,
@@ -208,19 +210,7 @@ public static class AdminPartyEndpoints
             .ThenBy(item => item.CodeNumber)
             .ToList();
 
-        var buyerIds = new SortedSet<long>();
-        foreach (var item in items)
-        {
-            if (item.Sale is { Client: null } sale)
-            {
-                buyerIds.Add(sale.ClientId);
-            }
-        }
-
-        foreach (long buyerId in buyerIds)
-        {
-            await clientService.FindByIdAsync(buyerId, ct);
-        }
+        await clientService.LoadSaleClientsAsync(items, ct);
 
         var itemRows = items
             .Select(item => ItemProjection.From(item) with { Photo = null })

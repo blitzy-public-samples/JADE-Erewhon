@@ -1,6 +1,5 @@
 using CoreWCF;
 using Erewhon.Api.Soap.Contracts;
-using Erewhon.Application.Abstractions;
 using Erewhon.Application.Common;
 using Erewhon.Application.Domain;
 using Erewhon.Application.Messages;
@@ -13,8 +12,10 @@ namespace Erewhon.Api.Soap;
 /// <summary>
 /// The <c>ErewhonWebServiceAdmin</c> SOAP service: creates and deletes the agents and clients of the bound company
 /// by name through <see cref="AgentService"/> and <see cref="ClientService"/>, each operation in its own
-/// dependency-injection scope. A value longer than its field faults with the reason <c>String too long (1035)</c>;
-/// every other exception, including <see cref="NoCompanyException"/>, faults unchanged.
+/// dependency-injection scope. The name lookup of each operation reads the bound company, before the duplicate or
+/// not-found check and before any field-length check. A value longer than its field faults with the reason
+/// <c>String too long (1035)</c>; every other exception, including <see cref="NoCompanyException"/>, faults
+/// unchanged.
 /// </summary>
 [ServiceBehavior(
     Name = "ErewhonWebServiceAdmin",
@@ -55,7 +56,6 @@ public sealed class ErewhonWebServiceAdmin : IErewhonWebServiceAdmin
 
         return InvokeAsync(async services =>
         {
-            await ReadCompanyAsync(services);
             AgentService agents = services.GetRequiredService<AgentService>();
 
             if (await agents.FindByNameAsync(name) is not null)
@@ -102,7 +102,6 @@ public sealed class ErewhonWebServiceAdmin : IErewhonWebServiceAdmin
 
         return InvokeAsync(async services =>
         {
-            await ReadCompanyAsync(services);
             ClientService clients = services.GetRequiredService<ClientService>();
 
             if (await clients.FindByNameAsync(name) is not null)
@@ -134,7 +133,6 @@ public sealed class ErewhonWebServiceAdmin : IErewhonWebServiceAdmin
 
         return InvokeAsync(async services =>
         {
-            await ReadCompanyAsync(services);
             AgentService agents = services.GetRequiredService<AgentService>();
 
             Agent? agent = await agents.FindByNameAsync(name);
@@ -163,7 +161,6 @@ public sealed class ErewhonWebServiceAdmin : IErewhonWebServiceAdmin
 
         return InvokeAsync(async services =>
         {
-            await ReadCompanyAsync(services);
             ClientService clients = services.GetRequiredService<ClientService>();
 
             Client? client = await clients.FindByNameAsync(name);
@@ -201,13 +198,6 @@ public sealed class ErewhonWebServiceAdmin : IErewhonWebServiceAdmin
         {
             throw new FaultException(new FaultReason($"{ex.Message} ({ex.ErrorCode})"));
         }
-    }
-
-    /// <summary>Reads the bound company of the scope.</summary>
-    /// <exception cref="NoCompanyException">The bound company does not exist.</exception>
-    private static async Task ReadCompanyAsync(IServiceProvider services)
-    {
-        _ = await services.GetRequiredService<ICompanyContext>().GetCurrentAsync();
     }
 
     /// <summary>

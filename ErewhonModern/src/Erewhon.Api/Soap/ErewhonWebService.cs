@@ -1,6 +1,5 @@
 using CoreWCF;
 using Erewhon.Api.Soap.Contracts;
-using Erewhon.Application.Abstractions;
 using Erewhon.Application.Common;
 using Erewhon.Application.Domain;
 using Erewhon.Application.Messages;
@@ -14,7 +13,9 @@ namespace Erewhon.Api.Soap;
 /// <summary>
 /// The <c>ErewhonWebService</c> SOAP service: agent and client lookups by name, the agent and client name lists, the
 /// photo of a client's purchased retail items, and address updates of an existing agent or client. Ports JADE
-/// <c>ErewhonWebService</c>. Each operation runs in its own dependency-injection scope.
+/// <c>ErewhonWebService</c>. Each operation runs in its own dependency-injection scope. The first agent or client
+/// lookup of an operation reads the bound company, after the DTO checks of <c>updateAgentWithDTO</c> and
+/// <c>updateClientWithDTO</c>; a <see cref="NoCompanyException"/> from that read faults unchanged.
 /// </summary>
 [ServiceBehavior(
     Name = "ErewhonWebService",
@@ -41,7 +42,6 @@ public sealed class ErewhonWebService : IErewhonWebService
     public Task<DTOAgent?> getAgent(string? pName) =>
         InvokeAsync<DTOAgent?>(async services =>
         {
-            await ReadCompanyAsync(services);
             Agent? agent = await services.GetRequiredService<AgentService>().FindByNameAsync(pName ?? string.Empty);
             return agent is null ? null : ToDto(AgentProjection.From(agent));
         });
@@ -50,7 +50,6 @@ public sealed class ErewhonWebService : IErewhonWebService
     public Task<DTOName[]> getAgentNames() =>
         InvokeAsync(async services =>
         {
-            await ReadCompanyAsync(services);
             IReadOnlyList<NameProjection> names = await services.GetRequiredService<AgentService>().GetAgentNamesAsync();
             return names.Select(ToDto).ToArray();
         });
@@ -59,7 +58,6 @@ public sealed class ErewhonWebService : IErewhonWebService
     public Task<DTOClient?> getClient(string? pName) =>
         InvokeAsync<DTOClient?>(async services =>
         {
-            await ReadCompanyAsync(services);
             Client? client = await services.GetRequiredService<ClientService>()
                 .FindByNameAsync(JadeValues.TrimBlanks(pName));
             return client is null ? null : ToDto(ClientProjection.From(client));
@@ -69,7 +67,6 @@ public sealed class ErewhonWebService : IErewhonWebService
     public Task<DTOName[]> getClientNames() =>
         InvokeAsync(async services =>
         {
-            await ReadCompanyAsync(services);
             IReadOnlyList<NameProjection> names = await services.GetRequiredService<ClientService>().GetClientNamesAsync();
             return names.Select(ToDto).ToArray();
         });
@@ -78,7 +75,6 @@ public sealed class ErewhonWebService : IErewhonWebService
     public Task<DTOPhoto?> getPhoto(string? pName) =>
         InvokeAsync<DTOPhoto?>(async services =>
         {
-            await ReadCompanyAsync(services);
             ClientService clients = services.GetRequiredService<ClientService>();
             Client? client = await clients.FindByNameAsync(pName ?? string.Empty);
             if (client is null)
@@ -87,13 +83,10 @@ public sealed class ErewhonWebService : IErewhonWebService
             }
 
             var dtoPhoto = new DTOPhoto();
-            foreach (RetailSale sale in await clients.GetRetailSalesAsync(client.Id))
+            byte[]? photo = await clients.GetLastRetailSalePhotoAsync(client.Id);
+            if (!JadeValues.IsNull(photo))
             {
-                byte[]? photo = sale.Item?.Photo;
-                if (!JadeValues.IsNull(photo))
-                {
-                    dtoPhoto.photo = photo;
-                }
+                dtoPhoto.photo = photo;
             }
 
             return dtoPhoto;
@@ -202,7 +195,6 @@ public sealed class ErewhonWebService : IErewhonWebService
     /// </summary>
     private static async Task<DTOResult> UpdateAgentAsync(IServiceProvider services, string name, AddressValues address)
     {
-        await ReadCompanyAsync(services);
         AgentService agents = services.GetRequiredService<AgentService>();
         Agent? agent = await agents.FindByNameAsync(name);
         if (agent is null)
@@ -226,7 +218,6 @@ public sealed class ErewhonWebService : IErewhonWebService
     /// </summary>
     private static async Task<DTOResult> UpdateClientAsync(IServiceProvider services, string name, AddressValues address)
     {
-        await ReadCompanyAsync(services);
         ClientService clients = services.GetRequiredService<ClientService>();
         Client? client = await clients.FindByNameAsync(name);
         if (client is null)
@@ -241,12 +232,6 @@ public sealed class ErewhonWebService : IErewhonWebService
         OperationResult result = await clients.ExecuteAsync(command, TransactionType.Persist, TransactionMode.Own);
         return UpdateOutcome(result, client.Guid);
     }
-
-    /// <summary>
-    /// Reads the bound company; throws <see cref="NoCompanyException"/> when it does not exist.
-    /// </summary>
-    private static Task ReadCompanyAsync(IServiceProvider services) =>
-        services.GetRequiredService<ICompanyContext>().GetCurrentAsync();
 
     /// <summary>
     /// Returns status 200 with the GUID of the result, or <paramref name="entityGuid"/> when the result has none, for a

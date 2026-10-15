@@ -62,8 +62,10 @@ public sealed class ClientCommand : TransactionCommand<Client>
 
 /// <summary>
 /// Creates, updates, modifies and deletes clients with their addresses, and reads the clients of the bound company
-/// by name, by id, in name order and with their retail sales. Ports JADE <c>ClientTA</c>, <c>Client.onCreate</c>,
-/// <c>Client.setCommonProperties</c> and the reads of <c>Company.allClients</c> and <c>Client.allRetailSales</c>.
+/// by name, by id, in name order and with their retail sales, the buying clients of item sales with their tenders on
+/// those items, and the last photo of a client's purchased retail items. Ports JADE <c>ClientTA</c>,
+/// <c>Client.onCreate</c>, <c>Client.setCommonProperties</c> and the reads of <c>Company.allClients</c> and
+/// <c>Client.allRetailSales</c>.
 /// </summary>
 /// <remarks>
 /// A client name is unique within its company, compared exactly, with case. Deleting a client deletes its retail
@@ -226,6 +228,74 @@ public sealed class ClientService : TransactionAgent<Client>
         Db.Clients.AnyAsync(candidate => candidate.Id == id, ct);
 
     /// <summary>
+    /// Reads with change tracking, in at most two queries, the client of each sale of <paramref name="items"/> whose
+    /// <see cref="Sale.Client"/> is not loaded, with its address; the winning tender of each sale of
+    /// <paramref name="items"/> that is a <see cref="TenderSale"/>; and the tenders those clients placed on the tender
+    /// items of <paramref name="items"/>. The tracked sales, tender sales and tender items of the scope then refer to
+    /// the clients and tenders read. Reads nothing when every sale of <paramref name="items"/> already has its client,
+    /// or no item has a loaded sale.
+    /// </summary>
+    /// <param name="items">
+    /// The items whose sales receive their clients; an item without a loaded sale is skipped.
+    /// </param>
+    /// <param name="ct">Token that cancels the reads.</param>
+    /// <returns>A task that completes when the clients and tenders are read.</returns>
+    /// <exception cref="ArgumentNullException">
+    /// <paramref name="items"/> is <see langword="null"/> or holds a <see langword="null"/> item.
+    /// </exception>
+    public async Task LoadSaleClientsAsync(IEnumerable<Item> items, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(items);
+
+        var buyerIds = new HashSet<long>();
+        var winningTenderIds = new HashSet<long>();
+        var tenderItemIds = new HashSet<long>();
+        foreach (Item item in items)
+        {
+            ArgumentNullException.ThrowIfNull(item, nameof(items));
+
+            if (item is TenderItem tenderItem)
+            {
+                tenderItemIds.Add(tenderItem.Id);
+            }
+
+            if (item.Sale is TenderSale { TenderId: long tenderId })
+            {
+                winningTenderIds.Add(tenderId);
+            }
+
+            if (item.Sale is { Client: null } sale)
+            {
+                buyerIds.Add(sale.ClientId);
+            }
+        }
+
+        if (buyerIds.Count == 0)
+        {
+            return;
+        }
+
+        long[] buyers = [.. buyerIds];
+        await Db.Clients
+            .AsTracking()
+            .Where(client => buyers.Contains(client.Id))
+            .LoadAsync(ct);
+
+        if (winningTenderIds.Count == 0 && tenderItemIds.Count == 0)
+        {
+            return;
+        }
+
+        long[] winners = [.. winningTenderIds];
+        long[] buyerTenderItems = [.. tenderItemIds];
+        await Db.Tenders
+            .AsTracking()
+            .Where(tender => winners.Contains(tender.Id)
+                || (buyers.Contains(tender.ClientId) && buyerTenderItems.Contains(tender.TenderItemId)))
+            .LoadAsync(ct);
+    }
+
+    /// <summary>
     /// Returns the projections of the clients of the bound company in name order. Ports <c>Company.allClients</c>
     /// (<c>ClientsByNameDict</c>) as <c>DTOClient.populateFromObject</c> reads it.
     /// </summary>
@@ -305,6 +375,59 @@ public sealed class ClientService : TransactionAgent<Client>
             .ThenBy(sale => sale.Item?.ItemCategory?.Prefix, StringComparer.Ordinal)
             .ThenBy(sale => sale.Item?.CodeNumber)
             .ToList();
+    }
+
+    /// <summary>
+    /// Returns the photo of the item of the last retail sale of the client with row id <paramref name="clientId"/>
+    /// whose item has a photo that is neither <see langword="null"/> nor empty, in the order of
+    /// <see cref="GetRetailSalesAsync"/>: time sold, then the item's category prefix (ordinal), then the item's code
+    /// number. Reads, without change tracking, the item id and those three keys of each such sale, then the photo of
+    /// the last item only; when that photo is <see langword="null"/> or empty by the time it is read, the photo of the
+    /// item before it, and so on. Ports the <c>Client.allRetailSales</c> walk of <c>getPhoto</c>.
+    /// </summary>
+    /// <param name="clientId">The row id of the client.</param>
+    /// <param name="ct">Token that cancels the reads.</param>
+    /// <returns>
+    /// The photo bytes; <see langword="null"/> when no retail sale of the client has an item with a photo, or no client
+    /// has that id.
+    /// </returns>
+    public async Task<byte[]?> GetLastRetailSalePhotoAsync(long clientId, CancellationToken ct = default)
+    {
+        var keys = await Db.Sales
+            .OfType<RetailSale>()
+            .AsNoTracking()
+            .Where(sale => sale.ClientId == clientId && sale.Item!.Photo != null && sale.Item.Photo.Length > 0)
+            .Select(sale => new
+            {
+                sale.ItemId,
+                sale.DateSold,
+                sale.Item!.ItemCategory!.Prefix,
+                sale.Item.CodeNumber,
+            })
+            .ToListAsync(ct);
+
+        IEnumerable<long> itemIdsLastFirst = keys
+            .OrderBy(key => key.DateSold)
+            .ThenBy(key => key.Prefix, StringComparer.Ordinal)
+            .ThenBy(key => key.CodeNumber)
+            .Select(key => key.ItemId)
+            .Reverse();
+
+        foreach (long itemId in itemIdsLastFirst)
+        {
+            byte[]? photo = await Db.Items
+                .AsNoTracking()
+                .Where(item => item.Id == itemId)
+                .Select(item => item.Photo)
+                .FirstOrDefaultAsync(ct);
+
+            if (!JadeValues.IsNull(photo))
+            {
+                return photo;
+            }
+        }
+
+        return null;
     }
 
     /// <summary>
