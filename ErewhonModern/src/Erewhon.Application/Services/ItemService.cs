@@ -443,7 +443,8 @@ public sealed class ItemService : TransactionAgent<Item>
     /// <summary>
     /// Records the deleted-row notifications of the rows the database deletes with the item: its sale, then, for a
     /// tender item, each of its tenders in id order. The rows are read as <see cref="CascadeRow"/> values (type name
-    /// and id; for the sale, also its item's type name and id and its tender id).
+    /// and id; for the sale, also its item's type name and id and its tender id). For a tender item, then records an
+    /// updated notification for each tender sale of another item whose tender is one of those tenders, in id order.
     /// </summary>
     /// <param name="entity">The tracked item about to be deleted.</param>
     /// <param name="ct">Token that cancels the reads.</param>
@@ -459,6 +460,7 @@ public sealed class ItemService : TransactionAgent<Item>
             .Select(CascadeRow.FromSale)
             .ToListAsync(ct));
 
+        List<CascadeRow> peerTenderSales = [];
         if (entity is TenderItem)
         {
             removed.AddRange(await Db.Tenders
@@ -466,9 +468,16 @@ public sealed class ItemService : TransactionAgent<Item>
                 .OrderBy(tender => tender.Id)
                 .Select(tender => new CascadeRow(nameof(Tender), tender.Id))
                 .ToListAsync(ct));
+            peerTenderSales = await Db.Sales
+                .OfType<TenderSale>()
+                .Where(sale => sale.ItemId != itemId && sale.Tender!.TenderItemId == itemId)
+                .OrderBy(sale => sale.Id)
+                .Select(sale => new CascadeRow(nameof(TenderSale), sale.Id))
+                .ToListAsync(ct);
         }
 
         _deriver.RecordCascadeDeleted(removed);
+        _deriver.RecordPeerCleared(peerTenderSales);
     }
 
     /// <summary>

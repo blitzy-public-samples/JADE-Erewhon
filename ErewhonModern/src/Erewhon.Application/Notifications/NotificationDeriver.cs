@@ -165,10 +165,13 @@ public sealed class NotificationDeriver(NotificationQueue queue)
 
     /// <summary>
     /// Enqueues, at once and in the given order, an <see cref="ChangeKind.Updated"/> event with the row's
-    /// <see cref="CascadeRow.EntityType"/> and <see cref="CascadeRow.Id"/> for each item whose agent or region reference
-    /// the database clears when that agent or region is deleted.
+    /// <see cref="CascadeRow.EntityType"/> and <see cref="CascadeRow.Id"/> for each row whose reference the database
+    /// clears when the referenced row is deleted: an item's agent or region, a tender sale's tender.
     /// </summary>
-    /// <param name="items">The items whose agent or region reference the delete clears.</param>
+    /// <param name="items">
+    /// The rows whose reference the delete clears: items whose agent or region it deletes and tender sales whose tender
+    /// it deletes.
+    /// </param>
     /// <exception cref="ArgumentNullException"><paramref name="items"/> is null.</exception>
     /// <exception cref="ArgumentException">
     /// <paramref name="items"/> contains a null element, a row whose <see cref="CascadeRow.EntityType"/> is null or
@@ -277,8 +280,8 @@ public sealed class NotificationDeriver(NotificationQueue queue)
 
 /// <summary>
 /// A row the database deletes or changes itself, reported to <see cref="NotificationDeriver.RecordCascadeDeleted"/>
-/// or <see cref="NotificationDeriver.RecordPeerCleared"/> by its domain type name and id and, for a <see cref="Sale"/>,
-/// its item's type name and id and its tender id.
+/// or <see cref="NotificationDeriver.RecordPeerCleared"/> by its domain type name and id and, for a deleted
+/// <see cref="Sale"/>, its item's type name and id and its tender id.
 /// </summary>
 /// <param name="EntityType">
 /// The domain type name of the row, as carried by <see cref="ChangeEvent.EntityType"/>: for example <c>Agent</c>,
@@ -286,16 +289,19 @@ public sealed class NotificationDeriver(NotificationQueue queue)
 /// </param>
 /// <param name="Id">The row id.</param>
 /// <param name="SaleItemType">
-/// For a sale, the domain type name of its item (<c>RetailItem</c> or <c>TenderItem</c>); <see langword="null"/> for
-/// every other row.
+/// For a deleted sale, the domain type name of its item (<c>RetailItem</c> or <c>TenderItem</c>);
+/// <see langword="null"/> for every other row.
 /// </param>
-/// <param name="SaleItemId">For a sale, the row id of its item (<see cref="Sale.ItemId"/>); 0 for every other row.</param>
+/// <param name="SaleItemId">
+/// For a deleted sale, the row id of its item (<see cref="Sale.ItemId"/>); 0 for every other row.
+/// </param>
 /// <param name="SaleTenderId">
-/// For a <see cref="TenderSale"/>, its <see cref="TenderSale.TenderId"/>; <see langword="null"/> for every other row.
+/// For a deleted <see cref="TenderSale"/>, its <see cref="TenderSale.TenderId"/>; <see langword="null"/> for every other
+/// row.
 /// </param>
 public sealed record CascadeRow(string EntityType, long Id, string? SaleItemType, long SaleItemId, long? SaleTenderId)
 {
-    /// <summary>Creates a row that is not a sale: no sale item type, sale item id 0 and no sale tender id.</summary>
+    /// <summary>Creates a row without sale details: no sale item type, sale item id 0 and no sale tender id.</summary>
     /// <param name="entityType">The domain type name of the row.</param>
     /// <param name="id">The row id.</param>
     public CascadeRow(string entityType, long id)

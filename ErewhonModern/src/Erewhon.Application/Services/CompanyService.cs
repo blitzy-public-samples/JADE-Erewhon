@@ -641,7 +641,10 @@ public sealed class CompanyService : TransactionAgent<Company>
     /// Records a deleted notification for each row the database deletes with the company, read in the delete's
     /// transaction as <see cref="CascadeRow"/> values (type name and id; for a sale, also its item's type name and id
     /// and its tender id): its agents, clients, countries, the countries' regions, item categories, the categories'
-    /// commission rates, items, sales and tenders, each group in id order.
+    /// commission rates; the items of the company or of its categories; and the sales and the tenders of the company,
+    /// of its clients or of those items; each group in id order. Then records an updated notification for each other
+    /// item whose agent is one of the company's agents or whose region is one of those regions, in id order, then for
+    /// each other tender sale whose tender is one of those tenders, in id order.
     /// </summary>
     /// <param name="entity">The tracked company about to be deleted.</param>
     /// <param name="ct">Token that cancels the reads.</param>
@@ -683,23 +686,50 @@ public sealed class CompanyService : TransactionAgent<Company>
             .OrderBy(rate => rate.Id)
             .Select(rate => new CascadeRow(nameof(CommissionRate), rate.Id))
             .ToListAsync(ct));
-        rows.AddRange(await Db.Items
-            .Where(item => item.CompanyId == companyId)
+        IQueryable<Item> deletedItems = Db.Items
+            .Where(item => item.CompanyId == companyId || item.ItemCategory!.CompanyId == companyId);
+        IQueryable<long> deletedItemIds = deletedItems.Select(item => item.Id);
+        IQueryable<Sale> deletedSales = Db.Sales
+            .Where(sale => sale.CompanyId == companyId
+                || sale.Client!.CompanyId == companyId
+                || deletedItemIds.Contains(sale.ItemId));
+        IQueryable<Tender> deletedTenders = Db.Tenders
+            .Where(tender => tender.CompanyId == companyId
+                || tender.Client!.CompanyId == companyId
+                || deletedItemIds.Contains(tender.TenderItemId));
+        IQueryable<long> deletedSaleIds = deletedSales.Select(sale => sale.Id);
+        IQueryable<long> deletedTenderIds = deletedTenders.Select(tender => tender.Id);
+
+        rows.AddRange(await deletedItems
             .OrderBy(item => item.Id)
             .Select(CascadeRow.FromItem)
             .ToListAsync(ct));
-        rows.AddRange(await Db.Sales
-            .Where(sale => sale.CompanyId == companyId)
+        rows.AddRange(await deletedSales
             .OrderBy(sale => sale.Id)
             .Select(CascadeRow.FromSale)
             .ToListAsync(ct));
-        rows.AddRange(await Db.Tenders
-            .Where(tender => tender.CompanyId == companyId)
+        rows.AddRange(await deletedTenders
             .OrderBy(tender => tender.Id)
             .Select(tender => new CascadeRow(nameof(Tender), tender.Id))
             .ToListAsync(ct));
 
+        List<CascadeRow> peerItems = await Db.Items
+            .Where(item => !deletedItemIds.Contains(item.Id)
+                && (item.Agent!.CompanyId == companyId || item.Region!.Country!.CompanyId == companyId))
+            .OrderBy(item => item.Id)
+            .Select(CascadeRow.FromItem)
+            .ToListAsync(ct);
+        List<CascadeRow> peerTenderSales = await Db.Sales
+            .OfType<TenderSale>()
+            .Where(sale => sale.TenderId != null
+                && deletedTenderIds.Contains(sale.TenderId.Value)
+                && !deletedSaleIds.Contains(sale.Id))
+            .OrderBy(sale => sale.Id)
+            .Select(sale => new CascadeRow(nameof(TenderSale), sale.Id))
+            .ToListAsync(ct);
+
         _deriver.RecordCascadeDeleted(rows);
+        _deriver.RecordPeerCleared([.. peerItems, .. peerTenderSales]);
     }
 
     private static CompanyCommand AsCompanyCommand(TransactionCommand<Company> command)

@@ -451,7 +451,8 @@ public sealed class ItemCategoryService : TransactionAgent<ItemCategory>
     /// <see cref="CascadeRow"/> values (type name and id; for a sale, also its item's type name and id and its tender
     /// id): its commission rates in percentage order, its items in code-number order, the items' sales in item
     /// code-number order and the items' tenders in item code-number, time and descending offer order; each sale also
-    /// records an update of its item and tender.
+    /// records an update of its item and tender. Then records an updated notification for each tender sale of an item of
+    /// another category whose tender is one of those tenders, in id order.
     /// </summary>
     /// <param name="entity">The tracked category about to be deleted.</param>
     /// <param name="ct">Token that cancels the reads.</param>
@@ -488,7 +489,16 @@ public sealed class ItemCategoryService : TransactionAgent<ItemCategory>
             .Select(tender => new CascadeRow(nameof(Tender), tender.Id))
             .ToListAsync(ct);
 
+        List<CascadeRow> peerTenderSales = await Db.Sales
+            .OfType<TenderSale>()
+            .Where(sale => sale.Item!.ItemCategoryId != categoryId
+                && sale.Tender!.TenderItem!.ItemCategoryId == categoryId)
+            .OrderBy(sale => sale.Id)
+            .Select(sale => new CascadeRow(nameof(TenderSale), sale.Id))
+            .ToListAsync(ct);
+
         _deriver.RecordCascadeDeleted([.. rates, .. items, .. sales, .. tenders]);
+        _deriver.RecordPeerCleared(peerTenderSales);
     }
 
     /// <summary>

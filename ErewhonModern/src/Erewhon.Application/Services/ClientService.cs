@@ -704,7 +704,8 @@ public sealed class ClientService : TransactionAgent<Client>
     /// Records a deleted notification for each row the database deletes with the client, read in the delete's
     /// transaction as <see cref="CascadeRow"/> values (type name and id; for a sale, also its item's type name and id
     /// and its tender id): its retail and tender sales in id order, then its tenders in id order. Each sale also
-    /// records an update of its item and, for a tender sale, of its winning tender.
+    /// records an update of its item and, for a tender sale, of its winning tender. Then records an updated notification
+    /// for each tender sale of another client whose tender is one of those tenders, in id order.
     /// </summary>
     /// <param name="entity">The tracked client about to be deleted.</param>
     /// <param name="ct">Token that cancels the reads.</param>
@@ -727,7 +728,15 @@ public sealed class ClientService : TransactionAgent<Client>
             .Select(tender => new CascadeRow(nameof(Tender), tender.Id))
             .ToListAsync(ct);
 
+        List<CascadeRow> peerTenderSales = await Db.Sales
+            .OfType<TenderSale>()
+            .Where(sale => sale.ClientId != clientId && sale.Tender!.ClientId == clientId)
+            .OrderBy(sale => sale.Id)
+            .Select(sale => new CascadeRow(nameof(TenderSale), sale.Id))
+            .ToListAsync(ct);
+
         _deriver.RecordCascadeDeleted([.. sales, .. tenders]);
+        _deriver.RecordPeerCleared(peerTenderSales);
     }
 
     /// <summary>Returns <paramref name="command"/> as a <see cref="ClientCommand"/>.</summary>
