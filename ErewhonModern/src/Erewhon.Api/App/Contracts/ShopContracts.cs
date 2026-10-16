@@ -160,8 +160,8 @@ public sealed record AddCartItemRequest(long? ItemId, decimal Offer);
 public sealed record RemoveCartItemRequest(long? ItemId);
 
 /// <summary>
-/// Response of the cart operations <c>POST /api/app/shop/cart/items</c>, <c>POST /api/app/shop/cart/remove</c> and
-/// <c>POST /api/app/shop/cart/empty</c>: the outcome of the operation and the session cart after it.
+/// Response of the cart operations <c>POST /api/app/shop/cart/items</c> and <c>POST /api/app/shop/cart/remove</c>: the
+/// outcome of the operation and the session cart after it.
 /// </summary>
 /// <param name="Result">
 /// The outcome of the operation: its success flag, its errors in the order added and their full error text.
