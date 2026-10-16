@@ -75,7 +75,7 @@ public sealed class TestGetClient : ErewhonTestBase
 
         Address address = Builder.CreateTestAddress(
             ClientStreet, ClientCity, ClientCountry, ClientPhone, ClientFax, ClientEmail, ClientWebsite);
-        await Builder.CreateTestClientAsync(ClientName, address);
+        Client client = await Builder.CreateTestClientAsync(ClientName, address);
 
         Assert.True(await ClientExistsAsync(ClientName));
 
@@ -90,6 +90,8 @@ public sealed class TestGetClient : ErewhonTestBase
         Assert.Equal(ClientFax, dtoClient.fax);
         Assert.Equal(ClientEmail, dtoClient.email);
         Assert.True(JadeValues.IsNull(dtoClient.website));
+        Assert.False(JadeValues.IsNull(client.Guid));
+        Assert.Equal(client.Guid, dtoClient.guid);
     }
 
     /// <summary>

@@ -67,10 +67,11 @@ public sealed class TestGetAgentNames : ErewhonTestBase
         // Act
         DTOName[] names = await Client.getAgentNamesAsync();
 
-        // Assert
+        // Verify
         Assert.NotNull(names);
         Assert.True(names.Length > 0);
         Assert.Equal(AgentName, names[0].name);
+        Assert.Equal(new[] { AgentName, "Test Agent" }, names.Select(dtoName => dtoName.name));
     }
 
     /// <summary>

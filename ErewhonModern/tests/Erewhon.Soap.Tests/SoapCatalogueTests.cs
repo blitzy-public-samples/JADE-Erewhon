@@ -2,6 +2,7 @@ using System.ServiceModel;
 using Erewhon.Api.Soap;
 using Erewhon.Application.Abstractions;
 using Erewhon.Application.Common;
+using Erewhon.Application.Domain;
 using Erewhon.Application.Messages;
 using Erewhon.Application.Services;
 using Erewhon.Testing;
@@ -12,10 +13,12 @@ using WebService = Erewhon.SoapClient.WebService;
 namespace Erewhon.Soap.Tests;
 
 /// <summary>
-/// The SOAP behaviour-catalogue entries that no JADE SOAP test pins, run over the real <c>ErewhonWebService</c> and
-/// <c>ErewhonWebServiceAdmin</c> endpoints through the generated clients: B-51, the status constants and the absence
-/// of status 403 from every reachable operation outcome, and the SOAP cases of B-22, error 1035 for a street longer
-/// than its 51 characters. Each test starts from <see cref="TestCompanyBuilder.CreateTestDataAsync"/>.
+/// The SOAP behaviour-catalogue entries, and parts of entries, that no JADE SOAP test pins, run over the real
+/// <c>ErewhonWebService</c> and <c>ErewhonWebServiceAdmin</c> endpoints through the generated clients: B-51, the status
+/// constants and the absence of status 403 from every reachable operation outcome; the SOAP cases of B-22, error 1035
+/// for a street longer than its 51 characters; and B-47 with Q-13, the photo <c>getPhoto</c> returns among a client's
+/// sales, that of the last retail sale whose item has a photo. Each test starts from
+/// <see cref="TestCompanyBuilder.CreateTestDataAsync"/>.
 /// </summary>
 public sealed class SoapCatalogueTests : ErewhonTestBase
 {
@@ -26,6 +29,7 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
     private const string FixtureStreet = "Street";
     private const string NewAgentName = "Rowan Stracke";
     private const string NewClientName = "Dariush Kamran";
+    private const string PhotoClientName = "Aroha Ngata";
     private const string StringTooLongFault = "String too long (1035)";
     private const int OverLongStreetLength = 60;
 
@@ -64,6 +68,12 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
 
     private Admin.ErewhonWebServiceAdminClient AdminClient =>
         _adminClient ?? throw new InvalidOperationException($"The admin service client is created by {nameof(SetUpAsync)}.");
+
+    private Region FixtureRegion =>
+        Builder.MyRegion ?? throw new InvalidOperationException($"The fixture region is created by {nameof(SetUpAsync)}.");
+
+    private Agent FixtureAgent =>
+        Builder.MyAgent ?? throw new InvalidOperationException($"The fixture agent is created by {nameof(SetUpAsync)}.");
 
     /// <summary>
     /// Every status constant holds its JADE value, and no outcome of the eight <c>DTOResult</c> operations reached
@@ -257,6 +267,101 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
     }
 
     /// <summary>
+    /// After each sale added to a new client, <c>getPhoto</c> returns the photo of the item of the client's last retail
+    /// sale whose item has a photo, in order of time sold, then category prefix, then item code number: no photo after
+    /// a tender sale of a tender item with a photo, tendered after every retail sale that follows; of two retail sales
+    /// created later-dated first, the later-dated sale's photo; the same photo after a retail sale dated after every
+    /// other of an item with no photo; at one time sold, the photo of the item whose category prefix sorts last,
+    /// although the item whose prefix sorts first has the highest code number; at a later time sold and one prefix,
+    /// the photo of the item with the higher code number, although its sale is created before the other's. Every photo
+    /// is distinct from the others and from <see cref="TestPhoto"/>.
+    /// </summary>
+    /// <returns>A task that completes when every step has been checked.</returns>
+    [Fact]
+    public async Task B47_PhotoOfLastRetailSaleWithPhoto()
+    {
+        var category = Builder.MyItemCategory ?? throw new InvalidOperationException(
+            $"The fixture item category is created by {nameof(SetUpAsync)}.");
+
+        DateOnly serverDate = await GetService<IServerClock>().GetServerDateAsync();
+        DateTime earlier = TenAm(serverDate.AddDays(-30));
+        DateTime later = TenAm(serverDate.AddDays(-20));
+        DateTime latest = TenAm(serverDate.AddDays(-15));
+        DateTime afterEveryPhotoSale = TenAm(serverDate.AddDays(-10));
+
+        Client client = await Builder.CreateTestClientAsync(
+            PhotoClientName,
+            Builder.CreateTestAddress(
+                MashhadAddress.Street,
+                MashhadAddress.City,
+                MashhadAddress.Country,
+                MashhadAddress.Phone,
+                MashhadAddress.Fax,
+                MashhadAddress.Email,
+                MashhadAddress.Website));
+
+        // A tender sale of a tender item with a photo, tendered after every retail sale: no photo.
+        await CreateTenderSaleAsync(
+            client, MarkedPhoto(1), category, TenAm(serverDate.AddDays(-5)), serverDate.AddDays(7));
+        byte[]? tenderOnlyPhoto = await GetPhotoBytesAsync(PhotoClientName);
+        Assert.True(
+            JadeValues.IsNull(tenderOnlyPhoto),
+            $"Expected no photo, got {tenderOnlyPhoto?.Length} bytes.");
+
+        // Two retail sales created later-dated first: the later-dated sale's photo.
+        byte[] laterPhoto = MarkedPhoto(2);
+        RetailItem laterItem = await CreateRetailItemAsync("Later Item", laterPhoto, category);
+        await Builder.CreateTestRetailSaleAsync(laterItem, client, later);
+        Assert.Equal(laterPhoto, await GetPhotoBytesAsync(PhotoClientName));
+
+        byte[] earlierPhoto = MarkedPhoto(3);
+        RetailItem earlierItem = await CreateRetailItemAsync("Earlier Item", earlierPhoto, category);
+        await Builder.CreateTestRetailSaleAsync(earlierItem, client, earlier);
+        Assert.Equal(laterPhoto, await GetPhotoBytesAsync(PhotoClientName));
+
+        // A retail sale dated after every other, of an item with no photo: unchanged.
+        RetailItem noPhotoItem = await CreateRetailItemAsync("No Photo Item", null, category);
+        await Builder.CreateTestRetailSaleAsync(noPhotoItem, client, afterEveryPhotoSale);
+        Assert.Equal(laterPhoto, await GetPhotoBytesAsync(PhotoClientName));
+
+        // At one time sold, the category prefix decides before the code number.
+        ItemCategory firstPrefixCategory = await Builder.CreateTestItemCategoryAsync(
+            "Photo Category AAAA", "AAAA", "A category whose prefix sorts first");
+        ItemCategory lastPrefixCategory = await Builder.CreateTestItemCategoryAsync(
+            "Photo Category ZZZZ", "ZZZZ", "A category whose prefix sorts last");
+
+        byte[] lastPrefixPhoto = MarkedPhoto(4);
+        RetailItem lastPrefixItem = await CreateRetailItemAsync(
+            "Last Prefix Item", lastPrefixPhoto, lastPrefixCategory);
+        byte[] firstPrefixPhoto = MarkedPhoto(5);
+        RetailItem firstPrefixItem = await CreateRetailItemAsync(
+            "First Prefix Item", firstPrefixPhoto, firstPrefixCategory);
+        Assert.True(
+            laterItem.CodeNumber < lastPrefixItem.CodeNumber && lastPrefixItem.CodeNumber < firstPrefixItem.CodeNumber,
+            $"Expected code numbers {laterItem.CodeNumber} < {lastPrefixItem.CodeNumber} < "
+            + $"{firstPrefixItem.CodeNumber}.");
+
+        await Builder.CreateTestRetailSaleAsync(firstPrefixItem, client, later);
+        Assert.Equal(laterPhoto, await GetPhotoBytesAsync(PhotoClientName));
+
+        await Builder.CreateTestRetailSaleAsync(lastPrefixItem, client, later);
+        Assert.Equal(lastPrefixPhoto, await GetPhotoBytesAsync(PhotoClientName));
+
+        // At one later time sold and one prefix, the code number decides, not the order the sales are created in.
+        byte[] lowerCodePhoto = MarkedPhoto(6);
+        RetailItem lowerCodeItem = await CreateRetailItemAsync("Lower Code Item", lowerCodePhoto, category);
+        byte[] higherCodePhoto = MarkedPhoto(7);
+        RetailItem higherCodeItem = await CreateRetailItemAsync("Higher Code Item", higherCodePhoto, category);
+        Assert.Equal(lowerCodeItem.CodeNumber + 1, higherCodeItem.CodeNumber);
+
+        await Builder.CreateTestRetailSaleAsync(higherCodeItem, client, latest);
+        Assert.Equal(higherCodePhoto, await GetPhotoBytesAsync(PhotoClientName));
+
+        await Builder.CreateTestRetailSaleAsync(lowerCodeItem, client, latest);
+        Assert.Equal(higherCodePhoto, await GetPhotoBytesAsync(PhotoClientName));
+    }
+
+    /// <summary>
     /// Builds <see cref="TestCompanyBuilder.CreateTestDataAsync"/>, which creates and binds its own company, then
     /// creates both SOAP clients from one factory addressed to <see cref="ErewhonTestBase.Api"/>.
     /// </summary>
@@ -363,6 +468,12 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
     /// <summary>Returns <paramref name="errors"/> in order, separated by <c> | </c>.</summary>
     private static string JoinErrors(IReadOnlyList<string> errors) => string.Join(" | ", errors);
 
+    /// <summary>Returns 10:00:00 on <paramref name="date"/>.</summary>
+    private static DateTime TenAm(DateOnly date) => date.ToDateTime(new TimeOnly(10, 0, 0));
+
+    /// <summary>Returns the bytes of <see cref="TestPhoto"/> followed by the one byte <paramref name="marker"/>.</summary>
+    private static byte[] MarkedPhoto(byte marker) => [.. TestPhoto.ToArray(), marker];
+
     /// <summary>Calls <c>updateAgent</c> with <paramref name="name"/> and the seven values of <paramref name="address"/>.</summary>
     private Task<WebService.DTOResult> UpdateAgentAsync(string name, SoapAddress address) =>
         WebClient.updateAgentAsync(
@@ -398,6 +509,51 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
 
         var agent = await scope.ServiceProvider.GetRequiredService<AgentService>().FindByNameAsync(name);
         return agent?.Address.Street;
+    }
+
+    /// <summary>
+    /// Creates the retail item <paramref name="name"/> in <paramref name="category"/> with <paramref name="photo"/>,
+    /// priced 100, listed in the fixture region and sold by the fixture agent.
+    /// </summary>
+    private Task<RetailItem> CreateRetailItemAsync(string name, byte[]? photo, ItemCategory category) =>
+        Builder.CreateTestRetailItemAsync(
+            name, "An item sold to the photo client", photo, FixtureRegion, category, FixtureAgent, 100m);
+
+    /// <summary>
+    /// Creates a tender item in <paramref name="category"/> with <paramref name="photo"/>, reserve 500 and closure date
+    /// <paramref name="closureDate"/>, listed in the fixture region and sold by the fixture agent; a tender by
+    /// <paramref name="client"/> on it of its reserve, placed at <paramref name="dateTendered"/>; and the tender sale
+    /// that awards the item to <paramref name="client"/> through that tender.
+    /// </summary>
+    private async Task CreateTenderSaleAsync(
+        Client client,
+        byte[] photo,
+        ItemCategory category,
+        DateTime dateTendered,
+        DateOnly closureDate)
+    {
+        TenderItem tenderItem = await Builder.CreateTestTenderItemAsync(
+            "Photo Tender Item",
+            "A tender item sold to the photo client",
+            photo,
+            FixtureRegion,
+            category,
+            FixtureAgent,
+            500m,
+            closureDate);
+        Tender tender = await Builder.CreateTestTenderAsync(tenderItem.Price, dateTendered, client, tenderItem);
+        await Builder.CreateTestTenderSaleAsync(tenderItem, tender, client);
+    }
+
+    /// <summary>
+    /// Calls <c>getPhoto</c> for <paramref name="clientName"/>, checks that it returns a <c>DTOPhoto</c>, and returns
+    /// that DTO's photo bytes.
+    /// </summary>
+    private async Task<byte[]?> GetPhotoBytesAsync(string clientName)
+    {
+        WebService.DTOPhoto dtoPhoto = await WebClient.getPhotoAsync(clientName);
+        Assert.NotNull(dtoPhoto);
+        return dtoPhoto.photo;
     }
 
     /// <summary>The seven address values an operation sends, in the order of its parameters.</summary>

@@ -6,6 +6,7 @@ using Erewhon.Api.Sessions;
 using Erewhon.Application.Abstractions;
 using Erewhon.Application.Common;
 using Erewhon.Application.Domain;
+using Erewhon.Application.Notifications;
 using Erewhon.Persistence;
 using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
@@ -108,9 +109,11 @@ public sealed class TestSessionContext : ISessionContext
 /// <para>
 /// <see cref="InitializeAsync"/> clears <see cref="LogSink"/>, opens the test's service scope on <see cref="Api"/>,
 /// takes the scope's <see cref="TestSessionContext"/> as <see cref="Session"/>, creates <see cref="Builder"/> over the
-/// scope and runs <see cref="SetUpAsync"/>. When a step after the scope is opened fails, it deletes every company,
-/// removes the session's cart, disposes the scope and rethrows. <see cref="DisposeAsync"/> runs
-/// <see cref="TearDownAsync"/>, removes the session's cart and disposes the scope.
+/// scope and runs <see cref="SetUpAsync"/>. When a step after the scope is opened fails, it rolls back the scope's
+/// active transaction, discards the scope's queued change notifications and tracked entities, deletes every company,
+/// removes the session's cart, disposes the scope and rethrows. <see cref="DisposeAsync"/> rolls back and discards the
+/// scope's uncommitted work in the same way, runs <see cref="TearDownAsync"/>, removes the session's cart and disposes
+/// the scope.
 /// </para>
 /// <para>
 /// The tests of one assembly must not run in parallel.
@@ -178,8 +181,10 @@ public abstract class ErewhonTestBase : IAsyncLifetime
     /// <summary>
     /// Prepares the test: obtains the shared host of the test assembly, clears its log sink, opens the test's scope,
     /// takes the scope's <see cref="TestSessionContext"/> as <see cref="Session"/>, creates <see cref="Builder"/> over
-    /// the scope and runs <see cref="SetUpAsync"/>. When a step after the scope is opened fails, deletes every company in
-    /// a new scope, removes the session's cart, disposes the test's scope and rethrows the failure.
+    /// the scope and runs <see cref="SetUpAsync"/>. When a step after the scope is opened fails, rolls back the
+    /// transaction of the test's scope when one is active, discards the scope's queued change notifications and tracked
+    /// entities, then deletes every company in a new scope, removes the session's cart, disposes the test's scope and
+    /// rethrows the failure.
     /// </summary>
     /// <returns>A task that completes when the test's fixtures exist.</returns>
     /// <exception cref="InvalidOperationException">
@@ -205,6 +210,7 @@ public abstract class ErewhonTestBase : IAsyncLifetime
         catch (Exception setUpFailure)
         {
             var failures = new List<Exception> { setUpFailure };
+            await DiscardScopeWorkAsync(failures);
             try
             {
                 await DeleteCompaniesAsync();
@@ -220,9 +226,10 @@ public abstract class ErewhonTestBase : IAsyncLifetime
     }
 
     /// <summary>
-    /// Ends the test: runs <see cref="TearDownAsync"/>, then removes the session's cart from <see cref="ICartStore"/>,
-    /// then disposes the test's scope. The cart is removed and the scope disposed even when an earlier step fails. Does
-    /// nothing when no test scope is open.
+    /// Ends the test: rolls back the transaction of the test's scope when one is active and discards the scope's queued
+    /// change notifications and tracked entities, then runs <see cref="TearDownAsync"/>, then removes the session's cart
+    /// from <see cref="ICartStore"/>, then disposes the test's scope. Each step runs even when an earlier step fails.
+    /// Does nothing when no test scope is open.
     /// </summary>
     /// <returns>A task that completes when the test's companies, cart and scope are gone.</returns>
     /// <exception cref="AggregateException">More than one step failed; holds each failure in step order.</exception>
@@ -234,6 +241,7 @@ public abstract class ErewhonTestBase : IAsyncLifetime
         }
 
         var failures = new List<Exception>();
+        await DiscardScopeWorkAsync(failures);
         try
         {
             await TearDownAsync();
@@ -271,7 +279,9 @@ public abstract class ErewhonTestBase : IAsyncLifetime
     /// <see cref="TestCompanyBuilder.DeleteCompanyAsync"/> with everything it owns: first
     /// <see cref="TestCompanyBuilder.MyCompany"/> when it is set, then every company still in
     /// <see cref="IErewhonDbContext.Companies"/>, in ascending id order. A company that no longer exists is skipped.
-    /// Ports <c>tearDown</c>/<c>afterTest</c>: <c>delete self.myCompany</c>. Runs first in <see cref="DisposeAsync"/>.
+    /// Ports <c>tearDown</c>/<c>afterTest</c>: <c>delete self.myCompany</c>. Runs in <see cref="DisposeAsync"/> once the
+    /// transaction of the test's scope is rolled back and its queued change notifications and tracked entities are
+    /// discarded.
     /// </summary>
     /// <returns>A task that completes when no company is left.</returns>
     /// <exception cref="InvalidOperationException">A delete failed; the message holds its full error text.</exception>
@@ -418,6 +428,54 @@ public abstract class ErewhonTestBase : IAsyncLifetime
         if (failures.Count > 1)
         {
             throw new AggregateException(message, failures);
+        }
+    }
+
+    /// <summary>
+    /// Discards the work the test's scope has not committed: rolls back the transaction of the scope's
+    /// <see cref="IUnitOfWork"/> when one is active, removes every event queued in the scope's
+    /// <see cref="NotificationQueue"/>, then stops tracking every entity in the scope's <see cref="IErewhonDbContext"/>.
+    /// Adds each failure to <paramref name="failures"/> and runs all three steps. Does nothing when no test scope is
+    /// open; the scope stays open.
+    /// </summary>
+    private async Task DiscardScopeWorkAsync(List<Exception> failures)
+    {
+        if (_scope is not { } scope)
+        {
+            return;
+        }
+
+        IServiceProvider services = scope.ServiceProvider;
+
+        try
+        {
+            IUnitOfWork unitOfWork = services.GetRequiredService<IUnitOfWork>();
+            if (unitOfWork.HasActiveTransaction)
+            {
+                await unitOfWork.RollbackAsync(CancellationToken.None);
+            }
+        }
+        catch (Exception rollbackFailure)
+        {
+            failures.Add(rollbackFailure);
+        }
+
+        try
+        {
+            services.GetRequiredService<NotificationQueue>().Clear();
+        }
+        catch (Exception queueFailure)
+        {
+            failures.Add(queueFailure);
+        }
+
+        try
+        {
+            services.GetRequiredService<IErewhonDbContext>().ChangeTracker.Clear();
+        }
+        catch (Exception trackerFailure)
+        {
+            failures.Add(trackerFailure);
         }
     }
 

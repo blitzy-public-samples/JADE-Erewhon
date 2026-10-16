@@ -1,5 +1,7 @@
 using System.ServiceModel;
 using Erewhon.Application.Abstractions;
+using Erewhon.Application.Common;
+using Erewhon.Application.Domain;
 using Erewhon.Application.Services;
 using Erewhon.SoapClient.WebService;
 using Erewhon.Testing;
@@ -63,7 +65,7 @@ public sealed class TestGetAgent : ErewhonTestBase
         // Act
         DTOAgent? dtoAgent = await Client.getAgentAsync(AgentName);
 
-        // Assert
+        // Verify
         Assert.Null(dtoAgent);
     }
 
@@ -87,14 +89,14 @@ public sealed class TestGetAgent : ErewhonTestBase
         // Arrange
         var address = Builder.CreateTestAddress(
             AgentStreet, AgentCity, AgentCountry, AgentPhone, AgentFax, AgentEmail, AgentWebsite);
-        await Builder.CreateTestAgentAsync(AgentName, address);
+        Agent agent = await Builder.CreateTestAgentAsync(AgentName, address);
 
         Assert.True(await AgentExistsAsync(AgentName));
 
         // Act
         DTOAgent? dtoAgent = await Client.getAgentAsync(AgentName);
 
-        // Assert
+        // Verify
         Assert.NotNull(dtoAgent);
         Assert.Equal(AgentName, dtoAgent.name);
         Assert.Equal(AgentStreet, dtoAgent.street);
@@ -104,6 +106,8 @@ public sealed class TestGetAgent : ErewhonTestBase
         Assert.Equal(AgentFax, dtoAgent.fax);
         Assert.Equal(AgentEmail, dtoAgent.email);
         Assert.Equal(AgentWebsite, dtoAgent.website);
+        Assert.False(JadeValues.IsNull(agent.Guid));
+        Assert.Equal(agent.Guid, dtoAgent.guid);
     }
 
     /// <summary>

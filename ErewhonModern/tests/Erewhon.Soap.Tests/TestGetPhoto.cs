@@ -48,7 +48,7 @@ public sealed class TestGetPhoto : ErewhonTestBase
         // Act
         DTOPhoto dtoPhoto = await WebService.getPhotoAsync(Client_Name);
 
-        // Assert
+        // Verify
         Assert.NotNull(dtoPhoto);
         Assert.True(dtoPhoto.photo is null || dtoPhoto.photo.Length == 0);
     }
@@ -63,7 +63,7 @@ public sealed class TestGetPhoto : ErewhonTestBase
         // Act
         DTOPhoto dtoPhoto = await WebService.getPhotoAsync(myClient.Name);
 
-        // Assert
+        // Verify
         Assert.NotNull(dtoPhoto);
         Assert.NotNull(dtoPhoto.photo);
         Assert.NotEmpty(dtoPhoto.photo);
@@ -78,7 +78,7 @@ public sealed class TestGetPhoto : ErewhonTestBase
         // Act
         DTOPhoto dtoPhoto = await WebService.getPhotoAsync(Client_Name);
 
-        // Assert
+        // Verify
         Assert.Null(dtoPhoto);
     }
 
