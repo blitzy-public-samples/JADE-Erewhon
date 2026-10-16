@@ -1,0 +1,1785 @@
+using System.Diagnostics;
+using Erewhon.Api.Errors;
+using Erewhon.Application.Abstractions;
+using Erewhon.Application.Cart;
+using Erewhon.Application.Common;
+using Erewhon.Application.Domain;
+using Erewhon.Application.Messages;
+using Erewhon.Application.Search;
+using Erewhon.Application.Services;
+using Erewhon.Application.Transactions;
+using Erewhon.Persistence;
+using Erewhon.Testing;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Npgsql;
+
+namespace Erewhon.Application.Tests.Catalogue;
+
+/// <summary>
+/// The behaviour-catalogue entries that no JADE unit test pins, one test per entry named after its catalogue ID, each
+/// run through the production services on the PostgreSQL test database against the fixture company of
+/// <see cref="ErewhonTestBase"/>.
+/// </summary>
+public sealed class BehaviourCatalogueTests : ErewhonTestBase
+{
+    private static readonly TimeSpan PollLimit = TimeSpan.FromSeconds(5);
+
+    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(10);
+
+    /// <summary>
+    /// B-06 cases: the case name, the photo bytes and whether the photo is a valid picture. Every signature is padded
+    /// with zeros to at least 16 bytes, except the JPEG cut after its first 4 bytes and the missing photo.
+    /// </summary>
+    public static TheoryData<string, byte[]?, bool> PictureCases => new()
+    {
+        { "BMP", Padded(0x42, 0x4D), true },
+        { "ICO", Padded(0x00, 0x00, 0x01, 0x00), true },
+        { "CUR", Padded(0x00, 0x00, 0x02, 0x00), true },
+        { "WMF", Padded(0xD7, 0xCD, 0xC6, 0x9A), true },
+        { "EMF", EnhancedMetafile(), true },
+        { "TIFF II", Padded(0x49, 0x49, 0x2A, 0x00), true },
+        { "TIFF MM", Padded(0x4D, 0x4D, 0x00, 0x2A), true },
+        { "JPEG", Padded(0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00), true },
+        { "PNG", Padded(0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A), true },
+        { "JPEG cut after 4 bytes", new byte[] { 0xFF, 0xD8, 0xFF, 0xE0 }, true },
+        { "GIF", Padded(0x47, 0x49, 0x46, 0x38, 0x39, 0x61), false },
+        { "No signature", Padded(0x13, 0x37, 0xC0, 0xDE, 0x5A, 0xA5, 0x0F, 0xF0, 0x3C, 0xC3), false },
+        { "No photo", null, true },
+    };
+
+    private long CompanyId => Builder.MyCompany?.Id
+        ?? throw new InvalidOperationException("The fixture company has not been created.");
+
+    private string SessionId => Session.SessionId
+        ?? throw new InvalidOperationException("The test session has no session id.");
+
+    private ShoppingCartService Cart => GetService<ShoppingCartService>();
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Shared arrangement and verification helpers
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// <summary>Returns the bytes given followed by zeros up to 16 bytes.</summary>
+    private static byte[] Padded(params byte[] signature)
+    {
+        var bytes = new byte[Math.Max(16, signature.Length)];
+        signature.CopyTo(bytes, 0);
+        return bytes;
+    }
+
+    /// <summary>Returns an EMF header: record type <c>01 00 00 00</c>, zeros up to offset 40, then " EMF".</summary>
+    private static byte[] EnhancedMetafile()
+    {
+        var bytes = new byte[48];
+        new byte[] { 0x01, 0x00, 0x00, 0x00 }.CopyTo(bytes, 0);
+        new byte[] { 0x20, 0x45, 0x4D, 0x46 }.CopyTo(bytes, 40);
+        return bytes;
+    }
+
+    /// <summary>Returns the locale-5129 text of <paramref name="key"/> with <paramref name="args"/>.</summary>
+    private static string Text(string key, params object?[] args) => MessageCatalog.Get(key, args);
+
+    /// <summary>Asserts that <paramref name="result"/> succeeded and returns the row id it reports.</summary>
+    private static long Succeeded(OperationResult result)
+    {
+        Assert.True(result.Succeeded, result.FullErrorText);
+        return Assert.IsType<long>(result.Id);
+    }
+
+    /// <summary>Runs <paramref name="call"/>, asserts that it throws nothing and returns its result.</summary>
+    private static async Task<OperationResult> WithoutExceptionAsync(Func<Task<OperationResult>> call)
+    {
+        OperationResult? result = null;
+        Exception? failure = await Record.ExceptionAsync(async () => result = await call());
+        Assert.Null(failure);
+        return Assert.IsType<OperationResult>(result);
+    }
+
+    /// <summary>Returns the labels of <paramref name="ids"/>, in order, joined by spaces.</summary>
+    private static string Labels(IEnumerable<long> ids, IReadOnlyDictionary<long, string> labels) =>
+        string.Join(" ", ids.Select(id => labels.TryGetValue(id, out string? label) ? label : "#" + id));
+
+    /// <summary>Opens a new scope of the API with the fixture company bound.</summary>
+    private AsyncServiceScope NewBoundScope()
+    {
+        AsyncServiceScope scope = Api.Services.CreateAsyncScope();
+        scope.ServiceProvider.GetRequiredService<ICompanyContext>().Bind(CompanyId);
+        return scope;
+    }
+
+    /// <summary>Runs <paramref name="action"/> in a new scope with the fixture company bound.</summary>
+    private async Task<T> InNewScopeAsync<T>(Func<IServiceProvider, Task<T>> action)
+    {
+        await using AsyncServiceScope scope = NewBoundScope();
+        return await action(scope.ServiceProvider);
+    }
+
+    /// <summary>Runs <paramref name="read"/> against the database context of a new scope.</summary>
+    private async Task<T> ReadAsync<T>(Func<IErewhonDbContext, Task<T>> read)
+    {
+        await using AsyncServiceScope scope = Api.Services.CreateAsyncScope();
+        return await read(scope.ServiceProvider.GetRequiredService<IErewhonDbContext>());
+    }
+
+    private Task<DateOnly> ServerDateAsync() => GetService<IServerClock>().GetServerDateAsync();
+
+    private Task<DateTime> ServerTimeStampAsync() => GetService<IServerClock>().GetServerTimeStampAsync();
+
+    /// <summary>Reads the server timestamp until it is later than <paramref name="instant"/>, for at most five seconds.</summary>
+    private async Task<DateTime> WaitForServerTimeAfterAsync(DateTime instant)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        DateTime now = await ServerTimeStampAsync();
+        while (now <= instant)
+        {
+            Assert.True(stopwatch.Elapsed < PollLimit, $"The server timestamp did not pass {instant:O} within {PollLimit}.");
+            await Task.Delay(PollInterval);
+            now = await ServerTimeStampAsync();
+        }
+
+        return now;
+    }
+
+    /// <summary>
+    /// Counts the advisory locks of the test database that sessions are waiting for, on a connection of its own, until
+    /// <paramref name="expected"/> are waiting or five seconds have passed.
+    /// </summary>
+    /// <returns><see langword="true"/> when <paramref name="expected"/> waiters were seen.</returns>
+    private async Task<bool> WaitForAdvisoryLockWaitersAsync(long expected)
+    {
+        await using var connection = new NpgsqlConnection(Database.ConnectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted "
+            + "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            connection);
+
+        var stopwatch = Stopwatch.StartNew();
+        while (stopwatch.Elapsed < PollLimit)
+        {
+            if (await command.ExecuteScalarAsync() is long waiting && waiting >= expected)
+            {
+                return true;
+            }
+
+            await Task.Delay(PollInterval);
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Creates, through <see cref="Builder"/>, the country "France", its region "Paris", the item category "Lamps"
+    /// ("LAMP"), the agent "John Smith" and the client "Clive Entworth".
+    /// </summary>
+    private async Task<CatalogueFixture> ArrangeCatalogueAsync()
+    {
+        Country country = await Builder.CreateCountryAsync();
+        Region region = await Builder.CreateRegionAsync(country);
+        ItemCategory category = await Builder.CreateItemCategoryAsync("Lamps", "LAMP", "Lamps and lighting");
+        Agent agent = await Builder.CreateAgentAsync();
+        Client client = await Builder.CreateClientAsync();
+        return new CatalogueFixture(country, region, category, agent, client);
+    }
+
+    /// <summary>Creates an agent named <paramref name="name"/> at 314 Nohwere Lane and returns its id.</summary>
+    private async Task<long> NewAgentAsync(string name) =>
+        Succeeded(await GetService<AgentService>().ExecuteAsync(
+            new AgentCommand { Name = name, Address = TestCompanyBuilder.NohwereLaneAddress() },
+            TransactionType.Persist));
+
+    /// <summary>Creates a client named <paramref name="name"/> at 555 Fake St. and returns its id.</summary>
+    private async Task<long> NewClientAsync(string name) =>
+        Succeeded(await GetService<ClientService>().ExecuteAsync(
+            new ClientCommand { Name = name, Address = TestCompanyBuilder.FakeStreetAddress() },
+            TransactionType.Persist));
+
+    /// <summary>Creates a commission rate of <paramref name="percentage"/> on a category, held by the agents given.</summary>
+    private async Task<long> NewCommissionRateAsync(long itemCategoryId, decimal percentage, params long[] agentIds) =>
+        Succeeded(await GetService<CommissionRateService>().ExecuteAsync(
+            new CommissionRateCommand { ItemCategoryId = itemCategoryId, Percentage = percentage, AgentIds = [.. agentIds] },
+            TransactionType.Persist));
+
+    /// <summary>Returns a retail item command with code number 0 and the given references and price.</summary>
+    private static RetailItemCommand RetailItemCommandFor(long agentId, long itemCategoryId, long regionId, decimal price) => new()
+    {
+        CodeNumber = 0,
+        Name = "Catalogue Retail",
+        Description = "A retail item of the catalogue tests",
+        Price = price,
+        AgentId = agentId,
+        ItemCategoryId = itemCategoryId,
+        RegionId = regionId,
+    };
+
+    /// <summary>Returns a tender item command with code number 0 and the given references, reserve and closure date.</summary>
+    private static TenderItemCommand TenderItemCommandFor(
+        long agentId,
+        long itemCategoryId,
+        long regionId,
+        decimal reserve,
+        DateOnly closureDate)
+    {
+        return new TenderItemCommand
+        {
+            CodeNumber = 0,
+            Name = "Catalogue Tender",
+            Description = "A tender item of the catalogue tests",
+            Price = reserve,
+            ClosureDate = closureDate,
+            AgentId = agentId,
+            ItemCategoryId = itemCategoryId,
+            RegionId = regionId,
+        };
+    }
+
+    /// <summary>Persists <paramref name="command"/> through <see cref="ItemService"/>, asserts success and returns the id.</summary>
+    private async Task<long> PersistItemAsync(ItemCommand command) =>
+        Succeeded(await GetService<ItemService>().ExecuteAsync(command, TransactionType.Persist));
+
+    private Task<long> NewRetailItemAsync(long agentId, long itemCategoryId, long regionId, decimal price) =>
+        PersistItemAsync(RetailItemCommandFor(agentId, itemCategoryId, regionId, price));
+
+    private Task<long> NewRetailItemAsync(CatalogueFixture fixture, decimal price) =>
+        NewRetailItemAsync(fixture.Agent.Id, fixture.Category.Id, fixture.Region.Id, price);
+
+    private Task<long> NewTenderItemAsync(
+        long agentId,
+        long itemCategoryId,
+        long regionId,
+        decimal reserve,
+        DateOnly closureDate) =>
+        PersistItemAsync(TenderItemCommandFor(agentId, itemCategoryId, regionId, reserve, closureDate));
+
+    private Task<long> NewTenderItemAsync(CatalogueFixture fixture, decimal reserve, DateOnly closureDate) =>
+        NewTenderItemAsync(fixture.Agent.Id, fixture.Category.Id, fixture.Region.Id, reserve, closureDate);
+
+    /// <summary>Runs a retail sale create of the item to the client through <see cref="RetailSaleService"/>.</summary>
+    private Task<OperationResult> SellAsync(long itemId, long clientId, decimal salePrice, decimal agentCommission = 0m) =>
+        GetService<RetailSaleService>().ExecuteAsync(
+            new RetailSaleCommand
+            {
+                ItemId = itemId,
+                ClientId = clientId,
+                SalePrice = salePrice,
+                AgentCommission = agentCommission,
+            },
+            TransactionType.Persist);
+
+    /// <summary>Runs a tender create by the client on the tender item through <see cref="TenderService"/>.</summary>
+    private Task<OperationResult> TenderAsync(long clientId, long tenderItemId, decimal offer, DateTime? dateTendered) =>
+        GetService<TenderService>().ExecuteAsync(
+            new TenderCommand
+            {
+                ClientId = clientId,
+                TenderItemId = tenderItemId,
+                Offer = offer,
+                DateTendered = dateTendered,
+            },
+            TransactionType.Persist);
+
+    /// <summary>
+    /// Reads the item with <paramref name="itemId"/> in a new scope, applies <paramref name="change"/> to a command
+    /// populated from it and persists the update; asserts that the update succeeded.
+    /// </summary>
+    private Task<OperationResult> UpdateItemAsync(long itemId, Action<ItemCommand> change) =>
+        InNewScopeAsync(async services =>
+        {
+            ItemService items = services.GetRequiredService<ItemService>();
+            Item item = await items.FindByIdAsync(itemId)
+                ?? throw new InvalidOperationException($"Item {itemId} does not exist.");
+            ItemCommand command = item is TenderItem ? new TenderItemCommand() : new RetailItemCommand();
+            command.PopulateFromObject(item);
+            change(command);
+            OperationResult result = await items.ExecuteAsync(command, TransactionType.Persist);
+            Assert.True(result.Succeeded, result.FullErrorText);
+            return result;
+        });
+
+    /// <summary>Runs <see cref="TenderClosureService.CloseTendersAtDateAsync"/> in a new scope.</summary>
+    private Task<int> CloseTendersAsync(DateOnly date) =>
+        InNewScopeAsync(services => services.GetRequiredService<TenderClosureService>().CloseTendersAtDateAsync(date));
+
+    /// <summary>Reads, in a new scope, the item with its category, region, agent and sale.</summary>
+    private Task<Item> ReadItemAsync(long itemId) =>
+        InNewScopeAsync(async services =>
+            await services.GetRequiredService<ItemService>().FindByIdAsync(itemId)
+            ?? throw new InvalidOperationException($"Item {itemId} does not exist."));
+
+    /// <summary>Reads, untracked, the sales of the item.</summary>
+    private Task<List<Sale>> SalesOfItemAsync(long itemId) =>
+        ReadAsync(db => db.Sales.AsNoTracking().Where(sale => sale.ItemId == itemId).OrderBy(sale => sale.Id).ToListAsync());
+
+    /// <summary>Reads, untracked, the tenders on the tender item in time order.</summary>
+    private Task<List<Tender>> TendersOnItemAsync(long tenderItemId) =>
+        ReadAsync(db => db.Tenders
+            .AsNoTracking()
+            .Where(tender => tender.TenderItemId == tenderItemId)
+            .OrderBy(tender => tender.DateTendered)
+            .ToListAsync());
+
+    /// <summary>Reads, untracked, the ids of the items of the fixture company.</summary>
+    private Task<List<long>> CompanyItemIdsAsync()
+    {
+        long companyId = CompanyId;
+        return ReadAsync(db => db.Items.AsNoTracking().Where(item => item.CompanyId == companyId).Select(item => item.Id).ToListAsync());
+    }
+
+    /// <summary>Reads, untracked, the ids of the agents of the fixture company.</summary>
+    private Task<List<long>> CompanyAgentIdsAsync()
+    {
+        long companyId = CompanyId;
+        return ReadAsync(db => db.Agents.AsNoTracking().Where(agent => agent.CompanyId == companyId).Select(agent => agent.Id).ToListAsync());
+    }
+
+    /// <summary>Creates a company named <paramref name="name"/> at 5 Sir Gill Simpson Drive in a new scope and returns its id.</summary>
+    private async Task<long> CreateExtraCompanyAsync(string name)
+    {
+        await using AsyncServiceScope scope = Api.Services.CreateAsyncScope();
+        var command = new CompanyCommand { Name = name, Address = TestCompanyBuilder.GillSimpsonDriveAddress() };
+        return Succeeded(await scope.ServiceProvider.GetRequiredService<CompanyService>()
+            .ExecuteAsync(command, TransactionType.Persist, TransactionMode.Own));
+    }
+
+    /// <summary>Deletes the company with <paramref name="companyId"/> in a new scope and asserts that the delete succeeded.</summary>
+    private async Task DeleteExtraCompanyAsync(long companyId)
+    {
+        await using AsyncServiceScope scope = Api.Services.CreateAsyncScope();
+        OperationResult result = await scope.ServiceProvider.GetRequiredService<CompanyService>()
+            .DeleteByIdAsync(companyId, TransactionMode.Own);
+        Assert.True(result.Succeeded, result.FullErrorText);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Item model and catalogue
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// B-04: a retail item create validated without pre-validation, with code number 0, no agent, category or region,
+    /// an empty name and description, price 10.00 and no photo → the six required-field errors in the JADE order, the
+    /// first one setting the focus field.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B04_ItemRequiredFieldsInOrder()
+    {
+        Assert.Equal("Item number must be provided", Text(MessageKeys.ItemNumberRequired));
+        Assert.Equal("Agent is required", Text(MessageKeys.AgentRequired));
+        Assert.Equal("Item Category is required", Text(MessageKeys.ItemCategoryRequired));
+        Assert.Equal("Region is required", Text(MessageKeys.RegionRequired));
+        Assert.Equal("A Name for the item is required", Text(MessageKeys.ItemNameRequired));
+        Assert.Equal("A description of the item is required", Text(MessageKeys.ItemDescriptionRequired));
+
+        var command = new RetailItemCommand
+        {
+            CodeNumber = 0,
+            Name = string.Empty,
+            Description = string.Empty,
+            Price = 10.00m,
+            Photo = null,
+        };
+        var result = new OperationResult();
+
+        bool valid = await GetService<ItemService>().ValidateAsync(command, ValidationType.Create, result);
+
+        Assert.False(valid);
+        Assert.Equal(
+            new[]
+            {
+                Text(MessageKeys.ItemNumberRequired),
+                Text(MessageKeys.AgentRequired),
+                Text(MessageKeys.ItemCategoryRequired),
+                Text(MessageKeys.RegionRequired),
+                Text(MessageKeys.ItemNameRequired),
+                Text(MessageKeys.ItemDescriptionRequired),
+            },
+            result.Errors);
+        Assert.Equal(FocusFields.CodeNumber, result.FocusField);
+        Assert.Equal(0, command.CodeNumber);
+    }
+
+    /// <summary>
+    /// B-05: a retail item created with no listed date, the name <c>"  Lamp "</c> and the description
+    /// <c>" A lamp\t"</c> → stored with the server date as its listed date, the name "Lamp" and the description "A lamp".
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B05_ItemDefaultsAndTrims()
+    {
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        RetailItemCommand command = RetailItemCommandFor(fixture.Agent.Id, fixture.Category.Id, fixture.Region.Id, 25.00m);
+        command.ListedDate = null;
+        command.Name = "  Lamp ";
+        command.Description = " A lamp\t";
+
+        DateOnly before = await ServerDateAsync();
+        long itemId = await PersistItemAsync(command);
+        DateOnly after = await ServerDateAsync();
+
+        Item item = await ReadItemAsync(itemId);
+        Assert.InRange(item.ListedDate, before, after);
+        Assert.Equal("Lamp", item.Name);
+        Assert.Equal("A lamp", item.Description);
+    }
+
+    /// <summary>
+    /// B-06 (Q-22, EE-16): a retail item created with each photo of <see cref="PictureCases"/> → created when the photo
+    /// is a valid picture; otherwise the single error <c>$ImageNotValid</c> and nothing stored.
+    /// <see cref="PictureValidator.IsValidPicture"/> gives the same classification.
+    /// </summary>
+    /// <param name="name">The case name, also part of the item name.</param>
+    /// <param name="photo">The photo bytes, or <see langword="null"/> for no photo.</param>
+    /// <param name="expectedValid">Whether the photo is a valid picture.</param>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Theory]
+    [MemberData(nameof(PictureCases))]
+    public async Task B06_PictureValidity(string name, byte[]? photo, bool expectedValid)
+    {
+        Assert.Equal("The image provided is not a valid picture file", Text(MessageKeys.ImageNotValid));
+        Assert.Equal(expectedValid, PictureValidator.IsValidPicture(photo));
+
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        RetailItemCommand command = RetailItemCommandFor(fixture.Agent.Id, fixture.Category.Id, fixture.Region.Id, 25.00m);
+        command.Name = "Picture " + name;
+        command.Photo = photo;
+
+        OperationResult result = await GetService<ItemService>().ExecuteAsync(command, TransactionType.Persist);
+
+        if (expectedValid)
+        {
+            long itemId = Succeeded(result);
+            Assert.DoesNotContain(Text(MessageKeys.ImageNotValid), result.Errors);
+            Assert.Equal(photo, (await ReadItemAsync(itemId)).Photo);
+        }
+        else
+        {
+            Assert.False(result.Succeeded);
+            Assert.Equal(Text(MessageKeys.ImageNotValid), Assert.Single(result.Errors));
+            Assert.Empty(await CompanyItemIdsAsync());
+        }
+    }
+
+    /// <summary>
+    /// B-07 (C-03, Q-02): item prices 0 and −1 → the single error <c>$ItemPriceNotValid</c> and nothing stored;
+    /// price 0.01 → stored at 0.01.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B07_ItemPriceZeroIsRejected()
+    {
+        Assert.Equal("Item price must be greater than 0", Text(MessageKeys.ItemPriceNotValid));
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        ItemService items = GetService<ItemService>();
+
+        foreach (decimal rejected in new[] { 0m, -1m })
+        {
+            OperationResult result = await items.ExecuteAsync(
+                RetailItemCommandFor(fixture.Agent.Id, fixture.Category.Id, fixture.Region.Id, rejected),
+                TransactionType.Persist);
+
+            Assert.False(result.Succeeded);
+            Assert.Equal(Text(MessageKeys.ItemPriceNotValid), Assert.Single(result.Errors));
+        }
+
+        Assert.Empty(await CompanyItemIdsAsync());
+
+        long itemId = await NewRetailItemAsync(fixture, 0.01m);
+        Assert.Equal(0.01m, (await ReadItemAsync(itemId)).Price);
+    }
+
+    /// <summary>
+    /// B-08: a tender item create with no closure date → the single error <c>$TenderItemClosureDateNotValid</c> and
+    /// nothing stored.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B08_TenderClosureDateRequired()
+    {
+        Assert.Equal("The tender closure date is not a valid date", Text(MessageKeys.TenderItemClosureDateNotValid));
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        var command = new TenderItemCommand
+        {
+            Name = "Undated Tender",
+            Description = "A tender item without a closure date",
+            Price = 100.00m,
+            ClosureDate = null,
+            AgentId = fixture.Agent.Id,
+            ItemCategoryId = fixture.Category.Id,
+            RegionId = fixture.Region.Id,
+        };
+
+        OperationResult result = await GetService<ItemService>().ExecuteAsync(command, TransactionType.Persist);
+
+        Assert.False(result.Succeeded);
+        Assert.Equal(Text(MessageKeys.TenderItemClosureDateNotValid), Assert.Single(result.Errors));
+        Assert.Empty(await CompanyItemIdsAsync());
+    }
+
+    /// <summary>
+    /// B-09 (Q-01): a category created with the 5-character prefix "ABCDE" → stored with that prefix; the first item of
+    /// the company in it has code number 1 and the code "ABCDE1".
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B09_FiveCharacterPrefix()
+    {
+        Assert.Equal("Category Prefix must be exactly 4 characters", Text(MessageKeys.ItemCategoryPrefixInvalid));
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        var categoryCommand = new ItemCategoryCommand
+        {
+            Name = "Five Letter Prefix",
+            Prefix = "ABCDE",
+            Description = "A category with a five-character prefix",
+        };
+
+        long categoryId = Succeeded(
+            await GetService<ItemCategoryService>().ExecuteAsync(categoryCommand, TransactionType.Persist));
+
+        string storedPrefix = await ReadAsync(db => db.ItemCategories
+            .AsNoTracking()
+            .Where(category => category.Id == categoryId)
+            .Select(category => category.Prefix)
+            .SingleAsync());
+        Assert.Equal("ABCDE", storedPrefix);
+
+        long itemId = await NewRetailItemAsync(fixture.Agent.Id, categoryId, fixture.Region.Id, 10.00m);
+        Item item = await ReadItemAsync(itemId);
+        Assert.Equal(1, item.CodeNumber);
+        Assert.Equal("ABCDE1", item.GetCode());
+    }
+
+    /// <summary>
+    /// B-13 (C-08, Q-23): a second company created through <see cref="CompanyService"/> with the fixture company's
+    /// name → created, two companies carry the name, and the fixture company stays bound.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B13_CompanyNameNotCheckedForUniqueness()
+    {
+        Assert.Equal("Company name is required", Text(MessageKeys.CompanyNameRequired));
+        string name = Builder.MyCompany!.Name;
+        long secondCompanyId = await CreateExtraCompanyAsync(name);
+        try
+        {
+            List<long> namedCompanies = await ReadAsync(db => db.Companies
+                .AsNoTracking()
+                .Where(company => company.Name == name)
+                .OrderBy(company => company.Id)
+                .Select(company => company.Id)
+                .ToListAsync());
+
+            Assert.Equal(new[] { CompanyId, secondCompanyId }, namedCompanies);
+            Assert.Equal(CompanyId, GetService<ICompanyContext>().CurrentId);
+        }
+        finally
+        {
+            await DeleteExtraCompanyAsync(secondCompanyId);
+        }
+    }
+
+    /// <summary>B-14 (Q-04): a commission rate created with the percentage 12.345 → stored as 12.35.</summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B14_PercentageStoredWithTwoDecimals()
+    {
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        var command = new CommissionRateCommand { ItemCategoryId = fixture.Category.Id, Percentage = 12.345m };
+
+        long rateId = Succeeded(await GetService<CommissionRateService>().ExecuteAsync(command, TransactionType.Persist));
+
+        decimal stored = await ReadAsync(db => db.CommissionRates
+            .AsNoTracking()
+            .Where(rate => rate.Id == rateId)
+            .Select(rate => rate.Percentage)
+            .SingleAsync());
+        Assert.Equal(12.35m, command.Percentage);
+        Assert.Equal(12.35m, stored);
+    }
+
+    /// <summary>
+    /// B-16: with the category prefix "ABCD" stored, a category with another name and description and the prefix
+    /// "abcd" → the single error <c>$ItemCategoryPrefixExists</c>, and one category of the company has the upper-case
+    /// prefix "ABCD".
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B16_PrefixCaseInsensitiveDuplicate()
+    {
+        Assert.Equal("Category Prefix already exists", Text(MessageKeys.ItemCategoryPrefixExists));
+        await Builder.CreateItemCategoryAsync("Upper Case", "ABCD", "The category holding ABCD");
+        var command = new ItemCategoryCommand
+        {
+            Name = "Lower Case",
+            Prefix = "abcd",
+            Description = "A category asking for abcd",
+        };
+
+        OperationResult result = await GetService<ItemCategoryService>().ExecuteAsync(command, TransactionType.Persist);
+
+        Assert.False(result.Succeeded);
+        Assert.Equal(Text(MessageKeys.ItemCategoryPrefixExists), Assert.Single(result.Errors));
+
+        long companyId = CompanyId;
+        List<long> abcdCategories = await ReadAsync(db => db.ItemCategories
+            .AsNoTracking()
+            .Where(category => category.CompanyId == companyId && category.Prefix.ToUpper() == "ABCD")
+            .Select(category => category.Id)
+            .ToListAsync());
+        Assert.Single(abcdCategories);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Validation outcomes, string length
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// B-12: a lock-entity modify (1001) of a client with an empty name → the single error <c>$ClientNameRequired</c>
+    /// and the client row unchanged and unlocked; the same modify of an agent with an empty name → no error, the soft
+    /// lock written and the name unchanged.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B12_ClientNameCheckedOnModify()
+    {
+        Assert.Equal("Client name is required", Text(MessageKeys.ClientNameRequired));
+        Client client = await Builder.CreateClientAsync();
+        Agent agent = await Builder.CreateAgentAsync();
+        DateTime lockedAt = await ServerTimeStampAsync();
+
+        var clientCommand = new ClientCommand();
+        clientCommand.PopulateFromObject(client);
+        clientCommand.Name = string.Empty;
+        clientCommand.LockedBySession = SessionId;
+        clientCommand.LockedTimestamp = lockedAt;
+
+        OperationResult clientResult = await GetService<ClientService>()
+            .ExecuteAsync(clientCommand, TransactionType.ModifyLockEntity);
+
+        Assert.False(clientResult.Succeeded);
+        Assert.Equal(Text(MessageKeys.ClientNameRequired), Assert.Single(clientResult.Errors));
+        Client storedClient = await ReadAsync(db => db.Clients.AsNoTracking().SingleAsync(c => c.Id == client.Id));
+        Assert.Equal("Clive Entworth", storedClient.Name);
+        Assert.Null(storedClient.LockedBySession);
+
+        var agentCommand = new AgentCommand();
+        agentCommand.PopulateFromObject(agent);
+        agentCommand.Name = string.Empty;
+        agentCommand.LockedBySession = SessionId;
+        agentCommand.LockedTimestamp = lockedAt;
+
+        OperationResult agentResult = await GetService<AgentService>()
+            .ExecuteAsync(agentCommand, TransactionType.ModifyLockEntity);
+
+        Assert.True(agentResult.Succeeded, agentResult.FullErrorText);
+        Assert.Empty(agentResult.Errors);
+        Agent storedAgent = await ReadAsync(db => db.Agents.AsNoTracking().SingleAsync(a => a.Id == agent.Id));
+        Assert.Equal("John Smith", storedAgent.Name);
+        Assert.Equal(SessionId, storedAgent.LockedBySession);
+    }
+
+    /// <summary>
+    /// B-22 (D-41): an agent create with an 82-character name, and with an 81-character name followed by one space →
+    /// <see cref="StringTooLongException"/> 1035 "String too long" for the name (maximum 81, actual 82), whose error
+    /// outcome is headed "Error 1035" with the web exception body; no agent stored.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B22_StringTooLong()
+    {
+        Assert.Equal(1035, StringTooLongException.Code);
+        Assert.Equal(81, FieldLengths.AgentName);
+        AgentService agents = GetService<AgentService>();
+
+        foreach (string name in new[] { new string('A', 82), new string('B', 81) + " " })
+        {
+            var command = new AgentCommand { Name = name, Address = TestCompanyBuilder.NohwereLaneAddress() };
+
+            StringTooLongException failure = await Assert.ThrowsAsync<StringTooLongException>(
+                () => agents.ExecuteAsync(command, TransactionType.Persist));
+
+            Assert.Equal(StringTooLongException.Code, failure.ErrorCode);
+            Assert.Equal("String too long", failure.Message);
+            Assert.Equal(nameof(AgentCommand.Name), failure.FieldName);
+            Assert.Equal(FieldLengths.AgentName, failure.MaxLength);
+            Assert.Equal(82, failure.ActualLength);
+
+            ErrorOutcome outcome = ErrorOutcomeMiddleware.Create(failure);
+            Assert.Equal(ErrorOutcome.KindException, outcome.Kind);
+            Assert.Equal("Error 1035", outcome.Heading);
+            Assert.Equal(
+                Text(MessageKeys.BaseExceptionBodyWeb, "1035", "String too long", nameof(AgentCommand.Name), string.Empty),
+                outcome.Body);
+            Assert.Contains("Error: String too long (1035)", outcome.Body);
+        }
+
+        Assert.Empty(await CompanyAgentIdsAsync());
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Sales
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// B-19 (Q-05): retail sales of two unsold items → the one with agent commission 0 is created; the one with agent
+    /// commission −0.01 gets the single error <c>$SaleAgentCommissionInvalid</c> and stores no sale.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B19_ZeroCommissionAccepted()
+    {
+        Assert.Equal("Agent commission must be greater than 0", Text(MessageKeys.SaleAgentCommissionInvalid));
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        long acceptedItemId = await NewRetailItemAsync(fixture, 50.00m);
+        long rejectedItemId = await NewRetailItemAsync(fixture, 60.00m);
+
+        Succeeded(await SellAsync(acceptedItemId, fixture.Client.Id, 50.00m, agentCommission: 0m));
+        OperationResult rejected = await SellAsync(rejectedItemId, fixture.Client.Id, 60.00m, agentCommission: -0.01m);
+
+        Assert.False(rejected.Succeeded);
+        Assert.Equal(Text(MessageKeys.SaleAgentCommissionInvalid), Assert.Single(rejected.Errors));
+        Assert.Single(await SalesOfItemAsync(acceptedItemId));
+        Assert.Empty(await SalesOfItemAsync(rejectedItemId));
+    }
+
+    /// <summary>
+    /// B-21 (C-04): a retail sale at the price −5 → the single error <c>$RetailPriceInvalid</c>, not
+    /// <c>$RetailSalePriceRequired</c>, and no sale stored.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B21_NegativeRetailPrice()
+    {
+        Assert.Equal("The retail item price must be greater than 0", Text(MessageKeys.RetailPriceInvalid));
+        Assert.Equal("A price for the retail item is required", Text(MessageKeys.RetailSalePriceRequired));
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        long itemId = await NewRetailItemAsync(fixture, 50.00m);
+
+        OperationResult result = await SellAsync(itemId, fixture.Client.Id, -5m);
+
+        Assert.False(result.Succeeded);
+        Assert.Equal(Text(MessageKeys.RetailPriceInvalid), Assert.Single(result.Errors));
+        Assert.DoesNotContain(Text(MessageKeys.RetailSalePriceRequired), result.Errors);
+        Assert.Empty(await SalesOfItemAsync(itemId));
+    }
+
+    /// <summary>
+    /// B-21 (D-58): a retail sale with no sold date validated without pre-validation → the single error
+    /// <c>$SoldDateNotValid</c>; the same sale through the service → created with no error and the server timestamp as
+    /// its sold date.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B21_SoldDateDefaultAndValidation()
+    {
+        Assert.Equal("Sold Date is Not Valid", Text(MessageKeys.SoldDateNotValid));
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        long itemId = await NewRetailItemAsync(fixture, 50.00m);
+        RetailSaleService sales = GetService<RetailSaleService>();
+
+        var unvalidated = new RetailSaleCommand { ItemId = itemId, ClientId = fixture.Client.Id, SalePrice = 50.00m };
+        var validation = new OperationResult();
+        bool valid = await sales.ValidateAsync(unvalidated, ValidationType.Create, validation);
+
+        Assert.False(valid);
+        Assert.Equal(Text(MessageKeys.SoldDateNotValid), Assert.Single(validation.Errors));
+        Assert.Null(unvalidated.DateSold);
+
+        DateTime before = await ServerTimeStampAsync();
+        OperationResult created = await SellAsync(itemId, fixture.Client.Id, 50.00m);
+        DateTime after = await ServerTimeStampAsync();
+
+        Succeeded(created);
+        Assert.Empty(created.Errors);
+        RetailSale sale = Assert.IsType<RetailSale>(Assert.Single(await SalesOfItemAsync(itemId)));
+        Assert.InRange(sale.DateSold, before, after);
+    }
+
+    /// <summary>
+    /// B-29 (C-06, Q-07): category rates 2.00 and 3.50, agent A1 holding 3.50 and agent A2 holding none → a sale at
+    /// 23.00 of A1's item earns 0.81 (0.805 rounded away from zero); a sale at 100.00 of A2's item earns 2.00; a sale at
+    /// 100.00 of A2's item in a category with no rates earns 0.00.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B29_CommissionFallbackAndRounding()
+    {
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        long firstAgentId = fixture.Agent.Id;
+        long secondAgentId = await NewAgentAsync("Agent Without Rate");
+        await NewCommissionRateAsync(fixture.Category.Id, 2.00m);
+        await NewCommissionRateAsync(fixture.Category.Id, 3.50m, firstAgentId);
+        ItemCategory unratedCategory = await Builder.CreateItemCategoryAsync("Unrated", "UNRT", "A category with no rates");
+
+        long roundedItemId = await NewRetailItemAsync(firstAgentId, fixture.Category.Id, fixture.Region.Id, 23.00m);
+        long fallbackItemId = await NewRetailItemAsync(secondAgentId, fixture.Category.Id, fixture.Region.Id, 100.00m);
+        long unratedItemId = await NewRetailItemAsync(secondAgentId, unratedCategory.Id, fixture.Region.Id, 100.00m);
+
+        Succeeded(await SellAsync(roundedItemId, fixture.Client.Id, 23.00m));
+        Succeeded(await SellAsync(fallbackItemId, fixture.Client.Id, 100.00m));
+        Succeeded(await SellAsync(unratedItemId, fixture.Client.Id, 100.00m));
+
+        Assert.Equal(0.81m, Assert.Single(await SalesOfItemAsync(roundedItemId)).AgentCommission);
+        Assert.Equal(2.00m, Assert.Single(await SalesOfItemAsync(fallbackItemId)).AgentCommission);
+        Assert.Equal(0.00m, Assert.Single(await SalesOfItemAsync(unratedItemId)).AgentCommission);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Purchasing
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// <summary>B-23: adding no item to the cart → the single error <c>$ItemRequired</c> and the cart stays empty.</summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B23_AddNullItem()
+    {
+        Assert.Equal("An Item must be provided", Text(MessageKeys.ItemRequired));
+        Client client = await Builder.CreateClientAsync();
+        Session.SetClient(client.Id);
+
+        OperationResult result = await Cart.AddItemAsync(SessionId, null, 0m);
+
+        Assert.False(result.Succeeded);
+        Assert.Equal(Text(MessageKeys.ItemRequired), Assert.Single(result.Errors));
+        Assert.True(GetService<ICartStore>().GetCart(SessionId).IsEmpty);
+    }
+
+    /// <summary>
+    /// B-24 (Q-16): a tender line added at server time t0 holds a time tendered tl ≥ t0; checked out once the server
+    /// clock has passed tl → the stored tender has the time tendered tl.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B24_TenderLineTimestampAtAdd()
+    {
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        DateOnly today = await ServerDateAsync();
+        long tenderItemId = await NewTenderItemAsync(fixture, 100.00m, today.AddDays(5));
+        Session.SetClient(fixture.Client.Id);
+
+        DateTime t0 = await ServerTimeStampAsync();
+        Assert.True((await Cart.AddItemAsync(SessionId, tenderItemId, 150.00m)).Succeeded);
+        DateTime addedBy = await ServerTimeStampAsync();
+
+        CartItem line = Assert.Single(GetService<ICartStore>().GetCart(SessionId).Items);
+        DateTime tl = Assert.NotNull(line.DateTendered);
+        Assert.InRange(tl, t0, addedBy);
+
+        await WaitForServerTimeAfterAsync(tl);
+        (OperationResult checkout, _) = await Cart.CheckoutAsync(SessionId);
+
+        Assert.True(checkout.Succeeded, checkout.FullErrorText);
+        Tender tender = Assert.Single(await TendersOnItemAsync(tenderItemId));
+        Assert.Equal(tl, tender.DateTendered);
+    }
+
+    /// <summary>
+    /// B-24 (Q-29): with the agent holding a 5.00 rate on the category, a retail item at 100.00 is added to the cart and
+    /// then repriced to 120.00 → the cart total is 120.00; checkout stores a sale at 100.00 with commission 5.00.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B24_PriceChangeBetweenAddAndCheckout()
+    {
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        await Builder.CreateCommissionRateAsync(fixture.Category, 5.00m, fixture.Agent);
+        long itemId = await NewRetailItemAsync(fixture, 100.00m);
+        Session.SetClient(fixture.Client.Id);
+        Assert.True((await Cart.AddItemAsync(SessionId, itemId, 0m)).Succeeded);
+
+        await UpdateItemAsync(itemId, command => command.Price = 120.00m);
+
+        Assert.Equal(120.00m, await Cart.GetCartTotalAsync(SessionId));
+        (OperationResult checkout, _) = await Cart.CheckoutAsync(SessionId);
+
+        Assert.True(checkout.Succeeded, checkout.FullErrorText);
+        RetailSale sale = Assert.IsType<RetailSale>(Assert.Single(await SalesOfItemAsync(itemId)));
+        Assert.Equal(100.00m, sale.SalePrice);
+        Assert.Equal(5.00m, sale.AgentCommission);
+        Assert.Equal(fixture.Client.Id, sale.ClientId);
+    }
+
+    /// <summary>B-25: removing no item from the cart → the single error <c>$NoItemSelected</c>.</summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B25_RemoveNothingSelected()
+    {
+        Assert.Equal("No Item selected", Text(MessageKeys.NoItemSelected));
+        Client client = await Builder.CreateClientAsync();
+        Session.SetClient(client.Id);
+
+        OperationResult result = Cart.RemoveItem(SessionId, null);
+
+        Assert.False(result.Succeeded);
+        Assert.Equal(Text(MessageKeys.NoItemSelected), Assert.Single(result.Errors));
+    }
+
+    /// <summary>
+    /// B-26: a cart holding a retail item at 100.00 and an offer of 250.50 on a tender item with reserve 200.00 → the
+    /// cart total is 350.50.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B26_CartTotal()
+    {
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        DateOnly today = await ServerDateAsync();
+        long retailItemId = await NewRetailItemAsync(fixture, 100.00m);
+        long tenderItemId = await NewTenderItemAsync(fixture, 200.00m, today.AddDays(5));
+        Session.SetClient(fixture.Client.Id);
+
+        Assert.True((await Cart.AddItemAsync(SessionId, retailItemId, 0m)).Succeeded);
+        Assert.True((await Cart.AddItemAsync(SessionId, tenderItemId, 250.50m)).Succeeded);
+
+        Assert.Equal(350.50m, await Cart.GetCartTotalAsync(SessionId));
+        Assert.Equal(350.50m, (await Cart.GetCartAsync(SessionId)).Total);
+    }
+
+    /// <summary>
+    /// B-27: checkout of an empty cart → the single error <c>$ShoppingCartHasNoItems</c>; checkout of retail items R1
+    /// and R2 and tender item T1 after R2 is sold to another client → fails with <c>$ItemSold</c> in the full error
+    /// text, no receipt, no sale of R1, no tender on T1 by the client, and three lines kept; after emptying the cart,
+    /// checkout of retail item R3 and tender item T2 → succeeds with a receipt of both lines, an empty cart, one sale of
+    /// R3 and one tender on T2.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B27_CheckoutAllOrNothing()
+    {
+        Assert.Equal("There are no items in the shopping cart", Text(MessageKeys.ShoppingCartHasNoItems));
+        Assert.Equal("The Item has already been sold", Text(MessageKeys.ItemSold));
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        DateOnly today = await ServerDateAsync();
+        long clientId = fixture.Client.Id;
+        long otherClientId = await NewClientAsync("Other Client");
+        Session.SetClient(clientId);
+
+        (OperationResult empty, CheckoutReceipt? emptyReceipt) = await Cart.CheckoutAsync(SessionId);
+        Assert.False(empty.Succeeded);
+        Assert.Equal(Text(MessageKeys.ShoppingCartHasNoItems), Assert.Single(empty.Errors));
+        Assert.Null(emptyReceipt);
+
+        long r1 = await NewRetailItemAsync(fixture, 10.00m);
+        long r2 = await NewRetailItemAsync(fixture, 20.00m);
+        long t1 = await NewTenderItemAsync(fixture, 30.00m, today.AddDays(5));
+        Assert.True((await Cart.AddItemAsync(SessionId, r1, 0m)).Succeeded);
+        Assert.True((await Cart.AddItemAsync(SessionId, r2, 0m)).Succeeded);
+        Assert.True((await Cart.AddItemAsync(SessionId, t1, 35.00m)).Succeeded);
+        Succeeded(await SellAsync(r2, otherClientId, 20.00m));
+
+        (OperationResult failed, CheckoutReceipt? failedReceipt) = await Cart.CheckoutAsync(SessionId);
+
+        Assert.False(failed.Succeeded);
+        Assert.Contains(Text(MessageKeys.ItemSold), failed.FullErrorText);
+        Assert.Null(failedReceipt);
+        Assert.Empty(await SalesOfItemAsync(r1));
+        Assert.DoesNotContain(await TendersOnItemAsync(t1), tender => tender.ClientId == clientId);
+        Assert.Equal(3, GetService<ICartStore>().GetCart(SessionId).Size);
+
+        Cart.Empty(SessionId);
+        long r3 = await NewRetailItemAsync(fixture, 40.00m);
+        long t2 = await NewTenderItemAsync(fixture, 50.00m, today.AddDays(5));
+        Assert.True((await Cart.AddItemAsync(SessionId, r3, 0m)).Succeeded);
+        Assert.True((await Cart.AddItemAsync(SessionId, t2, 55.00m)).Succeeded);
+        string r3Code = (await ReadItemAsync(r3)).GetCode()!;
+        string t2Code = (await ReadItemAsync(t2)).GetCode()!;
+
+        (OperationResult succeeded, CheckoutReceipt? succeededReceipt) = await Cart.CheckoutAsync(SessionId);
+
+        Assert.True(succeeded.Succeeded, succeeded.FullErrorText);
+        CheckoutReceipt receipt = Assert.IsType<CheckoutReceipt>(succeededReceipt);
+        Assert.Equal(
+            new[]
+            {
+                new CheckoutReceiptLine(Text(MessageKeys.RetailItemType), r3Code, "Catalogue Retail", 40.00m, 0m, false),
+                new CheckoutReceiptLine(Text(MessageKeys.TenderItemType), t2Code, "Catalogue Tender", 50.00m, 55.00m, true),
+            },
+            receipt.Lines);
+        Assert.True(GetService<ICartStore>().GetCart(SessionId).IsEmpty);
+        Assert.Equal(clientId, Assert.Single(await SalesOfItemAsync(r3)).ClientId);
+        Tender tender = Assert.Single(await TendersOnItemAsync(t2));
+        Assert.Equal(clientId, tender.ClientId);
+        Assert.Equal(55.00m, tender.Offer);
+    }
+
+    /// <summary>
+    /// B-27: checkout of a cart holding one tender line with the offer 150.00 → one tender of 150.00 by the client
+    /// stored, no tender sale or other sale of the item, and the item unsold.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B27_CheckoutPersistsTendersNotTenderSales()
+    {
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        DateOnly today = await ServerDateAsync();
+        long tenderItemId = await NewTenderItemAsync(fixture, 100.00m, today.AddDays(5));
+        Session.SetClient(fixture.Client.Id);
+        Assert.True((await Cart.AddItemAsync(SessionId, tenderItemId, 150.00m)).Succeeded);
+
+        (OperationResult checkout, _) = await Cart.CheckoutAsync(SessionId);
+
+        Assert.True(checkout.Succeeded, checkout.FullErrorText);
+        Tender tender = Assert.Single(await TendersOnItemAsync(tenderItemId));
+        Assert.Equal(150.00m, tender.Offer);
+        Assert.Equal(fixture.Client.Id, tender.ClientId);
+        Assert.Empty(await SalesOfItemAsync(tenderItemId));
+        Assert.False((await ReadItemAsync(tenderItemId)).IsSold);
+    }
+
+    /// <summary>
+    /// B-27 (Q-34): a checkout of retail items R1 and R2 that fails at T1 with R2 sold to another client, then,
+    /// with R2 removed from the cart, succeeds once the server clock has passed T1 → the sale of R1 has the sold date T1.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B27_RetryKeepsFirstSoldTimestamp()
+    {
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        long otherClientId = await NewClientAsync("Other Client");
+        long r1 = await NewRetailItemAsync(fixture, 10.00m);
+        long r2 = await NewRetailItemAsync(fixture, 20.00m);
+        Session.SetClient(fixture.Client.Id);
+        Assert.True((await Cart.AddItemAsync(SessionId, r1, 0m)).Succeeded);
+        Assert.True((await Cart.AddItemAsync(SessionId, r2, 0m)).Succeeded);
+        Succeeded(await SellAsync(r2, otherClientId, 20.00m));
+
+        DateTime beforeFirstAttempt = await ServerTimeStampAsync();
+        (OperationResult failed, _) = await Cart.CheckoutAsync(SessionId);
+        DateTime afterFirstAttempt = await ServerTimeStampAsync();
+
+        Assert.False(failed.Succeeded);
+        Assert.Contains(Text(MessageKeys.ItemSold), failed.FullErrorText);
+        CartItem r1Line = Assert.Single(GetService<ICartStore>().GetCart(SessionId).Items, line => line.ItemId == r1);
+        DateTime firstAttempt = Assert.NotNull(r1Line.DateSold);
+        Assert.InRange(firstAttempt, beforeFirstAttempt, afterFirstAttempt);
+
+        Assert.True(Cart.RemoveItem(SessionId, r2).Succeeded);
+        DateTime secondAttempt = await WaitForServerTimeAfterAsync(firstAttempt);
+        (OperationResult succeeded, _) = await Cart.CheckoutAsync(SessionId);
+
+        Assert.True(succeeded.Succeeded, succeeded.FullErrorText);
+        RetailSale sale = Assert.IsType<RetailSale>(Assert.Single(await SalesOfItemAsync(r1)));
+        Assert.Equal(firstAttempt, sale.DateSold);
+        Assert.True(sale.DateSold < secondAttempt, $"The sale of R1 is dated {sale.DateSold:O}, not before {secondAttempt:O}.");
+    }
+
+    /// <summary>
+    /// B-77: a retail item and a tender item created with the same GUID → both store it and the cart holds two lines;
+    /// removing the retail line leaves the tender line alone; with the retail line added again, deleting the retail item
+    /// leaves the tender line alone.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B77_SameGuidItemsAreDistinctCartLines()
+    {
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        DateOnly today = await ServerDateAsync();
+        string guid = PersistentModel.GenerateGuid();
+
+        RetailItemCommand retailCommand = RetailItemCommandFor(fixture.Agent.Id, fixture.Category.Id, fixture.Region.Id, 10.00m);
+        retailCommand.Guid = guid;
+        long retailItemId = await PersistItemAsync(retailCommand);
+        TenderItemCommand tenderCommand = TenderItemCommandFor(
+            fixture.Agent.Id, fixture.Category.Id, fixture.Region.Id, 20.00m, today.AddDays(5));
+        tenderCommand.Guid = guid;
+        long tenderItemId = await PersistItemAsync(tenderCommand);
+
+        Assert.Equal(guid, (await ReadItemAsync(retailItemId)).Guid);
+        Assert.Equal(guid, (await ReadItemAsync(tenderItemId)).Guid);
+
+        Session.SetClient(fixture.Client.Id);
+        ShoppingCart cart = GetService<ICartStore>().GetCart(SessionId);
+        Assert.True((await Cart.AddItemAsync(SessionId, retailItemId, 0m)).Succeeded);
+        Assert.True((await Cart.AddItemAsync(SessionId, tenderItemId, 25.00m)).Succeeded);
+        Assert.Equal(new[] { retailItemId, tenderItemId }, cart.Items.Select(line => line.ItemId));
+
+        Assert.True(Cart.RemoveItem(SessionId, retailItemId).Succeeded);
+        Assert.Equal(tenderItemId, Assert.Single(cart.Items).ItemId);
+
+        Assert.True((await Cart.AddItemAsync(SessionId, retailItemId, 0m)).Succeeded);
+        OperationResult deleted = await InNewScopeAsync(
+            services => services.GetRequiredService<ItemService>().DeleteByIdAsync(retailItemId, TransactionMode.Own));
+        Assert.True(deleted.Succeeded, deleted.FullErrorText);
+        Assert.Equal(tenderItemId, Assert.Single(cart.Items).ItemId);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Tendering and closure
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// B-30 (Q-14): two tenders of 500 by client Y on one tender item, both validated while a held lock on Y's tenders
+    /// blocks their writes, are both stored once the lock is released → a third tender of 500 by Y on the item gets
+    /// <c>$TenderAlreadyPlaced</c> twice, once per matching tender, and the item keeps two tenders.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B30_DuplicateMessagesPerMatch()
+    {
+        Assert.Equal("A tender has already been placed on this item", Text(MessageKeys.TenderAlreadyPlaced));
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        DateOnly today = await ServerDateAsync();
+        DateTime start = (await ServerTimeStampAsync()).AddHours(-1);
+        long tenderItemId = await NewTenderItemAsync(fixture, 100.00m, today.AddDays(5));
+        long clientId = await NewClientAsync("Client Y");
+
+        await using AsyncServiceScope blocker = NewBoundScope();
+        await using AsyncServiceScope firstScope = NewBoundScope();
+        await using AsyncServiceScope secondScope = NewBoundScope();
+        IUnitOfWork blockerTransaction = blocker.ServiceProvider.GetRequiredService<IUnitOfWork>();
+        await blockerTransaction.BeginAsync();
+        try
+        {
+            Assert.True(await blocker.ServiceProvider.GetRequiredService<IEntityLocks>()
+                .TryLockAsync(LockNames.ClientAllTenders(clientId)));
+
+            Task<OperationResult> first = firstScope.ServiceProvider.GetRequiredService<TenderService>().ExecuteAsync(
+                new TenderCommand { ClientId = clientId, TenderItemId = tenderItemId, Offer = 500m, DateTendered = start.AddMinutes(1) },
+                TransactionType.Persist);
+            Task<OperationResult> second = secondScope.ServiceProvider.GetRequiredService<TenderService>().ExecuteAsync(
+                new TenderCommand { ClientId = clientId, TenderItemId = tenderItemId, Offer = 500m, DateTendered = start.AddMinutes(2) },
+                TransactionType.Persist);
+
+            bool bothWaiting = await WaitForAdvisoryLockWaitersAsync(2);
+            await blockerTransaction.CommitAsync();
+            OperationResult[] results = await Task.WhenAll(first, second);
+
+            Assert.True(bothWaiting, "The two tender creates were not both waiting for the client's tender lock.");
+            Assert.All(results, result => Assert.True(result.Succeeded, result.FullErrorText));
+        }
+        finally
+        {
+            if (blockerTransaction.HasActiveTransaction)
+            {
+                await blockerTransaction.RollbackAsync();
+            }
+        }
+
+        Assert.Equal(2, (await TendersOnItemAsync(tenderItemId)).Count);
+
+        OperationResult third = await TenderAsync(clientId, tenderItemId, 500m, start.AddMinutes(3));
+
+        Assert.False(third.Succeeded);
+        Assert.Equal(new[] { Text(MessageKeys.TenderAlreadyPlaced), Text(MessageKeys.TenderAlreadyPlaced) }, third.Errors);
+        Assert.Equal(2, (await TendersOnItemAsync(tenderItemId)).Count);
+    }
+
+    /// <summary>
+    /// B-30 (Q-17, EE-01): a tender of 500 at time t by client X on one tender item, then a tender of 500 at the same
+    /// time t by client Y on another → the second fails at the database with the unique-violation SQLSTATE 23505 and
+    /// stores no tender.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B30_TenderTimeOfferCollision()
+    {
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        DateOnly today = await ServerDateAsync();
+        DateTime at = (await ServerTimeStampAsync()).AddHours(-1);
+        long firstItemId = await NewTenderItemAsync(fixture, 100.00m, today.AddDays(5));
+        long secondItemId = await NewTenderItemAsync(fixture, 100.00m, today.AddDays(5));
+        long otherClientId = await NewClientAsync("Client Y");
+
+        Succeeded(await TenderAsync(fixture.Client.Id, firstItemId, 500m, at));
+
+        Exception failure = await Assert.ThrowsAnyAsync<Exception>(() => InNewScopeAsync(
+            services => services.GetRequiredService<TenderService>().ExecuteAsync(
+                new TenderCommand { ClientId = otherClientId, TenderItemId = secondItemId, Offer = 500m, DateTendered = at },
+                TransactionType.Persist)));
+
+        Assert.Equal(PostgresErrorMapper.UniqueViolation, PostgresErrorMapper.GetSqlState(failure));
+        Assert.Equal("23505", PostgresErrorMapper.UniqueViolation);
+        Assert.Empty(await TendersOnItemAsync(secondItemId));
+        Assert.Single(await TendersOnItemAsync(firstItemId));
+    }
+
+    /// <summary>
+    /// B-30 (D-58): a tender with no time tendered validated without pre-validation → the single error
+    /// <c>$TimeStampInvalid</c>; the same tender through the service → stored with no error and the server timestamp as
+    /// its time tendered.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B30_TimestampDefaultAndValidation()
+    {
+        Assert.Equal("Timestamp must be a valid date/time", Text(MessageKeys.TimeStampInvalid));
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        DateOnly today = await ServerDateAsync();
+        long tenderItemId = await NewTenderItemAsync(fixture, 100.00m, today.AddDays(5));
+        TenderService tenders = GetService<TenderService>();
+
+        var unvalidated = new TenderCommand { ClientId = fixture.Client.Id, TenderItemId = tenderItemId, Offer = 150.00m };
+        var validation = new OperationResult();
+        bool valid = await tenders.ValidateAsync(unvalidated, ValidationType.Create, validation);
+
+        Assert.False(valid);
+        Assert.Equal(Text(MessageKeys.TimeStampInvalid), Assert.Single(validation.Errors));
+        Assert.Null(unvalidated.DateTendered);
+
+        DateTime before = await ServerTimeStampAsync();
+        OperationResult created = await TenderAsync(fixture.Client.Id, tenderItemId, 150.00m, null);
+        DateTime after = await ServerTimeStampAsync();
+
+        Succeeded(created);
+        Assert.Empty(created.Errors);
+        Assert.InRange(Assert.Single(await TendersOnItemAsync(tenderItemId)).DateTendered, before, after);
+    }
+
+    /// <summary>
+    /// B-33 (Q-27): a tender on an item closing at the server date → Open, and the item is not closed; with the closure
+    /// date moved to the day before → Closed; after closing tenders at the server date, which awards one item → Successful.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B33_TenderStatus()
+    {
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        DateOnly today = await ServerDateAsync();
+        long tenderItemId = await NewTenderItemAsync(fixture, 100.00m, today);
+        long tenderId = Succeeded(await TenderAsync(fixture.Client.Id, tenderItemId, 150.00m, null));
+
+        Tender open = await ReadTenderForStatusAsync(tenderId);
+        Assert.Equal(TenderStatus.Open, open.GetStatus(today));
+        Assert.False(open.TenderItem!.IsClosed(today));
+
+        await UpdateItemAsync(tenderItemId, command => ((TenderItemCommand)command).ClosureDate = today.AddDays(-1));
+
+        Tender closed = await ReadTenderForStatusAsync(tenderId);
+        Assert.Equal(TenderStatus.Closed, closed.GetStatus(today));
+        Assert.True(closed.TenderItem!.IsClosed(today));
+
+        Assert.Equal(1, await CloseTendersAsync(today));
+
+        Assert.Equal(TenderStatus.Successful, (await ReadTenderForStatusAsync(tenderId)).GetStatus(today));
+    }
+
+    /// <summary>
+    /// B-34 (Q-03, Q-27): closing at the server date with item A (closing that day; X 500 at t1, Y 700 at t2), item B
+    /// (closing that day; no tenders) and item C (closing the next day; one tender) → 1 award: A sold to Y through a
+    /// tender sale of the 700 tender while A is not closed that day; B and C unsold and C keeps its tender. Closing again
+    /// after item D (closing that day; X 800 at t3, Y 800 at t4) is added → 1 award: D won by X's earlier 800 tender, A
+    /// still holding one sale and C still unsold.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B34_ClosureOrderStopAndTieBreak()
+    {
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        DateOnly today = await ServerDateAsync();
+        DateTime start = (await ServerTimeStampAsync()).AddHours(-1);
+        long x = fixture.Client.Id;
+        long y = await NewClientAsync("Client Y");
+
+        long itemA = await NewTenderItemAsync(fixture, 100.00m, today);
+        long itemB = await NewTenderItemAsync(fixture, 100.00m, today);
+        long itemC = await NewTenderItemAsync(fixture, 100.00m, today.AddDays(1));
+        Succeeded(await TenderAsync(x, itemA, 500m, start.AddMinutes(1)));
+        long y700 = Succeeded(await TenderAsync(y, itemA, 700m, start.AddMinutes(2)));
+        Succeeded(await TenderAsync(x, itemC, 600m, start.AddMinutes(3)));
+
+        Assert.Equal(1, await CloseTendersAsync(today));
+
+        Item awardedA = await ReadItemAsync(itemA);
+        Assert.False(Assert.IsType<TenderItem>(awardedA).IsClosed(today));
+        TenderSale saleOfA = Assert.IsType<TenderSale>(Assert.Single(await SalesOfItemAsync(itemA)));
+        Assert.Equal(y700, saleOfA.TenderId);
+        Assert.Equal(y, saleOfA.ClientId);
+        Assert.Empty(await SalesOfItemAsync(itemB));
+        Assert.Empty(await SalesOfItemAsync(itemC));
+        Assert.Single(await TendersOnItemAsync(itemC));
+
+        long itemD = await NewTenderItemAsync(fixture, 100.00m, today);
+        long x800 = Succeeded(await TenderAsync(x, itemD, 800m, start.AddMinutes(4)));
+        Succeeded(await TenderAsync(y, itemD, 800m, start.AddMinutes(5)));
+
+        Assert.Equal(1, await CloseTendersAsync(today));
+
+        TenderSale saleOfD = Assert.IsType<TenderSale>(Assert.Single(await SalesOfItemAsync(itemD)));
+        Assert.Equal(x800, saleOfD.TenderId);
+        Assert.Equal(x, saleOfD.ClientId);
+        Assert.Single(await SalesOfItemAsync(itemA));
+        Assert.Empty(await SalesOfItemAsync(itemC));
+    }
+
+    /// <summary>Reads, in a new scope, the tender with its tender item and tender sale for its status.</summary>
+    private Task<Tender> ReadTenderForStatusAsync(long tenderId) =>
+        InNewScopeAsync(async services =>
+            await services.GetRequiredService<TenderService>().FindForStatusAsync(tenderId)
+            ?? throw new InvalidOperationException($"Tender {tenderId} does not exist."));
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Search
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// B-35 (Q-25, D-37): items I1 to I6 in code-number order (I1 retail K1/R1/G1 100; I2 retail K2/R2/G2 200; I3 tender
+    /// K1/R2/G1 300 open; I4 tender K2/R1/G2 400 closed; I5 retail K1/R1/G2 500 sold to Z; I6 retail K2/R2/G1 600 in
+    /// the session cart; R1 in N1, R2 in N2) searched with each criteria set → the items listed per set, in code-number
+    /// order; a price bound of 0 sets no bound.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B35_ItemSearchFilters()
+    {
+        SearchFixture fixture = await ArrangeSearchAsync();
+        var cases = new (string Name, Action<ItemSearchCriteria> Configure, string Expected)[]
+        {
+            ("defaults", _ => { }, "I1 I2 I3"),
+            ("include closed tenders", c => c.IncludeClosedTenders = true, "I1 I2 I3 I4"),
+            ("include items in cart", c => c.IncludeItemsInCart = true, "I1 I2 I3 I6"),
+            ("include sold items", c => c.IncludeSoldItems = true, "I1 I2 I3 I5"),
+            ("agent G1", c => c.AgentId = fixture.G1, "I1 I3"),
+            ("client Z with sold items", c => { c.ClientId = fixture.Z; c.IncludeSoldItems = true; }, "I5"),
+            ("client X with sold items", c => { c.ClientId = fixture.X; c.IncludeSoldItems = true; }, string.Empty),
+            ("country N1", c => c.CountryId = fixture.N1, "I1"),
+            ("region R2", c => c.RegionId = fixture.R2, "I2 I3"),
+            ("category K1", c => c.ItemCategoryId = fixture.K1, "I1 I3"),
+            ("only retail items", c => c.OnlyRetailItems = true, "I1 I2"),
+            ("only tender items", c => c.OnlyTenderItems = true, "I3"),
+            ("price 200 to 300", c => { c.PriceLow = 200m; c.PriceHigh = 300m; }, "I2 I3"),
+            ("price 0 to 0", c => { c.PriceLow = 0m; c.PriceHigh = 0m; }, "I1 I2 I3"),
+            ("price 0 to 150", c => { c.PriceLow = 0m; c.PriceHigh = 150m; }, "I1"),
+            ("price 250 to 0", c => { c.PriceLow = 250m; c.PriceHigh = 0m; }, "I3"),
+        };
+
+        var expected = new Dictionary<string, string>();
+        var actual = new Dictionary<string, string>();
+        foreach ((string name, Action<ItemSearchCriteria> configure, string expectedItems) in cases)
+        {
+            var criteria = new ItemSearchCriteria();
+            configure(criteria);
+            IReadOnlyList<Item> items = await GetService<ItemSearch>().DoSearchAsync(criteria, SessionId);
+
+            expected[name] = expectedItems;
+            actual[name] = Labels(items.Select(item => item.Id), fixture.Labels);
+            Assert.Equal(items.Select(item => item.Id), criteria.ResultItemIds);
+        }
+
+        Assert.Equal(expected, actual);
+    }
+
+    /// <summary>
+    /// B-35: a search with the price bounds 900 and 800 → <see cref="ErewhonException"/> 500002, whose error outcome is
+    /// <c>$MinPriceGreaterThanMaxError</c> titled <c>$Error</c>; the bounds 0 and 800 → no exception.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B35_PriceBandRejectsLowAboveHigh()
+    {
+        Assert.Equal("The maximum price must be greater than the minimum price", Text(MessageKeys.MinPriceGreaterThanMaxError));
+        Assert.Equal("Error", Text(MessageKeys.Error));
+        Assert.Equal(500002, ErewhonException.MinHigherThanMax);
+        ItemSearch search = GetService<ItemSearch>();
+
+        ErewhonException failure = await Assert.ThrowsAsync<ErewhonException>(
+            () => search.DoSearchAsync(new ItemSearchCriteria { PriceLow = 900m, PriceHigh = 800m }, SessionId));
+
+        Assert.Equal(ErewhonException.MinHigherThanMax, failure.ErrorCode);
+        ErrorOutcome outcome = ErrorOutcomeMiddleware.Create(failure);
+        Assert.Equal(ErrorOutcome.KindException, outcome.Kind);
+        Assert.Equal(Text(MessageKeys.Error), outcome.Heading);
+        Assert.Equal(Text(MessageKeys.MinPriceGreaterThanMaxError), outcome.Body);
+
+        Exception? noBound = await Record.ExceptionAsync(
+            () => search.DoSearchAsync(new ItemSearchCriteria { PriceLow = 0m, PriceHigh = 800m }, SessionId));
+        Assert.Null(noBound);
+    }
+
+    /// <summary>
+    /// B-36 (Q-21): with every criterion set, agent G1, client Z and include-items-in-cart among them, and results held,
+    /// <see cref="ItemSearchCriteria.Initialize"/> keeps the agent, the client and the cart flag and clears every other
+    /// criterion and the results; with the client then cleared, a search → I1, I3 and I6.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B36_InitializeKeepsAgentClientAndCartFlag()
+    {
+        SearchFixture fixture = await ArrangeSearchAsync();
+        ItemSearch search = GetService<ItemSearch>();
+        var criteria = new ItemSearchCriteria();
+        await search.DoSearchAsync(criteria, SessionId);
+        Assert.NotEmpty(criteria.ResultItemIds);
+
+        criteria.AgentId = fixture.G1;
+        criteria.ClientId = fixture.Z;
+        criteria.IncludeItemsInCart = true;
+        criteria.CountryId = fixture.N2;
+        criteria.RegionId = fixture.R2;
+        criteria.ItemCategoryId = fixture.K2;
+        criteria.OnlyRetailItems = true;
+        criteria.OnlyTenderItems = true;
+        criteria.IncludeClosedTenders = true;
+        criteria.IncludeSoldItems = true;
+        criteria.PriceLow = 100m;
+        criteria.PriceHigh = 600m;
+
+        criteria.Initialize();
+
+        Assert.Equal(fixture.G1, criteria.AgentId);
+        Assert.Equal(fixture.Z, criteria.ClientId);
+        Assert.True(criteria.IncludeItemsInCart);
+        Assert.Null(criteria.CountryId);
+        Assert.Null(criteria.RegionId);
+        Assert.Null(criteria.ItemCategoryId);
+        Assert.False(criteria.OnlyRetailItems);
+        Assert.False(criteria.OnlyTenderItems);
+        Assert.False(criteria.IncludeClosedTenders);
+        Assert.False(criteria.IncludeSoldItems);
+        Assert.True(JadeValues.IsNull(criteria.PriceLow));
+        Assert.True(JadeValues.IsNull(criteria.PriceHigh));
+        Assert.Empty(criteria.ResultItemIds);
+
+        criteria.ClientId = null;
+        IReadOnlyList<Item> items = await search.DoSearchAsync(criteria, SessionId);
+
+        Assert.Equal("I1 I3 I6", Labels(items.Select(item => item.Id), fixture.Labels));
+    }
+
+    /// <summary>
+    /// B-37: tenders X300 (t1) and Y310 (t4) on an open item, X500 (t3) and Y450 (t5) on an item awarded to X500 at the
+    /// server date, and X400 (t2) on an item whose closure date is then moved to the day before → by status, Successful
+    /// gives X500, Closed X400, Open X300 Y310 Y450, all three X300 X400 X500 Y310 Y450 in time order; the client X, the
+    /// open item and the agent of the closed item each narrow the all-status result.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B37_TenderSearch()
+    {
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        DateOnly today = await ServerDateAsync();
+        DateTime start = (await ServerTimeStampAsync()).AddHours(-1);
+        long x = fixture.Client.Id;
+        long y = await NewClientAsync("Client Y");
+        long secondAgentId = await NewAgentAsync("Agent G2");
+
+        long openItem = await NewTenderItemAsync(fixture, 100.00m, today.AddDays(5));
+        long wonItem = await NewTenderItemAsync(fixture, 100.00m, today);
+        var labels = new Dictionary<long, string>
+        {
+            [Succeeded(await TenderAsync(x, openItem, 300m, start.AddMinutes(1)))] = "X300",
+            [Succeeded(await TenderAsync(y, openItem, 310m, start.AddMinutes(4)))] = "Y310",
+            [Succeeded(await TenderAsync(x, wonItem, 500m, start.AddMinutes(3)))] = "X500",
+            [Succeeded(await TenderAsync(y, wonItem, 450m, start.AddMinutes(5)))] = "Y450",
+        };
+        Assert.Equal(1, await CloseTendersAsync(today));
+
+        long closedItem = await NewTenderItemAsync(secondAgentId, fixture.Category.Id, fixture.Region.Id, 100.00m, today);
+        labels[Succeeded(await TenderAsync(x, closedItem, 400m, start.AddMinutes(2)))] = "X400";
+        await UpdateItemAsync(closedItem, command => ((TenderItemCommand)command).ClosureDate = today.AddDays(-1));
+
+        static void AllStatuses(TenderSearchCriteria criteria)
+        {
+            criteria.IncludeOpenTenders = true;
+            criteria.IncludeClosedTenders = true;
+            criteria.IncludeSuccessfulTenders = true;
+        }
+
+        var cases = new (string Name, Action<TenderSearchCriteria> Configure, string Expected)[]
+        {
+            ("successful", c => c.IncludeSuccessfulTenders = true, "X500"),
+            ("closed", c => c.IncludeClosedTenders = true, "X400"),
+            ("open", c => c.IncludeOpenTenders = true, "X300 Y310 Y450"),
+            ("all statuses", AllStatuses, "X300 X400 X500 Y310 Y450"),
+            ("all statuses, client X", c => { AllStatuses(c); c.ClientId = x; }, "X300 X400 X500"),
+            ("all statuses, open item", c => { AllStatuses(c); c.ItemId = openItem; }, "X300 Y310"),
+            ("all statuses, agent of the closed item", c => { AllStatuses(c); c.AgentId = secondAgentId; }, "X400"),
+        };
+
+        var expected = new Dictionary<string, string>();
+        var actual = new Dictionary<string, string>();
+        foreach ((string name, Action<TenderSearchCriteria> configure, string expectedTenders) in cases)
+        {
+            var criteria = new TenderSearchCriteria();
+            configure(criteria);
+            IReadOnlyList<Tender> tenders = await GetService<TenderSearch>().DoSearchAsync(criteria);
+
+            expected[name] = expectedTenders;
+            actual[name] = Labels(tenders.Select(tender => tender.Id), labels);
+        }
+
+        Assert.Equal(expected, actual);
+    }
+
+    /// <summary>
+    /// Creates the B-35 items I1 to I6 with countries N1 and N2, regions R1 (in N1) and R2 (in N2), categories K1 and K2,
+    /// agents G1 and G2 and clients X and Z; sells I5 to Z and adds I6 to the cart of the test session, whose client is X.
+    /// </summary>
+    private async Task<SearchFixture> ArrangeSearchAsync()
+    {
+        DateOnly today = await ServerDateAsync();
+        Country n1 = await Builder.CreateTestCountryAsync("Country N1");
+        Country n2 = await Builder.CreateTestCountryAsync("Country N2");
+        Region r1 = await Builder.CreateTestRegionAsync("Region R1", n1);
+        Region r2 = await Builder.CreateTestRegionAsync("Region R2", n2);
+        ItemCategory k1 = await Builder.CreateItemCategoryAsync("Category K1", "KONE", "First search category");
+        ItemCategory k2 = await Builder.CreateItemCategoryAsync("Category K2", "KTWO", "Second search category");
+        long g1 = await NewAgentAsync("Agent G1");
+        long g2 = await NewAgentAsync("Agent G2");
+        long x = await NewClientAsync("Client X");
+        long z = await NewClientAsync("Client Z");
+
+        long i1 = await NewRetailItemAsync(g1, k1.Id, r1.Id, 100m);
+        long i2 = await NewRetailItemAsync(g2, k2.Id, r2.Id, 200m);
+        long i3 = await NewTenderItemAsync(g1, k1.Id, r2.Id, 300m, today.AddDays(5));
+        long i4 = await NewTenderItemAsync(g2, k2.Id, r1.Id, 400m, today.AddDays(-1));
+        long i5 = await NewRetailItemAsync(g2, k1.Id, r1.Id, 500m);
+        Succeeded(await SellAsync(i5, z, 500m));
+        long i6 = await NewRetailItemAsync(g1, k2.Id, r2.Id, 600m);
+        Session.SetClient(x);
+        Assert.True((await Cart.AddItemAsync(SessionId, i6, 0m)).Succeeded);
+
+        var labels = new Dictionary<long, string>
+        {
+            [i1] = "I1",
+            [i2] = "I2",
+            [i3] = "I3",
+            [i4] = "I4",
+            [i5] = "I5",
+            [i6] = "I6",
+        };
+
+        return new SearchFixture(labels, g1, g2, x, z, n1.Id, n2.Id, r1.Id, r2.Id, k1.Id, k2.Id);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------------
+    // Transactions and company
+    // ---------------------------------------------------------------------------------------------------------------
+
+    /// <summary>
+    /// B-39 (C-07, Q-08): one agent read in two scopes before any write, then updated from each read with the cities
+    /// "First City" and "Second City" in turn → both updates succeed and the stored city is "Second City".
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B39_StaleEditLastWriterWins()
+    {
+        Agent agent = await Builder.CreateAgentAsync();
+        await using AsyncServiceScope firstScope = NewBoundScope();
+        await using AsyncServiceScope secondScope = NewBoundScope();
+        AgentService firstAgents = firstScope.ServiceProvider.GetRequiredService<AgentService>();
+        AgentService secondAgents = secondScope.ServiceProvider.GetRequiredService<AgentService>();
+
+        Agent firstRead = await firstAgents.FindByIdAsync(agent.Id)
+            ?? throw new InvalidOperationException($"Agent {agent.Id} does not exist.");
+        Agent secondRead = await secondAgents.FindByIdAsync(agent.Id)
+            ?? throw new InvalidOperationException($"Agent {agent.Id} does not exist.");
+
+        var firstCommand = new AgentCommand();
+        firstCommand.PopulateFromObject(firstRead);
+        firstCommand.Address!.City = "First City";
+        var secondCommand = new AgentCommand();
+        secondCommand.PopulateFromObject(secondRead);
+        secondCommand.Address!.City = "Second City";
+
+        OperationResult firstUpdate = await firstAgents.ExecuteAsync(firstCommand, TransactionType.Persist);
+        OperationResult secondUpdate = await secondAgents.ExecuteAsync(secondCommand, TransactionType.Persist);
+
+        Assert.True(firstUpdate.Succeeded, firstUpdate.FullErrorText);
+        Assert.True(secondUpdate.Succeeded, secondUpdate.FullErrorText);
+        string storedCity = await ReadAsync(db => db.Agents
+            .AsNoTracking()
+            .Where(stored => stored.Id == agent.Id)
+            .Select(stored => stored.Address.City)
+            .SingleAsync());
+        Assert.Equal("Second City", storedCity);
+    }
+
+    /// <summary>
+    /// B-70: agent operations in Own mode → Delete with no model object succeeds and writes nothing; Persist with no
+    /// model object creates the agent; Persist with the model object updates it; the add-commission-rate modify (1004)
+    /// gives the agent the rate; the transaction type −2 fails with no error and writes nothing.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B70_PersistEntityDispatch()
+    {
+        AgentService agents = GetService<AgentService>();
+
+        OperationResult deleted = await agents.ExecuteAsync(new AgentCommand { Name = "Nobody" }, TransactionType.Delete);
+        Assert.True(deleted.Succeeded, deleted.FullErrorText);
+        Assert.Empty(deleted.Errors);
+        Assert.Empty(await CompanyAgentIdsAsync());
+
+        var command = new AgentCommand { Name = "Dispatch Agent", Address = TestCompanyBuilder.NohwereLaneAddress() };
+        long agentId = Succeeded(await agents.ExecuteAsync(command, TransactionType.Persist));
+        Assert.Equal(agentId, Assert.Single(await CompanyAgentIdsAsync()));
+        Assert.NotNull(command.ModelObject);
+
+        command.Address!.City = "Dispatch City";
+        OperationResult updated = await agents.ExecuteAsync(command, TransactionType.Persist);
+        Assert.True(updated.Succeeded, updated.FullErrorText);
+        Assert.Equal(agentId, Assert.Single(await CompanyAgentIdsAsync()));
+        Agent stored = await ReadAsync(db => db.Agents.AsNoTracking().SingleAsync(agent => agent.Id == agentId));
+        Assert.Equal("Dispatch City", stored.Address.City);
+
+        ItemCategory category = await Builder.CreateItemCategoryAsync("Dispatch", "DSPT", "The category of the dispatch rate");
+        long rateId = await NewCommissionRateAsync(category.Id, 10.00m);
+        command.CommissionRateId = rateId;
+        OperationResult modified = await agents.ExecuteAsync(command, TransactionType.ModifyAddCommissionRateForAgent);
+        Assert.True(modified.Succeeded, modified.FullErrorText);
+        List<long> heldRates = await ReadAsync(db => db.AgentCommissionRates
+            .AsNoTracking()
+            .Where(link => link.AgentId == agentId)
+            .Select(link => link.CommissionRateId)
+            .ToListAsync());
+        Assert.Equal(rateId, Assert.Single(heldRates));
+
+        var unknownType = new AgentCommand { Name = "Never Written", Address = TestCompanyBuilder.NohwereLaneAddress() };
+        OperationResult rejected = await agents.ExecuteAsync(unknownType, (TransactionType)(-2));
+        Assert.False(rejected.Succeeded);
+        Assert.Empty(rejected.Errors);
+        Assert.Null(unknownType.ModelObject);
+        Assert.Equal(agentId, Assert.Single(await CompanyAgentIdsAsync()));
+    }
+
+    /// <summary>
+    /// B-70: agent operations in Ambient mode with no active transaction → Delete with no model object returns
+    /// success, the transaction type −2 returns failure, and an empty-name Persist returns failure with
+    /// <c>$AgentNameRequired</c> first, each without an exception and without a row; a valid Persist raises
+    /// <see cref="NotInTransactionStateException"/> 1048 and writes no row.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B70_InTransStateEarlyReturnsOutsideTransaction()
+    {
+        Assert.Equal("Agent name is required", Text(MessageKeys.AgentNameRequired));
+        Assert.Equal(1048, NotInTransactionStateException.Code);
+        AgentService agents = GetService<AgentService>();
+        IUnitOfWork unitOfWork = GetService<IUnitOfWork>();
+        Assert.False(unitOfWork.HasActiveTransaction);
+
+        OperationResult deleted = await WithoutExceptionAsync(() => agents.ExecuteAsync(
+            new AgentCommand { Name = "Nobody" }, TransactionType.Delete, TransactionMode.Ambient));
+        Assert.True(deleted.Succeeded, deleted.FullErrorText);
+
+        OperationResult unknownType = await WithoutExceptionAsync(() => agents.ExecuteAsync(
+            new AgentCommand { Name = "Never Written", Address = TestCompanyBuilder.NohwereLaneAddress() },
+            (TransactionType)(-2),
+            TransactionMode.Ambient));
+        Assert.False(unknownType.Succeeded);
+
+        OperationResult invalid = await WithoutExceptionAsync(() => agents.ExecuteAsync(
+            new AgentCommand { Name = string.Empty, Address = TestCompanyBuilder.NohwereLaneAddress() },
+            TransactionType.Persist,
+            TransactionMode.Ambient));
+        Assert.False(invalid.Succeeded);
+        Assert.Equal(Text(MessageKeys.AgentNameRequired), invalid.Errors[0]);
+
+        Assert.Empty(await CompanyAgentIdsAsync());
+
+        NotInTransactionStateException outside = await Assert.ThrowsAsync<NotInTransactionStateException>(
+            () => agents.ExecuteAsync(
+                new AgentCommand { Name = "Outside Transaction", Address = TestCompanyBuilder.NohwereLaneAddress() },
+                TransactionType.Persist,
+                TransactionMode.Ambient));
+        Assert.Equal(NotInTransactionStateException.Code, outside.ErrorCode);
+        Assert.Empty(await CompanyAgentIdsAsync());
+        Assert.False(unitOfWork.HasActiveTransaction);
+    }
+
+    /// <summary>
+    /// B-73 (Q-30): agent "Only In Second" created in a second company and agent "Only In First" in the bound fixture
+    /// company → asked on the second company, <see cref="CompanyService.AgentExists"/> answers for the bound company:
+    /// "Only In First" true, "Only In Second" false, <see langword="null"/> and "" false.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B73_AgentExistsReadsBoundCompany()
+    {
+        long secondCompanyId = await CreateExtraCompanyAsync("Second Company");
+        try
+        {
+            await using (AsyncServiceScope secondScope = Api.Services.CreateAsyncScope())
+            {
+                secondScope.ServiceProvider.GetRequiredService<ICompanyContext>().Bind(secondCompanyId);
+                Succeeded(await secondScope.ServiceProvider.GetRequiredService<AgentService>().ExecuteAsync(
+                    new AgentCommand { Name = "Only In Second", Address = TestCompanyBuilder.NohwereLaneAddress() },
+                    TransactionType.Persist));
+            }
+
+            await NewAgentAsync("Only In First");
+            CompanyService companies = GetService<CompanyService>();
+
+            Assert.True(await companies.AgentExists(secondCompanyId, "Only In First"));
+            Assert.False(await companies.AgentExists(secondCompanyId, "Only In Second"));
+            Assert.False(await companies.AgentExists(secondCompanyId, null));
+            Assert.False(await companies.AgentExists(secondCompanyId, string.Empty));
+        }
+        finally
+        {
+            await DeleteExtraCompanyAsync(secondCompanyId);
+        }
+    }
+
+    /// <summary>
+    /// B-80 (C-16): <see cref="CompanyService.CreateCompanyAsync"/> with the fixture company present →
+    /// <see cref="ErewhonException"/> 500003 "Company already exists"; one company remains and it stays bound.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B80_CreateCompanyRefusesSurvivingCompany()
+    {
+        Assert.Equal(500003, ErewhonException.CompanyAlreadyExists);
+        await using (AsyncServiceScope scope = Api.Services.CreateAsyncScope())
+        {
+            var command = new CompanyCommand
+            {
+                Name = "Erewhon Investments Inc",
+                Address = TestCompanyBuilder.GillSimpsonDriveAddress(),
+            };
+
+            ErewhonException failure = await Assert.ThrowsAsync<ErewhonException>(
+                () => scope.ServiceProvider.GetRequiredService<CompanyService>().CreateCompanyAsync(command));
+
+            Assert.Equal(ErewhonException.CompanyAlreadyExists, failure.ErrorCode);
+            Assert.Equal("Company already exists", failure.Message);
+        }
+
+        List<long> companyIds = await ReadAsync(db => db.Companies.AsNoTracking().Select(company => company.Id).ToListAsync());
+        Assert.Equal(CompanyId, Assert.Single(companyIds));
+        Assert.Equal(CompanyId, GetService<ICompanyContext>().CurrentId);
+    }
+
+    /// <summary>
+    /// B-80 (D-43): with a second company created through <see cref="CompanyService"/>, the company context of a new
+    /// scope with no company bound resolves the lowest company id, the fixture company's.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B80_FirstCompanyIsBound()
+    {
+        long secondCompanyId = await CreateExtraCompanyAsync("Second Company");
+        try
+        {
+            long lowestId = await ReadAsync(db => db.Companies.AsNoTracking().MinAsync(company => company.Id));
+
+            await using AsyncServiceScope unbound = Api.Services.CreateAsyncScope();
+            long currentId = unbound.ServiceProvider.GetRequiredService<ICompanyContext>().CurrentId;
+
+            Assert.Equal(lowestId, currentId);
+            Assert.Equal(CompanyId, currentId);
+            Assert.NotEqual(secondCompanyId, currentId);
+        }
+        finally
+        {
+            await DeleteExtraCompanyAsync(secondCompanyId);
+        }
+    }
+
+    /// <summary>The fixtures of <see cref="ArrangeCatalogueAsync"/>.</summary>
+    private sealed record CatalogueFixture(Country Country, Region Region, ItemCategory Category, Agent Agent, Client Client);
+
+    /// <summary>The fixtures of <see cref="ArrangeSearchAsync"/>: the item labels and the ids of the other rows.</summary>
+    private sealed record SearchFixture(
+        IReadOnlyDictionary<long, string> Labels,
+        long G1,
+        long G2,
+        long X,
+        long Z,
+        long N1,
+        long N2,
+        long R1,
+        long R2,
+        long K1,
+        long K2);
+}
