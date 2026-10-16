@@ -39,7 +39,6 @@ public sealed class RestTestGetClient : ErewhonTestBase
         using HttpClient http = Api.CreateHttpClient();
         using HttpResponseMessage response = await http.GetAsync(ByNamePath(ClientName));
 
-        // Assert
         Assert.Equal(string.Empty, await response.Content.ReadAsStringAsync());
         Assert.Equal(ExpectedError, (int)response.StatusCode);
     }
@@ -72,7 +71,6 @@ public sealed class RestTestGetClient : ErewhonTestBase
         using HttpClient http = Api.CreateHttpClient();
         using HttpResponseMessage response = await http.GetAsync(ByNamePath(ClientName));
 
-        // Assert
         Assert.Equal(ExpectedStatus, (int)response.StatusCode);
         ClientDto? dtoClient = await response.Content.ReadFromJsonAsync<ClientDto>(Json);
         Assert.NotNull(dtoClient);

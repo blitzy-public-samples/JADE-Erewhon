@@ -240,7 +240,7 @@ No parameters.
 ]
 ```
 
-Proving tests: `RestTestGetAllAgents.testGetAllAgents`.
+Proving tests: `RestTestGetAllAgents.testGetAllAgents`, `RestTestGetAllAgents.AgentsListedInNameOrder`.
 
 ### 3. `getAllClients` — `GET /api/rest/clients`
 
@@ -269,7 +269,7 @@ No parameters.
 ]
 ```
 
-Proving tests: `RestTestGetAllClients.testGetAllClients`.
+Proving tests: `RestTestGetAllClients.testGetAllClients`, `RestTestGetAllClients.ClientsListedInNameOrder`.
 
 ### 4. `getAllSales` — `GET /api/rest/sales`
 
@@ -424,7 +424,7 @@ No parameters.
 ]
 ```
 
-Proving tests: `RestTestGetAllSales.testGetAllSales`.
+Proving tests: `RestTestGetAllSales.testGetAllSales`, `RestTestGetAllSales.SalesListedByItemPrefixThenCodeNumber`.
 
 ### 5. `getClient` — `GET /api/rest/clients/by-name?name=`
 
@@ -620,7 +620,7 @@ JADE: `getItemsByPrice(pMinPrice : Integer; pMaxPrice : Integer) : DTOItemsArray
 
 With the same data, `minPrice=800&maxPrice=900` returns the tender item alone.
 
-Proving tests: `RestTestGetItemsByPrice.testInvalidMinPrice`, `RestTestGetItemsByPrice.testInvalidMaxPrice`, `RestTestGetItemsByPrice.testMaxPriceHigherThanMinPrice`, `RestTestGetItemsByPrice.testNoItems`, `RestTestGetItemsByPrice.testPriceBetween800And900`, `RestTestGetItemsByPrice.testPriceBetween900And1000`.
+Proving tests: `RestTestGetItemsByPrice.testInvalidMinPrice`, `RestTestGetItemsByPrice.testInvalidMaxPrice`, `RestTestGetItemsByPrice.testMaxPriceHigherThanMinPrice`, `RestTestGetItemsByPrice.testNoItems`, `RestTestGetItemsByPrice.testPriceBetween800And900`, `RestTestGetItemsByPrice.testPriceBetween900And1000`, `RestTestGetItemsByPrice.PriceBandBoundsAreInclusive`.
 
 ### 9. `getSale` — `GET /api/rest/sales/by-code?codePrefix=&codeNumber=`
 

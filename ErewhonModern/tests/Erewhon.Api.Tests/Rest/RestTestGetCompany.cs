@@ -43,7 +43,6 @@ public sealed class RestTestGetCompany : ErewhonTestBase
         using HttpClient http = Api.CreateHttpClient();
         using HttpResponseMessage response = await http.GetAsync(CompanyPath);
 
-        // Assert
         Assert.Equal(string.Empty, await response.Content.ReadAsStringAsync());
         Assert.Equal(ExpectedStatus, (int)response.StatusCode);
     }
@@ -63,7 +62,6 @@ public sealed class RestTestGetCompany : ErewhonTestBase
         Assert.Equal(ExpectedStatus, (int)response.StatusCode);
         CompanyDto? dtoCompany = await response.Content.ReadFromJsonAsync<CompanyDto>(Json);
 
-        // Assert
         Assert.NotNull(dtoCompany);
         Company company = await ReadBoundCompanyAsync();
         Assert.Equal(company.Name, dtoCompany.Name);

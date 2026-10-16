@@ -30,7 +30,6 @@ public sealed class RestTestGetItemByCode : ErewhonTestBase
         // Arrange/Act
         using HttpResponseMessage response = await GetItemByCodeAsync(http, "CAT1", 1);
 
-        // Assert
         using JsonDocument dtoItem = await ReadItemAsync(response);
         Assert.Equal(200, (int)response.StatusCode);
         Assert.Equal("retailItem", dtoItem.RootElement.GetProperty("type").GetString());
@@ -46,7 +45,6 @@ public sealed class RestTestGetItemByCode : ErewhonTestBase
         // Arrange/Act
         using HttpResponseMessage response = await GetItemByCodeAsync(http, "CAT1", 2);
 
-        // Assert
         using JsonDocument dtoItem = await ReadItemAsync(response);
         Assert.Equal(200, (int)response.StatusCode);
         Assert.Equal("tenderItem", dtoItem.RootElement.GetProperty("type").GetString());
@@ -62,7 +60,6 @@ public sealed class RestTestGetItemByCode : ErewhonTestBase
         // Arrange/Act
         using HttpResponseMessage response = await GetItemByCodeAsync(http, "CAT1", 0);
 
-        // Assert
         Assert.Equal(string.Empty, await response.Content.ReadAsStringAsync());
         Assert.Equal(400, (int)response.StatusCode);
     }
@@ -77,7 +74,6 @@ public sealed class RestTestGetItemByCode : ErewhonTestBase
         // Arrange/Act
         using HttpResponseMessage response = await GetItemByCodeAsync(http, "INVALID", 999);
 
-        // Assert
         Assert.Equal(string.Empty, await response.Content.ReadAsStringAsync());
         Assert.Equal(400, (int)response.StatusCode);
     }
@@ -92,7 +88,6 @@ public sealed class RestTestGetItemByCode : ErewhonTestBase
         // Arrange/Act
         using HttpResponseMessage response = await GetItemByCodeAsync(http, "CAT1", 3);
 
-        // Assert
         Assert.Equal(string.Empty, await response.Content.ReadAsStringAsync());
         Assert.Equal(404, (int)response.StatusCode);
     }
@@ -105,7 +100,7 @@ public sealed class RestTestGetItemByCode : ErewhonTestBase
         http.GetAsync($"/api/rest/items/by-code?codePrefix={Uri.EscapeDataString(prefix)}&codeNumber={number}");
 
     /// <summary>
-    /// Asserts that the body of <paramref name="response"/> is not empty and is a JSON object, and returns it parsed.
+    /// Checks that the body of <paramref name="response"/> is not empty and is a JSON object, and returns it parsed.
     /// </summary>
     private static async Task<JsonDocument> ReadItemAsync(HttpResponseMessage response)
     {

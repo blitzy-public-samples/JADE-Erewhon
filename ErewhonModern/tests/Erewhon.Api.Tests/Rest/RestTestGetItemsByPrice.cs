@@ -26,7 +26,6 @@ public sealed class RestTestGetItemsByPrice : ErewhonTestBase
         using var http = Api.CreateHttpClient();
         using HttpResponseMessage response = await GetItemsByPriceAsync(http, 100, -10);
 
-        // Assert
         Assert.Equal(string.Empty, await response.Content.ReadAsStringAsync());
         Assert.Equal(400, (int)response.StatusCode);
     }
@@ -42,7 +41,6 @@ public sealed class RestTestGetItemsByPrice : ErewhonTestBase
         using var http = Api.CreateHttpClient();
         using HttpResponseMessage response = await GetItemsByPriceAsync(http, -100, 100);
 
-        // Assert
         Assert.Equal(string.Empty, await response.Content.ReadAsStringAsync());
         Assert.Equal(400, (int)response.StatusCode);
     }
@@ -59,7 +57,6 @@ public sealed class RestTestGetItemsByPrice : ErewhonTestBase
         using var http = Api.CreateHttpClient();
         using HttpResponseMessage response = await GetItemsByPriceAsync(http, 1000, 100);
 
-        // Assert
         Assert.Equal(string.Empty, await response.Content.ReadAsStringAsync());
         Assert.Equal(400, (int)response.StatusCode);
     }
@@ -79,7 +76,6 @@ public sealed class RestTestGetItemsByPrice : ErewhonTestBase
         using var http = Api.CreateHttpClient();
         using HttpResponseMessage response = await GetItemsByPriceAsync(http, 100, 1000);
 
-        // Assert
         using JsonDocument items = await ReadItemsArrayAsync(response);
         Assert.Equal(0, items.RootElement.GetArrayLength());
         Assert.Equal(200, (int)response.StatusCode);
@@ -97,7 +93,6 @@ public sealed class RestTestGetItemsByPrice : ErewhonTestBase
         using var http = Api.CreateHttpClient();
         using HttpResponseMessage response = await GetItemsByPriceAsync(http, 800, 900);
 
-        // Assert
         using JsonDocument items = await ReadItemsArrayAsync(response);
         Assert.Equal(1, items.RootElement.GetArrayLength());
         Assert.Equal(200, (int)response.StatusCode);
@@ -116,11 +111,78 @@ public sealed class RestTestGetItemsByPrice : ErewhonTestBase
         using var http = Api.CreateHttpClient();
         using HttpResponseMessage response = await GetItemsByPriceAsync(http, 900, 1000);
 
-        // Assert
         using JsonDocument items = await ReadItemsArrayAsync(response);
         Assert.Equal(1, items.RootElement.GetArrayLength());
         Assert.Equal(200, (int)response.StatusCode);
         Assert.Equal("retailItem", items.RootElement[0].GetProperty("type").GetString());
+    }
+
+    /// <summary>
+    /// After the retail item 3 at 900.00, the tender item 4 of reserve 800.00, the retail item 5 at 799.99 and the
+    /// retail item 6 at 900.01 are created in that order, <c>getItemsByPrice(minPrice, maxPrice)</c> returns status
+    /// 200 with the items whose price lies between <paramref name="minPrice"/> and <paramref name="maxPrice"/>, both
+    /// included, in code-number order: 800 to 900 → 2, 3 and 4; 900 to 900 → 3; 800 to 800 → 4; 0 to 0 → none. Item
+    /// 2 is the fixture tender item of reserve 888.88.
+    /// </summary>
+    /// <param name="minPrice">The lowest price requested.</param>
+    /// <param name="maxPrice">The highest price requested.</param>
+    /// <param name="expectedNumbers">The code numbers of the items returned, in response order.</param>
+    /// <returns>A task that completes when the test has run.</returns>
+    [Theory]
+    [InlineData(800, 900, new[] { 2, 3, 4 })]
+    [InlineData(900, 900, new[] { 3 })]
+    [InlineData(800, 800, new[] { 4 })]
+    [InlineData(0, 0, new int[0])]
+    public async Task PriceBandBoundsAreInclusive(int minPrice, int maxPrice, int[] expectedNumbers)
+    {
+        // Arrange
+        DateOnly serverDate = await GetService<IServerClock>().GetServerDateAsync();
+        await Builder.CreateTestRetailItemAsync(
+            "Upper Bound Item",
+            "Description",
+            null,
+            Builder.MyRegion!,
+            Builder.MyItemCategory!,
+            Builder.MyAgent!,
+            900.00m);
+        await Builder.CreateTestTenderItemAsync(
+            "Lower Bound Item",
+            "Description",
+            null,
+            Builder.MyRegion!,
+            Builder.MyItemCategory!,
+            Builder.MyAgent!,
+            800.00m,
+            serverDate.AddDays(7));
+        await Builder.CreateTestRetailItemAsync(
+            "Below Lower Bound Item",
+            "Description",
+            null,
+            Builder.MyRegion!,
+            Builder.MyItemCategory!,
+            Builder.MyAgent!,
+            799.99m);
+        await Builder.CreateTestRetailItemAsync(
+            "Above Upper Bound Item",
+            "Description",
+            null,
+            Builder.MyRegion!,
+            Builder.MyItemCategory!,
+            Builder.MyAgent!,
+            900.01m);
+
+        // Act
+        using var http = Api.CreateHttpClient();
+        using HttpResponseMessage response = await GetItemsByPriceAsync(http, minPrice, maxPrice);
+
+        using JsonDocument items = await ReadItemsArrayAsync(response);
+        Assert.Equal(200, (int)response.StatusCode);
+        Assert.Equal(
+            expectedNumbers.Select(ExpectedBandItem),
+            items.RootElement.EnumerateArray().Select(item => (
+                item.GetProperty("number").GetInt32(),
+                item.GetProperty("type").GetString(),
+                item.GetProperty("price").GetDecimal())));
     }
 
     /// <summary>
@@ -145,6 +207,23 @@ public sealed class RestTestGetItemsByPrice : ErewhonTestBase
         http.GetAsync(string.Create(
             CultureInfo.InvariantCulture,
             $"/api/rest/items?minPrice={minPrice}&maxPrice={maxPrice}"));
+
+    /// <summary>
+    /// Returns the code number, <c>type</c> discriminator and price that <c>getItemsByPrice</c> answers for the item
+    /// numbered <paramref name="number"/> in <see cref="PriceBandBoundsAreInclusive"/>: 2 is the tender item of reserve
+    /// 888.88, 3 the retail item at 900.00 and 4 the tender item of reserve 800.00.
+    /// </summary>
+    /// <param name="number">The code number of the item, 2, 3 or 4.</param>
+    /// <returns>The code number, type discriminator and price of the item.</returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="number"/> is not 2, 3 or 4.</exception>
+    private static (int Number, string? Type, decimal Price) ExpectedBandItem(int number) => number switch
+    {
+        2 => (2, "tenderItem", 888.88m),
+        3 => (3, "retailItem", 900.00m),
+        4 => (4, "tenderItem", 800.00m),
+        _ => throw new ArgumentOutOfRangeException(
+            nameof(number), number, "Only the items 2, 3 and 4 are expected in a price band."),
+    };
 
     /// <summary>
     /// Reads the body of <paramref name="response"/>, asserts that it is not empty and that it is a JSON array, and

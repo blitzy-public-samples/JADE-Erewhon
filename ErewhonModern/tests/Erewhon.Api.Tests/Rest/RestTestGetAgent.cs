@@ -40,7 +40,6 @@ public sealed class RestTestGetAgent : Erewhon.Testing.ErewhonTestBase
         // Act
         using HttpResponseMessage response = await http.GetAsync(ByNamePath(AgentName));
 
-        // Assert
         Assert.Equal(string.Empty, await response.Content.ReadAsStringAsync());
         Assert.Equal(ExpectedError, (int)response.StatusCode);
     }
@@ -75,7 +74,6 @@ public sealed class RestTestGetAgent : Erewhon.Testing.ErewhonTestBase
         // Act
         using HttpResponseMessage response = await http.GetAsync(ByNamePath(AgentName));
 
-        // Assert
         Assert.Equal(ExpectedStatus, (int)response.StatusCode);
         AgentDto? dtoAgent = await response.Content.ReadFromJsonAsync<AgentDto>(Json);
         Assert.NotNull(dtoAgent);
