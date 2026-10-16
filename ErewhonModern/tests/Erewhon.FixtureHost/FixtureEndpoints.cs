@@ -1,9 +1,12 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Net.Mime;
 using System.Text;
 using Erewhon.Api.Sessions;
 using Erewhon.Application.Abstractions;
+using Erewhon.Application.Common;
 using Erewhon.Application.Services;
+using Erewhon.Persistence;
 using Erewhon.Testing;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -47,8 +50,11 @@ public static class FixtureEndpoints
     /// the exception message when the delete fails.
     /// </description></item>
     /// </list>
-    /// Build and delete failures are logged at Error level under the category <c>Erewhon.FixtureHost</c>. Both routes
-    /// must be mapped before the application starts.
+    /// Build and delete failures are logged at Error level under the category <c>Erewhon.FixtureHost</c>, each with the
+    /// fixture name (<c>FixtureName</c>) or the company id (<c>CompanyId</c>) or both, the exception type
+    /// (<c>ExceptionType</c>, <see cref="FailureDescription.TypeName"/>) and the error code (<c>ErrorCode</c>,
+    /// <see cref="FailureDescription.ErrorCodeOrNone"/>), and without the exception. Both routes must be mapped before
+    /// the application starts.
     /// </summary>
     /// <param name="app">The built, unstarted Erewhon web application.</param>
     /// <exception cref="ArgumentNullException"><paramref name="app"/> is <see langword="null"/>.</exception>
@@ -120,7 +126,11 @@ public static class FixtureEndpoints
             }
             catch (Exception exception)
             {
-                logger.LogError(exception, "Fixture {FixtureName} could not be built.", definition.Name);
+                logger.LogError(
+                    "Fixture {FixtureName} could not be built: {ExceptionType}, error code {ErrorCode}.",
+                    definition.Name,
+                    FailureDescription.TypeName(exception),
+                    FailureDescription.ErrorCodeOrNone(exception));
                 await DeleteBuiltCompanyAsync(builder.MyCompany?.Id, definition.Name);
                 return PlainText(StatusCodes.Status500InternalServerError, exception.Message);
             }
@@ -160,7 +170,11 @@ public static class FixtureEndpoints
             }
             catch (Exception exception)
             {
-                logger.LogError(exception, "Fixture company {CompanyId} could not be deleted.", companyId);
+                logger.LogError(
+                    "Fixture company {CompanyId} could not be deleted: {ExceptionType}, error code {ErrorCode}.",
+                    companyId,
+                    FailureDescription.TypeName(exception),
+                    FailureDescription.ErrorCodeOrNone(exception));
                 return PlainText(StatusCodes.Status500InternalServerError, exception.Message);
             }
 
@@ -216,10 +230,12 @@ public static class FixtureEndpoints
             catch (Exception exception)
             {
                 logger.LogError(
-                    exception,
-                    "Company {CompanyId} of fixture {FixtureName} could not be deleted after the request failed.",
+                    "Company {CompanyId} of fixture {FixtureName} could not be deleted after the request failed: "
+                    + "{ExceptionType}, error code {ErrorCode}.",
                     id,
-                    fixtureName);
+                    fixtureName,
+                    FailureDescription.TypeName(exception),
+                    FailureDescription.ErrorCodeOrNone(exception));
             }
         }
 
@@ -237,6 +253,56 @@ public static class FixtureEndpoints
         private static IResult PlainText(int statusCode, string body) =>
             Results.Text(body, MediaTypeNames.Text.Plain, Encoding.UTF8, statusCode);
     }
+}
+
+/// <summary>
+/// Describes a failure by the full name of its exception type and by its error code only, never by the exception's
+/// message, string form or data, or by anything of its inner exceptions other than their SQLSTATE.
+/// </summary>
+internal static class FailureDescription
+{
+    /// <summary>The value <see cref="ErrorCodeOrNone"/> returns for an exception without an error code.</summary>
+    public const string NoErrorCode = "none";
+
+    /// <summary>Returns the full name of the type of <paramref name="exception"/>, or its name when it has none.</summary>
+    /// <param name="exception">The failure.</param>
+    /// <returns>The type name.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="exception"/> is <see langword="null"/>.</exception>
+    public static string TypeName(Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+
+        Type type = exception.GetType();
+        return type.FullName ?? type.Name;
+    }
+
+    /// <summary>
+    /// Returns the JADE error number of <paramref name="exception"/> when it is an <see cref="IJadeException"/>;
+    /// otherwise the SQLSTATE that <see cref="PostgresErrorMapper.GetSqlState"/> finds in its exception chain
+    /// (<see cref="PostgresErrorMapper.ConnectionFailure"/> for a provider failure that carries no server SQLSTATE) when
+    /// that SQLSTATE is five ASCII letters or digits; otherwise <see langword="null"/>.
+    /// </summary>
+    /// <param name="exception">The failure.</param>
+    /// <returns>The error code, or <see langword="null"/> when the failure has none.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="exception"/> is <see langword="null"/>.</exception>
+    public static string? ErrorCode(Exception exception)
+    {
+        ArgumentNullException.ThrowIfNull(exception);
+
+        if (exception is IJadeException jade)
+        {
+            return jade.ErrorCode.ToString(CultureInfo.InvariantCulture);
+        }
+
+        string? sqlState = PostgresErrorMapper.GetSqlState(exception);
+        return sqlState is { Length: 5 } && sqlState.All(char.IsAsciiLetterOrDigit) ? sqlState : null;
+    }
+
+    /// <summary>Returns <see cref="ErrorCode"/>, or <see cref="NoErrorCode"/> when it is <see langword="null"/>.</summary>
+    /// <param name="exception">The failure.</param>
+    /// <returns>The error code or <see cref="NoErrorCode"/>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="exception"/> is <see langword="null"/>.</exception>
+    public static string ErrorCodeOrNone(Exception exception) => ErrorCode(exception) ?? NoErrorCode;
 }
 
 /// <summary>

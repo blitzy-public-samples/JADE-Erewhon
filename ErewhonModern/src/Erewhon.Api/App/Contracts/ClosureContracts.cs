@@ -39,7 +39,7 @@ public sealed record StartClosureScheduleRequest(DateOnly Date, int Minutes);
 /// <summary>
 /// Result of starting the closure schedule, replacing the button and label state <c>startTimer(false)</c> sets.
 /// </summary>
-/// <param name="Started">True when the schedule started, as when <c>startTimer</c> begins the timer, disables <c>btnStart</c> and enables <c>btnStop</c>; false when <c>secondsToGo</c> is not greater than 0.</param>
+/// <param name="Started">True when the schedule started, as when <c>startTimer</c> begins the timer, disables <c>btnStart</c> and enables <c>btnStop</c>; false when <c>secondsToGo</c> is not greater than 0, or when the session was logged out before the schedule could start.</param>
 /// <param name="SecondsToGo">The initial <c>secondsToGo</c>, the minutes multiplied by 60, shown in <c>lblSecondsToGo</c> while the schedule runs.</param>
 public sealed record StartClosureScheduleResponse(bool Started, int SecondsToGo);
 

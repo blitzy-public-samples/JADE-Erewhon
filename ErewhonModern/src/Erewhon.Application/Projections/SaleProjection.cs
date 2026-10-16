@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using Erewhon.Application.Domain;
 
 namespace Erewhon.Application.Projections;
@@ -8,7 +9,7 @@ namespace Erewhon.Application.Projections;
 /// sold and sale price of a retail sale or the offer and time of the winning tender of a tender sale.
 /// </summary>
 /// <param name="Id">The row id of the sale.</param>
-/// <param name="Guid">The source GUID text of the sale.</param>
+/// <param name="Guid">The source GUID text of the sale; not written to JSON.</param>
 /// <param name="IsTender"><see langword="true"/> for a tender sale; <see langword="false"/> for a retail sale.</param>
 /// <param name="AgentCommission">The commission earned by the item's agent on the sale.</param>
 /// <param name="Client">The client who bought the item.</param>
@@ -24,7 +25,7 @@ namespace Erewhon.Application.Projections;
 /// </param>
 public sealed record SaleDetailProjection(
     long Id,
-    string Guid,
+    [property: JsonIgnore] string Guid,
     bool IsTender,
     decimal AgentCommission,
     ClientProjection Client,
@@ -67,7 +68,7 @@ public sealed record SaleDetailProjection(
 /// time and price of a retail sale or the offer and winning tender of a tender sale.
 /// </summary>
 /// <param name="Id">The row id of the sale.</param>
-/// <param name="Guid">The source GUID text of the sale.</param>
+/// <param name="Guid">The source GUID text of the sale; not written to JSON.</param>
 /// <param name="IsTender"><see langword="true"/> for a tender sale; <see langword="false"/> for a retail sale.</param>
 /// <param name="AgentCommission">The commission earned by the item's agent on the sale.</param>
 /// <param name="Client">The client who bought the item.</param>
@@ -83,7 +84,7 @@ public sealed record SaleDetailProjection(
 /// </param>
 public sealed record SaleProjection(
     long Id,
-    string Guid,
+    [property: JsonIgnore] string Guid,
     bool IsTender,
     decimal AgentCommission,
     ClientProjection Client,

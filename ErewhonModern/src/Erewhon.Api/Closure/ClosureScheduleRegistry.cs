@@ -23,7 +23,8 @@ public sealed record ClosureSchedule(string SessionId, DateOnly Date, int Minute
 /// <summary>
 /// Holds at most one tender-closure schedule per session in process memory, keyed by the ordinal session id.
 /// A schedule lasts until <see cref="Stop"/>, a later <see cref="Start"/> for the same session, or the removal of
-/// the session from the <see cref="SessionRegistry"/> ends it. Every member is safe to call from several threads at
+/// the session from the <see cref="SessionRegistry"/> ends it; <see cref="Start"/> starts no schedule for a session the
+/// <see cref="SessionRegistry"/> does not hold. Every member is safe to call from several threads at
 /// once, and every returned <see cref="ClosureSchedule"/> is an immutable snapshot.
 /// </summary>
 public sealed class ClosureScheduleRegistry : IDisposable
@@ -49,7 +50,10 @@ public sealed class ClosureScheduleRegistry : IDisposable
     /// <summary>
     /// Creates an empty registry that stops the schedule of each session removed from <paramref name="sessions"/>.
     /// </summary>
-    /// <param name="sessions">The registry whose <see cref="SessionRegistry.SessionRemoved"/> event stops schedules.</param>
+    /// <param name="sessions">
+    /// The registry whose <see cref="SessionRegistry.SessionRemoved"/> event stops schedules and whose sessions
+    /// <see cref="Start"/> looks up.
+    /// </param>
     /// <exception cref="ArgumentNullException"><paramref name="sessions"/> is null.</exception>
     public ClosureScheduleRegistry(SessionRegistry sessions)
     {
@@ -60,14 +64,17 @@ public sealed class ClosureScheduleRegistry : IDisposable
 
     /// <summary>
     /// Removes any schedule of the session, then starts a new one at <paramref name="date"/> with
-    /// <paramref name="minutes"/> × <see cref="SecondsPerMinute"/> seconds to go when that number is greater than 0.
+    /// <paramref name="minutes"/> × <see cref="SecondsPerMinute"/> seconds to go when that number is greater than 0 and
+    /// the <see cref="SessionRegistry"/> holds a session with the id. The removal, the session lookup and the start
+    /// happen under the lock that <see cref="Stop"/> takes when <see cref="SessionRegistry.SessionRemoved"/> is raised.
     /// </summary>
     /// <param name="sessionId">The id of the session that owns the schedule.</param>
     /// <param name="date">The date the first closure closes tenders at.</param>
     /// <param name="minutes">The minutes per cycle.</param>
     /// <returns>
     /// <see langword="true"/> when a schedule was started; <see langword="false"/> when the seconds to go are 0 or
-    /// less, in which case the session has no schedule.
+    /// less, or when <see cref="SessionRegistry.TryGet"/> finds no session with the id, in which case the session has no
+    /// schedule.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="sessionId"/> is null.</exception>
     /// <exception cref="ArgumentException"><paramref name="sessionId"/> is empty.</exception>
@@ -84,7 +91,7 @@ public sealed class ClosureScheduleRegistry : IDisposable
             _schedules.Remove(sessionId);
 
             var seconds = checked(minutes * SecondsPerMinute);
-            if (seconds <= 0)
+            if (seconds <= 0 || !_sessions.TryGet(sessionId, out _))
             {
                 return false;
             }

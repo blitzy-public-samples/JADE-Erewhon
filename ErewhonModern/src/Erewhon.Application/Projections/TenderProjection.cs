@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using Erewhon.Application.Domain;
 
 namespace Erewhon.Application.Projections;
@@ -7,7 +8,7 @@ namespace Erewhon.Application.Projections;
 /// source GUID, offer, time placed, client and tender item, with the row id of the tender sale it won.
 /// </summary>
 /// <param name="Id">The row id of the tender.</param>
-/// <param name="Guid">The source GUID text of the tender.</param>
+/// <param name="Guid">The source GUID text of the tender; not written to JSON.</param>
 /// <param name="Offer">The amount offered.</param>
 /// <param name="Timestamp">The time the tender was placed, as stored.</param>
 /// <param name="Client">The client who placed the tender.</param>
@@ -17,7 +18,7 @@ namespace Erewhon.Application.Projections;
 /// </param>
 public sealed record TenderProjection(
     long Id,
-    string Guid,
+    [property: JsonIgnore] string Guid,
     decimal Offer,
     DateTime Timestamp,
     ClientProjection Client,

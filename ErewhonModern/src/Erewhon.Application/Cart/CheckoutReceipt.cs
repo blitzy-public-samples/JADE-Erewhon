@@ -9,6 +9,7 @@ public sealed record CheckoutReceipt(IReadOnlyList<CheckoutReceiptLine> Lines);
 /// <summary>
 /// One row of the checkout confirmation, for a retail purchase or a tender bid.
 /// </summary>
+/// <param name="ItemId">The row id of the cart line's item.</param>
 /// <param name="Transaction">The cart line's transaction text: "Retail" or "Tender".</param>
 /// <param name="Code">The item code held by the cart line.</param>
 /// <param name="ItemName">The item name read after the commit.</param>
@@ -16,6 +17,7 @@ public sealed record CheckoutReceipt(IReadOnlyList<CheckoutReceiptLine> Lines);
 /// <param name="Offer">The cart line's offer, unformatted.</param>
 /// <param name="IsTender"><see langword="true"/> when the line is a tender bid; <see langword="false"/> for a retail purchase.</param>
 public sealed record CheckoutReceiptLine(
+    long ItemId,
     string Transaction,
     string Code,
     string ItemName,

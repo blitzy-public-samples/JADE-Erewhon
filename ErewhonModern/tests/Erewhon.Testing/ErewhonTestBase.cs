@@ -1,9 +1,12 @@
 using System.Collections.Concurrent;
+using System.Globalization;
 using System.Reflection;
 using System.Runtime.ExceptionServices;
 using Erewhon.Api.Sessions;
 using Erewhon.Application.Abstractions;
+using Erewhon.Application.Common;
 using Erewhon.Application.Domain;
+using Erewhon.Persistence;
 using Microsoft.AspNetCore.Http;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
@@ -338,8 +341,12 @@ public abstract class ErewhonTestBase : IAsyncLifetime
     }
 
     /// <summary>
-    /// Stops and then disposes <paramref name="host"/>, waiting at most <see cref="ProcessExitStopTimeout"/>; a failure,
-    /// or a stop still running when the wait ends, is written to the standard error stream.
+    /// Stops and then disposes <paramref name="host"/>, waiting at most <see cref="ProcessExitStopTimeout"/>. A stop still
+    /// running when the wait ends is written to the standard error stream as one line with the host's
+    /// <see cref="ErewhonApiHost.BaseAddress"/> and the wait. A failure is written there as one line with the
+    /// <see cref="ErewhonApiHost.BaseAddress"/>, the full name of the failure's type and, when it has one, its JADE error
+    /// number or SQLSTATE, as <see cref="DescribeStopFailure"/> returns them; the failure's message, inner exceptions and
+    /// data are not written.
     /// </summary>
     private static void StopAtProcessExit(ErewhonApiHost host)
     {
@@ -367,8 +374,30 @@ public abstract class ErewhonTestBase : IAsyncLifetime
         catch (AggregateException stopFailure)
         {
             Console.Error.WriteLine(
-                $"The shared Erewhon API host at {host.BaseAddress} failed to stop at process exit: {stopFailure.InnerException ?? stopFailure}");
+                $"The shared Erewhon API host at {host.BaseAddress} failed to stop at process exit: {DescribeStopFailure(stopFailure.InnerException ?? stopFailure)}.");
         }
+    }
+
+    /// <summary>
+    /// Returns the full name of the type of <paramref name="failure"/>, followed by <c>(JADE error &lt;n&gt;)</c> with the
+    /// <see cref="IJadeException.ErrorCode"/> when <paramref name="failure"/> is an <see cref="IJadeException"/>, or else
+    /// by <c>(SQLSTATE &lt;code&gt;)</c> when <see cref="PostgresErrorMapper.GetSqlState"/> finds a SQLSTATE of five ASCII
+    /// letters or digits; for example <c>Npgsql.NpgsqlException (SQLSTATE 08006)</c>. No message, inner exception or data
+    /// of <paramref name="failure"/> is included.
+    /// </summary>
+    private static string DescribeStopFailure(Exception failure)
+    {
+        Type failureType = failure.GetType();
+        string typeName = failureType.FullName ?? failureType.Name;
+
+        if (failure is IJadeException jade)
+        {
+            return $"{typeName} (JADE error {jade.ErrorCode.ToString(CultureInfo.InvariantCulture)})";
+        }
+
+        return PostgresErrorMapper.GetSqlState(failure) is { Length: 5 } sqlState && sqlState.All(char.IsAsciiLetterOrDigit)
+            ? $"{typeName} (SQLSTATE {sqlState})"
+            : typeName;
     }
 
     /// <summary>Returns the exception for <paramref name="member"/> read before <see cref="InitializeAsync"/>.</summary>

@@ -52,6 +52,11 @@ public sealed class ErewhonApiHost : IAsyncDisposable
     /// <summary>The default listen address: the IPv4 loopback interface on a port the operating system assigns.</summary>
     public const string DefaultUrl = "http://127.0.0.1:0";
 
+    /// <summary>
+    /// The <see cref="HttpClient.Timeout"/> of every client <see cref="CreateHttpClient"/> returns: 100 seconds.
+    /// </summary>
+    public static readonly TimeSpan DefaultHttpClientTimeout = TimeSpan.FromSeconds(100);
+
     private const string ConnectionStringKey = "ConnectionStrings:Erewhon";
     private const string LockTimeoutKey = "Erewhon:Locks:TimeoutMs";
     private const string AllocationTimeoutKey = "Erewhon:Locks:AllocationTimeoutMs";
@@ -197,9 +202,13 @@ public sealed class ErewhonApiHost : IAsyncDisposable
             $"No folder at or above '{AppContext.BaseDirectory}' holds {SolutionFileName}.");
     }
 
-    /// <summary>Creates an HTTP client whose base address is <see cref="BaseAddress"/>. The caller disposes it.</summary>
+    /// <summary>
+    /// Creates an HTTP client whose base address is <see cref="BaseAddress"/> and whose timeout is
+    /// <see cref="DefaultHttpClientTimeout"/>; a request that runs longer fails with a
+    /// <see cref="TaskCanceledException"/>. The caller disposes it.
+    /// </summary>
     /// <returns>A new <see cref="HttpClient"/>.</returns>
-    public HttpClient CreateHttpClient() => new() { BaseAddress = BaseAddress };
+    public HttpClient CreateHttpClient() => new() { BaseAddress = BaseAddress, Timeout = DefaultHttpClientTimeout };
 
     /// <summary>
     /// Creates a SOAP client factory for <c>/soap/ErewhonWebService</c> and <c>/soap/ErewhonWebServiceAdmin</c> under

@@ -75,8 +75,6 @@ export interface OperationResult {
   fullErrorText: string;
   /** Internal row id of the created or changed row. */
   id: Id | null;
-  /** Source GUID of the created or changed row. */
-  guid: string | null;
 }
 
 /** Body of a status 500 error response. */
@@ -95,8 +93,6 @@ export interface SoftLockStatus {
   isLocked: boolean;
   /** True when the caller's session holds the row's soft edit lock. */
   isLockedByCaller: boolean;
-  /** Id of the session holding the lock; null when the row is unlocked. */
-  lockedBySession: string | null;
   /** Name of the thing being edited. */
   thing: string;
   /** Text of the Yes/No prompt shown when the row is locked. */
@@ -152,6 +148,8 @@ export interface CheckoutReceipt {
 
 /** One row of a checkout confirmation. */
 export interface CheckoutReceiptLine {
+  /** Internal id of the line's item. */
+  itemId: Id;
   /** "Retail" or "Tender". */
   transaction: string;
   code: string;
@@ -170,7 +168,6 @@ export interface NameProjection {
 /** An agent with its address. */
 export interface AgentProjection {
   id: Id;
-  guid: string;
   name: string;
   street: string;
   city: string;
@@ -184,7 +181,6 @@ export interface AgentProjection {
 /** A client with its address. */
 export interface ClientProjection {
   id: Id;
-  guid: string;
   name: string;
   street: string;
   city: string;
@@ -198,7 +194,6 @@ export interface ClientProjection {
 /** The company with its address; body of GET /api/app/admin/company. */
 export interface CompanyProjection {
   id: Id;
-  guid: string;
   name: string;
   street: string;
   city: string;
@@ -212,7 +207,6 @@ export interface CompanyProjection {
 /** The sale of an item, embedded in {@link ItemProjection}. */
 export interface SaleDetailProjection {
   id: Id;
-  guid: string;
   isTender: boolean;
   agentCommission: number;
   client: ClientProjection;
@@ -229,7 +223,6 @@ export interface SaleDetailProjection {
 /** A retail or tender item. */
 export interface ItemProjection {
   id: Id;
-  guid: string;
   isTender: boolean;
   codeNumber: number;
   categoryPrefix: string | null;
@@ -260,7 +253,6 @@ export interface ItemProjection {
 /** A tender on a tender item. */
 export interface TenderProjection {
   id: Id;
-  guid: string;
   offer: number;
   timestamp: IsoDateTime;
   client: ClientProjection;

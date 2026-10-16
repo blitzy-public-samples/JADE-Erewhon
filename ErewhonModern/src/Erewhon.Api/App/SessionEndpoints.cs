@@ -46,8 +46,10 @@ public static class SessionEndpoints
     /// </description></item>
     /// <item><description>
     /// <c>DELETE /sessions/current</c>, which needs a registered session: the caller's session is removed through
-    /// <see cref="SessionRegistry.Remove"/>, which also discards its cart and its closure schedule, and the route
-    /// answers 204. A request without a registered session answers 401 with an empty body.
+    /// <see cref="SessionRegistry.Remove"/>, which also discards its closure schedule, and the route answers 204. The
+    /// session's cart is discarded when the last <see cref="SessionLease"/> on the session is disposed: the lease this
+    /// request holds through <see cref="SessionMiddleware"/>, or the lease of a request of the session still running
+    /// after it. A request without a registered session answers 401 with an empty body.
     /// </description></item>
     /// </list>
     /// Every route also declares the 500 <see cref="ErrorOutcome"/> of an exception that escapes it.

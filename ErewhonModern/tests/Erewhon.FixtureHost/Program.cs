@@ -24,16 +24,19 @@ var databaseNamePattern = new Regex(@"^[a-z_][a-z0-9_]{0,62}\z", RegexOptions.Cu
 TextWriter standardOutput = Console.Out;
 Console.SetOut(Console.Error);
 
+string step = $"reading the connection string of the environment variable {PostgresDatabase.EnvironmentVariable}";
 try
 {
     switch (args)
     {
         case ["serve", "--database", var name] when databaseNamePattern.IsMatch(name):
-            await ServeAsync(PostgresDatabase.Named(name), standardOutput);
+            await ServeAsync(PostgresDatabase.Named(name), standardOutput, current => step = current);
             return SuccessExitCode;
 
         case ["reset-database", var name] when databaseNamePattern.IsMatch(name):
-            await PostgresDatabase.Named(name).RecreateAsync();
+            PostgresDatabase resetDatabase = PostgresDatabase.Named(name);
+            step = $"recreating database {name}";
+            await resetDatabase.RecreateAsync();
             Console.Error.WriteLine($"Database {name} recreated");
             return SuccessExitCode;
 
@@ -44,27 +47,51 @@ try
 }
 catch (Exception exception)
 {
-    Console.Error.WriteLine($"{exception.GetType().FullName}: {exception.Message}");
+    string? errorCode = FailureDescription.ErrorCode(exception);
+    Console.Error.WriteLine(
+        $"Erewhon.FixtureHost failed while {step}: {FailureDescription.TypeName(exception)}"
+        + (errorCode is null ? string.Empty : $", error code {errorCode}")
+        + ". The server, role and password are taken from the environment variable "
+        + $"{PostgresDatabase.EnvironmentVariable}.");
     return FailureExitCode;
 }
 
-// Recreates and migrates the database, starts the API with the fixture endpoints, writes the base URL without a
-// trailing slash to urlOutput, then stops the API when standard input reaches its end or the application begins
-// stopping. A failure to read standard input is rethrown after the API has stopped.
-static async Task ServeAsync(PostgresDatabase database, TextWriter urlOutput)
+// Recreates and migrates the database, starts the API with the fixture endpoints and with Serilog writing, whatever the
+// working directory, every event at Warning level and above as compact JSON to standard error, except events of the
+// Microsoft.EntityFrameworkCore and Npgsql categories below Fatal, writes the base URL without a trailing slash to
+// urlOutput, then stops the API when standard input reaches its end or the application begins stopping. A failure to
+// read standard input is rethrown after the API has stopped. enterStep receives the description of each step before
+// the step runs.
+static async Task ServeAsync(PostgresDatabase database, TextWriter urlOutput, Action<string> enterStep)
 {
+    enterStep($"recreating database {database.DatabaseName}");
     await database.RecreateAsync();
+    enterStep($"migrating database {database.DatabaseName}");
     await database.MigrateAsync();
 
+    enterStep("starting the API");
     await using ErewhonApiHost host = await ErewhonApiHost.StartAsync(new ErewhonApiHostOptions
     {
         ConnectionString = database.ConnectionString,
+        Settings = new Dictionary<string, string?>
+        {
+            ["Serilog:Using:0"] = "Serilog.Sinks.Console",
+            ["Serilog:MinimumLevel:Default"] = "Warning",
+            ["Serilog:MinimumLevel:Override:Microsoft.EntityFrameworkCore"] = "Fatal",
+            ["Serilog:MinimumLevel:Override:Npgsql"] = "Fatal",
+            ["Serilog:WriteTo:0:Name"] = "Console",
+            ["Serilog:WriteTo:0:Args:formatter"] =
+                "Serilog.Formatting.Compact.CompactJsonFormatter, Serilog.Formatting.Compact",
+            ["Serilog:WriteTo:0:Args:standardErrorFromLevel"] = "Verbose",
+        },
         MapEndpoints = FixtureEndpoints.MapFixtureEndpoints,
     });
 
+    enterStep("writing the base URL to standard output");
     await urlOutput.WriteLineAsync(host.BaseAddress.GetLeftPart(UriPartial.Authority));
     await urlOutput.FlushAsync();
 
+    enterStep("waiting for standard input to end or the API to stop");
     var stopping = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
     using CancellationTokenRegistration stoppingRegistration = host.Services
         .GetRequiredService<IHostApplicationLifetime>()
@@ -73,8 +100,11 @@ static async Task ServeAsync(PostgresDatabase database, TextWriter urlOutput)
 
     Task first = await Task.WhenAny(ReadStandardInputToEndAsync(), stopping.Task);
 
+    enterStep("stopping the API");
     await host.StopAsync();
+    enterStep("reading standard input");
     await first;
+    enterStep("stopping the API");
 }
 
 // Reads and discards standard input on a thread-pool thread until the stream reports its end.

@@ -44,7 +44,8 @@ public static class ClosureEndpoints
     /// schedule of the session with one at the request date and minutes, and answers 200 with a
     /// <see cref="StartClosureScheduleResponse"/>. When the minutes × <see cref="ClosureScheduleRegistry.SecondsPerMinute"/>
     /// are 0 or less, the session is left without a schedule, <see cref="StartClosureScheduleResponse.Started"/> is
-    /// <see langword="false"/> and <see cref="StartClosureScheduleResponse.SecondsToGo"/> is 0.
+    /// <see langword="false"/> and <see cref="StartClosureScheduleResponse.SecondsToGo"/> is 0. The same answer is given
+    /// when the session was logged out while the request ran, and no schedule is left for it.
     /// </description></item>
     /// <item><description>
     /// <c>POST /admin/tenders/closure-schedule/stop</c>: removes the session's schedule and answers 200 with a

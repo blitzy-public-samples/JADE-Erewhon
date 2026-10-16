@@ -141,7 +141,7 @@ The first argument after `--` selects a verb, compared case-sensitively. A verb 
 | `seed` with no operand, or with more than one | Loads nothing | The `$ExampleCommandLine` message, verbatim JADE text (D-22) | 1 |
 | `seed ""` | Loads nothing | None | 0 |
 
-A failing verb writes one error log event with the verb, the error code and the error text (section 6.2).
+A verb that fails with an exception exits with 1 and writes one `ErewhonUnhandledException` error event, with the verb as its `Verb` property (section 6.2, D-146). The lock outcome is not logged: when the `seed` post-load closure cannot obtain a tender item's row lock within `Erewhon:Locks:TimeoutMs` (`55P03`), the verb exits with 1 without an event (B-38); the loaded data and the awards made before the lock stay. A wrong `seed` operand count is a usage error: `$ExampleCommandLine` on standard output, exit code 1 and no log event. A cancellation requested by the caller ends the verb without a log event.
 
 `<data dir>` is trimmed of spaces and resolved against the process's current directory, which `dotnet run` sets to `src/Erewhon.Api` (section 2.2). From a checkout, name the repository's data files with an absolute path or with `../../../Erewhon/DataFiles`.
 
@@ -196,16 +196,18 @@ Serilog writes one compact JSON (CLEF) object per event, one per line, to the pr
 |---|---|---|
 | Each HTTP request (`UseSerilogRequestLogging`) | `Information`; `Error` for status 500 and above or an exception | `RequestMethod`, `RequestPath`, `StatusCode`, `Elapsed` |
 | An unhandled exception in a request (`ErrorOutcomeMiddleware`), event id 500 `ErewhonUnhandledException` | `Error` | `ErrorCode`, `ErrorText`, `ErrorItem`; `Role`, `AgentId` and `ClientId` when the request has a session. The session id is not logged (D-64) |
-| A failed closure-schedule run (`TenderClosureScheduleService`), event id 500 `ErewhonUnhandledException` | `Error` | `ErrorCode`, `ErrorText`, `ErrorItem`, with `SessionId` and `ClosureDate` from the log scope (D-123) |
-| A failed `migrate` or `seed` verb | `Error` | `Verb`, `ErrorCode`, `ErrorText` |
+| A failed closure-schedule run (`TenderClosureScheduleService`), event id 500 `ErewhonUnhandledException` | `Error` | `ErrorCode`, `ErrorText`, `ErrorItem`, with `ClosureDate` from the log scope. The session id is not logged (D-64, D-123) |
+| A failed closure-schedule tick (`TenderClosureScheduleService`) | `Error` | None; `@x` is the sanitized rendering below (D-64, D-123) |
+| A failed closure-schedule SignalR send (`TenderClosureScheduleService`) | `Warning` | `HubMethod`; `@x` is the sanitized rendering below. The session id is not logged (D-64, D-123) |
+| A failed `migrate` or `seed` verb (`CommandLineVerbs`), event id 500 `ErewhonUnhandledException` | `Error` | `ErrorCode`, `ErrorText`, `ErrorItem`, with `Verb` from the log scope. No event for the lock outcome or a usage error (D-146) |
 | A seed loader line | `Information` | `SeedLine` |
 
 The property values are:
 
-- `ErrorCode`: the JADE error number (for example `500001`, `1035`), else the PostgreSQL SQLSTATE (for example `23505`, `40P01`, `08006` for a lost connection (D-62)), else the .NET `HResult`. A failed verb gives the exception type name where these are absent.
-- `ErrorText`: the JADE error text of a JADE-numbered error, otherwise the full name of the exception type. In a failed-verb event it is the exception message.
+- `ErrorCode`: the JADE error number (for example `500001`, `1035`), else the PostgreSQL SQLSTATE (for example `23505`, `40P01`, `08006` for a lost connection (D-62)), else the .NET `HResult`.
+- `ErrorText`: the JADE error text of a JADE-numbered error, otherwise the full name of the exception type.
 - `ErrorItem`: the field name of a 1035 "String too long" error, otherwise the `$BaseNotAvailable` text "Not available".
-- `@x` of an unhandled-exception event: the chain of exception types, each JADE error's number and text, and the stack traces. It carries no other exception message, PostgreSQL detail or connection text (D-64).
+- `@x` of an unhandled-exception event, a failed closure-schedule tick and a failed closure-schedule SignalR send: the chain of exception types, each JADE error's number and text, and the stack traces. It carries no other exception message, PostgreSQL detail or connection text (D-64, D-123).
 
 When `seed` runs from the command line, standard output carries each loader line twice: once as plain text and once as its JSON event.
 
@@ -214,7 +216,7 @@ When `seed` runs from the command line, standard output carries each loader line
 | Condition | Outcome for the caller | `ErewhonUnhandledException` event |
 |---|---|---|
 | A transaction-agent lock is not obtained within `Erewhon:Locks:TimeoutMs` (SQLSTATE `55P03`) | The operation fails with `$CreateConflictedWithAnotherUser`, `$UpdateConflictedWithAnotherUser` or `$DeleteConflictedWithAnotherUser` in its error list | No |
-| A tender-closure row lock is not obtained within `Erewhon:Locks:TimeoutMs` (`55P03`) | Status 500 with `{"kind": "lock", ...}`; awards already committed stay | No |
+| A tender-closure row lock is not obtained within `Erewhon:Locks:TimeoutMs` (`55P03`) | Status 500 with `{"kind": "lock", ...}`; from the `seed` verb, exit code 1 with the loaded data kept (D-146); awards already committed stay | No |
 | A deadlock (`40P01`) | Status 500 with `{"kind": "deadlock", ...}`; the transaction is rolled back | Yes, `ErrorCode` `40P01` |
 | Item-code allocation fails three times | Status 500 with `{"kind": "exception", ...}`, heading "Error 500001" (B-03) | Yes |
 | Another database failure, for example `23505` (unique key), `23503` (foreign key) or a lost connection | Status 500 with `{"kind": "exception", ...}` carrying the SQLSTATE and the PostgreSQL message (EE-01) | Yes, `ErrorCode` is the SQLSTATE |

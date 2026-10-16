@@ -130,7 +130,11 @@ public sealed class OperationResult
     /// <summary>The internal id of the created or changed row, or <see langword="null"/> when there is none.</summary>
     public long? Id { get; set; }
 
-    /// <summary>The source GUID of the created or changed row, or <see langword="null"/> when there is none.</summary>
+    /// <summary>
+    /// The source GUID of the created or changed row, or <see langword="null"/> when there is none. Not written to JSON;
+    /// JSON read through the constructor leaves it <see langword="null"/>.
+    /// </summary>
+    [JsonIgnore]
     public string? Guid { get; set; }
 
     /// <summary>True when at least one error has been added.</summary>

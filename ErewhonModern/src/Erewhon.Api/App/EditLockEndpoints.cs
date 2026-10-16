@@ -102,8 +102,8 @@ public static class EditLockEndpoints
     /// when the service finds no such row.
     /// </summary>
     private static async Task<Results<Ok<SoftLockStatus>, NotFound>> GetStatusAsync(
-        string type,
-        long id,
+        [FromRoute] string type,
+        [FromRoute] long id,
         [FromServices] SoftLockService softLocks,
         CancellationToken ct)
     {
@@ -116,8 +116,8 @@ public static class EditLockEndpoints
     /// returns 200 with the operation result, or 404 when the service finds no such row.
     /// </summary>
     private static async Task<Results<Ok<OperationResult>, NotFound>> LockAsync(
-        string type,
-        long id,
+        [FromRoute] string type,
+        [FromRoute] long id,
         [FromServices] SoftLockService softLocks,
         CancellationToken ct)
     {
@@ -130,8 +130,8 @@ public static class EditLockEndpoints
     /// holds it and returns 200 with the operation result, or 404 when the service finds no such row.
     /// </summary>
     private static async Task<Results<Ok<OperationResult>, NotFound>> UnlockAsync(
-        string type,
-        long id,
+        [FromRoute] string type,
+        [FromRoute] long id,
         [FromServices] SoftLockService softLocks,
         CancellationToken ct)
     {
@@ -144,8 +144,8 @@ public static class EditLockEndpoints
     /// holding its lock and returns 200 with whether it was sent, or 404 when the service finds no such row.
     /// </summary>
     private static async Task<Results<Ok<SaveRequestResponse>, NotFound>> RequestSaveAsync(
-        string type,
-        long id,
+        [FromRoute] string type,
+        [FromRoute] long id,
         [FromServices] SoftLockService softLocks,
         CancellationToken ct)
     {

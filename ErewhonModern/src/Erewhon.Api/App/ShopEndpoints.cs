@@ -418,7 +418,7 @@ public static class ShopEndpoints
     /// offer order, then by time tendered; 404 when no item has that id.
     /// </summary>
     private static async Task<Results<Ok<ItemDetailsResponse>, NotFound, UnauthorizedHttpResult>> GetItemDetailsAsync(
-        long id,
+        [FromRoute] long id,
         HttpContext httpContext,
         [FromServices] ItemService itemService,
         [FromServices] IServerClock clock,
@@ -461,7 +461,7 @@ public static class ShopEndpoints
     /// type; 404 when no item has that id or the item has no photo.
     /// </summary>
     private static async Task<Results<FileContentHttpResult, NotFound, UnauthorizedHttpResult>> GetItemPhotoAsync(
-        long id,
+        [FromRoute] long id,
         HttpContext httpContext,
         [FromServices] ItemService itemService,
         CancellationToken ct)

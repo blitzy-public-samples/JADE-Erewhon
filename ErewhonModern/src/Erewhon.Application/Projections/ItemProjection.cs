@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Linq.Expressions;
+using System.Text.Json.Serialization;
 using Erewhon.Application.Domain;
 
 namespace Erewhon.Application.Projections;
@@ -11,7 +12,7 @@ namespace Erewhon.Application.Projections;
 /// Also carries the data read by the item <c>display</c> and <c>getSearchResultString</c> helpers.
 /// </summary>
 /// <param name="Id">The row id of the item.</param>
-/// <param name="Guid">The source GUID text of the item.</param>
+/// <param name="Guid">The source GUID text of the item; not written to JSON.</param>
 /// <param name="IsTender"><see langword="true"/> for a tender item; <see langword="false"/> for a retail item.</param>
 /// <param name="CodeNumber">The code number of the item.</param>
 /// <param name="CategoryPrefix">The prefix of the item's category; <see langword="null"/> when the item has no category.</param>
@@ -44,7 +45,7 @@ namespace Erewhon.Application.Projections;
 /// </param>
 public sealed record ItemProjection(
     long Id,
-    string Guid,
+    [property: JsonIgnore] string Guid,
     bool IsTender,
     int CodeNumber,
     string? CategoryPrefix,

@@ -205,19 +205,25 @@ public sealed class ShoppingCartService : TransactionAgent<ShoppingCart>
     /// <summary>
     /// Adds the item to the session cart as one line. A tender item line holds the offer, the session client and the
     /// server timestamp read now; a retail item line holds the offer, the session client and the item price read now.
+    /// Once the line is in the cart, whether the item still exists is read again in one query by id.
     /// No item, or no item with that id → <see cref="MessageKeys.ItemRequired"/>; a tender offer below the item's
     /// reserve price → <see cref="MessageKeys.TenderOfferLessThanReserve"/> (<see cref="FocusFields.Tender"/>); in
-    /// both cases no line is added. Ports <c>ShoppingCartTA.addItem</c>.
+    /// both cases no line is added. An item that no longer exists when it is read again →
+    /// <see cref="MessageKeys.ItemRequired"/>, and this call's line is removed from the cart. An exception from that
+    /// read removes this call's line from the cart and propagates. Removing this call's line leaves in place a line
+    /// another call holds in the cart for the same item. Ports <c>ShoppingCartTA.addItem</c>.
     /// </summary>
     /// <param name="sessionId">The id of the session that owns the cart.</param>
     /// <param name="itemId">The internal id of the item; <see langword="null"/> or 0 for none.</param>
     /// <param name="offer">The offer; on a tender item, the amount tendered.</param>
     /// <param name="ct">Token that cancels the reads.</param>
-    /// <returns>The result: succeeded with no errors when the line was added.</returns>
+    /// <returns>The result: succeeded with no errors when the line was added and the item still exists.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="sessionId"/> is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException"><paramref name="sessionId"/> is empty.</exception>
     /// <exception cref="StringTooLongException">The item code is longer than 11 characters.</exception>
-    /// <exception cref="InvalidOperationException">The cart already holds a line for the item.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The cart already holds a line for the item; that line stays and the item is not read again.
+    /// </exception>
     public async Task<OperationResult> AddItemAsync(
         string sessionId,
         long? itemId,
@@ -301,6 +307,26 @@ public sealed class ShoppingCartService : TransactionAgent<ShoppingCart>
         }
 
         cart.Add(line);
+
+        bool itemExists;
+        try
+        {
+            itemExists = await Db.Items.AnyAsync(candidate => candidate.Id == line.ItemId, ct);
+        }
+        catch
+        {
+            cart.RemoveLines(new[] { line });
+            throw;
+        }
+
+        if (!itemExists)
+        {
+            cart.RemoveLines(new[] { line });
+            result.AddError(MessageKeys.ItemRequired);
+            result.Succeeded = false;
+            return result;
+        }
+
         result.Succeeded = true;
         return result;
     }
@@ -428,6 +454,7 @@ public sealed class ShoppingCartService : TransactionAgent<ShoppingCart>
             {
                 ItemSummary? item = items.GetValueOrDefault(line.ItemId);
                 receiptLines.Add(new CheckoutReceiptLine(
+                    line.ItemId,
                     line.Transaction,
                     line.Code,
                     item?.Name ?? string.Empty,

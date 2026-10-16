@@ -7,6 +7,7 @@ namespace Erewhon.Api.Sessions;
 /// Resolves the session of a request to the app endpoints or the SignalR hub against <see cref="SessionRegistry"/>,
 /// stores the resolved <see cref="SessionEntry"/> in <see cref="HttpContext.Items"/> under
 /// <see cref="HttpContextItemKey"/>, and answers 401 with an empty body to a request that needs a session and has none.
+/// An app endpoint request holds a <see cref="SessionLease"/> on its session until the rest of the pipeline ends.
 /// Requests outside <c>/api/app</c> and <c>/hubs/erewhon</c> pass through unchanged.
 /// </summary>
 /// <param name="next">The next middleware in the pipeline.</param>
@@ -57,18 +58,20 @@ public sealed class SessionMiddleware(RequestDelegate next, SessionRegistry regi
     /// Applies the session gate to the request and then, unless it answers 401, runs the rest of the pipeline.
     /// <list type="bullet">
     /// <item><description>
-    /// A path under <c>/api/app</c>, compared case-insensitively: the first <see cref="HeaderName"/> header value is
-    /// looked up with <see cref="SessionRegistry.TryGet"/> and a registered session is stored under
-    /// <see cref="HttpContextItemKey"/>. <c>GET /api/app/logon-options</c>, <c>POST /api/app/sessions</c> and
-    /// <c>POST /api/app/setup/load-data</c>, matched on method and on the path case-insensitively with one trailing
-    /// <c>/</c> allowed, continue whether or not a session was resolved. Every other request answers 401 with an empty
-    /// body and no content type when no session was resolved, without running the rest of the pipeline.
+    /// A path under <c>/api/app</c>, compared case-insensitively: a <see cref="SessionLease"/> is taken with
+    /// <see cref="SessionRegistry.TryAcquire"/> on the first <see cref="HeaderName"/> header value. When it is taken,
+    /// the leased <see cref="SessionLease.Entry"/> is stored under <see cref="HttpContextItemKey"/>, the rest of the
+    /// pipeline runs, and the lease is disposed once the rest of the pipeline has completed or thrown.
+    /// <c>GET /api/app/logon-options</c>, <c>POST /api/app/sessions</c> and <c>POST /api/app/setup/load-data</c>,
+    /// matched on method and on the path case-insensitively with one trailing <c>/</c> allowed, continue whether or
+    /// not a session was resolved. Every other request answers 401 with an empty body and no content type when no lease
+    /// was taken, without running the rest of the pipeline.
     /// </description></item>
     /// <item><description>
     /// A path under <c>/hubs/erewhon</c>, compared case-insensitively: the first <see cref="HubSessionQueryKey"/>
-    /// query-string value is looked up with <see cref="SessionRegistry.TryGet"/>; a registered session is stored under
-    /// <see cref="HttpContextItemKey"/> and the request continues, otherwise it answers 401 with an empty body without
-    /// running the rest of the pipeline. The <see cref="HeaderName"/> header is not read.
+    /// query-string value is looked up with <see cref="SessionRegistry.TryGet"/>, without a lease; a registered session
+    /// is stored under <see cref="HttpContextItemKey"/> and the request continues, otherwise it answers 401 with an
+    /// empty body without running the rest of the pipeline. The <see cref="HeaderName"/> header is not read.
     /// </description></item>
     /// <item><description>
     /// Any other path continues unchanged; nothing is read or stored.
@@ -86,8 +89,22 @@ public sealed class SessionMiddleware(RequestDelegate next, SessionRegistry regi
 
         if (request.Path.StartsWithSegments(AppPath, StringComparison.OrdinalIgnoreCase))
         {
-            var resolved = TryStoreSession(context, request.Headers[HeaderName]);
-            if (!resolved && !IsBootstrapEndpoint(request))
+            if (_registry.TryAcquire(FirstValue(request.Headers[HeaderName]), out var lease))
+            {
+                try
+                {
+                    context.Items[HttpContextItemKey] = lease.Entry;
+                    await _next(context);
+                }
+                finally
+                {
+                    lease.Dispose();
+                }
+
+                return;
+            }
+
+            if (!IsBootstrapEndpoint(request))
             {
                 context.Response.StatusCode = StatusCodes.Status401Unauthorized;
                 return;
@@ -107,8 +124,7 @@ public sealed class SessionMiddleware(RequestDelegate next, SessionRegistry regi
 
     private bool TryStoreSession(HttpContext context, StringValues values)
     {
-        var sessionId = values.Count > 0 ? values[0] : null;
-        if (!_registry.TryGet(sessionId, out var entry))
+        if (!_registry.TryGet(FirstValue(values), out var entry))
         {
             return false;
         }
@@ -116,6 +132,8 @@ public sealed class SessionMiddleware(RequestDelegate next, SessionRegistry regi
         context.Items[HttpContextItemKey] = entry;
         return true;
     }
+
+    private static string? FirstValue(StringValues values) => values.Count > 0 ? values[0] : null;
 
     private static bool IsBootstrapEndpoint(HttpRequest request)
     {

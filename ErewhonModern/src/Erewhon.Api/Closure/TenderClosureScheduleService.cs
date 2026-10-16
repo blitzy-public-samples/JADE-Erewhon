@@ -18,7 +18,7 @@ namespace Erewhon.Api.Closure;
 /// <param name="scopes">The factory of the dependency-injection scope each closure runs in.</param>
 /// <param name="hub">The hub context that sends the tick and completion messages to the session groups.</param>
 /// <param name="configuration">The configuration that supplies <see cref="TickMsKey"/>.</param>
-/// <param name="logger">The logger that receives closure failures and send failures.</param>
+/// <param name="logger">The logger that receives closure failures, send failures and tick failures.</param>
 public sealed class TenderClosureScheduleService(
     ClosureScheduleRegistry registry,
     IServiceScopeFactory scopes,
@@ -46,8 +46,9 @@ public sealed class TenderClosureScheduleService(
 
     /// <summary>
     /// Reads the timer period from <see cref="TickMsKey"/> once, then runs <see cref="TickAsync"/> on every period
-    /// until <paramref name="stoppingToken"/> is cancelled. A tick that throws is logged as an error and the next
-    /// period runs as usual; cancellation ends the loop without logging an error.
+    /// until <paramref name="stoppingToken"/> is cancelled. A tick that throws is logged as an error event with the
+    /// rendering of <see cref="ErrorOutcomeMiddleware.Sanitize"/> attached, and the next period runs as usual;
+    /// cancellation ends the loop without logging an error.
     /// </summary>
     /// <param name="stoppingToken">Token that is cancelled when the host stops.</param>
     /// <returns>A task that completes when the host stops.</returns>
@@ -71,7 +72,7 @@ public sealed class TenderClosureScheduleService(
                 }
                 catch (Exception exception)
                 {
-                    _logger.LogError(exception, "Tender closure schedule tick failed");
+                    _logger.LogError(ErrorOutcomeMiddleware.Sanitize(exception), "Tender closure schedule tick failed");
                 }
             }
         }
@@ -91,8 +92,12 @@ public sealed class TenderClosureScheduleService(
     /// seconds to go, and its session receives <see cref="ErewhonHub.ClosureCompleted"/> with a
     /// <see cref="ClosureCompletedMessage"/> holding the date closed and the number of tender items awarded, then
     /// <see cref="ErewhonHub.ClosureTick"/> with the restarted countdown. When the closure throws, the schedule is
-    /// removed, nothing more is sent to its session, and one error event is logged, except for a lock outcome, which
-    /// logs nothing; the awards committed before the failure stay. A failure of one schedule leaves the others running.
+    /// removed, nothing more is sent to its session, and one error event is logged through
+    /// <see cref="ErrorOutcomeMiddleware.LogOutcome"/> with <c>ClosureDate</c> in the log scope, except for a lock
+    /// outcome, which logs nothing; the awards committed before the failure stay. A send that fails is logged as a
+    /// warning event with the hub method as <c>HubMethod</c> and the rendering of
+    /// <see cref="ErrorOutcomeMiddleware.Sanitize"/> attached, and the schedule continues. No event carries the
+    /// session id. A failure of one schedule leaves the others running.
     /// Ports <c>ErewhonCloseTendersForm.timerEvent</c>.
     /// </summary>
     /// <param name="ct">Token that cancels the tick.</param>
@@ -151,7 +156,6 @@ public sealed class TenderClosureScheduleService(
             var translated = ErrorOutcomeMiddleware.Translate(exception, mapper);
             using (_logger.BeginScope(new Dictionary<string, object>
             {
-                ["SessionId"] = counted.SessionId,
                 ["ClosureDate"] = counted.Date,
             }))
             {
@@ -194,10 +198,9 @@ public sealed class TenderClosureScheduleService(
         catch (Exception exception)
         {
             _logger.LogWarning(
-                exception,
-                "Could not send {HubMethod} to the group of session {SessionId}",
-                method,
-                sessionId);
+                ErrorOutcomeMiddleware.Sanitize(exception),
+                "Could not send {HubMethod} to the scheduling session",
+                method);
         }
     }
 }

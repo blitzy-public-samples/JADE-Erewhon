@@ -1,3 +1,4 @@
+using System.Text.Json.Serialization;
 using Erewhon.Application.Domain;
 
 namespace Erewhon.Application.Projections;
@@ -7,7 +8,7 @@ namespace Erewhon.Application.Projections;
 /// source GUID, name and the seven fields of its address.
 /// </summary>
 /// <param name="Id">The row id of the company.</param>
-/// <param name="Guid">The source GUID text of the company.</param>
+/// <param name="Guid">The source GUID text of the company; not written to JSON.</param>
 /// <param name="Name">The company name.</param>
 /// <param name="Street">The street of the company's address.</param>
 /// <param name="City">The city of the company's address.</param>
@@ -18,7 +19,7 @@ namespace Erewhon.Application.Projections;
 /// <param name="WebSite">The web site of the company's address.</param>
 public sealed record CompanyProjection(
     long Id,
-    string Guid,
+    [property: JsonIgnore] string Guid,
     string Name,
     string Street,
     string City,

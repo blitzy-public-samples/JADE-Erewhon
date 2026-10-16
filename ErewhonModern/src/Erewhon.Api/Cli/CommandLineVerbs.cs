@@ -1,4 +1,4 @@
-using System.Globalization;
+using Erewhon.Api.Errors;
 using Erewhon.Application.Common;
 using Erewhon.Application.Messages;
 using Erewhon.Persistence;
@@ -23,7 +23,7 @@ public static class CommandLineVerbs
     public const string SeedVerb = "seed";
 
     private const string LoggerCategory = "Erewhon.Api.Cli.CommandLineVerbs";
-    private const string FailureLogTemplate = "{Verb} failed with error {ErrorCode}: {ErrorText}";
+    private const string VerbScopeProperty = "Verb";
     private const int SeedOperandCount = 1;
     private const int SucceededExitCode = 0;
     private const int FailedExitCode = 1;
@@ -57,9 +57,10 @@ public static class CommandLineVerbs
     /// <paramref name="output"/>, and returns 0.
     /// </description></item>
     /// </list>
-    /// A verb that fails with any exception other than a requested cancellation writes one error-level log entry with
-    /// the verb, the error code and the error text, and returns 1. <paramref name="output"/> is flushed before
-    /// returning.
+    /// A verb that fails with any exception other than a requested cancellation returns 1. The exception is translated
+    /// with <see cref="ErrorOutcomeMiddleware.Translate"/>; the lock outcome writes no log event, and any other outcome
+    /// writes one event through <see cref="ErrorOutcomeMiddleware.LogOutcome"/>, with the verb as the <c>Verb</c>
+    /// property of its log scope. <paramref name="output"/> is flushed before returning.
     /// </summary>
     /// <param name="services">The services of the built, unstarted host.</param>
     /// <param name="args">The process arguments; the first is the verb, the rest are its operands.</param>
@@ -180,20 +181,28 @@ public static class CommandLineVerbs
     }
 
     /// <summary>
-    /// Writes one error-level log entry for a failed verb, with the exception attached: <c>Verb</c>, <c>ErrorCode</c>
-    /// (the JADE error number of an <see cref="IJadeException"/>, else the SQLSTATE that
-    /// <see cref="PostgresErrorMapper.GetSqlState"/> finds, else the exception type name) and <c>ErrorText</c> (the
-    /// exception message).
+    /// Translates the exception of a failed verb with <see cref="ErrorOutcomeMiddleware.Translate"/>, using the
+    /// <see cref="PostgresErrorMapper"/> of the verb's scope when one is registered. Writes nothing when
+    /// <see cref="ErrorOutcomeMiddleware.IsLogged"/> is <see langword="false"/> for the translated exception, the lock
+    /// outcome; otherwise writes one event through <see cref="ErrorOutcomeMiddleware.LogOutcome"/>, with no session,
+    /// inside a log scope whose <c>Verb</c> property is <paramref name="verb"/>.
     /// </summary>
     /// <param name="scopedServices">The services of the verb's scope.</param>
     /// <param name="verb">The verb that failed.</param>
     /// <param name="failure">The exception the verb failed with.</param>
     private static void LogFailure(IServiceProvider scopedServices, string verb, Exception failure)
     {
+        PostgresErrorMapper? mapper = scopedServices.GetService<PostgresErrorMapper>();
+        Exception translated = ErrorOutcomeMiddleware.Translate(failure, mapper);
+        if (!ErrorOutcomeMiddleware.IsLogged(translated))
+        {
+            return;
+        }
+
         ILogger logger = scopedServices.GetRequiredService<ILoggerFactory>().CreateLogger(LoggerCategory);
-        string errorCode = failure is IJadeException jade
-            ? jade.ErrorCode.ToString(CultureInfo.InvariantCulture)
-            : PostgresErrorMapper.GetSqlState(failure) ?? failure.GetType().Name;
-        logger.LogError(failure, FailureLogTemplate, verb, errorCode, failure.Message);
+        using (logger.BeginScope(new Dictionary<string, object> { [VerbScopeProperty] = verb }))
+        {
+            ErrorOutcomeMiddleware.LogOutcome(logger, translated, null);
+        }
     }
 }

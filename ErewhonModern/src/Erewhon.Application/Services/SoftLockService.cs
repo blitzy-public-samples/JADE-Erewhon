@@ -20,7 +20,6 @@ namespace Erewhon.Application.Services;
 /// <see langword="true"/> when any session holds the row's soft edit lock, the caller's own session included.
 /// </param>
 /// <param name="IsLockedByCaller"><see langword="true"/> when the caller's session holds the row's soft edit lock.</param>
-/// <param name="LockedBySession">The id of the session holding the lock; <see langword="null"/> when the row is unlocked.</param>
 /// <param name="Thing">The name of the thing being edited, the <c>$Thing</c> text "thing".</param>
 /// <param name="Prompt">The <c>$ThingCurrentlyEdited</c> text for <paramref name="Thing"/>, asked with Yes and No.</param>
 /// <param name="Title">The <c>$ThingAlreadyBeingEdited</c> text for <paramref name="Thing"/>, the title of the prompt.</param>
@@ -29,7 +28,6 @@ public sealed record SoftLockStatus(
     long Id,
     bool IsLocked,
     bool IsLockedByCaller,
-    string? LockedBySession,
     string Thing,
     string Prompt,
     string Title);
@@ -164,7 +162,6 @@ public sealed class SoftLockService
             state.Id,
             PersistentModel.IsSoftLockSet(state.LockedBySession),
             IsLockedByCaller(state.LockedBySession),
-            state.LockedBySession,
             thing,
             MessageCatalog.Get(MessageKeys.ThingCurrentlyEdited, thing),
             MessageCatalog.Get(MessageKeys.ThingAlreadyBeingEdited, thing));

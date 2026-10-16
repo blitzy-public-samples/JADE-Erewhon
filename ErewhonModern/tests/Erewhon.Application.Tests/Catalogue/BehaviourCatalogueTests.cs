@@ -991,8 +991,8 @@ public sealed class BehaviourCatalogueTests : ErewhonTestBase
         Assert.Equal(
             new[]
             {
-                new CheckoutReceiptLine(Text(MessageKeys.RetailItemType), r3Code, "Catalogue Retail", 40.00m, 0m, false),
-                new CheckoutReceiptLine(Text(MessageKeys.TenderItemType), t2Code, "Catalogue Tender", 50.00m, 55.00m, true),
+                new CheckoutReceiptLine(r3, Text(MessageKeys.RetailItemType), r3Code, "Catalogue Retail", 40.00m, 0m, false),
+                new CheckoutReceiptLine(t2, Text(MessageKeys.TenderItemType), t2Code, "Catalogue Tender", 50.00m, 55.00m, true),
             },
             receipt.Lines);
         Assert.True(GetService<ICartStore>().GetCart(SessionId).IsEmpty);
