@@ -1,6 +1,7 @@
 using System.ServiceModel;
 using Erewhon.Application.Abstractions;
 using Erewhon.Application.Common;
+using Erewhon.Application.Domain;
 using Erewhon.Application.Messages;
 using Erewhon.Application.Services;
 using Erewhon.SoapClient.WebService;
@@ -47,6 +48,10 @@ public sealed class TestUpdateClientWithDTO : ErewhonTestBase
             email = NewEmail,
             website = NewWebsite,
         };
+        Client fixtureClient = Builder.MyClient
+            ?? throw new InvalidOperationException($"{nameof(TestCompanyBuilder.MyClient)} is not set.");
+        Client? snapshot = await ReadClientAsync(fixtureClient.Id);
+        Assert.NotNull(snapshot);
 
         DTOResult dtoResult = await WebService.updateClientWithDTOAsync(dtoClient);
 
@@ -54,6 +59,21 @@ public sealed class TestUpdateClientWithDTO : ErewhonTestBase
         Assert.Equal(ExpectedErrorCount, dtoResult.allErrors?.Length ?? 0);
         Assert.Equal(MessageCatalog.Get(MessageKeys.ClientNameNotFound, NewClientName), dtoResult.allErrors![0]);
         Assert.Equal("Client Some Agent That Does Not Exist not found", dtoResult.allErrors[0]);
+        Assert.True(JadeValues.IsNull(dtoResult.guid));
+
+        Assert.False(await ClientExistsAsync(NewClientName));
+
+        Client? stored = await ReadClientAsync(fixtureClient.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(snapshot.Name, stored.Name);
+        Assert.Equal(snapshot.Guid, stored.Guid);
+        Assert.Equal(snapshot.Address.Street, stored.Address.Street);
+        Assert.Equal(snapshot.Address.City, stored.Address.City);
+        Assert.Equal(snapshot.Address.Country, stored.Address.Country);
+        Assert.Equal(snapshot.Address.Phone, stored.Address.Phone);
+        Assert.Equal(snapshot.Address.Fax, stored.Address.Fax);
+        Assert.Equal(snapshot.Address.Email, stored.Address.Email);
+        Assert.Equal(snapshot.Address.WebSite, stored.Address.WebSite);
     }
 
     [Fact]
@@ -69,7 +89,7 @@ public sealed class TestUpdateClientWithDTO : ErewhonTestBase
         const string NewWebsite = "www.Friedrichsdorf.de";
         const int ExpectedStatus = 200;
 
-        await Builder.CreateTestClientAsync(
+        Client client = await Builder.CreateTestClientAsync(
             ClientName,
             Builder.CreateTestAddress(
                 "555 Fake St.",
@@ -100,6 +120,19 @@ public sealed class TestUpdateClientWithDTO : ErewhonTestBase
         Assert.False(JadeValues.IsNull(dtoResult.guid));
         Assert.Equal(0, dtoResult.allErrors?.Length ?? 0);
         Assert.Equal(ExpectedStatus, dtoResult.statusCode);
+        Assert.Equal(client.Guid, dtoResult.guid);
+
+        Client? stored = await ReadClientAsync(client.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(ClientName, stored.Name);
+        Assert.Equal(client.Guid, stored.Guid);
+        Assert.Equal(NewStreet, stored.Address.Street);
+        Assert.Equal(NewCity, stored.Address.City);
+        Assert.Equal(NewCountry, stored.Address.Country);
+        Assert.Equal(NewPhone, stored.Address.Phone);
+        Assert.Equal(NewFax, stored.Address.Fax);
+        Assert.Equal(NewEmail, stored.Address.Email);
+        Assert.Equal(NewWebsite, stored.Address.WebSite);
     }
 
     /// <summary>
@@ -148,6 +181,25 @@ public sealed class TestUpdateClientWithDTO : ErewhonTestBase
         await using AsyncServiceScope scope = Api.Services.CreateAsyncScope();
         scope.ServiceProvider.GetRequiredService<ICompanyContext>().Bind(companyId);
         return await scope.ServiceProvider.GetRequiredService<ClientService>().FindByNameAsync(name) is not null;
+    }
+
+    /// <summary>
+    /// Returns the client with row id <paramref name="id"/>, with its address, read through
+    /// <see cref="ClientService.FindByIdAsync"/> in a new scope of <see cref="ErewhonTestBase.Api"/> bound to the
+    /// company <see cref="TestCompanyBuilder.MyCompany"/>.
+    /// </summary>
+    /// <param name="id">The row id of the client.</param>
+    /// <returns>The stored client, or <see langword="null"/> when no client has that id.</returns>
+    /// <exception cref="InvalidOperationException"><see cref="TestCompanyBuilder.MyCompany"/> is not set.</exception>
+    private async Task<Client?> ReadClientAsync(long id)
+    {
+        long companyId = Builder.MyCompany?.Id
+            ?? throw new InvalidOperationException(
+                $"{nameof(ReadClientAsync)} reads the company of {nameof(TestCompanyBuilder.CreateTestDataAsync)}, which is not set.");
+
+        await using AsyncServiceScope scope = Api.Services.CreateAsyncScope();
+        scope.ServiceProvider.GetRequiredService<ICompanyContext>().Bind(companyId);
+        return await scope.ServiceProvider.GetRequiredService<ClientService>().FindByIdAsync(id);
     }
 
     /// <summary>

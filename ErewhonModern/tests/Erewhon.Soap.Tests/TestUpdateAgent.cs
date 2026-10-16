@@ -25,8 +25,9 @@ public sealed class TestUpdateAgent : ErewhonTestBase
             $"{nameof(WebService)} is available from {nameof(SetUpAsync)} until {nameof(TearDownAsync)}.");
 
     /// <summary>
-    /// Updates an agent that does not exist: the result has status 404 and no GUID.
-    /// Ports <c>TestUpdateAgent.testInvalidAgent</c>.
+    /// Updates an agent that does not exist: the result has status 404 and no GUID, no agent of that name exists
+    /// afterwards, and the fixture agent "Test Agent", read back by id in a new scope, keeps the name, GUID and seven
+    /// address fields read before the update. Ports <c>TestUpdateAgent.testInvalidAgent</c>.
     /// </summary>
     /// <returns>A task that completes when the test has run.</returns>
     [Fact]
@@ -42,17 +43,37 @@ public sealed class TestUpdateAgent : ErewhonTestBase
         const string NewWebsite = "www.tamil.in";
         const int ExpectedError = 404;
 
+        Agent fixtureAgent = Builder.MyAgent
+            ?? throw new InvalidOperationException($"{nameof(TestCompanyBuilder.MyAgent)} is not set.");
+        Agent? snapshot = await ReadAgentAsync(fixtureAgent.Id);
+        Assert.NotNull(snapshot);
+
         DTOResult result = await WebService.updateAgentAsync(
             AgentName, NewStreet, NewCity, NewCountry, NewPhone, NewFax, NewEmail, NewWebsite);
 
         Assert.NotNull(result);
         Assert.Equal(ExpectedError, result.statusCode);
         Assert.True(JadeValues.IsNull(result.guid));
+
+        Assert.False(await AgentExistsAsync(AgentName));
+
+        Agent? stored = await ReadAgentAsync(fixtureAgent.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(snapshot.Name, stored.Name);
+        Assert.Equal(snapshot.Guid, stored.Guid);
+        Assert.Equal(snapshot.Address.Street, stored.Address.Street);
+        Assert.Equal(snapshot.Address.City, stored.Address.City);
+        Assert.Equal(snapshot.Address.Country, stored.Address.Country);
+        Assert.Equal(snapshot.Address.Phone, stored.Address.Phone);
+        Assert.Equal(snapshot.Address.Fax, stored.Address.Fax);
+        Assert.Equal(snapshot.Address.Email, stored.Address.Email);
+        Assert.Equal(snapshot.Address.WebSite, stored.Address.WebSite);
     }
 
     /// <summary>
     /// Creates the agent "Tabai Tanivula" at 314 Nohwere Lane, Christchurch, then updates its address to
-    /// 1, TVS School Road, Tamil Nadu: the result has status 200 and a GUID.
+    /// 1, TVS School Road, Tamil Nadu: the result has status 200 and the agent's GUID, and the agent, read back by id
+    /// in a new scope, has its name, its GUID and the seven new address fields.
     /// Ports <c>TestUpdateAgent.testValidAgent</c>.
     /// </summary>
     /// <returns>A task that completes when the test has run.</returns>
@@ -77,7 +98,7 @@ public sealed class TestUpdateAgent : ErewhonTestBase
             "FAX",
             "admin@Erewhon.nz",
             "www.jadeworld.com");
-        await Builder.CreateTestAgentAsync(AgentName, address);
+        Agent agent = await Builder.CreateTestAgentAsync(AgentName, address);
 
         Assert.True(await AgentExistsAsync(AgentName));
 
@@ -87,6 +108,19 @@ public sealed class TestUpdateAgent : ErewhonTestBase
         Assert.NotNull(result);
         Assert.Equal(ExpectedStatus, result.statusCode);
         Assert.False(JadeValues.IsNull(result.guid));
+        Assert.Equal(agent.Guid, result.guid);
+
+        Agent? stored = await ReadAgentAsync(agent.Id);
+        Assert.NotNull(stored);
+        Assert.Equal(AgentName, stored.Name);
+        Assert.Equal(agent.Guid, stored.Guid);
+        Assert.Equal(NewStreet, stored.Address.Street);
+        Assert.Equal(NewCity, stored.Address.City);
+        Assert.Equal(NewCountry, stored.Address.Country);
+        Assert.Equal(NewPhone, stored.Address.Phone);
+        Assert.Equal(NewFax, stored.Address.Fax);
+        Assert.Equal(NewEmail, stored.Address.Email);
+        Assert.Equal(NewWebsite, stored.Address.WebSite);
     }
 
     /// <summary>
@@ -135,6 +169,25 @@ public sealed class TestUpdateAgent : ErewhonTestBase
         scope.ServiceProvider.GetRequiredService<ICompanyContext>().Bind(company.Id);
 
         return await scope.ServiceProvider.GetRequiredService<AgentService>().FindByNameAsync(name) is not null;
+    }
+
+    /// <summary>
+    /// Returns the agent with internal id <paramref name="id"/>, with its address, read through
+    /// <see cref="AgentService.FindByIdAsync"/> in a new scope of <see cref="ErewhonTestBase.Api"/> bound to the
+    /// company <see cref="TestCompanyBuilder.MyCompany"/>.
+    /// </summary>
+    /// <param name="id">The internal id (<c>agents.id</c>) of the agent.</param>
+    /// <returns>The stored agent, or <see langword="null"/> when no agent has that id.</returns>
+    /// <exception cref="InvalidOperationException"><see cref="TestCompanyBuilder.MyCompany"/> is not set.</exception>
+    private async Task<Agent?> ReadAgentAsync(long id)
+    {
+        Company company = Builder.MyCompany
+            ?? throw new InvalidOperationException($"{nameof(TestCompanyBuilder.MyCompany)} is not set.");
+
+        await using AsyncServiceScope scope = Api.Services.CreateAsyncScope();
+        scope.ServiceProvider.GetRequiredService<ICompanyContext>().Bind(company.Id);
+
+        return await scope.ServiceProvider.GetRequiredService<AgentService>().FindByIdAsync(id);
     }
 
     /// <summary>
