@@ -10,6 +10,7 @@ using Erewhon.Application.Services;
 using Erewhon.Application.Transactions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
+using Npgsql;
 
 namespace Erewhon.Persistence.Seed;
 
@@ -37,6 +38,16 @@ public sealed record SeedLoadResult(int TenderSalesBuilt, IReadOnlyList<string> 
 /// at the server date. Dates and timestamps read from the files are moved forward by the number of days from
 /// 1 January 2000 to the server date. Every progress line is written to the output writer, to the log and to
 /// <see cref="SeedLoadResult.OutputLines"/>. Ports JADE <c>InitialDataLoader</c>.
+/// <para>
+/// Every load holds the exclusive session-level PostgreSQL advisory lock
+/// <c>pg_advisory_lock(hashtextextended('InitialDataLoader.loadData', 0))</c>, one lock for the whole database, so loads
+/// run one after another across connections and processes. The loader opens a dedicated connection with the context's
+/// connection string, <c>Pooling</c> and <c>Multiplexing</c> off, takes the lock on it before the purge reads the
+/// lowest-id company, holds it through the load commit, the publication of the notifications and the post-load
+/// closure, then releases it and disposes the connection, which ends its PostgreSQL session. The context's own
+/// connections take no part in the lock. The wait for the lock sets no <c>lock_timeout</c>, runs with no command
+/// timeout, and ends only when the lock is granted or the load's token is cancelled.
+/// </para>
 /// </summary>
 /// <remarks>
 /// The data files are only read. One instance serves one dependency-injection scope; its members are not safe to call
@@ -51,10 +62,15 @@ public sealed class InitialDataLoader
     private const int DataDirectoryMaxLength = 301;
     private const char ForwardSlash = '/';
     private const char BackSlash = '\\';
+    private const string LoadLockName = "InitialDataLoader.loadData";
+    private const string LoadLockNameParameter = "name";
+    private const string LoadLockSql = "SELECT pg_advisory_lock(hashtextextended(@name, 0))";
+    private const string LoadUnlockSql = "SELECT pg_advisory_unlock(hashtextextended(@name, 0))";
+    private const int NoCommandTimeout = 0;
 
     private static readonly DateOnly OffsetStartDate = new(2000, 1, 1);
 
-    private readonly IErewhonDbContext _db;
+    private readonly ErewhonDbContext _db;
     private readonly IUnitOfWork _unitOfWork;
     private readonly ICompanyContext _companyContext;
     private readonly IServerClock _serverClock;
@@ -78,7 +94,10 @@ public sealed class InitialDataLoader
     /// Creates the loader over the database, unit of work, bound company, server clock, notification queue and
     /// application services of its scope.
     /// </summary>
-    /// <param name="db">The Erewhon database of the scope, read by the name and GUID look-ups.</param>
+    /// <param name="db">
+    /// The Erewhon database of the scope, read by the name and GUID look-ups; its connection string is that of the
+    /// connection that holds the load lock.
+    /// </param>
     /// <param name="unitOfWork">The unit of work that begins, commits and rolls back the load transaction.</param>
     /// <param name="companyContext">The company bound to the scope; the loader's company is bound to it on creation.</param>
     /// <param name="serverClock">The database server clock that gives the load date.</param>
@@ -99,7 +118,7 @@ public sealed class InitialDataLoader
     /// <param name="logger">The log that receives every output line, or <see langword="null"/> for none.</param>
     /// <exception cref="ArgumentNullException">Any argument other than <paramref name="logger"/> is <see langword="null"/>.</exception>
     public InitialDataLoader(
-        IErewhonDbContext db,
+        ErewhonDbContext db,
         IUnitOfWork unitOfWork,
         ICompanyContext companyContext,
         IServerClock serverClock,
@@ -157,8 +176,64 @@ public sealed class InitialDataLoader
     /// The configured directory exists and its path, trimmed of spaces and followed by <c>/</c> unless it ends with
     /// <c>/</c> or <c>\</c>, is longer than 301 characters (1035); nothing is deleted.
     /// </exception>
+    /// <exception cref="MissingConnectionStringException">
+    /// The configured directory is valid and the context has no connection string; nothing is deleted.
+    /// </exception>
     public Task<SeedLoadResult> LoadConfiguredAsync(TextWriter? output = null, CancellationToken ct = default) =>
         LoadAsync(_settings.DataDirectory ?? string.Empty, output, ct);
+
+    /// <summary>
+    /// Opens the dedicated lock connection and waits on it for the load lock <c>InitialDataLoader.loadData</c>, then
+    /// reads whether any company exists. When one does, it releases the lock, disposes the lock connection and returns
+    /// <see langword="null"/>, having written no line and run no load step. Otherwise, still holding the lock, it loads
+    /// the seed data files of <see cref="SeedSettings.DataDirectory"/> as <see cref="LoadConfiguredAsync"/> does, from
+    /// the directory check on, then releases the lock and disposes the lock connection. The seconds of the final line
+    /// <c>Database Initialized in &lt;n&gt; seconds</c> count from the call, the wait for the lock included.
+    /// </summary>
+    /// <param name="output">The writer that receives each output line; <see cref="Console.Out"/> when <see langword="null"/>.</param>
+    /// <param name="ct">
+    /// Token that cancels the wait for the lock, the company read and the load; the publication of the committed load's
+    /// notifications ignores it.
+    /// </param>
+    /// <returns>
+    /// The number of tender sales the post-load closure built and every line written; <see langword="null"/> when a
+    /// company exists once the lock is held.
+    /// </returns>
+    /// <exception cref="ErewhonException">
+    /// The configured directory is missing, empty, not a valid path or not an existing directory (500004), or a
+    /// company still exists after the purge (500003).
+    /// </exception>
+    /// <exception cref="StringTooLongException">
+    /// The configured directory exists and its path, trimmed of spaces and followed by <c>/</c> unless it ends with
+    /// <c>/</c> or <c>\</c>, is longer than 301 characters (1035); nothing is deleted.
+    /// </exception>
+    /// <exception cref="MissingConnectionStringException">The context has no connection string.</exception>
+    public async Task<SeedLoadResult?> LoadConfiguredWhenNoCompanyAsync(
+        TextWriter? output = null,
+        CancellationToken ct = default)
+    {
+        Stopwatch startTime = Stopwatch.StartNew();
+
+        NpgsqlConnection lockConnection = await AcquireLoadLockAsync(ct);
+        try
+        {
+            if (await _db.Companies.AnyAsync(ct))
+            {
+                return null;
+            }
+
+            return await RunLoadAsync(
+                _settings.DataDirectory ?? string.Empty,
+                output,
+                startTime,
+                loadLockHeld: true,
+                ct);
+        }
+        finally
+        {
+            await ReleaseLoadLockAsync(lockConnection);
+        }
+    }
 
     /// <summary>
     /// Loads the seed data files of <paramref name="directoryPath"/>:
@@ -166,6 +241,9 @@ public sealed class InitialDataLoader
     /// <item><description>
     /// Validates the directory path, trimmed of spaces, and checks that it, followed by <c>/</c> unless it ends with
     /// <c>/</c> or <c>\</c>, is at most 301 characters long.
+    /// </description></item>
+    /// <item><description>
+    /// Opens the dedicated lock connection and waits on it for the load lock <c>InitialDataLoader.loadData</c>.
     /// </description></item>
     /// <item><description>Reads the server date once; it is the load date.</description></item>
     /// <item><description>Deletes the lowest-id company, with everything it owns, in its own transaction.</description></item>
@@ -175,8 +253,12 @@ public sealed class InitialDataLoader
     /// queued notifications and propagates; the committed purge stays.
     /// </description></item>
     /// <item><description>Publishes the load's notifications, then closes the tenders due at the load date.</description></item>
+    /// <item><description>
+    /// Releases the load lock and disposes the lock connection, whether or not the steps since the lock succeeded.
+    /// </description></item>
     /// </list>
-    /// The final line <c>Database Initialized in &lt;n&gt; seconds</c> is written whether or not the load succeeds.
+    /// The final line <c>Database Initialized in &lt;n&gt; seconds</c> is written whether or not the load succeeds; its
+    /// seconds count from the call, the wait for the lock included.
     /// </summary>
     /// <param name="directoryPath">
     /// The path of the directory holding the seed data files; a relative path is resolved against the current
@@ -184,7 +266,8 @@ public sealed class InitialDataLoader
     /// </param>
     /// <param name="output">The writer that receives each output line; <see cref="Console.Out"/> when <see langword="null"/>.</param>
     /// <param name="ct">
-    /// Token that cancels the load; the publication of the committed load's notifications ignores it.
+    /// Token that cancels the wait for the lock and the load; the publication of the committed load's notifications
+    /// ignores it.
     /// </param>
     /// <returns>The number of tender sales the post-load closure built and every line written.</returns>
     /// <exception cref="ErewhonException">
@@ -203,24 +286,59 @@ public sealed class InitialDataLoader
     /// An agent rate names an item category, or a percentage, that no stored category or rate has.
     /// </exception>
     /// <exception cref="ErewhonLockException">A tender item row lock was not obtained during the post-load closure.</exception>
-    public async Task<SeedLoadResult> LoadAsync(
+    /// <exception cref="MissingConnectionStringException">
+    /// The directory path is valid and the context has no connection string; nothing is deleted.
+    /// </exception>
+    public Task<SeedLoadResult> LoadAsync(
         string directoryPath,
         TextWriter? output = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default) =>
+        RunLoadAsync(directoryPath, output, Stopwatch.StartNew(), loadLockHeld: false, ct);
+
+    /// <summary>
+    /// Runs the steps of <see cref="LoadAsync"/> over <paramref name="directoryPath"/>. When
+    /// <paramref name="loadLockHeld"/> is <see langword="false"/>, the lock connection is opened and the load lock taken
+    /// after the directory check, and the lock released and the lock connection disposed in a <see langword="finally"/>
+    /// block after the post-load closure; when it is <see langword="true"/>, the caller holds the lock and releases it.
+    /// Writes the final line <c>Database Initialized in &lt;n&gt; seconds</c>, with the whole seconds elapsed on
+    /// <paramref name="startTime"/>, whether or not the load succeeds.
+    /// </summary>
+    /// <param name="directoryPath">The path of the directory holding the seed data files.</param>
+    /// <param name="output">The writer that receives each output line; <see cref="Console.Out"/> when <see langword="null"/>.</param>
+    /// <param name="startTime">The clock started by the public call.</param>
+    /// <param name="loadLockHeld">Whether the caller already holds the load lock on its own lock connection.</param>
+    /// <param name="ct">Token that cancels the wait for the lock and the load.</param>
+    /// <returns>The number of tender sales the post-load closure built and every line written.</returns>
+    private async Task<SeedLoadResult> RunLoadAsync(
+        string directoryPath,
+        TextWriter? output,
+        Stopwatch startTime,
+        bool loadLockHeld,
+        CancellationToken ct)
     {
         var run = new SeedRun(output ?? Console.Out);
-        Stopwatch startTime = Stopwatch.StartNew();
 
         int total;
         try
         {
             run.DataDirectory = ValidateDirectoryPath(directoryPath);
 
-            DateOnly currentDate = await _serverClock.GetServerDateAsync(ct);
-
-            await PurgeFirstCompanyAsync(ct);
-            await LoadInTransactionAsync(run, currentDate, ct);
-            total = await CloseTendersAtCurrentDateAsync(run, currentDate, ct);
+            if (loadLockHeld)
+            {
+                total = await LoadWithLockHeldAsync(run, ct);
+            }
+            else
+            {
+                NpgsqlConnection lockConnection = await AcquireLoadLockAsync(ct);
+                try
+                {
+                    total = await LoadWithLockHeldAsync(run, ct);
+                }
+                finally
+                {
+                    await ReleaseLoadLockAsync(lockConnection);
+                }
+            }
         }
         finally
         {
@@ -230,6 +348,98 @@ public sealed class InitialDataLoader
         }
 
         return new SeedLoadResult(total, run.Lines.ToArray());
+    }
+
+    /// <summary>
+    /// Reads the server date as the load date, purges the lowest-id company, runs the load transaction and closes the
+    /// tenders due at the load date. The caller holds the load lock.
+    /// </summary>
+    /// <param name="run">The state of the running load, with its validated data directory.</param>
+    /// <param name="ct">Token that cancels the load.</param>
+    /// <returns>The number of tender items the post-load closure awarded.</returns>
+    private async Task<int> LoadWithLockHeldAsync(SeedRun run, CancellationToken ct)
+    {
+        DateOnly currentDate = await _serverClock.GetServerDateAsync(ct);
+
+        await PurgeFirstCompanyAsync(ct);
+        await LoadInTransactionAsync(run, currentDate, ct);
+        return await CloseTendersAtCurrentDateAsync(run, currentDate, ct);
+    }
+
+    /// <summary>
+    /// Opens the lock connection: a new <see cref="NpgsqlConnection"/> whose connection string is the context's,
+    /// copied through <see cref="NpgsqlConnectionStringBuilder"/> with <c>Pooling</c> and <c>Multiplexing</c> set to
+    /// <see langword="false"/> and every other setting unchanged, so it opens a physical connection, and a PostgreSQL
+    /// session, of its own. On it, outside any transaction, it takes the exclusive session-level advisory lock
+    /// <c>pg_advisory_lock(hashtextextended('InitialDataLoader.loadData', 0))</c> with command timeout 0, no timeout;
+    /// no <c>lock_timeout</c> is set, so the wait lasts until the lock is granted or <paramref name="ct"/> is
+    /// cancelled. When the connection does not open or the lock is not taken, the connection is disposed and the
+    /// failure propagates.
+    /// </summary>
+    /// <param name="ct">Token that cancels the opening of the connection and the wait for the lock.</param>
+    /// <returns>
+    /// The open lock connection, whose session holds the lock; <see cref="ReleaseLoadLockAsync"/> releases the lock and
+    /// disposes it.
+    /// </returns>
+    /// <exception cref="MissingConnectionStringException">
+    /// The context's connection string is <see langword="null"/>, empty or white space; no connection is opened.
+    /// </exception>
+    private async Task<NpgsqlConnection> AcquireLoadLockAsync(CancellationToken ct)
+    {
+        string? connectionString = _db.Database.GetConnectionString();
+        if (string.IsNullOrWhiteSpace(connectionString))
+        {
+            throw new MissingConnectionStringException();
+        }
+
+        var lockConnection = new NpgsqlConnection(
+            new NpgsqlConnectionStringBuilder(connectionString) { Pooling = false, Multiplexing = false }
+                .ConnectionString);
+        try
+        {
+            await lockConnection.OpenAsync(ct);
+            await using var command = new NpgsqlCommand(LoadLockSql, lockConnection)
+            {
+                CommandTimeout = NoCommandTimeout,
+            };
+            command.Parameters.AddWithValue(LoadLockNameParameter, LoadLockName);
+            await command.ExecuteNonQueryAsync(ct);
+        }
+        catch
+        {
+            await lockConnection.DisposeAsync();
+            throw;
+        }
+
+        return lockConnection;
+    }
+
+    /// <summary>
+    /// Releases the load lock with <c>pg_advisory_unlock(hashtextextended('InitialDataLoader.loadData', 0))</c> on
+    /// <paramref name="lockConnection"/> and <see cref="CancellationToken.None"/>, then disposes the connection, which
+    /// closes its physical connection and ends its PostgreSQL session together with any lock the session still holds.
+    /// A failure of the release is not thrown: it is logged as one Warning event with the fixed text
+    /// <c>The seed load lock could not be released.</c>, which has no message property, and a
+    /// <see cref="SanitizedException"/> of the failure attached in its place.
+    /// </summary>
+    /// <param name="lockConnection">The lock connection returned by <see cref="AcquireLoadLockAsync"/>.</param>
+    /// <returns>A task that completes when the lock connection is disposed.</returns>
+    private async Task ReleaseLoadLockAsync(NpgsqlConnection lockConnection)
+    {
+        try
+        {
+            await using var command = new NpgsqlCommand(LoadUnlockSql, lockConnection);
+            command.Parameters.AddWithValue(LoadLockNameParameter, LoadLockName);
+            await command.ExecuteNonQueryAsync(CancellationToken.None);
+        }
+        catch (Exception unlockFailure)
+        {
+            _logger?.LogWarning(new SanitizedException(unlockFailure), "The seed load lock could not be released.");
+        }
+        finally
+        {
+            await lockConnection.DisposeAsync();
+        }
     }
 
     /// <summary>
@@ -670,7 +880,6 @@ public sealed class InitialDataLoader
         }
     }
 
-
     /// <summary>
     /// Loads <see cref="SeedFileNames.RetailItemsDataFile"/> (GUID, name, description, photo file, price, listed date,
     /// agent, country, region, category): for each line, persists a retail item with the line's GUID, a newly allocated
@@ -1052,7 +1261,6 @@ public sealed class InitialDataLoader
                     ElapsedText(startClock))));
         }
     }
-
 
     /// <summary>
     /// Sets the item values of <paramref name="command"/> from <paramref name="item"/>, in this order: the GUID, a code

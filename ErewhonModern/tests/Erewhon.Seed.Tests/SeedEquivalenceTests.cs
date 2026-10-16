@@ -1,6 +1,7 @@
 using System.Data.Common;
 using System.Diagnostics;
 using System.Globalization;
+using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -47,8 +48,12 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
     private const string ConnectionSentinel = "Host=secret-host;Username=secret-user";
     private const string RollbackWarningTemplate = "The seed load transaction could not be rolled back.";
     private const string EndLineWarningTemplate = "The end line of seed data file {SeedFile} was not written.";
+    private const string LoadLockWarningTemplate = "The seed load lock could not be released.";
     private const string SeedFileProperty = "SeedFile";
     private const string SourceContextProperty = "SourceContext";
+    private const string LoadLockName = "InitialDataLoader.loadData";
+    private const string LoadDataPath = "/api/app/setup/load-data";
+    private const string RefusedLoadDataBody = "{\"loaded\":false,\"tenderSalesBuilt\":0,\"outputLines\":[]}";
 
     private const string LocationsFile = "Locations.txt";
     private const string AgentsFile = "Agents.txt";
@@ -90,6 +95,8 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
 
     private static readonly TimeSpan HubDeliveryTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan HubRoundTimeout = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan LoadLockWaitTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan LoadLockPollInterval = TimeSpan.FromMilliseconds(50);
 
     private readonly PostgresDatabase _database = PostgresDatabase.ForAssembly(typeof(SeedEquivalenceTests).Assembly);
     private readonly CollectingLogSink _logSink = new();
@@ -546,6 +553,116 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// Two <see cref="InitialDataLoader.LoadAsync"/> calls over <c>Erewhon/DataFiles</c>, started together on the empty
+    /// database, each in its own scope of the host: while one loads, the other waits for the seed load lock
+    /// <c>InitialDataLoader.loadData</c>; both complete with 1 tender sale built, exactly one company remains, holding the
+    /// seed counts once, and no advisory lock is held or waited for in the database afterwards.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B80_ConcurrentLoadsLeaveOneCompany()
+    {
+        Task<(SeedLoadResult Result, string Output)>[] loads = [LoadAsync(), LoadAsync()];
+
+        bool secondLoadWaited = await WaitForLoadLockWaiterAsync();
+        (SeedLoadResult Result, string Output)[] completed = await Task.WhenAll(loads);
+
+        // B-80, D-170: the loads run one after another, so the later one purges the earlier one's company.
+        Assert.Equal(0, await CountAdvisoryLocksAsync());
+        Assert.True(secondLoadWaited, $"No load waited for {LoadLockName} within {LoadLockWaitTimeout}.");
+        Assert.All(completed, load => Assert.Equal(1, load.Result.TenderSalesBuilt));
+        Assert.Single(await CompanyIdsAsync());
+        AssertSeedCounts(await CountTablesAsync());
+    }
+
+    /// <summary>
+    /// Two <see cref="InitialDataLoader.LoadConfiguredWhenNoCompanyAsync"/> calls, started together on the empty
+    /// database, each in its own scope of the host and writing to its own writer: one loads and returns 1 tender sale
+    /// built, its writer holding exactly the result's lines; the other returns <see langword="null"/> and writes
+    /// nothing. Exactly one company remains, holding the seed counts once, and no advisory lock is held or waited for in
+    /// the database afterwards.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B80_ConcurrentGatedLoadsRefuseSecond()
+    {
+        using var firstWriter = new StringWriter(CultureInfo.InvariantCulture);
+        using var secondWriter = new StringWriter(CultureInfo.InvariantCulture);
+        StringWriter[] writers = [firstWriter, secondWriter];
+
+        SeedLoadResult?[] results = await Task.WhenAll(
+            LoadWhenNoCompanyAsync(firstWriter),
+            LoadWhenNoCompanyAsync(secondWriter));
+
+        // B-80, D-170: the company is read again under the seed load lock, so the later load is refused.
+        Assert.Equal(0, await CountAdvisoryLocksAsync());
+        SeedLoadResult? loaded = Assert.Single(results, result => result is not null);
+        Assert.NotNull(loaded);
+        Assert.Equal(1, loaded.TenderSalesBuilt);
+        int refusedIndex = Array.FindIndex(results, result => result is null);
+        Assert.InRange(refusedIndex, 0, 1);
+        Assert.Empty(writers[refusedIndex].ToString());
+        Assert.Equal(
+            string.Concat(loaded.OutputLines.Select(line => line + Environment.NewLine)),
+            writers[1 - refusedIndex].ToString());
+
+        Assert.Single(await CompanyIdsAsync());
+        AssertSeedCounts(await CountTablesAsync());
+    }
+
+    /// <summary>
+    /// Over HTTP, on a second host whose <c>ConnectionStrings:Erewhon</c> is the test database's connection string with
+    /// <c>Multiplexing=true</c>, two <c>POST /api/app/setup/load-data</c> requests sent together on the empty database:
+    /// while one loads, the other waits for the seed load lock <c>InitialDataLoader.loadData</c>; one answers 200 with
+    /// <c>loaded</c> <see langword="true"/> and <c>tenderSalesBuilt</c> 1, the other 409 with the body
+    /// <c>{"loaded":false,"tenderSalesBuilt":0,"outputLines":[]}</c>. Exactly one company remains, holding the seed
+    /// counts once, and no advisory lock is held or waited for in the database afterwards.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B80_ParallelLoadDataRequestsOnMultiplexedConnectionsGive200And409()
+    {
+        await using ErewhonApiHost host = await ErewhonApiHost.StartAsync(new ErewhonApiHostOptions
+        {
+            ConnectionString = new NpgsqlConnectionStringBuilder(_database.ConnectionString) { Multiplexing = true }
+                .ConnectionString,
+            LogSink = new CollectingLogSink(),
+            Settings = new Dictionary<string, string?> { [SeedDataDirectoryKey] = _dataDirectory },
+        });
+        using HttpClient client = host.CreateHttpClient();
+
+        Task<HttpResponseMessage>[] requests =
+        [
+            client.PostAsync(LoadDataPath, content: null),
+            client.PostAsync(LoadDataPath, content: null),
+        ];
+        bool secondRequestWaited = await WaitForLoadLockWaiterAsync();
+        HttpResponseMessage[] responses = await Task.WhenAll(requests);
+        using HttpResponseMessage firstResponse = responses[0];
+        using HttpResponseMessage secondResponse = responses[1];
+
+        // B-80, D-170: the later request waits for the seed load lock, finds the loaded company and is refused.
+        Assert.Equal(0, await CountAdvisoryLocksAsync());
+        Assert.True(secondRequestWaited, $"No request waited for {LoadLockName} within {LoadLockWaitTimeout}.");
+        Assert.Equal(
+            new[] { HttpStatusCode.OK, HttpStatusCode.Conflict },
+            responses.Select(response => response.StatusCode).Order());
+
+        HttpResponseMessage loaded = responses.Single(response => response.StatusCode == HttpStatusCode.OK);
+        using (JsonDocument body = JsonDocument.Parse(await loaded.Content.ReadAsStringAsync()))
+        {
+            Assert.True(body.RootElement.GetProperty("loaded").GetBoolean());
+            Assert.Equal(1, body.RootElement.GetProperty("tenderSalesBuilt").GetInt32());
+        }
+
+        HttpResponseMessage refused = responses.Single(response => response.StatusCode == HttpStatusCode.Conflict);
+        Assert.Equal(RefusedLoadDataBody, await refused.Content.ReadAsStringAsync());
+
+        Assert.Single(await CompanyIdsAsync());
+        AssertSeedCounts(await CountTablesAsync());
+    }
+
+    /// <summary>
     /// After one load, a load from an existing directory holding a copy of the data files fails with error 1035 on the
     /// <c>DataDirectory</c> field (at most 301 characters, 302 given) when the directory is named by its
     /// <paramref name="pathLength"/>-character path followed by <paramref name="suffix"/>, with
@@ -850,6 +967,43 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// When <see cref="TerminateLoadLockHolder"/> ends the session that holds the seed load lock just after the
+    /// <c>1 Tender Sales built in</c> line is written, so the release of the lock fails, a load of
+    /// <c>Erewhon/DataFiles</c> still returns 1 tender sale built with the <c>Database Initialized in</c> line last.
+    /// Exactly one session is ended. The failure is logged as exactly one Warning event of the loader,
+    /// <c>The seed load lock could not be released.</c>, without the <c>SeedFile</c> property and carrying no failure
+    /// text (<see cref="AssertCarriesNoTerminationText"/>); no advisory lock remains in the database; one company
+    /// remains.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task LoadLockReleaseFailureEndsSessionWithOneWarning()
+    {
+        (string tenderSalesPrefix, _) = SplitAtSentinel(MessageCatalog.Get(MessageKeys.TenderSalesBuilt, 1, Sentinel));
+        int terminatedSessions = 0;
+        using var writer = new ArmingLineWriter(tenderSalesPrefix, () => terminatedSessions = TerminateLoadLockHolder());
+
+        SeedLoadResult result = await LoadOnHostAsync(Host, _dataDirectory, writer, CancellationToken.None);
+
+        // D-170: the failed release is logged, not thrown, and disposing the lock connection ends its session.
+        Assert.True(writer.Armed, "The tender sales line was not written.");
+        Assert.Equal(1, terminatedSessions);
+        Assert.Equal(1, result.TenderSalesBuilt);
+        (string initializedPrefix, _) = SplitAtSentinel(MessageCatalog.Get(MessageKeys.DatabaseInitialized, Sentinel));
+        Assert.StartsWith(initializedPrefix, result.OutputLines[^1], StringComparison.Ordinal);
+
+        LogEvent warning = Assert.Single(
+            _logSink.Events,
+            logEvent => logEvent.Level == LogEventLevel.Warning && IsFromCategory(logEvent, typeof(InitialDataLoader)));
+        Assert.Equal(LoadLockWarningTemplate, warning.MessageTemplate.Text);
+        Assert.DoesNotContain(SeedFileProperty, warning.Properties.Keys);
+        AssertCarriesNoTerminationText(warning);
+
+        Assert.Equal(0, await CountAdvisoryLocksAsync());
+        Assert.Single(await CompanyIdsAsync());
+    }
+
+    /// <summary>
     /// When the token of a load is cancelled as the commit of the load transaction returns, the load writes the closing
     /// line and fails with <see cref="OperationCanceledException"/> in the post-load closure, and the loaded rows stay
     /// committed with no tender sale built. The committed load's notifications are still published: after the load the
@@ -901,6 +1055,105 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
         using var writer = new StringWriter(CultureInfo.InvariantCulture);
         SeedLoadResult result = await loader.LoadAsync(directory ?? _dataDirectory, writer, CancellationToken.None);
         return (result, writer.ToString());
+    }
+
+    /// <summary>
+    /// Runs <see cref="InitialDataLoader.LoadConfiguredWhenNoCompanyAsync"/> in a new scope of the host, writing to
+    /// <paramref name="writer"/>.
+    /// </summary>
+    private async Task<SeedLoadResult?> LoadWhenNoCompanyAsync(TextWriter writer)
+    {
+        await using AsyncServiceScope scope = Host.Services.CreateAsyncScope();
+        InitialDataLoader loader = scope.ServiceProvider.GetRequiredService<InitialDataLoader>();
+        return await loader.LoadConfiguredWhenNoCompanyAsync(writer, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Opens a connection to the test database with pooling off, so it shares no session with the pooled connections
+    /// of the hosts. The caller disposes it.
+    /// </summary>
+    private async Task<NpgsqlConnection> OpenUnpooledConnectionAsync()
+    {
+        var connection = new NpgsqlConnection(
+            new NpgsqlConnectionStringBuilder(_database.ConnectionString) { Pooling = false }.ConnectionString);
+        try
+        {
+            await connection.OpenAsync();
+        }
+        catch
+        {
+            await connection.DisposeAsync();
+            throw;
+        }
+
+        return connection;
+    }
+
+    /// <summary>
+    /// Polls <c>pg_locks</c> on a connection from <see cref="OpenUnpooledConnectionAsync"/> every
+    /// <see cref="LoadLockPollInterval"/> until a session of the test database waits for the advisory lock keyed
+    /// <c>hashtextextended('InitialDataLoader.loadData', 0)</c>, or <see cref="LoadLockWaitTimeout"/> has passed.
+    /// </summary>
+    /// <returns><see langword="true"/> when a waiter was seen.</returns>
+    private async Task<bool> WaitForLoadLockWaiterAsync()
+    {
+        await using NpgsqlConnection connection = await OpenUnpooledConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND objsubid = 1 "
+            + "AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) "
+            + "AND ((classid::bigint << 32) | objid::bigint) = hashtextextended(@name, 0)",
+            connection);
+        command.Parameters.AddWithValue("name", LoadLockName);
+
+        Stopwatch elapsed = Stopwatch.StartNew();
+        while (elapsed.Elapsed < LoadLockWaitTimeout)
+        {
+            if (await command.ExecuteScalarAsync() is long waiting && waiting > 0)
+            {
+                return true;
+            }
+
+            await Task.Delay(LoadLockPollInterval);
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Counts, on a connection from <see cref="OpenUnpooledConnectionAsync"/>, the advisory locks held or waited for in
+    /// the test database.
+    /// </summary>
+    private async Task<long> CountAdvisoryLocksAsync()
+    {
+        await using NpgsqlConnection connection = await OpenUnpooledConnectionAsync();
+        await using var command = new NpgsqlCommand(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' "
+            + "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+            connection);
+        return Assert.IsType<long>(await command.ExecuteScalarAsync());
+    }
+
+    /// <summary>
+    /// Synchronously, on a new connection to the test database with pooling off, ends with
+    /// <c>pg_terminate_backend(pid, timeout)</c> every session of the test database that holds the advisory lock keyed
+    /// <c>hashtextextended('InitialDataLoader.loadData', 0)</c>, waiting at most <see cref="LoadLockWaitTimeout"/> for
+    /// each to exit, and returns the number of sessions that exited within that wait.
+    /// </summary>
+    /// <returns>The number of lock-holding sessions ended.</returns>
+    private int TerminateLoadLockHolder()
+    {
+        using var connection = new NpgsqlConnection(
+            new NpgsqlConnectionStringBuilder(_database.ConnectionString) { Pooling = false }.ConnectionString);
+        connection.Open();
+        using var command = new NpgsqlCommand(
+            "SELECT count(*) FILTER (WHERE pg_terminate_backend(pid, @timeoutMs)) FROM pg_locks "
+            + "WHERE locktype = 'advisory' AND granted AND objsubid = 1 "
+            + "AND database = (SELECT oid FROM pg_database WHERE datname = current_database()) "
+            + "AND ((classid::bigint << 32) | objid::bigint) = hashtextextended(@name, 0)",
+            connection);
+        command.Parameters.AddWithValue("timeoutMs", (long)LoadLockWaitTimeout.TotalMilliseconds);
+        command.Parameters.AddWithValue("name", LoadLockName);
+        return checked((int)Assert.IsType<long>(command.ExecuteScalar()));
     }
 
     /// <summary>
@@ -1084,6 +1337,42 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
         Assert.Empty(attached.Data);
         Assert.StartsWith(failureType, attached.ToString(), StringComparison.Ordinal);
         Assert.Contains(" ---> " + typeof(NpgsqlException).FullName, attached.ToString(), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The event's rendered message, property values, compact JSON form and attached exception hold neither the
+    /// PostgreSQL text of a terminated session, nor Npgsql's stream failure text, nor the name of the test database; the
+    /// attached exception has the full name of an <see cref="NpgsqlException"/> type as its message, no inner exception
+    /// and no data, and its string form starts with that name.
+    /// </summary>
+    private void AssertCarriesNoTerminationText(LogEvent logEvent)
+    {
+        using var json = new StringWriter(CultureInfo.InvariantCulture);
+        new CompactJsonFormatter().Format(logEvent, json);
+        Exception attached = Assert.IsAssignableFrom<Exception>(logEvent.Exception);
+        string databaseName = Required(new NpgsqlConnectionStringBuilder(_database.ConnectionString).Database);
+        string[] texts =
+        [
+            logEvent.RenderMessage(CultureInfo.InvariantCulture),
+            .. logEvent.Properties.Values.Select(value => value.ToString()),
+            json.ToString(),
+            attached.Message,
+            attached.ToString(),
+        ];
+        Assert.All(texts, text =>
+        {
+            Assert.DoesNotContain("terminating connection", text, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("Exception while", text, StringComparison.Ordinal);
+            Assert.DoesNotContain(databaseName, text, StringComparison.Ordinal);
+        });
+
+        Type? failureType = typeof(NpgsqlException).Assembly.GetType(attached.Message);
+        Assert.True(
+            failureType is not null && failureType.IsAssignableTo(typeof(NpgsqlException)),
+            $"The attached exception's message {attached.Message} is not the name of an NpgsqlException type.");
+        Assert.Null(attached.InnerException);
+        Assert.Empty(attached.Data);
+        Assert.StartsWith(attached.Message, attached.ToString(), StringComparison.Ordinal);
     }
 
     /// <summary>

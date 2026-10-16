@@ -154,6 +154,8 @@ Ctrl+C (SIGINT), SIGTERM or SIGQUIT while a verb runs cancels the verb (D-124). 
 
 The interactive load, `POST /api/app/setup/load-data`, runs the same loader on `Erewhon:Seed:DataDirectory`. It runs only while no company exists and answers 409 otherwise (D-43, D-117).
 
+Concurrent `seed` runs and load-data requests run one after another under the seed-load lock `InitialDataLoader.loadData` (section 7.1). A later `seed` waits for the running load to end, then purges the company that load created and reloads; a load-data request that obtains the lock after a company exists answers 409 (D-170).
+
 ### 4.3 Schema migrations
 
 The migrations live in `src/Erewhon.Persistence/Migrations` (first migration `20261015000000_InitialSchema`). The `dotnet ef` commands take their connection from the `ConnectionStrings__Erewhon` environment variable (D-74). They build the host of `src/Erewhon.Api` and stop it before it starts, with no `ErewhonHostFailed` event (D-157).
@@ -263,7 +265,7 @@ No write is audited. Log events are written outside database transactions, so an
 
 ### 7.1 Advisory lock names
 
-Each transaction-agent lock, and the item-code allocation lock, is a PostgreSQL advisory lock on a name of the form `<Owner>.<collection>:<ownerId>`, where `<ownerId>` is the `id` of the owning row. The database key is `hashtextextended(<name>, 0)` (D-07). Each lock is exclusive, and each wait is bounded by `lock_timeout`, which the API sets for the current transaction only.
+Each transaction-agent lock, and the item-code allocation lock, is a PostgreSQL advisory lock on a name of the form `<Owner>.<collection>:<ownerId>`, where `<ownerId>` is the `id` of the owning row. The database key is `hashtextextended(<name>, 0)` (D-07). Each lock is exclusive, and each wait for these locks is bounded by `lock_timeout`, which the API sets for the current transaction only. The seed-load lock `InitialDataLoader.loadData`, in the last row, has no owner id and covers the whole database. Each load takes it on a dedicated connection of its own, `ConnectionStrings:Erewhon` with `Pooling=false` and `Multiplexing=false`, beside its pooled connections, and the lock ends with that connection's session; its wait sets no `lock_timeout` and no command timeout, and lasts until the running load releases the lock or the waiting caller cancels. Ending the holding session (section 7.5) frees the lock but does not stop its load, so another load can start while that one is still loading (D-170).
 
 | Lock name | Lifetime | Taken by |
 |---|---|---|
@@ -280,6 +282,7 @@ Each transaction-agent lock, and the item-code allocation lock, is a PostgreSQL 
 | `Client.allRetailSales:<client id>` | Transaction | `RetailSaleService`, checkout |
 | `Client.allTenderSales:<client id>` | Transaction | `TenderSaleService`, checkout |
 | `Client.allTenders:<client id>`, `TenderItem.allTendersByOfferTime:<item id>`, `TenderItem.allTendersByTimeOffer:<item id>` | Transaction | `TenderService` |
+| `InitialDataLoader.loadData` | Session of the load's dedicated unpooled connection, from before the purge through the post-load closure; it ends with that session | `InitialDataLoader`, for `seed` and `POST /api/app/setup/load-data` (D-170) |
 
 A transaction lock is held until its transaction commits or rolls back. The key of a name:
 

@@ -29,10 +29,14 @@ public static class SetupEndpoints
     /// and runs no load.
     /// </description></item>
     /// <item><description>
-    /// Otherwise it runs <see cref="InitialDataLoader.LoadConfiguredAsync(TextWriter?, CancellationToken)"/> and
-    /// returns 200 with a <see cref="LoadDataResponse"/> whose <see cref="LoadDataResponse.Loaded"/> is
-    /// <see langword="true"/> and which carries the number of tender sales the post-load closure built and every line
-    /// the loader wrote, in order.
+    /// Otherwise it runs <see cref="InitialDataLoader.LoadConfiguredWhenNoCompanyAsync(TextWriter?, CancellationToken)"/>,
+    /// which waits for the seed load lock <c>InitialDataLoader.loadData</c> and reads the companies again once it holds
+    /// it. When a company exists by then, it returns the same 409 and no load runs.
+    /// </description></item>
+    /// <item><description>
+    /// When the load runs, it returns 200 with a <see cref="LoadDataResponse"/> whose
+    /// <see cref="LoadDataResponse.Loaded"/> is <see langword="true"/> and which carries the number of tender sales the
+    /// post-load closure built and every line the loader wrote, in order.
     /// </description></item>
     /// </list>
     /// A failed load, such as a configured directory that is missing or invalid (error 500004), a company that
@@ -60,12 +64,13 @@ public static class SetupEndpoints
     }
 
     /// <summary>
-    /// Returns 409 with a refused load result, whose <c>loaded</c> is false, when a company exists; otherwise loads the
-    /// configured seed data and returns 200 with the loader's result.
+    /// Returns 409 with a refused load result, whose <c>loaded</c> is false, when a company exists, or when one exists
+    /// once the loader holds the seed load lock; otherwise loads the configured seed data and returns 200 with the
+    /// loader's result.
     /// </summary>
     /// <param name="companyContext">The company bound to the request scope.</param>
     /// <param name="loader">The seed data loader of the request scope.</param>
-    /// <param name="ct">Cancels the company read and the load.</param>
+    /// <param name="ct">Cancels the company read, the wait for the seed load lock and the load.</param>
     /// <returns>The 200 or 409 result.</returns>
     private static async Task<Results<Ok<LoadDataResponse>, Conflict<LoadDataResponse>>> LoadDataAsync(
         [FromServices] ICompanyContext companyContext,
@@ -74,14 +79,27 @@ public static class SetupEndpoints
     {
         if (await companyContext.FindCurrentAsync(ct) is not null)
         {
-            return TypedResults.Conflict(
-                new LoadDataResponse(Loaded: false, TenderSalesBuilt: 0, OutputLines: Array.Empty<string>()));
+            return Refused();
         }
 
         using var output = new StringWriter(CultureInfo.InvariantCulture);
-        SeedLoadResult result = await loader.LoadConfiguredAsync(output, ct);
+        SeedLoadResult? result = await loader.LoadConfiguredWhenNoCompanyAsync(output, ct);
+        if (result is null)
+        {
+            return Refused();
+        }
 
         return TypedResults.Ok(
             new LoadDataResponse(Loaded: true, TenderSalesBuilt: result.TenderSalesBuilt, OutputLines: result.OutputLines));
     }
+
+    /// <summary>
+    /// Returns 409 with a <see cref="LoadDataResponse"/> whose <see cref="LoadDataResponse.Loaded"/> is
+    /// <see langword="false"/>, <see cref="LoadDataResponse.TenderSalesBuilt"/> is 0 and
+    /// <see cref="LoadDataResponse.OutputLines"/> is empty.
+    /// </summary>
+    /// <returns>The 409 result.</returns>
+    private static Conflict<LoadDataResponse> Refused() =>
+        TypedResults.Conflict(
+            new LoadDataResponse(Loaded: false, TenderSalesBuilt: 0, OutputLines: Array.Empty<string>()));
 }
