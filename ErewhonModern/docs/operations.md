@@ -3,7 +3,7 @@
 This note covers running the Erewhon store in `ErewhonModern/`: one ASP.NET Core 8 process (`src/Erewhon.Api`) over one PostgreSQL 16 database. It replaces the JADECare Start utilities and the JADE exception log.
 
 - Commands run from `ErewhonModern/` unless stated otherwise.
-- Values in angle brackets (`<connection string>`, `<database>`, `<data dir>`, `<backup dir>`, `<file>`, `<host>`, `<port>`, `<id>`) are placeholders. No host, user, password or connection string is given here or committed anywhere (D-28).
+- Values in angle brackets (`<connection string>`, `<database>`, `<data dir>`, `<backup dir>`, `<file>`, `<host>`, `<port>`, `<id>`) are placeholders. In the commands, a placeholder for a file or directory path is written in double quotes, so that a path with spaces stays one argument. No host, user, password or connection string is given here or committed anywhere (D-28).
 - Decision IDs (`D-xx`) refer to `docs/migration/decision-log.md`, which holds the reasons. Behaviour IDs (`B-xx`, `Q-xx`, `EE-xx`) refer to `docs/migration/behaviour-catalogue.md`.
 
 ## 1. Prerequisites
@@ -41,8 +41,10 @@ No JADE installation, JADE runtime, JADE INI file or JADECare Start component is
 dotnet run --project src/Erewhon.Api
 ```
 
-- The launch profile `Erewhon.Api` (`src/Erewhon.Api/Properties/launchSettings.json`) listens on `http://localhost:5080` and sets `ASPNETCORE_ENVIRONMENT=Development`, so `appsettings.Development.json` applies.
-- `--urls <url>` sets another listening address. `--no-launch-profile` runs without the profile: the environment is then `Production`, unless `ASPNETCORE_ENVIRONMENT` names another, and the address is the ASP.NET Core default.
+- The launch profile `Erewhon.Api` (`src/Erewhon.Api/Properties/launchSettings.json`) listens on `http://localhost:5080` and sets `ASPNETCORE_ENVIRONMENT=Development`, replacing any value the shell gives that variable. The environment is then `Development`, so `appsettings.Development.json` applies, unless `DOTNET_ENVIRONMENT` or `--environment` names another.
+- `--urls <url>` sets another listening address. `--no-launch-profile` runs without the profile: the environment then comes from the selectors in the next item, and the address is the ASP.NET Core default.
+- The environment is the first name given by, in this order: the switch `--environment <name>` (or `--environment=<name>`), placed after `--` with `dotnet run`, for the web host only; the environment variable `DOTNET_ENVIRONMENT`; the environment variable `ASPNETCORE_ENVIRONMENT`. It is `Production` when none of them gives one.
+- The `migrate` and `seed` verbs take the environment from the two variables only, in the same order and with the same `Production` fallback; the launch profile's `ASPNETCORE_ENVIRONMENT` applies to them too. They do not read `--environment`: `migrate` ignores it; after the `seed` directory operand it counts as extra operands, so `seed` writes its example command line and exits with code 1; placed before either verb, it makes the process start the web host instead (D-124).
 - `dotnet run` starts the process with `src/Erewhon.Api` as its current directory. That directory is the content root: `appsettings*.json`, `wwwroot` and relative configured paths are read from it.
 - Ctrl+C or SIGTERM stops the host; the process then exits with code 0.
 
@@ -64,6 +66,8 @@ Configuration uses the standard ASP.NET Core sources. Each source overrides the 
 2. `src/Erewhon.Api/appsettings.<environment>.json` (`appsettings.Development.json` is the only one committed);
 3. environment variables, where `__` separates the sections of a key (`Erewhon__Locks__TimeoutMs`);
 4. command-line switches (`--Erewhon:Locks:TimeoutMs=<ms>`), for the web host only.
+
+In item 2, `<environment>` is the environment name, chosen as section 2.2 describes.
 
 The `migrate` and `seed` verbs read no command-line switches, so their values come from the files and environment variables (D-124).
 
@@ -92,7 +96,7 @@ Schema changes are made only through EF Core migrations (section 4.3) (D-28).
 
 ### 3.2 Test databases
 
-`ConnectionStrings__ErewhonTests` must name a role allowed to create databases. Its `Database` is the maintenance database used for `DROP DATABASE` and `CREATE DATABASE` (`postgres` when it names none), and it must not be one of the test databases. Each run drops a test database with `WITH (FORCE)`, which ends every session connected to it, recreates it and applies the migrations:
+`ConnectionStrings__ErewhonTests` must name a role allowed to create databases. Its `Database` is the maintenance database used for `DROP DATABASE` and `CREATE DATABASE` (`postgres` when it names none), and it must not be one of the test databases. Each run first drops a test database with `WITH (FORCE)`, which ends every session connected to it. When PostgreSQL refuses that drop with SQLSTATE `42501` (insufficient privilege), the run terminates the role's own other sessions on the database and drops it without `FORCE`, which also ends any autovacuum worker connected to it. A connected session of another role that is not an autovacuum worker, or a session of the role that reconnects between the termination and the second drop, then makes the reset fail with SQLSTATE `55006` (object in use), so end such sessions before a run (D-136). The run then recreates the database and applies the migrations:
 
 | Database | Used by |
 |---|---|
@@ -121,7 +125,7 @@ Database names are 1 to 63 lower-case letters, digits and underscores.
 dotnet tool restore
 export ConnectionStrings__Erewhon='<connection string>'
 dotnet run --project src/Erewhon.Api -- migrate
-dotnet run --project src/Erewhon.Api -- seed <data dir>
+dotnet run --project src/Erewhon.Api -- seed "<data dir>"
 (cd web && npm ci && npm run build)
 dotnet run --project src/Erewhon.Api
 ```
@@ -133,7 +137,7 @@ The first argument after `--` selects a verb, compared case-sensitively. A verb 
 | Command | What it does | Output | Exit code |
 |---|---|---|---|
 | `migrate` | Applies every pending EF Core migration of `src/Erewhon.Persistence` to the database of `ConnectionStrings:Erewhon`. Further operands are ignored | None | 0; 1 on failure |
-| `seed <data dir>` | Runs the seed loader on `<data dir>` (D-18, D-114): checks the directory (error 500004), deletes the existing company with all its data and commits that, creates the company "Erewhon Investments Inc" (error 500003 when a company remains), loads the ten data files through the application services in one transaction, then closes the tenders due at the current server date | The loader's lines (`$Loading`, `$LoadedObject`, the `*Loaded` lines, then `$TenderSalesBuilt` or `$NoTendersToCloseAsAt`) on standard output; each line is also written to the log (section 6.2) (EE-11) | 0; 1 on failure |
+| `seed "<data dir>"` | Runs the seed loader on `<data dir>` (D-18, D-114): checks the directory (error 500004), deletes the existing company with all its data and commits that, creates the company "Erewhon Investments Inc" (error 500003 when a company remains), loads the ten data files through the application services in one transaction, then closes the tenders due at the current server date | The loader's lines (`$Loading`, `$LoadedObject`, the `*Loaded` lines, then `$TenderSalesBuilt` or `$NoTendersToCloseAsAt`) on standard output; each line is also written to the log (section 6.2) (EE-11) | 0; 1 on failure |
 | `seed` with no operand, or with more than one | Loads nothing | The `$ExampleCommandLine` message, verbatim JADE text (D-22) | 1 |
 | `seed ""` | Loads nothing | None | 0 |
 
@@ -149,7 +153,7 @@ The migrations live in `src/Erewhon.Persistence/Migrations` (first migration `20
 
 ```bash
 # SQL script of every migration; each step is skipped on a database that already has it
-dotnet ef migrations script --idempotent --project src/Erewhon.Persistence --startup-project src/Erewhon.Api --output <file>.sql
+dotnet ef migrations script --idempotent --project src/Erewhon.Persistence --startup-project src/Erewhon.Api --output "<file>.sql"
 
 # Migrations known to the code and applied to the database
 dotnet ef migrations list --project src/Erewhon.Persistence --startup-project src/Erewhon.Api
@@ -214,7 +218,9 @@ When `seed` runs from the command line, standard output carries each loader line
 | A deadlock (`40P01`) | Status 500 with `{"kind": "deadlock", ...}`; the transaction is rolled back | Yes, `ErrorCode` `40P01` |
 | Item-code allocation fails three times | Status 500 with `{"kind": "exception", ...}`, heading "Error 500001" (B-03) | Yes |
 | Another database failure, for example `23505` (unique key), `23503` (foreign key) or a lost connection | Status 500 with `{"kind": "exception", ...}` carrying the SQLSTATE and the PostgreSQL message (EE-01) | Yes, `ErrorCode` is the SQLSTATE |
-| A REST request with no company, or a REST `DTO*` field longer than its length | Status 500 with an empty body | No (D-63) |
+| A REST operation reads the company and no company exists (D-40, B-69). Outcomes decided before that read keep their status with or without a company: an invalid request to `getItemByCode`, `getItemsByPrice` or `getSale` is 400 with an empty body from the operation's input checks, and a request that fails model binding is 400 before any operation runs (D-109, D-110). `docs/rest-api.md` section "No company" gives the outcome of each operation | Status 500 with an empty body | No (D-63) |
+| A REST `DTO*` field longer than its length (D-41) | Status 500 with an empty body | No (D-63) |
+| A `postCreateAgent` or `postCreateClient` request whose body is absent, empty or JSON `null`, with or without a company. A chunked request that sends no data fails model binding instead (400). `docs/rest-api.md` sections `postCreateAgent` and `postCreateClient` give each outcome of the two operations | Status 500 with an empty body | No (D-63) |
 | Any other unhandled exception | Status 500 with `{"kind": "exception", ...}` | Yes |
 
 The three lock outcomes are B-38 (D-07, D-64). Every response with status 500 also gets the HTTP request event at `Error` level.
@@ -340,17 +346,17 @@ Example commands:
 
 ```bash
 pg_isready -h <host> -p <port>
-pg_dump -Fc -f <file>.dump <database>
-pg_restore -d <database> <file>.dump
-pg_dump --schema-only -f <file>.sql <database>
-pg_basebackup -D <backup dir> -X stream -P -c fast
-pg_verifybackup <backup dir>
+pg_dump -Fc -f "<file>.dump" <database>
+pg_restore -d <database> "<file>.dump"
+pg_dump --schema-only -f "<file>.sql" <database>
+pg_basebackup -D "<backup dir>" -X stream -P -c fast
+pg_verifybackup "<backup dir>"
 vacuumdb --analyze <database>
 reindexdb <database>
 pg_amcheck <database>
-pg_waldump <data dir>/pg_wal/<WAL segment file>
-pg_checksums --check -D <data dir>
-pg_ctl status -D <data dir>
+pg_waldump "<data dir>/pg_wal/<WAL segment file>"
+pg_checksums --check -D "<data dir>"
+pg_ctl status -D "<data dir>"
 psql -d <database> -c 'SELECT CURRENT_DATE, clock_timestamp()::timestamp(3);'
 ```
 

@@ -14,11 +14,11 @@ Contents:
 
 ## OpenAPI document
 
-The OpenAPI document `rest` is served at `/swagger/rest/swagger.json` (title "Erewhon REST API", version `v1`), and the Swagger UI at `/swagger`, for example `http://localhost:5080/swagger` under the development launch profile. Swashbuckle generates the document from the same seven controllers this reference describes, each marked `[ApiExplorerSettings(GroupName = "rest")]`, and from their XML doc comments, which state what each operation does (D-25). The document lists exactly the 13 paths and verbs of the [mapping table](#mapping-to-the-jade-operations).
+The `Erewhon.Api` host serves the OpenAPI document `rest` at [`/swagger/rest/swagger.json`](http://localhost:5080/swagger/rest/swagger.json) (title "Erewhon REST API", version `v1`) and the Swagger UI at [`/swagger`](http://localhost:5080/swagger), whatever address it listens on; both links use `http://localhost:5080`, the address of the development launch profile. Swashbuckle generates the document from the same seven controllers this reference describes, each marked `[ApiExplorerSettings(GroupName = "rest")]`, and from their XML doc comments, which state what each operation does (D-25). The document lists exactly the 13 paths and verbs of the [mapping table](#mapping-to-the-jade-operations).
 
 ## Conventions
 
-**Routes and parameters.** Routes, verbs and JSON names are new; every JADE status code and body is kept per operation (D-03). Lookups take query parameters. Request bodies are JSON sent with `Content-Type: application/json`; a body with another content type is answered 415 by the framework before the operation runs.
+**Routes and parameters.** Routes, verbs and JSON names are new; every JADE status code and body is kept per operation (D-03). Lookups take query parameters. Request bodies are JSON; send them with `Content-Type: application/json`. A body sent as `text/json`, or as any `application/` or `text/` type with the `+json` suffix such as `application/merge-patch+json`, is read the same way. A body is read as UTF-8 unless the `Content-Type` has a `charset` parameter, which must name UTF-8 or little-endian UTF-16 by a name .NET recognises, such as `utf-8`, `utf-16`, `utf-16le` or `unicode`. A request with a body in any other content type, in any other `charset`, such as `iso-8859-1`, `us-ascii`, `utf8` or `utf-16be`, or with no `Content-Type`, is answered by the framework before the operation runs: status 415 with the framework's problem-details JSON (`type`, `title`, `status`, `traceId`). A request sent with `Content-Length: 0`, or with neither `Content-Length` nor `Transfer-Encoding`, has no body and is never answered 415, whatever its content type or `charset`; each POST operation reads it as its section describes. A chunked request (`Transfer-Encoding: chunked`) has a body even when it sends no data; with no data it gets the binding 400 below when its content type and `charset` are accepted, and 415 otherwise.
 
 **Request binding.** A query parameter declared as an integer (`codeNumber`, `minPrice`, `maxPrice`) that is absent binds as `0`, and an absent string parameter is read as empty; both then reach the operation's own checks. A value that cannot be bound to its declared type, such as `codeNumber=abc`, `minPrice=1.5`, a value outside the 32-bit integer range, malformed JSON, or a body field that cannot be converted, is rejected by ASP.NET Core model validation before the operation runs: status 400 with the framework's validation-problem JSON (`type`, `title`, `status`, `errors`, `traceId`), and no `ResultDto`. That 400 precedes every check of the operation, the company read included (D-109, D-110). A JSON number may also be sent as a JSON string that holds a number, for example `"offer": "250.50"`.
 
@@ -693,7 +693,20 @@ Proving tests: `RestTestGetSale.testGetRetailSale`, `RestTestGetSale.testGetTend
 
 JADE: `postCreateAgent(pAgent : DTOAgent) : DTOResult` [Erewhon/ErehwhonExternalInterfacesSchema.scm:L2652-2691] (B-60).
 
-Request body: an `AgentDto`. `guid` is length-checked and not stored; `name` and the seven address fields are copied untrimmed into the agent create operation, which trims them (`name` with `trimBlanks`, the address fields with `trimWhiteSpace`) and validates them (B-10, B-11). The agent is created in its own transaction. Example from `RestTestPostCreateAgent.testValidAgent`:
+Request body: an `AgentDto`. `guid` is length-checked and not stored; `name` and the seven address fields are copied untrimmed into the agent create operation. The agent is created in its own transaction. The create operation runs these steps in order; the first step that fails ends it with 400, and the steps after it do not run (B-10, B-11):
+
+1. Pre-validation removes leading and trailing spaces from `name` (`trimBlanks`); the address fields are left as given.
+2. Validation checks the name, then the address fields as given (`fax` and `website` are not checked): an absent or empty value is missing, a value of only white space counts as present, and `email` is matched against the e-mail format as given, without trimming.
+3. The agents lock is taken.
+4. The seven address fields are trimmed of leading and trailing CR, LF, tab, space and NUL characters (`trimWhiteSpace`) and the address is validated again. On success the agent is stored with the trimmed name and the trimmed address fields.
+
+So:
+
+- A padded `email`, such as `" agent@email.com "`, fails step 2 with `Email must be in a valid format e.g. user@domain.com` instead of being trimmed; an `email` of only white space fails the same way.
+- A `street`, `city`, `country` or `phone` of only white space passes step 2 and fails step 4 with its required error, for example `Street is required`.
+- When step 2 fails, the errors that only step 4 raises are not reported: an empty `name` with a `street` of only white space gives `Agent name is required` alone.
+
+Example from `RestTestPostCreateAgent.testValidAgent`:
 
 ```json
 {
@@ -710,10 +723,10 @@ Request body: an `AgentDto`. `guid` is length-checked and not stored; `name` and
 
 | Status | Body | Condition |
 |---|---|---|
-| 500 | empty | The body is absent, empty or JSON `null` |
+| 500 | empty | The body is absent, empty or JSON `null` (D-40) |
 | 500 | empty | A field is longer than its declared length (`guid` 39; `name` 81; `street`, `city`, `country` 51; `phone`, `fax` 26; `email`, `website` 61), measured before any trimming, so a padded value fails even when its trimmed form would fit (D-41, B-22) |
 | 500 | empty | No company exists |
-| 400 | `ResultDto`, `statusCode` 400, `allErrors` | The agent create operation fails; `allErrors` holds every error in check order: `Agent name is required`, or `Agent already exists` for a name, after trimming, that another agent of the company holds; then the address errors `Street is required`, `City is required`, `Country is required`, `Phone number is required`, `Email is required`, `Email must be in a valid format e.g. user@domain.com`; or `Create conflicted with another user's activity.  Try again shortly.` when the agents lock is not obtained. A duplicate name is 400, not 409 (D-04, C-05, Q-10) |
+| 400 | `ResultDto`, `statusCode` 400, `allErrors` | The agent create operation fails; `allErrors` holds every error of the step that failed, in check order: `Agent name is required`, or `Agent already exists` for a name, after trimming, that another agent of the company holds; then the address errors of the fields as given, `Street is required`, `City is required`, `Country is required`, `Phone number is required`, `Email is required`, `Email must be in a valid format e.g. user@domain.com`; or `Create conflicted with another user's activity.  Try again shortly.` when the agents lock is not obtained; or, from the trimmed address, `Street is required`, `City is required`, `Country is required`, `Phone number is required` for each of those fields that holds only white space. A duplicate name is 400, not 409 (D-04, C-05, Q-10) |
 | 201 | `ResultDto`, `statusCode` 201, `guid` | The agent is created; `guid` is the new agent's GUID |
 
 201 body:
@@ -746,7 +759,7 @@ Proving tests: `RestTestPostCreateAgent.testValidAgent`, `RestTestPostCreateAgen
 
 JADE: `postCreateClient(pClient : DTOClient) : DTOResult` [Erewhon/ErehwhonExternalInterfacesSchema.scm:L2692-2731] (B-60).
 
-Request body: a `ClientDto`, handled as `postCreateAgent` handles an `AgentDto`. The client create operation trims the name and the address fields with `trimWhiteSpace` and validates them (B-10, B-12). Example from `RestTestPostCreateClient.testValidClient`:
+Request body: a `ClientDto`, handled as [`postCreateAgent`](#10-postcreateagent--post-apirestagents) handles an `AgentDto`: the client is created in its own transaction by the same four steps in the same order, except that step 1 removes leading and trailing CR, LF, tab, space and NUL characters from `name` (`trimWhiteSpace`) and step 2 checks the client name (B-10, B-12). Step 1 leaves the address fields as given; step 2 validates them as given; step 4 trims them with `trimWhiteSpace`, validates them again and, on success, stores the client with the trimmed name and the trimmed address fields. So a padded `email`, such as `" client@email.com "`, is 400 with `Email must be in a valid format e.g. user@domain.com`; a `street`, `city`, `country` or `phone` of only white space is 400 with its required error from step 4; and when step 2 fails, the errors that only step 4 raises are not reported, so an empty `name` with a `street` of only white space gives `Client name is required` alone. Example from `RestTestPostCreateClient.testValidClient`:
 
 ```json
 {
@@ -763,10 +776,10 @@ Request body: a `ClientDto`, handled as `postCreateAgent` handles an `AgentDto`.
 
 | Status | Body | Condition |
 |---|---|---|
-| 500 | empty | The body is absent, empty or JSON `null` |
+| 500 | empty | The body is absent, empty or JSON `null` (D-40) |
 | 500 | empty | A field is longer than its declared length, measured before any trimming (lengths as for `postCreateAgent`) (D-41, B-22) |
 | 500 | empty | No company exists |
-| 400 | `ResultDto`, `statusCode` 400, `allErrors` | The client create operation fails; `allErrors` holds every error in check order: `Client name is required`, or `Client already exists` for a name, after trimming, that another client of the company holds; then the address errors as for `postCreateAgent`; or `Create conflicted with another user's activity.  Try again shortly.` when the clients lock is not obtained. A duplicate name is 400, not 409 (D-04) |
+| 400 | `ResultDto`, `statusCode` 400, `allErrors` | The client create operation fails; `allErrors` holds every error of the step that failed, in check order: `Client name is required`, or `Client already exists` for a name, after trimming, that another client of the company holds; then the address errors of the fields as given, as for `postCreateAgent`; or `Create conflicted with another user's activity.  Try again shortly.` when the clients lock is not obtained; or, from the trimmed address, the required errors as for `postCreateAgent`. A duplicate name is 400, not 409 (D-04) |
 | 201 | `ResultDto`, `statusCode` 201, `guid` | The client is created; `guid` is the new client's GUID |
 
 201 body:
@@ -908,7 +921,7 @@ Proving tests: `RestCatalogueTests.B22_PaddedRestNameRejectedBeforeTrim`, `RestC
 
 ### Unexpected and database-level failures
 
-An exception that `RestExceptionFilter` does not handle reaches `ErrorOutcomeMiddleware`, which answers 500 with `Content-Type: application/json` and the `ErrorOutcome` body `{kind, heading, body}` and writes one Serilog error event, except for the `lock` kind (D-64, D-36). Database failures are translated by `PostgresErrorMapper` (D-07, D-62); their error code and text are the PostgreSQL SQLSTATE and message in place of the JADE error number and text (EE-01).
+An exception that `RestExceptionFilter` does not handle reaches `ErrorOutcomeMiddleware`, which writes one Serilog error event, except for the `lock` kind (D-64, D-36). Before the response has started, the middleware answers 500 with `Content-Type: application/json` and the `ErrorOutcome` body `{kind, heading, body}`. Once the response has started, it does not rewrite the response: the status and any content already sent stay and nothing more is written; the exception is still translated and logged once, the `lock` kind again excepted, and is then rethrown unchanged, so the server aborts the response and the client can receive a truncated response with no `ErrorOutcome` body (D-64). Database failures are translated by `PostgresErrorMapper` (D-07, D-62); their error code and text are the PostgreSQL SQLSTATE and message in place of the JADE error number and text (EE-01).
 
 | Cause | `kind` | `heading` | `body` |
 |---|---|---|---|
