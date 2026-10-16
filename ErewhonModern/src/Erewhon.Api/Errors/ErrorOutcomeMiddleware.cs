@@ -194,11 +194,12 @@ public sealed class ErrorOutcomeMiddleware(RequestDelegate next, ILogger<ErrorOu
     /// <c>ErrorCode</c>, <c>ErrorText</c> and <c>ErrorItem</c>, plus <c>Role</c>, <c>AgentId</c> and
     /// <c>ClientId</c> when <paramref name="session"/> has a session. <c>ErrorCode</c> and <c>ErrorItem</c> are the
     /// error code and error item of the exception outcome; <c>ErrorText</c> is the message of an
-    /// <see cref="IJadeException"/> and the full name of the exception type for any other exception. The attached
-    /// exception has <c>ErrorText</c> as its message and no inner exception; its string form lists
-    /// <paramref name="translated"/>, its inner exceptions and the inner exceptions of any
-    /// <see cref="AggregateException"/>, depth first, each as its type's full name, followed for an
-    /// <see cref="IJadeException"/> by its error code and message, and by its stack trace when it has one; its
+    /// <see cref="IJadeException"/> or a <see cref="MissingConnectionStringException"/> and the full name of the
+    /// exception type for any other exception. The attached exception has <c>ErrorText</c> as its message and no
+    /// inner exception; its string form lists <paramref name="translated"/>, its inner exceptions and the inner
+    /// exceptions of any <see cref="AggregateException"/>, depth first, each as its type's full name, followed for an
+    /// <see cref="IJadeException"/> by its error code and message and for a
+    /// <see cref="MissingConnectionStringException"/> by its message, and by its stack trace when it has one; its
     /// stack trace is the first stack trace in that list.
     /// </summary>
     /// <param name="logger">The logger that receives the event.</param>
@@ -238,12 +239,13 @@ public sealed class ErrorOutcomeMiddleware(RequestDelegate next, ILogger<ErrorOu
     /// </summary>
     /// <param name="exception">The exception to render.</param>
     /// <returns>
-    /// An exception whose message is the message of an <see cref="IJadeException"/> and the full name of the
-    /// exception type for any other exception, and which has no inner exception. Its string form lists
-    /// <paramref name="exception"/>, its inner exceptions and the inner exceptions of any
-    /// <see cref="AggregateException"/>, depth first, each as its type's full name, followed for an
-    /// <see cref="IJadeException"/> by its error code and message, and by its stack trace when it has one; its stack
-    /// trace is the first stack trace in that list.
+    /// An exception whose message is the message of an <see cref="IJadeException"/> or a
+    /// <see cref="MissingConnectionStringException"/> and the full name of the exception type for any other
+    /// exception, and which has no inner exception. Its string form lists <paramref name="exception"/>, its inner
+    /// exceptions and the inner exceptions of any <see cref="AggregateException"/>, depth first, each as its type's
+    /// full name, followed for an <see cref="IJadeException"/> by its error code and message and for a
+    /// <see cref="MissingConnectionStringException"/> by its message, and by its stack trace when it has one; its
+    /// stack trace is the first stack trace in that list.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="exception"/> is <see langword="null"/>.</exception>
     public static Exception Sanitize(Exception exception)
@@ -302,7 +304,9 @@ public sealed class ErrorOutcomeMiddleware(RequestDelegate next, ILogger<ErrorOu
     private static (string Code, string Text, string Item) DescribeForLog(Exception exception)
     {
         var (code, _, item) = Describe(exception);
-        var text = exception is IJadeException ? exception.Message : TypeName(exception);
+        var text = exception is IJadeException or MissingConnectionStringException
+            ? exception.Message
+            : TypeName(exception);
         return (code, text, item);
     }
 
@@ -318,7 +322,8 @@ public sealed class ErrorOutcomeMiddleware(RequestDelegate next, ILogger<ErrorOu
     /// <summary>
     /// The exception attached to a logged event in place of the original: its message is the logged error text, it
     /// has no inner exception, and it renders the exception chain of the exception it stands for as type names, the
-    /// error code and message of each <see cref="IJadeException"/>, and stack traces.
+    /// error code and message of each <see cref="IJadeException"/>, the message of each
+    /// <see cref="MissingConnectionStringException"/>, and stack traces.
     /// </summary>
     private sealed class SanitizedException : Exception
     {
@@ -354,10 +359,13 @@ public sealed class ErrorOutcomeMiddleware(RequestDelegate next, ILogger<ErrorOu
         public override string ToString() => _rendering;
 
         private static string Header(Exception exception) =>
-            exception is IJadeException jade
-                ? string.Create(
+            exception switch
+            {
+                IJadeException jade => string.Create(
                     CultureInfo.InvariantCulture,
-                    $"{TypeName(exception)} ({jade.ErrorCode}): {exception.Message}")
-                : TypeName(exception);
+                    $"{TypeName(exception)} ({jade.ErrorCode}): {exception.Message}"),
+                MissingConnectionStringException => $"{TypeName(exception)}: {exception.Message}",
+                _ => TypeName(exception),
+            };
     }
 }

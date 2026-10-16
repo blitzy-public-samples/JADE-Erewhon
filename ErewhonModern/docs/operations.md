@@ -73,7 +73,7 @@ The `migrate` and `seed` verbs read no command-line switches, so their values co
 
 | Key | Environment variable | Default | Read by | Effect |
 |---|---|---|---|---|
-| `ConnectionStrings:Erewhon` | `ConnectionStrings__Erewhon` | Empty (committed empty in `appsettings.json`) | The API host, each time it builds a database context; the health check, on every request; the `migrate` and `seed` verbs. `DesignTimeDbContextFactory` (`dotnet ef`) reads the environment variable only (D-74) | The PostgreSQL connection of the store. Empty: `/healthz` answers 503, every database operation fails, and `dotnet ef database update` fails, while `dotnet ef migrations add` and `migrations script` still run (D-28) |
+| `ConnectionStrings:Erewhon` | `ConnectionStrings__Erewhon` | Empty (committed empty in `appsettings.json`) | The API host, each time it builds a database context; the health check, on every request; the `migrate` and `seed` verbs. `DesignTimeDbContextFactory` (`dotnet ef`) reads the environment variable only (D-74) | The PostgreSQL connection of the store. Empty: `/healthz` answers 503, every database operation, `migrate` and `seed` included, fails with "ConnectionStrings:Erewhon is not set.", and `dotnet ef database update` fails with the provider's message, while `dotnet ef migrations add` and `migrations script` still run (D-28, D-118) |
 | `ConnectionStrings:ErewhonTests` | `ConnectionStrings__ErewhonTests` (read from the environment only) | Not set | `PostgresDatabase` in `tests/Erewhon.Testing` (every .NET test assembly), `tests/Erewhon.FixtureHost` (the Vitest fixture bridge), `web/e2e/start-e2e-server.mjs` (Playwright) | The base connection of the test databases (section 3.2) (D-26, D-47) |
 | `Erewhon:Seed:DataDirectory` | `Erewhon__Seed__DataDirectory` | `../../../Erewhon/DataFiles`, which from the content root `src/Erewhon.Api` is the repository's `Erewhon/DataFiles` | `POST /api/app/setup/load-data`, read once at start-up | The directory the interactive load reads. Absent or empty gives the default; a relative path is resolved from the content root; the directory is checked only when a load runs (error 500004; error 1035 when the resolved path, followed by `/`, is longer than 301 characters) (D-18, D-114, D-117, D-118). The `seed` verb takes its directory from its operand instead |
 | `Erewhon:Locks:TimeoutMs` | `Erewhon__Locks__TimeoutMs` | `10000` | `PostgresEntityLocks`, read once at start-up | The `lock_timeout`, in milliseconds, of every transaction-agent advisory lock and of each tender-closure row lock. Absent, not an integer, 0 or negative gives 10000 (D-07, D-118, EE-14) |
@@ -113,9 +113,12 @@ Database names are 1 to 63 lower-case letters, digits and underscores.
 | `Serilog:Using` | `Serilog.Sinks.Console` | — |
 | `Serilog:MinimumLevel:Default` | `Information` | `Debug` |
 | `Serilog:MinimumLevel:Override:Microsoft.AspNetCore` | `Warning` | `Information` |
+| `Serilog:MinimumLevel:Override:Microsoft.AspNetCore.Hosting.Diagnostics` | `Warning` | `Warning` |
 | `Serilog:MinimumLevel:Override:Microsoft.EntityFrameworkCore` | `Warning` | `Information` |
 | `Serilog:WriteTo` | `Console` with `formatter` `Serilog.Formatting.Compact.CompactJsonFormatter, Serilog.Formatting.Compact` | — |
 | `Serilog:Enrich` | `FromLogContext` | — |
+
+The `Microsoft.AspNetCore.Hosting.Diagnostics` override keeps the framework's request-starting and request-finished events, which carry the query string, out of the log in every environment; the level policy is D-149.
 
 ## 4. Commands
 
@@ -205,9 +208,11 @@ Serilog writes one compact JSON (CLEF) object per event, one per line, to the pr
 The property values are:
 
 - `ErrorCode`: the JADE error number (for example `500001`, `1035`), else the PostgreSQL SQLSTATE (for example `23505`, `40P01`, `08006` for a lost connection (D-62)), else the .NET `HResult`.
-- `ErrorText`: the JADE error text of a JADE-numbered error, otherwise the full name of the exception type.
+- `ErrorText`: the JADE error text of a JADE-numbered error, "ConnectionStrings:Erewhon is not set." when that setting is absent or empty (D-118), otherwise the full name of the exception type.
 - `ErrorItem`: the field name of a 1035 "String too long" error, otherwise the `$BaseNotAvailable` text "Not available".
-- `@x` of an unhandled-exception event, a failed closure-schedule tick and a failed closure-schedule SignalR send: the chain of exception types, each JADE error's number and text, and the stack traces. It carries no other exception message, PostgreSQL detail or connection text (D-64, D-123).
+- `@x` of an unhandled-exception event, a failed closure-schedule tick and a failed closure-schedule SignalR send: the chain of exception types, each JADE error's number and text, the missing-connection-string text, and the stack traces. It carries no other exception message, PostgreSQL detail or connection text (D-64, D-123).
+
+EF Core's connection open, close and failure events, its data-reader close and dispose events, and its command, query, save and transaction failure events are not written at any level, so in this log a database failure appears only as the events above (D-118).
 
 When `seed` runs from the command line, standard output carries each loader line twice: once as plain text and once as its JSON event.
 

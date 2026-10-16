@@ -1,10 +1,13 @@
+using System.Data.Common;
 using System.Globalization;
 using System.Security;
 using Erewhon.Application.Abstractions;
 using Erewhon.Persistence.Seed;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace Erewhon.Persistence;
 
@@ -16,13 +19,38 @@ namespace Erewhon.Persistence;
 /// </summary>
 public static class DependencyInjection
 {
-    private const string ConnectionStringName = "Erewhon";
+    internal const string ConnectionStringName = "Erewhon";
     private const string LockTimeoutKey = "Erewhon:Locks:TimeoutMs";
     private const string AllocationTimeoutKey = "Erewhon:Locks:AllocationTimeoutMs";
     private const string SeedDataDirectoryKey = "Erewhon:Seed:DataDirectory";
     private const string ContentRootKey = "contentRoot";
     private const string DefaultSeedDataDirectory = "../../../Erewhon/DataFiles";
     private const int DefaultLockWaitMs = 10000;
+
+    private static readonly EventId[] IgnoredEvents =
+    [
+        RelationalEventId.ConnectionOpening,
+        RelationalEventId.ConnectionOpened,
+        RelationalEventId.ConnectionClosing,
+        RelationalEventId.ConnectionClosed,
+        RelationalEventId.ConnectionDisposing,
+        RelationalEventId.ConnectionDisposed,
+        RelationalEventId.ConnectionError,
+        RelationalEventId.DataReaderClosing,
+        RelationalEventId.DataReaderDisposing,
+        RelationalEventId.MigrateUsingConnection,
+        RelationalEventId.CommandError,
+        RelationalEventId.NonQueryOperationFailed,
+        RelationalEventId.ExecuteDeleteFailed,
+        RelationalEventId.ExecuteUpdateFailed,
+        RelationalEventId.TransactionError,
+        RelationalEventId.BatchExecutorFailedToRollbackToSavepoint,
+        RelationalEventId.BatchExecutorFailedToReleaseSavepoint,
+        CoreEventId.QueryIterationFailed,
+        CoreEventId.SaveChangesFailed,
+        CoreEventId.OptimisticConcurrencyException,
+        CoreEventId.ExecutionStrategyRetrying,
+    ];
 
     /// <summary>
     /// Adds the persistence services to <paramref name="services"/>. The lock and seed settings are read from
@@ -45,8 +73,20 @@ public static class DependencyInjection
     /// <item><description>
     /// a scoped <see cref="ErewhonDbContext"/> on the Npgsql provider with the connection string
     /// <c>ConnectionStrings:Erewhon</c>, or with no connection string when that value is absent, empty or white space,
-    /// in which case every database access fails with the provider's error; the context is created with the scope's
-    /// <see cref="ChangeNotificationInterceptor"/> attached to its saves;
+    /// in which case every database access fails with a <see cref="MissingConnectionStringException"/>, whose message
+    /// names the setting without a value, when the context creates or opens its connection; the context is created
+    /// with the scope's <see cref="ChangeNotificationInterceptor"/> attached to its saves;
+    /// </description></item>
+    /// <item><description>
+    /// on that context, these EF Core events are ignored, so none of them is logged at any level while interceptors
+    /// still receive them: the connection events <c>ConnectionOpening</c>, <c>ConnectionOpened</c>,
+    /// <c>ConnectionClosing</c>, <c>ConnectionClosed</c>, <c>ConnectionDisposing</c>, <c>ConnectionDisposed</c> and
+    /// <c>ConnectionError</c>; the data-reader events <c>DataReaderClosing</c> and <c>DataReaderDisposing</c>;
+    /// <c>MigrateUsingConnection</c>; the failure events <c>CommandError</c>,
+    /// <c>NonQueryOperationFailed</c>, <c>ExecuteDeleteFailed</c>, <c>ExecuteUpdateFailed</c>,
+    /// <c>TransactionError</c>, <c>BatchExecutorFailedToRollbackToSavepoint</c>,
+    /// <c>BatchExecutorFailedToReleaseSavepoint</c>, <c>QueryIterationFailed</c>, <c>SaveChangesFailed</c> and
+    /// <c>OptimisticConcurrencyException</c>; and <c>ExecutionStrategyRetrying</c>;
     /// </description></item>
     /// <item><description>
     /// scoped <see cref="IErewhonDbContext"/> (the scope's <see cref="ErewhonDbContext"/> itself),
@@ -83,11 +123,14 @@ public static class DependencyInjection
             if (string.IsNullOrWhiteSpace(connectionString))
             {
                 options.UseNpgsql();
+                options.AddInterceptors(MissingConnectionStringGuard.Instance);
             }
             else
             {
                 options.UseNpgsql(connectionString);
             }
+
+            options.ConfigureWarnings(warnings => warnings.Ignore(IgnoredEvents));
         });
 
         services.AddScoped<IErewhonDbContext>(provider => provider.GetRequiredService<ErewhonDbContext>());
@@ -145,5 +188,86 @@ public static class DependencyInjection
             // Passed on unnormalised; InitialDataLoader reports it as an invalid directory (D-118).
             return directory;
         }
+    }
+
+    /// <summary>
+    /// The connection interceptor of a context configured without a connection string: it throws
+    /// <see cref="MissingConnectionStringException"/> when the context creates or opens a connection that has no
+    /// connection string, and otherwise lets the creation or opening proceed unchanged.
+    /// </summary>
+    private sealed class MissingConnectionStringGuard : DbConnectionInterceptor
+    {
+        /// <summary>The instance attached to every context configured without a connection string.</summary>
+        public static readonly MissingConnectionStringGuard Instance = new();
+
+        /// <summary>
+        /// Throws <see cref="MissingConnectionStringException"/> when the connection is to be created with no
+        /// connection string; otherwise returns <paramref name="result"/>.
+        /// </summary>
+        /// <param name="eventData">The context and connection string of the connection being created.</param>
+        /// <param name="result">The interception result passed in.</param>
+        /// <returns><paramref name="result"/>.</returns>
+        /// <exception cref="MissingConnectionStringException">The connection string is absent, empty or white space.</exception>
+        public override InterceptionResult<DbConnection> ConnectionCreating(
+            ConnectionCreatingEventData eventData,
+            InterceptionResult<DbConnection> result) =>
+            string.IsNullOrWhiteSpace(eventData.ConnectionString)
+                ? throw new MissingConnectionStringException()
+                : result;
+
+        /// <summary>
+        /// Throws <see cref="MissingConnectionStringException"/> when <paramref name="connection"/> has no connection
+        /// string; otherwise returns <paramref name="result"/>.
+        /// </summary>
+        /// <param name="connection">The connection being opened.</param>
+        /// <param name="eventData">The context and connection of the event.</param>
+        /// <param name="result">The interception result passed in.</param>
+        /// <returns><paramref name="result"/>.</returns>
+        /// <exception cref="MissingConnectionStringException">The connection string is empty or white space.</exception>
+        public override InterceptionResult ConnectionOpening(
+            DbConnection connection,
+            ConnectionEventData eventData,
+            InterceptionResult result) =>
+            string.IsNullOrWhiteSpace(connection.ConnectionString)
+                ? throw new MissingConnectionStringException()
+                : result;
+
+        /// <summary>
+        /// Returns a task faulted with <see cref="MissingConnectionStringException"/> when
+        /// <paramref name="connection"/> has no connection string; otherwise a task completed with
+        /// <paramref name="result"/>.
+        /// </summary>
+        /// <param name="connection">The connection being opened.</param>
+        /// <param name="eventData">The context and connection of the event.</param>
+        /// <param name="result">The interception result passed in.</param>
+        /// <param name="cancellationToken">Not used.</param>
+        /// <returns>The faulted or completed task.</returns>
+        public override ValueTask<InterceptionResult> ConnectionOpeningAsync(
+            DbConnection connection,
+            ConnectionEventData eventData,
+            InterceptionResult result,
+            CancellationToken cancellationToken = default) =>
+            string.IsNullOrWhiteSpace(connection.ConnectionString)
+                ? ValueTask.FromException<InterceptionResult>(new MissingConnectionStringException())
+                : ValueTask.FromResult(result);
+    }
+}
+
+/// <summary>
+/// Raised when a database context registered by <see cref="DependencyInjection.AddErewhonPersistence"/> creates or
+/// opens its connection while <c>ConnectionStrings:Erewhon</c> is absent, empty or white space. Its message,
+/// <see cref="Text"/>, names the setting and carries no connection value.
+/// </summary>
+public sealed class MissingConnectionStringException : InvalidOperationException
+{
+    /// <summary>The exception message, <c>ConnectionStrings:Erewhon is not set.</c></summary>
+    public const string Text = "ConnectionStrings:" + DependencyInjection.ConnectionStringName + " is not set.";
+
+    /// <summary>
+    /// Creates the exception with <see cref="Text"/> as its message.
+    /// </summary>
+    public MissingConnectionStringException()
+        : base(Text)
+    {
     }
 }
