@@ -34,6 +34,7 @@ try
 
         case ["reset-database", var name] when databaseNamePattern.IsMatch(name):
             await PostgresDatabase.Named(name).RecreateAsync();
+            Console.Error.WriteLine($"Database {name} recreated");
             return SuccessExitCode;
 
         default:
@@ -43,7 +44,7 @@ try
 }
 catch (Exception exception)
 {
-    Console.Error.WriteLine(exception.Message);
+    Console.Error.WriteLine($"{exception.GetType().FullName}: {exception.Message}");
     return FailureExitCode;
 }
 
