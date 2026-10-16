@@ -93,8 +93,9 @@ public sealed record ItemsByCategoryResponse(long ItemCategoryId, IReadOnlyList<
 /// <param name="Name">The item name, the <c>name</c> text of <c>txtShortDesc</c>.</param>
 /// <param name="Description">The item description, the <c>description</c> text of <c>txtFullDesc</c>.</param>
 /// <param name="ListedDate">
-/// The date the item is listed, the TA's <c>listedDate</c>, which the editor form does not set;
-/// <see langword="null"/> for the server date.
+/// The date the item is listed, the TA's <c>listedDate</c>, which the editor form does not set. On a create,
+/// <see langword="null"/> gives the server date; on an update, <see langword="null"/> keeps the item's stored listed
+/// date. A date replaces it.
 /// </param>
 /// <param name="PhotoBase64">
 /// The base64 text of the picture file loaded into <c>picItem</c>, the <c>photo</c> value;
@@ -136,8 +137,9 @@ public sealed record RetailItemRequest(
 /// <param name="Name">The item name, the <c>name</c> text of <c>txtShortDesc</c>.</param>
 /// <param name="Description">The item description, the <c>description</c> text of <c>txtFullDesc</c>.</param>
 /// <param name="ListedDate">
-/// The date the item is listed, the TA's <c>listedDate</c>, which the editor form does not set;
-/// <see langword="null"/> for the server date.
+/// The date the item is listed, the TA's <c>listedDate</c>, which the editor form does not set. On a create,
+/// <see langword="null"/> gives the server date; on an update, <see langword="null"/> keeps the item's stored listed
+/// date. A date replaces it.
 /// </param>
 /// <param name="PhotoBase64">
 /// The base64 text of the picture file loaded into <c>picItem</c>, the <c>photo</c> value;

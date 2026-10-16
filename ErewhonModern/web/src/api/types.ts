@@ -625,7 +625,7 @@ export interface RetailItemRequest {
   codeNumber: number;
   name: string | null;
   description: string | null;
-  /** Null for the server date. */
+  /** On POST, null gives the server date; on PUT, null keeps the stored listed date. A date replaces it. */
   listedDate: IsoDate | null;
   /** Picture file content; null for no picture. */
   photoBase64: Base64 | null;
@@ -641,7 +641,7 @@ export interface TenderItemRequest {
   codeNumber: number;
   name: string | null;
   description: string | null;
-  /** Null for the server date. */
+  /** On POST, null gives the server date; on PUT, null keeps the stored listed date. A date replaces it. */
   listedDate: IsoDate | null;
   /** Picture file content; null for no picture. */
   photoBase64: Base64 | null;

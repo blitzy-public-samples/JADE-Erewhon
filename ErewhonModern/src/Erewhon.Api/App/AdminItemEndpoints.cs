@@ -374,7 +374,10 @@ public static class AdminItemEndpoints
         command.ClosureDate = request.ClosureDate;
     }
 
-    /// <summary>Writes the item values shared by retail and tender items to the command, decoding the photo.</summary>
+    /// <summary>
+    /// Writes the item values shared by retail and tender items to the command, decoding the photo; a
+    /// <see langword="null"/> <paramref name="listedDate"/> keeps the command's listed date.
+    /// </summary>
     private static void ApplyItemValues(
         ItemCommand command,
         int codeNumber,
@@ -390,7 +393,7 @@ public static class AdminItemEndpoints
         command.CodeNumber = codeNumber;
         command.Name = name;
         command.Description = description;
-        command.ListedDate = listedDate;
+        command.ListedDate = listedDate ?? command.ListedDate;
         command.Photo = DecodePhoto(photoBase64);
         command.Price = price;
         command.AgentId = agentId;
