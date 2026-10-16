@@ -1,6 +1,7 @@
 using Erewhon.Api.Sessions;
 using Erewhon.Application.Notifications;
 using Microsoft.AspNetCore.SignalR;
+using Microsoft.Extensions.Primitives;
 
 namespace Erewhon.Api.Realtime;
 
@@ -71,7 +72,9 @@ public sealed class ErewhonHub(SessionRegistry registry) : Hub
     /// <returns>A task that completes when the connection has been accepted into its groups or aborted.</returns>
     public override async Task OnConnectedAsync()
     {
-        var sessionId = Context.GetHttpContext()?.Request.Query[SessionMiddleware.HubSessionQueryKey].ToString();
+        var values = Context.GetHttpContext()?.Request.Query[SessionMiddleware.HubSessionQueryKey]
+            ?? StringValues.Empty;
+        var sessionId = values.Count > 0 ? values[0] : null;
         if (!registry.TryGet(sessionId, out var entry))
         {
             Context.Abort();

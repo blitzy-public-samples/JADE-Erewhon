@@ -2,6 +2,7 @@ using Erewhon.Api.App.Contracts;
 using Erewhon.Api.Closure;
 using Erewhon.Api.Errors;
 using Erewhon.Application.Abstractions;
+using Erewhon.Application.Common;
 using Erewhon.Application.Services;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -53,7 +54,9 @@ public static class ClosureEndpoints
     /// Every route answers 401 with an empty body when no session is bound and declares the 500
     /// <see cref="ErrorOutcome"/>, which reports, among others, the lock outcome of a closure row lock that was not
     /// obtained; the awards committed before it stay. The two routes that read a JSON body also declare the 400 with an
-    /// empty body of a request whose body cannot be read.
+    /// empty body of a request whose body cannot be read. They also answer 400 with an empty body when the request has
+    /// no <c>date</c> or its <c>date</c> is the null date 0001-01-01, before the session's schedule is stopped or
+    /// replaced and before any tender is closed.
     /// </summary>
     /// <param name="api">The <c>/api/app</c> route group.</param>
     /// <returns><paramref name="api"/>, for chaining.</returns>
@@ -130,9 +133,10 @@ public static class ClosureEndpoints
 
     /// <summary>
     /// Stops the session's schedule, closes the bound company's tenders due at the request date and returns 200 with
-    /// the number of tender items awarded, or 401 when no session id is bound.
+    /// the number of tender items awarded; 401 when no session id is bound, then 400 when the request date is the null
+    /// date, each before the schedule is stopped or any tender is closed.
     /// </summary>
-    private static async Task<Results<Ok<CloseNowResponse>, UnauthorizedHttpResult>> CloseNowAsync(
+    private static async Task<Results<Ok<CloseNowResponse>, UnauthorizedHttpResult, BadRequest>> CloseNowAsync(
         [FromBody] CloseNowRequest request,
         [FromServices] ISessionContext session,
         [FromServices] ClosureScheduleRegistry closureRegistry,
@@ -144,6 +148,11 @@ public static class ClosureEndpoints
             return TypedResults.Unauthorized();
         }
 
+        if (!JadeValues.IsValid(request.Date))
+        {
+            return TypedResults.BadRequest();
+        }
+
         closureRegistry.Stop(sessionId);
 
         int numClosed = await tenderClosureService.CloseTendersAtDateAsync(request.Date, ct);
@@ -153,9 +162,10 @@ public static class ClosureEndpoints
 
     /// <summary>
     /// Replaces the session's schedule with one at the request date and minutes and returns 200 with whether it started
-    /// and its initial seconds to go, or 401 when no session id is bound.
+    /// and its initial seconds to go; 401 when no session id is bound, then 400 when the request date is the null date,
+    /// each before the session's schedule is replaced.
     /// </summary>
-    private static Results<Ok<StartClosureScheduleResponse>, UnauthorizedHttpResult> StartSchedule(
+    private static Results<Ok<StartClosureScheduleResponse>, UnauthorizedHttpResult, BadRequest> StartSchedule(
         [FromBody] StartClosureScheduleRequest request,
         [FromServices] ISessionContext session,
         [FromServices] ClosureScheduleRegistry closureRegistry)
@@ -163,6 +173,11 @@ public static class ClosureEndpoints
         if (session.SessionId is not { Length: > 0 } sessionId)
         {
             return TypedResults.Unauthorized();
+        }
+
+        if (!JadeValues.IsValid(request.Date))
+        {
+            return TypedResults.BadRequest();
         }
 
         bool started = closureRegistry.Start(sessionId, request.Date, request.Minutes);

@@ -53,7 +53,8 @@ public static class ShopEndpoints
     /// <c>POST /shop/search</c>: resets the session's shop item search, sets it from the
     /// <see cref="ShopSearchRequest"/> with items in the session cart and sold items excluded, runs it, and answers 200
     /// with a <see cref="ShopSearchResponse"/> whose rows are in code-number order. A low price above a high price,
-    /// both non-zero, fails with the 500 <see cref="ErrorOutcome"/> of error 500002.
+    /// both non-zero, fails with the 500 <see cref="ErrorOutcome"/> of error 500002. An item kind that is not a defined
+    /// <see cref="ShopItemKind"/> answers 400 with an empty body and leaves the session's shop item search unchanged.
     /// </description></item>
     /// <item><description>
     /// <c>GET /shop/cart</c>: 200 with the session's <see cref="CartView"/>.
@@ -252,9 +253,11 @@ public static class ShopEndpoints
 
     /// <summary>
     /// Resets the session's shop item search, sets it from <paramref name="request"/> with cart and sold items
-    /// excluded, runs it for the session, and returns the found items as search rows in the order found.
+    /// excluded, runs it for the session, and returns the found items as search rows in the order found. Returns 400
+    /// with an empty body, leaving the session's shop item search unchanged, when the request's item kind is not a
+    /// defined <see cref="ShopItemKind"/>.
     /// </summary>
-    private static async Task<Results<Ok<ShopSearchResponse>, UnauthorizedHttpResult>> SearchAsync(
+    private static async Task<Results<Ok<ShopSearchResponse>, BadRequest, UnauthorizedHttpResult>> SearchAsync(
         [FromBody] ShopSearchRequest request,
         HttpContext httpContext,
         [FromServices] ItemSearch itemSearch,
@@ -265,6 +268,11 @@ public static class ShopEndpoints
         if (entry is null)
         {
             return TypedResults.Unauthorized();
+        }
+
+        if (!Enum.IsDefined(request.ItemKind))
+        {
+            return TypedResults.BadRequest();
         }
 
         ItemSearchCriteria criteria = entry.ShopSearch;

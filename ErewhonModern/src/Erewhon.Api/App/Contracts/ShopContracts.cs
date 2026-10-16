@@ -67,7 +67,8 @@ public enum ShopItemKind
 /// </param>
 /// <param name="ItemKind">
 /// The item types returned, the option chosen among <c>optAllItems</c>, <c>optRetailItems</c> and
-/// <c>optTenderItems</c>.
+/// <c>optTenderItems</c>; <see cref="ShopItemKind.All"/> when the member is omitted. A search request whose value is
+/// not a defined <see cref="ShopItemKind"/> answers 400 with an empty body.
 /// </param>
 /// <param name="PriceLow">
 /// The lowest price returned, inclusive, the <c>priceLow</c> decimal value of <c>txtPriceLower</c>; 0 for no lower bound.

@@ -19,7 +19,7 @@ public sealed record ClosureScheduleStateResponse(
 /// <summary>
 /// Request of the "Close now" action, replacing <c>ErewhonCloseTendersForm.btnCloseNow_click</c>.
 /// </summary>
-/// <param name="Date">The date tenders are closed at, the value of <c>txtCloseDate</c>.</param>
+/// <param name="Date">The date tenders are closed at, the value of <c>txtCloseDate</c>; a missing date binds the null date 0001-01-01, which the route refuses with 400.</param>
 public sealed record CloseNowRequest(DateOnly Date);
 
 /// <summary>
@@ -32,7 +32,7 @@ public sealed record CloseNowResponse(int NumClosed);
 /// Request that starts the closure schedule for the caller's session, replacing
 /// <c>ErewhonCloseTendersForm.btnStart_click</c> and <c>startTimer(false)</c>.
 /// </summary>
-/// <param name="Date">The date the first scheduled closure uses, the value of <c>txtCloseDate</c>.</param>
+/// <param name="Date">The date the first scheduled closure uses, the value of <c>txtCloseDate</c>; a missing date binds the null date 0001-01-01, which the route refuses with 400.</param>
 /// <param name="Minutes">The minutes between scheduled closures, the value of <c>txtMinutes</c>.</param>
 public sealed record StartClosureScheduleRequest(DateOnly Date, int Minutes);
 
