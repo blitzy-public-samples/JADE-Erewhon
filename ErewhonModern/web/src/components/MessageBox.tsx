@@ -12,8 +12,8 @@ import { createPortal } from 'react-dom';
 import type { ErrorOutcome } from '../api/types';
 import { ErrorOutcomeError, UnauthorizedError } from '../api/client';
 
-/** Button set of a message box: OK only, Yes and No, or Yes, No and Cancel. */
-export type MessageBoxButtons = 'ok' | 'yesNo' | 'yesNoCancel';
+/** Button set of a message box: OK only, OK and Cancel, Yes and No, or Yes, No and Cancel. */
+export type MessageBoxButtons = 'ok' | 'okCancel' | 'yesNo' | 'yesNoCancel';
 
 /** Icon shown beside the title of a message box. */
 export type MessageBoxIcon = 'information' | 'question' | 'error' | 'exclamation';
@@ -43,6 +43,7 @@ type Lifecycle = 'pending' | 'mounted' | 'unmounted';
 
 const BUTTON_RESULTS: Record<MessageBoxButtons, readonly MessageBoxResult[]> = {
   ok: ['ok'],
+  okCancel: ['ok', 'cancel'],
   yesNo: ['yes', 'no'],
   yesNoCancel: ['yes', 'no', 'cancel'],
 };
@@ -56,12 +57,14 @@ const BUTTON_CAPTIONS: Record<MessageBoxResult, string> = {
 
 const ESCAPE_RESULTS: Record<MessageBoxButtons, MessageBoxResult | null> = {
   ok: 'ok',
+  okCancel: 'cancel',
   yesNo: null,
   yesNoCancel: 'cancel',
 };
 
 const DISMISS_RESULTS: Record<MessageBoxButtons, MessageBoxResult> = {
   ok: 'ok',
+  okCancel: 'cancel',
   yesNo: 'no',
   yesNoCancel: 'cancel',
 };
@@ -288,11 +291,11 @@ function dismissEntries(entries: readonly QueueEntry[]): void {
 
 /**
  * Modal message box rendered into `document.body`. Each button calls `onClose` with its result; Escape calls it
- * with `'ok'` for an OK-only box and `'cancel'` for a Yes/No/Cancel box, and does nothing for a Yes/No box. The first
- * button is focused on mount, Tab and Shift+Tab cycle through the buttons, and the element that held the focus before
- * the box opened gets it back when the box closes and nothing else has taken it. Clicks outside the buttons do
- * nothing, a click on the backdrop leaves the focus where it was, and no click, double-click, mouse-down or key event
- * leaves the box.
+ * with `'ok'` for an OK-only box and `'cancel'` for an OK/Cancel or Yes/No/Cancel box, and does nothing for a Yes/No
+ * box. The first button is focused on mount, Tab and Shift+Tab cycle through the buttons, and the element that held
+ * the focus before the box opened gets it back when the box closes and nothing else has taken it. Clicks outside the
+ * buttons do nothing, a click on the backdrop leaves the focus where it was, and no click, double-click, mouse-down or
+ * key event leaves the box.
  */
 export function MessageBox(
   props: MessageBoxOptions & { onClose: (result: MessageBoxResult) => void },
@@ -420,7 +423,7 @@ export function errorOutcomeOptions(outcome: ErrorOutcome): MessageBoxOptions {
  * {@link ErrorOutcomeError} and resolves once it is closed, resolves without a box for an {@link UnauthorizedError},
  * and rejects with any other value. Both functions keep their identity for the component's lifetime. On unmount,
  * every queued box resolves without being shown further: `'ok'` for an OK-only box, `'no'` for a Yes/No box and
- * `'cancel'` for a Yes/No/Cancel box; a box requested after unmount resolves the same way.
+ * `'cancel'` for an OK/Cancel or Yes/No/Cancel box; a box requested after unmount resolves the same way.
  */
 export function useMessageBox(): {
   element: ReactElement | null;
