@@ -49,6 +49,9 @@ public sealed class RestCatalogueTests : ErewhonTestBase
 
     private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
+    /// <summary>Code prefixes made only of white space other than spaces, or of spaces around such white space.</summary>
+    private static readonly string[] WhiteSpaceOnlyPrefixes = ["\t", "\n", "\u00A0", " \t "];
+
     private long CompanyId =>
         Builder.MyCompany?.Id
         ?? throw new InvalidOperationException($"The fixture company is created by {nameof(SetUpAsync)}.");
@@ -71,7 +74,10 @@ public sealed class RestCatalogueTests : ErewhonTestBase
     /// empty body. <c>getClient</c> trims blanks: "  Test Client  " answers 200 with the client "Test Client".
     /// <c>getSale</c> checks the trimmed prefix and looks up the untrimmed one: <c>CAT1</c>/1 answers 200 with the
     /// retail sale and " CAT1 "/1 answers 404 with an empty body. <c>getItemByCode</c> looks the item up by number
-    /// only: " CAT1 "/1 and <c>ZZZZ</c>/1 both answer 200 with retail item 1.
+    /// only: " CAT1 "/1 and <c>ZZZZ</c>/1 both answer 200 with retail item 1. Each of the prefixes "\t", "\n",
+    /// "\u00A0" and " \t " with number 1 answers 200 with retail item 1 from <c>getItemByCode</c> and 404 with an empty
+    /// body from <c>getSale</c>. An agent named "\t" and a client named "\u00A0", each created with 201, are each
+    /// found by that name with 200.
     /// </summary>
     /// <returns>A task that completes when the test has run.</returns>
     [Fact]
@@ -105,6 +111,30 @@ public sealed class RestCatalogueTests : ErewhonTestBase
         JsonElement otherPrefixItem = await GetJsonAsync(http, ItemByCode("ZZZZ", RetailItemNumber));
         Assert.Equal("retailItem", otherPrefixItem.GetProperty("type").GetString());
         Assert.Equal(RetailItemNumber, otherPrefixItem.GetProperty("number").GetInt32());
+
+        // getItemByCode and getSale: white-space-only prefixes pass the prefix check.
+        foreach (string prefix in WhiteSpaceOnlyPrefixes)
+        {
+            JsonElement whiteSpacePrefixItem = await GetJsonAsync(http, ItemByCode(prefix, RetailItemNumber));
+            Assert.Equal("retailItem", whiteSpacePrefixItem.GetProperty("type").GetString());
+            Assert.Equal(RetailItemNumber, whiteSpacePrefixItem.GetProperty("number").GetInt32());
+
+            await GetEmptyAsync(http, SaleByCode(prefix, RetailItemNumber), NotFound);
+        }
+
+        // getAgent: a tab name found as given.
+        const string TabAgentName = "\t";
+        await PostResultAsync(http, AgentsPath, NewAgentDto(TabAgentName), Created);
+
+        JsonElement tabAgent = await GetJsonAsync(http, AgentByName(TabAgentName));
+        Assert.Equal(TabAgentName, tabAgent.GetProperty("name").GetString());
+
+        // getClient: a no-break space name found as given.
+        const string NoBreakSpaceClientName = "\u00A0";
+        await PostResultAsync(http, ClientsPath, NewClientDto(NoBreakSpaceClientName), Created);
+
+        JsonElement noBreakSpaceClient = await GetJsonAsync(http, ClientByName(NoBreakSpaceClientName));
+        Assert.Equal(NoBreakSpaceClientName, noBreakSpaceClient.GetProperty("name").GetString());
     }
 
     /// <summary>

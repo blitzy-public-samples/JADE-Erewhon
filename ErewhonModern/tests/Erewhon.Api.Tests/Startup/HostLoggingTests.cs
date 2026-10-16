@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using System.Text.Json;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 
 namespace Erewhon.Api.Tests.Startup;
@@ -10,8 +12,10 @@ namespace Erewhon.Api.Tests.Startup;
 /// the level overrides of the base <c>appsettings.json</c>, and a host with the committed configuration writes each event
 /// once through its configured sink. A failure to build or start the host, for the web server and for a command-line
 /// verb, ends <see cref="ErewhonHost.RunAsync"/> with exit code 1 and one fatal <c>ErewhonHostFailed</c> event on
-/// standard output instead of an exception. Standard output is captured by replacing <see cref="Console.Out"/> while
-/// each case runs.
+/// standard output instead of an exception. A <see cref="HostAbortedException"/> thrown from the <c>HostBuilt</c>
+/// diagnostic event while the host is built, as the EF Core design-time tools throw it, propagates out of
+/// <see cref="ErewhonHost.RunAsync"/> with no fatal and no <c>ErewhonHostFailed</c> event. Standard output is
+/// captured by replacing <see cref="Console.Out"/> while each case runs.
 /// </summary>
 public sealed class HostLoggingTests
 {
@@ -20,6 +24,14 @@ public sealed class HostLoggingTests
     private const string HostingDiagnosticsCategory = "Microsoft.AspNetCore.Hosting.Diagnostics";
 
     private const string FatalLevelMarker = "\"@l\":\"Fatal\"";
+
+    private const string HostFailedEventName = "ErewhonHostFailed";
+
+    /// <summary>
+    /// Whether a <see cref="HostBuiltEventObserver"/> aborts a host whose <c>HostBuilt</c> event is written in the
+    /// current execution context.
+    /// </summary>
+    private static readonly AsyncLocal<bool> HostBuiltAbortRequested = new();
 
     /// <summary>
     /// Builds the host with the test output folder as its content root, which holds the committed
@@ -132,6 +144,49 @@ public sealed class HostLoggingTests
     }
 
     /// <summary>
+    /// Runs <see cref="ErewhonHost.RunAsync"/> while a <see cref="HostBuiltAbortingObserver"/> observes the
+    /// host-building events as the EF Core design-time tools do: on the <c>HostBuilt</c> event it takes the built host
+    /// and throws a <see cref="HostAbortedException"/>. For the web server and for the <c>migrate</c> verb, that
+    /// exception propagates out of <see cref="ErewhonHost.RunAsync"/> as thrown, and standard output holds no fatal
+    /// event and no <c>ErewhonHostFailed</c> event. The taken host is disposed afterwards.
+    /// </summary>
+    /// <param name="verb">The verb to run, or <see langword="null"/> for the web server.</param>
+    [Theory]
+    [InlineData(null)]
+    [InlineData("migrate")]
+    public async Task HostAbortedWhileBuiltPropagatesWithoutFatalEvent(string? verb)
+    {
+        string[] args = verb is null ? ["--urls", "http://127.0.0.1:0"] : [verb];
+        var observer = new HostBuiltAbortingObserver();
+        HostAbortedException aborted;
+        string[] lines;
+        HostBuiltAbortRequested.Value = true;
+        try
+        {
+            (aborted, lines) = await CaptureStandardOutputAsync(
+                () => Assert.ThrowsAsync<HostAbortedException>(() => ErewhonHost.RunAsync(args)));
+        }
+        finally
+        {
+            HostBuiltAbortRequested.Value = false;
+            observer.Dispose();
+            if (observer.BuiltHost is IAsyncDisposable asyncDisposableHost)
+            {
+                await asyncDisposableHost.DisposeAsync();
+            }
+            else
+            {
+                observer.BuiltHost?.Dispose();
+            }
+        }
+
+        Assert.NotNull(observer.BuiltHost);
+        Assert.Same(observer.AbortException, aborted);
+        Assert.DoesNotContain(lines, line => line.Contains(FatalLevelMarker, StringComparison.Ordinal));
+        Assert.DoesNotContain(lines, line => line.Contains(HostFailedEventName, StringComparison.Ordinal));
+    }
+
+    /// <summary>
     /// Runs <paramref name="action"/> with <see cref="Console.Out"/> replaced by an in-memory writer, restores the
     /// previous writer, and returns the result with the captured text split into non-empty lines.
     /// </summary>
@@ -161,5 +216,148 @@ public sealed class HostLoggingTests
         }
 
         return (result, text.Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+    }
+
+    /// <summary>
+    /// Subscribes to <see cref="DiagnosticListener.AllListeners"/> when created and, for every listener named
+    /// <c>Microsoft.Extensions.Hosting</c> that exists or is created while subscribed, subscribes a
+    /// <see cref="HostBuiltEventObserver"/>. Every subscription is disposed by <see cref="Dispose"/>, or when the
+    /// sequence of listeners ends; a listener reported after that gets no subscription.
+    /// </summary>
+    private sealed class HostBuiltAbortingObserver : IObserver<DiagnosticListener>, IDisposable
+    {
+        private const string HostingListenerName = "Microsoft.Extensions.Hosting";
+
+        private readonly object gate = new();
+
+        private readonly List<IDisposable> subscriptions = [];
+
+        private bool disposed;
+
+        /// <summary>Subscribes the new observer to <see cref="DiagnosticListener.AllListeners"/>.</summary>
+        public HostBuiltAbortingObserver() => Track(DiagnosticListener.AllListeners.Subscribe(this));
+
+        /// <summary>Gets the host taken from the <c>HostBuilt</c> event that was aborted, if any.</summary>
+        public IHost? BuiltHost { get; private set; }
+
+        /// <summary>Gets the exception thrown from the <c>HostBuilt</c> event that was aborted, if any.</summary>
+        public HostAbortedException? AbortException { get; private set; }
+
+        /// <summary>
+        /// Subscribes a <see cref="HostBuiltEventObserver"/> to <paramref name="listener"/> when it is named
+        /// <c>Microsoft.Extensions.Hosting</c>.
+        /// </summary>
+        /// <param name="listener">A listener that exists or has been created.</param>
+        public void OnNext(DiagnosticListener listener)
+        {
+            if (listener.Name == HostingListenerName)
+            {
+                Track(new HostBuiltEventObserver(listener, this));
+            }
+        }
+
+        /// <summary>Disposes every subscription.</summary>
+        public void OnCompleted() => Dispose();
+
+        /// <summary>Disposes every subscription.</summary>
+        /// <param name="error">The error that ended the sequence of listeners.</param>
+        public void OnError(Exception error) => Dispose();
+
+        /// <summary>
+        /// Disposes every subscription, the one to <see cref="DiagnosticListener.AllListeners"/> included.
+        /// </summary>
+        public void Dispose()
+        {
+            IDisposable[] released;
+            lock (gate)
+            {
+                disposed = true;
+                released = [.. subscriptions];
+                subscriptions.Clear();
+            }
+
+            foreach (var subscription in released)
+            {
+                subscription.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Records <paramref name="host"/> as <see cref="BuiltHost"/> and throws a new
+        /// <see cref="HostAbortedException"/>, recorded as <see cref="AbortException"/>.
+        /// </summary>
+        /// <param name="host">The host of the <c>HostBuilt</c> event.</param>
+        /// <exception cref="HostAbortedException">Always.</exception>
+        public void AbortHostBuilt(IHost host)
+        {
+            BuiltHost = host;
+            AbortException = new HostAbortedException();
+            throw AbortException;
+        }
+
+        /// <summary>
+        /// Keeps <paramref name="subscription"/> for <see cref="Dispose"/>, or disposes it at once when
+        /// <see cref="Dispose"/> has already run.
+        /// </summary>
+        /// <param name="subscription">The subscription to keep.</param>
+        private void Track(IDisposable subscription)
+        {
+            lock (gate)
+            {
+                if (!disposed)
+                {
+                    subscriptions.Add(subscription);
+                    return;
+                }
+            }
+
+            subscription.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Observes the events of one <c>Microsoft.Extensions.Hosting</c> listener. When the listener writes the
+    /// <c>HostBuilt</c> event with an <see cref="IHost"/> while <see cref="HostBuiltAbortRequested"/> is set, passes
+    /// the host to <see cref="HostBuiltAbortingObserver.AbortHostBuilt"/>, which throws; every other event is ignored.
+    /// The subscription to the listener is disposed by <see cref="Dispose"/>, or when the listener ends.
+    /// </summary>
+    private sealed class HostBuiltEventObserver : IObserver<KeyValuePair<string, object?>>, IDisposable
+    {
+        private const string HostBuiltEventName = "HostBuilt";
+
+        private readonly HostBuiltAbortingObserver owner;
+
+        private readonly IDisposable subscription;
+
+        /// <summary>Subscribes the new observer to <paramref name="listener"/>.</summary>
+        /// <param name="listener">The <c>Microsoft.Extensions.Hosting</c> listener to observe.</param>
+        /// <param name="owner">The observer that records and throws the abort.</param>
+        public HostBuiltEventObserver(DiagnosticListener listener, HostBuiltAbortingObserver owner)
+        {
+            this.owner = owner;
+            subscription = listener.Subscribe(this);
+        }
+
+        /// <summary>
+        /// Aborts the host of a <c>HostBuilt</c> event while <see cref="HostBuiltAbortRequested"/> is set.
+        /// </summary>
+        /// <param name="value">The event's name and payload.</param>
+        public void OnNext(KeyValuePair<string, object?> value)
+        {
+            if (HostBuiltAbortRequested.Value && value.Key == HostBuiltEventName && value.Value is IHost host)
+            {
+                owner.AbortHostBuilt(host);
+            }
+        }
+
+        /// <summary>Disposes the subscription to the listener.</summary>
+        public void OnCompleted() => Dispose();
+
+        /// <summary>Disposes the subscription to the listener.</summary>
+        /// <param name="error">The error that ended the listener's events.</param>
+        public void OnError(Exception error) => Dispose();
+
+        /// <summary>Disposes the subscription to the listener.</summary>
+        public void Dispose() => subscription.Dispose();
     }
 }

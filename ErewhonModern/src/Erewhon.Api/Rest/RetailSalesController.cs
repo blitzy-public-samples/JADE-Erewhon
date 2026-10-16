@@ -29,39 +29,29 @@ public sealed class RetailSalesController(
     RetailSaleService retailSaleService) : ControllerBase
 {
     /// <summary>
-    /// Records a retail sale of the item with code number <see cref="RetailSaleRequest.CodeNumber"/> to the client
-    /// named <see cref="RetailSaleRequest.Client"/>, at the item's price, sold at the database server's current
-    /// timestamp, with the agent commission computed at creation. The client name is matched exactly, untrimmed; the
-    /// item is looked up by its number alone and <see cref="RetailSaleRequest.CodePrefix"/> is not used. A request
-    /// with no body is handled as one whose fields are all absent. Outcomes, checked in this order:
-    /// <list type="bullet">
-    /// <item><description>500 with an empty body when no company is bound.</description></item>
-    /// <item><description>
-    /// 404 with <see cref="MessageKeys.ClientNotFound"/> as the only error when the bound company has no client with
-    /// that name.
-    /// </description></item>
-    /// <item><description>
-    /// 404 with <see cref="MessageKeys.ItemNotFound"/> as the only error when the bound company has no item with
-    /// that number.
-    /// </description></item>
-    /// <item><description>
-    /// 400 with <see cref="MessageKeys.ItemNotRetailItem"/> as the only error when the item is a tender item.
-    /// </description></item>
-    /// <item><description>
-    /// 400 with the retail sale's validation and lock errors in the order they were raised, for example
-    /// <see cref="MessageKeys.ItemSold"/>, when the sale is not persisted.
-    /// </description></item>
-    /// <item><description>
-    /// 201 with no errors and the new retail sale's source GUID when the sale is persisted.
-    /// </description></item>
-    /// </list>
-    /// Every <see cref="ResultDto"/> returned carries the HTTP status as <see cref="ResultDto.StatusCode"/>.
+    /// Records a retail sale of the item with code number <c>codeNumber</c> to the client named <c>client</c>, at the
+    /// item's price, sold at the database server's current timestamp, with the agent commission computed at creation.
+    /// The client name is matched exactly, untrimmed; the item is looked up by its number alone and
+    /// <c>codePrefix</c> is not used. A request with no body is handled as one whose fields are all absent. The checks
+    /// run in this order: the bound company, the client, the item, the item kind, then the retail sale's own
+    /// validation. Every result returned carries the HTTP status as <c>statusCode</c>.
     /// </summary>
     /// <param name="request">
     /// The client name, category prefix and code number; <see langword="null"/> when the request has no body.
     /// </param>
     /// <param name="ct">Token that cancels the operation when the request is aborted.</param>
     /// <returns>The result of the operation with its HTTP status.</returns>
+    /// <response code="201">The retail sale was persisted: no errors and the new retail sale's source GUID.</response>
+    /// <response code="400">
+    /// The item is a tender item: the single error "Item is not a Retail Item". Or the retail sale was not persisted:
+    /// its validation and lock errors in the order they were raised, for example "The Item has already been sold", and
+    /// no GUID.
+    /// </response>
+    /// <response code="404">
+    /// No client of the bound company has the name: the single error "Client not found". Or the bound company has no
+    /// item with the code number: the single error "Item was not found".
+    /// </response>
+    /// <response code="500">No company is bound: an empty body.</response>
     [HttpPost]
     [ProducesResponseType(typeof(ResultDto), StatusCodes.Status201Created)]
     [ProducesResponseType(typeof(ResultDto), StatusCodes.Status400BadRequest)]

@@ -13,7 +13,7 @@ namespace Erewhon.Api.Errors;
 /// <summary>
 /// The JSON body of an error response: the outcome kind and the heading and body of the message shown to the user.
 /// </summary>
-/// <param name="Kind">The outcome kind: <see cref="KindException"/>, <see cref="KindLock"/> or <see cref="KindDeadlock"/>.</param>
+/// <param name="Kind">The outcome kind: <c>exception</c>, <c>lock</c> or <c>deadlock</c>.</param>
 /// <param name="Heading">The message heading.</param>
 /// <param name="Body">The message body.</param>
 public sealed record ErrorOutcome(

@@ -29,12 +29,11 @@ public sealed class TendersController(
     TenderService tenderService) : ControllerBase
 {
     /// <summary>
-    /// Places a tender of <see cref="TenderRequest.Offer"/>, rounded to 2 decimal places with ties away from zero, by
-    /// the client whose name equals <see cref="TenderRequest.Client"/> exactly, untrimmed, on the item of the bound
-    /// company with code number <see cref="TenderRequest.CodeNumber"/>, timestamped with the database server's current
-    /// timestamp, in its own transaction. <see cref="TenderRequest.CodePrefix"/> is not read. An absent body is read as
-    /// a request with every field unset. The checks run in this order: the bound company, the client, the item, the
-    /// item kind, then the tender's own validation.
+    /// Places a tender of <c>offer</c>, rounded to 2 decimal places with ties away from zero, by the client whose name
+    /// equals <c>client</c> exactly, untrimmed, on the item of the bound company with code number <c>codeNumber</c>,
+    /// timestamped with the database server's current timestamp, in its own transaction. <c>codePrefix</c> is not read.
+    /// An absent body is read as a request with every field unset. The checks run in this order: the bound company, the
+    /// client, the item, the item kind, then the tender's own validation.
     /// </summary>
     /// <param name="request">The client name, the item code and the offer.</param>
     /// <param name="ct">Token that cancels the reads and the persist.</param>

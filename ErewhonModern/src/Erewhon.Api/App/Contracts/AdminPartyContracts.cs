@@ -53,7 +53,7 @@ public sealed record AgentRateRow(
 /// <param name="Agent">The agent with its name and the seven fields of its address.</param>
 /// <param name="Items">
 /// The agent's items in <c>Agent.allItems</c> order (category, prefix, code number), the entries of <c>lstItems</c>;
-/// each with a <see langword="null"/> <see cref="ItemProjection.Photo"/>.
+/// each with a null <c>photo</c>.
 /// </param>
 /// <param name="CommissionRates">The agent's commission rates in category name order, the entries of <c>lstCommissnRate</c>.</param>
 public sealed record AgentDetailsResponse(
@@ -84,7 +84,7 @@ public sealed record CommissionRateAgents(
 /// </param>
 /// <param name="AllAgents">
 /// Every agent of the company in name order (<c>Company.allAgents</c>); the agents of a rate that are not in its
-/// <see cref="CommissionRateAgents.Agents"/> are the entries of <c>lstAgentsNotUsing</c>.
+/// <c>agents</c> are the entries of <c>lstAgentsNotUsing</c>.
 /// </param>
 public sealed record AgentCommissionRatesResponse(
     long ItemCategoryId,

@@ -83,7 +83,7 @@ public static class DocumentationEndpoints
         documentation.MapGet("/{type}/{id:long}/rtf", DownloadRtfAsync)
             .WithName("AppAdminDocumentationDownloadRtf")
             .WithTags(Tag)
-            .WithSummary("Downloads the RTF documentation of one agent or region as <name>.rtf.")
+            .WithSummary("Downloads the RTF documentation of one agent or region as an .rtf file named after it.")
             .Produces(StatusCodes.Status200OK, typeof(Stream), RtfContentType)
             .Produces(StatusCodes.Status404NotFound)
             .Produces(StatusCodes.Status401Unauthorized)

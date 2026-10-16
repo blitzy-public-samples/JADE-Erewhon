@@ -48,7 +48,7 @@ dotnet run --project src/Erewhon.Api
 - `dotnet run` starts the process in the directory it is run from, so a relative path on its command line, such as the `seed` operand, is resolved from that directory (D-156).
 - The content root is the folder that holds `Erewhon.Api.csproj`, `src/Erewhon.Api`, whenever the process runs from that project's build output, as it does under `dotnet run`: `appsettings*.json`, `wwwroot` and relative configured paths are read from it. `--contentRoot <dir>` (after `--` with `dotnet run`, web host only) or the environment variable `ASPNETCORE_CONTENTROOT` or `DOTNET_CONTENTROOT` sets another; a process run from anywhere else, such as a published copy, takes its current directory as the content root (D-156).
 - Ctrl+C or SIGTERM stops the host; the process then exits with code 0, also when the signal arrives while the host is starting.
-- When building, starting, running, stopping or disposing the host throws, for the web host or for a `migrate` or `seed` verb, the process writes one `Fatal` event `ErewhonHostFailed` (section 6.2) and exits with code 1, with no runtime crash and no core dump. Examples: `Erewhon__Closure__TickMs=abc` (the closure service cannot start), a `Serilog` level that is not a level (the logger cannot be built) (D-157).
+- When building, starting, running, stopping or disposing the host throws, for the web host or for a `migrate` or `seed` verb, the process writes one `Fatal` event `ErewhonHostFailed` (section 6.2) and exits with code 1, with no runtime crash and no core dump. Examples: `Erewhon__Closure__TickMs=abc` (the closure service cannot start), a `Serilog` level that is not a level (the logger cannot be built) (D-157). A `dotnet ef` command, which stops the host while it is built, writes no such event (D-157).
 
 ### 2.3 State held in process memory
 
@@ -156,7 +156,7 @@ The interactive load, `POST /api/app/setup/load-data`, runs the same loader on `
 
 ### 4.3 Schema migrations
 
-The migrations live in `src/Erewhon.Persistence/Migrations` (first migration `20261015000000_InitialSchema`). The `dotnet ef` commands take their connection from the `ConnectionStrings__Erewhon` environment variable (D-74).
+The migrations live in `src/Erewhon.Persistence/Migrations` (first migration `20261015000000_InitialSchema`). The `dotnet ef` commands take their connection from the `ConnectionStrings__Erewhon` environment variable (D-74). They build the host of `src/Erewhon.Api` and stop it before it starts, with no `ErewhonHostFailed` event (D-157).
 
 ```bash
 # SQL script of every migration; each step is skipped on a database that already has it

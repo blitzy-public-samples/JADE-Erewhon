@@ -60,8 +60,8 @@ public static class SetupEndpoints
     }
 
     /// <summary>
-    /// Returns 409 with the refused <see cref="LoadDataResponse"/> when a company exists; otherwise loads the configured
-    /// seed data and returns 200 with the loader's result.
+    /// Returns 409 with a refused load result, whose <c>loaded</c> is false, when a company exists; otherwise loads the
+    /// configured seed data and returns 200 with the loader's result.
     /// </summary>
     /// <param name="companyContext">The company bound to the request scope.</param>
     /// <param name="loader">The seed data loader of the request scope.</param>

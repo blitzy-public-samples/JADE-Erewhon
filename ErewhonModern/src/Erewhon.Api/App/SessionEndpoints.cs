@@ -123,9 +123,9 @@ public static class SessionEndpoints
     }
 
     /// <summary>
-    /// Validates the selected user of <paramref name="request"/> and returns 200 with the outcome: a new session for a
-    /// valid user, or the message for a rejected one. Returns 400 when the request's area is not a defined
-    /// <see cref="LogonArea"/>.
+    /// Validates the selected user of the request body and returns 200 with the outcome: a new session for a valid
+    /// user, or the message for a rejected one. Returns 400 when the request's <c>area</c> is not <c>shop</c> or
+    /// <c>admin</c>.
     /// </summary>
     /// <param name="request">The area, the Administrator option and the selected user name, as entered.</param>
     /// <param name="logonService">The logon service of the request scope.</param>

@@ -51,7 +51,8 @@ public enum ShopItemKind
 /// <summary>
 /// Request of <c>POST /api/app/shop/search</c>, carrying the values <c>ShopItemsForm.populateItemSearch</c> copies from
 /// the search plinth into the session's shop item search. A <see langword="null"/> id applies no filter on that value.
-/// Also the session's current search criteria returned in <see cref="ShopReferenceResponse.CurrentSearch"/>.
+/// Also the session's current search criteria returned in the <c>currentSearch</c> field of
+/// <c>GET /api/app/shop/reference</c>.
 /// </summary>
 /// <param name="CountryId">
 /// The row id of the country the items are in, the <c>myCountry</c> filter selected in <c>cmbCountry</c>;

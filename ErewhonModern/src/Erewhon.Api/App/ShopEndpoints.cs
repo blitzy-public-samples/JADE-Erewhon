@@ -252,10 +252,10 @@ public static class ShopEndpoints
     }
 
     /// <summary>
-    /// Resets the session's shop item search, sets it from <paramref name="request"/> with cart and sold items
-    /// excluded, runs it for the session, and returns the found items as search rows in the order found. Returns 400
-    /// with an empty body, leaving the session's shop item search unchanged, when the request's item kind is not a
-    /// defined <see cref="ShopItemKind"/>.
+    /// Resets the session's shop item search, sets it from the request body with cart and sold items excluded, runs it
+    /// for the session, and returns the found items as search rows in the order found. Returns 400 with an empty body,
+    /// leaving the session's shop item search unchanged, when the request's <c>itemKind</c> is not <c>all</c>,
+    /// <c>retail</c> or <c>tender</c>.
     /// </summary>
     private static async Task<Results<Ok<ShopSearchResponse>, BadRequest, UnauthorizedHttpResult>> SearchAsync(
         [FromBody] ShopSearchRequest request,

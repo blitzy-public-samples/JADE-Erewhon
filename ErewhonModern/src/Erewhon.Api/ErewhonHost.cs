@@ -17,6 +17,8 @@ using Erewhon.Application;
 using Erewhon.Application.Abstractions;
 using Erewhon.Persistence;
 using HealthChecks.NpgSql;
+using Microsoft.AspNetCore.Mvc.ModelBinding;
+using Microsoft.AspNetCore.Mvc.ModelBinding.Metadata;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.OpenApi.Models;
 using Serilog;
@@ -86,8 +88,10 @@ public static class ErewhonHost
     /// singleton <see cref="SignalRNotificationPublisher"/> as <see cref="INotificationPublisher"/>; a singleton
     /// <see cref="ClosureScheduleRegistry"/> and the hosted <see cref="TenderClosureScheduleService"/>; transient
     /// <see cref="ErewhonWebService"/> and <see cref="ErewhonWebServiceAdmin"/>; the controllers of this assembly with
-    /// the global <see cref="RestExceptionFilter"/> and no implicit required attribute on non-nullable reference
-    /// types; CoreWCF with metadata addresses taken from the request headers; SignalR; Swashbuckle with the
+    /// the global <see cref="RestExceptionFilter"/>, no implicit required attribute on non-nullable reference types,
+    /// and string action parameters bound from the query string keeping the value as sent
+    /// (<see cref="QueryStringAsSentMetadataProvider"/>); CoreWCF with metadata addresses taken from the request
+    /// headers; SignalR; Swashbuckle with the
     /// documents <c>rest</c> and <c>app</c>; the PostgreSQL health check <c>postgresql</c>, which reads
     /// <c>ConnectionStrings:Erewhon</c> each time it runs, opens its own unpooled connection with it and closes it
     /// after <c>SELECT 1</c>, and reports <c>Unhealthy</c> when the value is absent or empty, or when the connection
@@ -183,7 +187,9 @@ public static class ErewhonHost
     /// host without command-line configuration and runs the verb through <see cref="RunVerbAsync"/> without starting
     /// the web server or the hosted services; otherwise builds the host from <paramref name="args"/> and runs the web
     /// server through <see cref="RunWebServerAsync"/> until it shuts down. The host is disposed afterwards.
-    /// An exception thrown while the host is built, started, run, stopped or disposed is not rethrown:
+    /// A <see cref="HostAbortedException"/> thrown while the host is built propagates to the caller, with no event
+    /// written. Any other exception thrown while the host is built, started, run, stopped or disposed, and a
+    /// <see cref="HostAbortedException"/> thrown once the host is built, is not rethrown:
     /// <see cref="LogHostFailure"/> writes it as one fatal event, through the host's logger when the host was built
     /// and is not being disposed, and the process ends with exit code 1.
     /// </summary>
@@ -191,9 +197,13 @@ public static class ErewhonHost
     /// <returns>
     /// The verb's exit code; 1 when the verb ends with an <see cref="OperationCanceledException"/> after its token was
     /// cancelled; 0 once the web server has shut down; or 1 when building, starting, running, stopping or disposing
-    /// the host threw an exception.
+    /// the host threw an exception other than a <see cref="HostAbortedException"/> thrown while the host is built.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="args"/> is <see langword="null"/>.</exception>
+    /// <exception cref="HostAbortedException">
+    /// A <see cref="HostAbortedException"/> was thrown while the host was built, for example by an observer of the
+    /// host's <c>HostBuilt</c> diagnostic event; no event is written and nothing is disposed.
+    /// </exception>
     public static async Task<int> RunAsync(string[] args)
     {
         ArgumentNullException.ThrowIfNull(args);
@@ -206,7 +216,7 @@ public static class ErewhonHost
             host = Build(isVerb ? Array.Empty<string>() : args);
             exitCode = isVerb ? await RunVerbAsync(host, args) : await RunWebServerAsync(host);
         }
-        catch (Exception failure)
+        catch (Exception failure) when (host is not null || failure is not HostAbortedException)
         {
             LogHostFailure(host?.Services, failure);
             exitCode = HostFailureExitCode;
@@ -410,6 +420,7 @@ public static class ErewhonHost
             {
                 options.Filters.Add<RestExceptionFilter>();
                 options.SuppressImplicitRequiredAttributeForNonNullableReferenceTypes = true;
+                options.ModelMetadataDetailsProviders.Add(new QueryStringAsSentMetadataProvider());
             })
             .AddApplicationPart(typeof(ErewhonHost).Assembly)
             .AddJsonOptions(options => ConfigureJson(options.JsonSerializerOptions));
@@ -557,6 +568,35 @@ public static class ErewhonHost
     {
         options.PropertyNamingPolicy = JsonNamingPolicy.CamelCase;
         options.Converters.Add(new JsonStringEnumConverter(JsonNamingPolicy.CamelCase));
+    }
+
+    /// <summary>
+    /// The model-metadata provider that switches off <see cref="DisplayMetadata.ConvertEmptyStringToNull"/> for each
+    /// <see cref="string"/> action parameter bound from the query string. Such a parameter binds to the value as sent,
+    /// an empty or white-space-only value included, and to <see langword="null"/> when the query string does not
+    /// hold it. Every other model metadata is left unchanged.
+    /// </summary>
+    private sealed class QueryStringAsSentMetadataProvider : IDisplayMetadataProvider
+    {
+        /// <summary>
+        /// Sets <see cref="DisplayMetadata.ConvertEmptyStringToNull"/> to <see langword="false"/> when
+        /// <paramref name="context"/> describes a parameter of type <see cref="string"/> one of whose attributes is an
+        /// <see cref="IBindingSourceMetadata"/> with the binding source <see cref="BindingSource.Query"/>.
+        /// </summary>
+        /// <param name="context">The context of the metadata being created.</param>
+        /// <exception cref="ArgumentNullException"><paramref name="context"/> is <see langword="null"/>.</exception>
+        public void CreateDisplayMetadata(DisplayMetadataProviderContext context)
+        {
+            ArgumentNullException.ThrowIfNull(context);
+
+            if (context.Key.MetadataKind == ModelMetadataKind.Parameter
+                && context.Key.ModelType == typeof(string)
+                && context.Attributes.OfType<IBindingSourceMetadata>()
+                    .Any(attribute => attribute.BindingSource == BindingSource.Query))
+            {
+                context.DisplayMetadata.ConvertEmptyStringToNull = false;
+            }
+        }
     }
 
     /// <summary>
