@@ -89,7 +89,8 @@ public sealed class ErewhonSoapClientFactory
 
     /// <summary>
     /// Creates a new binding for both clients: SOAP 1.1 over plain HTTP with text encoding and no security,
-    /// with the maximum received message size, buffer size and reader quotas, and every other setting at its default.
+    /// with the maximum received message size, buffer size and reader quotas, a send timeout and a receive timeout
+    /// of one minute each, and every other setting at its default.
     /// </summary>
     /// <returns>A new <see cref="BasicHttpBinding"/> instance.</returns>
     public static BasicHttpBinding CreateBinding() => new(BasicHttpSecurityMode.None)
@@ -97,6 +98,8 @@ public sealed class ErewhonSoapClientFactory
         MaxReceivedMessageSize = int.MaxValue,
         MaxBufferSize = int.MaxValue,
         ReaderQuotas = XmlDictionaryReaderQuotas.Max,
+        SendTimeout = TimeSpan.FromMinutes(1),
+        ReceiveTimeout = TimeSpan.FromMinutes(1),
     };
 
     /// <summary>
