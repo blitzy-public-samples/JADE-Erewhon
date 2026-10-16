@@ -2,6 +2,7 @@ using System.Data;
 using Erewhon.Application.Abstractions;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Storage;
+using Npgsql;
 
 namespace Erewhon.Persistence;
 
@@ -13,6 +14,8 @@ namespace Erewhon.Persistence;
 /// </summary>
 public sealed class UnitOfWork : IUnitOfWork
 {
+    private static readonly PostgresErrorMapper Mapper = new();
+
     private readonly ErewhonDbContext _db;
 
     /// <summary>
@@ -49,19 +52,37 @@ public sealed class UnitOfWork : IUnitOfWork
     }
 
     /// <summary>
-    /// Commits the active transaction, then disposes it, so that no transaction is active afterwards.
-    /// When the commit fails the transaction is still disposed, which rolls back any part of it the database has
-    /// not ended, and the failure propagates.
+    /// Runs <c>SELECT 1</c> in the active transaction, then commits the transaction and disposes it, so that no
+    /// transaction is active afterwards.
+    /// When the database has already aborted the transaction after a failed statement, the <c>SELECT 1</c> fails with
+    /// SQLSTATE <c>25P02</c>, nothing is committed, and <see cref="PostgresErrorMapper.Map"/> maps that
+    /// <see cref="PostgresException"/> into the <see cref="DatabaseFailureException"/> that is thrown.
+    /// When the statement or the commit fails the transaction is still disposed, which rolls back any part of it the
+    /// database has not ended, and the failure propagates.
     /// </summary>
     /// <param name="ct">Token that cancels the operation.</param>
     /// <returns>A task that completes when the commit has returned and the transaction is disposed.</returns>
     /// <exception cref="InvalidOperationException">No transaction is active on the context.</exception>
+    /// <exception cref="DatabaseFailureException">
+    /// The database has already aborted the transaction after a failed statement (SQLSTATE <c>25P02</c>); the
+    /// exception carries the PostgreSQL message text and the <see cref="PostgresException"/> as inner exception, and
+    /// the transaction has been rolled back and disposed.
+    /// </exception>
     public async Task CommitAsync(CancellationToken ct = default)
     {
         var transaction = RequireActiveTransaction();
 
         try
         {
+            try
+            {
+                await _db.Database.ExecuteSqlRawAsync("SELECT 1", ct);
+            }
+            catch (PostgresException e) when (e.SqlState == PostgresErrorCodes.InFailedSqlTransaction)
+            {
+                throw Mapper.Map(e);
+            }
+
             await transaction.CommitAsync(ct);
         }
         finally

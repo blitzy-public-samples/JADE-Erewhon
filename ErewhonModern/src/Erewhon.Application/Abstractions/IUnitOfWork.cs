@@ -24,6 +24,8 @@ public interface IUnitOfWork
     /// <summary>
     /// Commits the active transaction, which releases every transaction-level lock taken in it.
     /// Pending change notifications are not published.
+    /// When the transaction cannot be committed, including when the database has already aborted it after a failed
+    /// statement, the call throws, nothing is committed, and no transaction is active afterwards.
     /// </summary>
     /// <param name="ct">Token that cancels the operation.</param>
     /// <returns>A task that completes when the commit has returned.</returns>
