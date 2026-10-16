@@ -7,7 +7,8 @@ namespace Erewhon.Persistence.Configurations;
 
 /// <summary>
 /// Maps <see cref="Client"/> to the <c>clients</c> table: the row identity, the GUID and soft-lock columns,
-/// the owning company, the name, unique within the company, and the address stored in the client's row.
+/// the owning company, the name, unique within the company and compared and ordered under the binary collation
+/// <c>C</c>, and the address stored in the client's row.
 /// </summary>
 public sealed class ClientConfiguration : IEntityTypeConfiguration<Client>
 {
@@ -46,6 +47,7 @@ public sealed class ClientConfiguration : IEntityTypeConfiguration<Client>
         builder.Property(x => x.Name)
             .HasColumnName("name")
             .HasMaxLength(FieldLengths.ClientName)
+            .UseCollation("C")
             .IsRequired();
 
         builder.Ignore(x => x.JadeClassNumber);

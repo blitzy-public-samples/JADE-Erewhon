@@ -7,7 +7,8 @@ namespace Erewhon.Persistence.Configurations;
 
 /// <summary>
 /// Maps <see cref="Agent"/> to the <c>agents</c> table: the row identity, the GUID and soft-lock columns, the owning
-/// company, the name, unique within the company, and the address stored in the agent's own row.
+/// company, the name, unique within the company and compared and ordered under the binary collation <c>C</c>, and the
+/// address stored in the agent's own row.
 /// </summary>
 public sealed class AgentConfiguration : IEntityTypeConfiguration<Agent>
 {
@@ -46,6 +47,7 @@ public sealed class AgentConfiguration : IEntityTypeConfiguration<Agent>
         builder.Property(x => x.Name)
             .HasColumnName("name")
             .HasMaxLength(FieldLengths.AgentName)
+            .UseCollation("C")
             .IsRequired();
 
         builder.OwnsOne(x => x.Address, address =>

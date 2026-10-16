@@ -12,7 +12,8 @@ namespace Erewhon.Api.Tests.Rest;
 
 /// <summary>
 /// Tests of the REST operation <c>postCreateClient</c>, <c>POST /api/rest/clients</c>, called over HTTP on the test
-/// host. Ports the JADE class <c>RestTestPostCreateClient</c>.
+/// host. Each test also checks the raw JSON result body: its four properties, status code, complete error list, empty
+/// warnings and GUID. Ports the JADE class <c>RestTestPostCreateClient</c>.
 /// </summary>
 public sealed class RestTestPostCreateClient : ErewhonTestBase
 {
@@ -32,7 +33,8 @@ public sealed class RestTestPostCreateClient : ErewhonTestBase
 
     /// <summary>
     /// Posting a client with no name answers 400 with <see cref="MessageKeys.ClientNameRequired"/> as the first error
-    /// and leaves the company with its one client.
+    /// and leaves the company with its one client. The raw body holds status code 400,
+    /// <see cref="MessageKeys.ClientNameRequired"/> as its only error, no warnings and a null GUID.
     /// </summary>
     /// <returns>A task that completes when the test has run.</returns>
     [Fact]
@@ -46,17 +48,18 @@ public sealed class RestTestPostCreateClient : ErewhonTestBase
         using HttpResponseMessage response = await http.PostAsJsonAsync(Route, dtoClient, Json);
         ResultDto? dtoResults = await response.Content.ReadFromJsonAsync<ResultDto>(Json);
 
-        // Assert
         Assert.NotNull(dtoResults);
         Assert.NotEmpty(dtoResults.AllErrors);
         Assert.Equal(400, (int)response.StatusCode);
         Assert.Equal(1, await CountClientsAsync());
         Assert.Equal(MessageCatalog.Get(MessageKeys.ClientNameRequired), dtoResults.AllErrors[0]);
+        await CheckResultBodyAsync(response, [MessageCatalog.Get(MessageKeys.ClientNameRequired)], expectedGuid: null);
     }
 
     /// <summary>
     /// Posting a new client answers 201 with no errors, adds the client to the company, and stores its name and the
-    /// seven address fields as posted.
+    /// seven address fields as posted. The raw body holds status code 201, no errors, no warnings and the GUID of the
+    /// stored client.
     /// </summary>
     /// <returns>A task that completes when the test has run.</returns>
     [Fact]
@@ -71,7 +74,6 @@ public sealed class RestTestPostCreateClient : ErewhonTestBase
         ResultDto? dtoResults = await response.Content.ReadFromJsonAsync<ResultDto>(Json);
         Client? client = await FindClientAsync("Test Client Name");
 
-        // Assert
         Assert.NotNull(dtoResults);
         Assert.Empty(dtoResults.AllErrors);
         Assert.Equal(201, (int)response.StatusCode);
@@ -85,6 +87,7 @@ public sealed class RestTestPostCreateClient : ErewhonTestBase
         Assert.Equal(dtoClient.Fax, client.Address.Fax);
         Assert.Equal(dtoClient.Email, client.Address.Email);
         Assert.Equal(dtoClient.Website, client.Address.WebSite);
+        await CheckResultBodyAsync(response, [], client.Guid);
     }
 
     /// <summary>
@@ -102,6 +105,54 @@ public sealed class RestTestPostCreateClient : ErewhonTestBase
         Email = "client@email.com",
         Website = "www.website.com",
     };
+
+    /// <summary>
+    /// Checks the raw JSON body of <paramref name="response"/>: an object with exactly the properties
+    /// <c>statusCode</c>, <c>allErrors</c>, <c>allWarnings</c> and <c>guid</c>, where <c>statusCode</c> is the number
+    /// of the HTTP status of <paramref name="response"/>, <c>allErrors</c> holds the strings of
+    /// <paramref name="expectedErrors"/> in order and nothing else, <c>allWarnings</c> is an empty array, and
+    /// <c>guid</c> is null when <paramref name="expectedGuid"/> is <see langword="null"/> and otherwise the non-empty
+    /// string <paramref name="expectedGuid"/>.
+    /// </summary>
+    private static async Task CheckResultBodyAsync(
+        HttpResponseMessage response,
+        IReadOnlyList<string> expectedErrors,
+        string? expectedGuid)
+    {
+        using JsonDocument body = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        JsonElement root = body.RootElement;
+        Assert.Equal(JsonValueKind.Object, root.ValueKind);
+        Assert.Equal(
+            new[] { "allErrors", "allWarnings", "guid", "statusCode" },
+            root.EnumerateObject().Select(property => property.Name).Order(StringComparer.Ordinal));
+
+        JsonElement statusCode = root.GetProperty("statusCode");
+        Assert.Equal(JsonValueKind.Number, statusCode.ValueKind);
+        Assert.Equal((int)response.StatusCode, statusCode.GetInt32());
+
+        JsonElement allErrors = root.GetProperty("allErrors");
+        Assert.Equal(JsonValueKind.Array, allErrors.ValueKind);
+        Assert.All(allErrors.EnumerateArray(), error => Assert.Equal(JsonValueKind.String, error.ValueKind));
+        Assert.Equal(expectedErrors, allErrors.EnumerateArray().Select(error => error.GetString()!));
+
+        JsonElement allWarnings = root.GetProperty("allWarnings");
+        Assert.Equal(JsonValueKind.Array, allWarnings.ValueKind);
+        Assert.Empty(allWarnings.EnumerateArray());
+
+        JsonElement guid = root.GetProperty("guid");
+        if (expectedGuid is null)
+        {
+            Assert.Equal(JsonValueKind.Null, guid.ValueKind);
+        }
+        else
+        {
+            Assert.Equal(JsonValueKind.String, guid.ValueKind);
+            string? actualGuid = guid.GetString();
+            Assert.NotNull(actualGuid);
+            Assert.NotEmpty(actualGuid);
+            Assert.Equal(expectedGuid, actualGuid);
+        }
+    }
 
     /// <summary>Returns the number of clients of the test company, read in a new scope of the test host.</summary>
     private async Task<int> CountClientsAsync()

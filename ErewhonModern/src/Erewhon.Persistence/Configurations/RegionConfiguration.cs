@@ -7,7 +7,8 @@ namespace Erewhon.Persistence.Configurations;
 
 /// <summary>
 /// Maps <see cref="Region"/> to the <c>regions</c> table: the row identity, the GUID and soft-lock columns,
-/// the owning country and the name, unique within the country.
+/// the owning country and the name, unique within the country and compared and ordered under the binary collation
+/// <c>C</c>.
 /// </summary>
 public sealed class RegionConfiguration : IEntityTypeConfiguration<Region>
 {
@@ -46,6 +47,7 @@ public sealed class RegionConfiguration : IEntityTypeConfiguration<Region>
         builder.Property(x => x.Name)
             .HasColumnName("name")
             .HasMaxLength(FieldLengths.LocationName)
+            .UseCollation("C")
             .IsRequired();
 
         builder.Ignore(x => x.JadeClassNumber);

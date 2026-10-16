@@ -57,7 +57,8 @@ namespace Erewhon.Persistence.Migrations
                         .IsRequired()
                         .HasMaxLength(81)
                         .HasColumnType("character varying(81)")
-                        .HasColumnName("name");
+                        .HasColumnName("name")
+                        .UseCollation("C");
 
                     b.HasKey("Id")
                         .HasName("pk_agents");
@@ -128,7 +129,8 @@ namespace Erewhon.Persistence.Migrations
                         .IsRequired()
                         .HasMaxLength(81)
                         .HasColumnType("character varying(81)")
-                        .HasColumnName("name");
+                        .HasColumnName("name")
+                        .UseCollation("C");
 
                     b.HasKey("Id")
                         .HasName("pk_clients");
@@ -251,7 +253,8 @@ namespace Erewhon.Persistence.Migrations
                         .IsRequired()
                         .HasMaxLength(81)
                         .HasColumnType("character varying(81)")
-                        .HasColumnName("name");
+                        .HasColumnName("name")
+                        .UseCollation("C");
 
                     b.HasKey("Id")
                         .HasName("pk_countries");
@@ -400,13 +403,15 @@ namespace Erewhon.Persistence.Migrations
                         .IsRequired()
                         .HasMaxLength(41)
                         .HasColumnType("character varying(41)")
-                        .HasColumnName("name");
+                        .HasColumnName("name")
+                        .UseCollation("C");
 
                     b.Property<string>("Prefix")
                         .IsRequired()
                         .HasMaxLength(5)
                         .HasColumnType("character varying(5)")
-                        .HasColumnName("prefix");
+                        .HasColumnName("prefix")
+                        .UseCollation("C");
 
                     b.HasKey("Id")
                         .HasName("pk_item_categories");
@@ -450,7 +455,8 @@ namespace Erewhon.Persistence.Migrations
                         .IsRequired()
                         .HasMaxLength(81)
                         .HasColumnType("character varying(81)")
-                        .HasColumnName("name");
+                        .HasColumnName("name")
+                        .UseCollation("C");
 
                     b.HasKey("Id")
                         .HasName("pk_regions");

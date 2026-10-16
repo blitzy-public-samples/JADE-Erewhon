@@ -43,7 +43,7 @@ namespace Erewhon.Persistence.Migrations
                     id = table.Column<long>(type: "bigint", nullable: false)
                         .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
                     company_id = table.Column<long>(type: "bigint", nullable: false),
-                    name = table.Column<string>(type: "character varying(81)", maxLength: 81, nullable: false),
+                    name = table.Column<string>(type: "character varying(81)", maxLength: 81, nullable: false, collation: "C"),
                     address_street = table.Column<string>(type: "character varying(51)", maxLength: 51, nullable: false),
                     address_city = table.Column<string>(type: "character varying(51)", maxLength: 51, nullable: false),
                     address_country = table.Column<string>(type: "character varying(51)", maxLength: 51, nullable: false),
@@ -74,7 +74,7 @@ namespace Erewhon.Persistence.Migrations
                     id = table.Column<long>(type: "bigint", nullable: false)
                         .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
                     company_id = table.Column<long>(type: "bigint", nullable: false),
-                    name = table.Column<string>(type: "character varying(81)", maxLength: 81, nullable: false),
+                    name = table.Column<string>(type: "character varying(81)", maxLength: 81, nullable: false, collation: "C"),
                     address_street = table.Column<string>(type: "character varying(51)", maxLength: 51, nullable: false),
                     address_city = table.Column<string>(type: "character varying(51)", maxLength: 51, nullable: false),
                     address_country = table.Column<string>(type: "character varying(51)", maxLength: 51, nullable: false),
@@ -108,7 +108,7 @@ namespace Erewhon.Persistence.Migrations
                     guid = table.Column<string>(type: "character varying(39)", maxLength: 39, nullable: false),
                     locked_by_session = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: true),
                     locked_timestamp = table.Column<DateTime>(type: "timestamp(3) without time zone", nullable: true),
-                    name = table.Column<string>(type: "character varying(81)", maxLength: 81, nullable: false)
+                    name = table.Column<string>(type: "character varying(81)", maxLength: 81, nullable: false, collation: "C")
                 },
                 constraints: table =>
                 {
@@ -128,8 +128,8 @@ namespace Erewhon.Persistence.Migrations
                     id = table.Column<long>(type: "bigint", nullable: false)
                         .Annotation("Npgsql:ValueGenerationStrategy", NpgsqlValueGenerationStrategy.IdentityByDefaultColumn),
                     company_id = table.Column<long>(type: "bigint", nullable: false),
-                    name = table.Column<string>(type: "character varying(41)", maxLength: 41, nullable: false),
-                    prefix = table.Column<string>(type: "character varying(5)", maxLength: 5, nullable: false),
+                    name = table.Column<string>(type: "character varying(41)", maxLength: 41, nullable: false, collation: "C"),
+                    prefix = table.Column<string>(type: "character varying(5)", maxLength: 5, nullable: false, collation: "C"),
                     description = table.Column<string>(type: "text", nullable: false),
                     guid = table.Column<string>(type: "character varying(39)", maxLength: 39, nullable: false),
                     locked_by_session = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: true),
@@ -156,7 +156,7 @@ namespace Erewhon.Persistence.Migrations
                     guid = table.Column<string>(type: "character varying(39)", maxLength: 39, nullable: false),
                     locked_by_session = table.Column<string>(type: "character varying(64)", maxLength: 64, nullable: true),
                     locked_timestamp = table.Column<DateTime>(type: "timestamp(3) without time zone", nullable: true),
-                    name = table.Column<string>(type: "character varying(81)", maxLength: 81, nullable: false)
+                    name = table.Column<string>(type: "character varying(81)", maxLength: 81, nullable: false, collation: "C")
                 },
                 constraints: table =>
                 {

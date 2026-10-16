@@ -7,7 +7,8 @@ namespace Erewhon.Persistence.Configurations;
 
 /// <summary>
 /// Maps <see cref="ItemCategory"/> to the <c>item_categories</c> table: the row identity, the GUID and soft-lock
-/// columns, the owning company, the name, unique within the company, the prefix and the description.
+/// columns, the owning company, the name, unique within the company, the prefix and the description. The name and the
+/// prefix are compared and ordered under the binary collation <c>C</c>.
 /// The unique index <c>ix_item_categories_company_id_upper_prefix</c> on <c>(company_id, upper(prefix))</c> is
 /// created by the <c>InitialSchema</c> migration SQL and is not part of this mapping (D-66).
 /// </summary>
@@ -48,11 +49,13 @@ public sealed class ItemCategoryConfiguration : IEntityTypeConfiguration<ItemCat
         builder.Property(x => x.Name)
             .HasColumnName("name")
             .HasMaxLength(FieldLengths.ItemCategoryName)
+            .UseCollation("C")
             .IsRequired();
 
         builder.Property(x => x.Prefix)
             .HasColumnName("prefix")
             .HasMaxLength(FieldLengths.ItemCategoryPrefix)
+            .UseCollation("C")
             .IsRequired();
 
         builder.Property(x => x.Description)
