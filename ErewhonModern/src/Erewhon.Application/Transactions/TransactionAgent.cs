@@ -495,7 +495,6 @@ public abstract class TransactionAgent<TEntity>
         CancellationToken ct) =>
         Task.FromResult(true);
 
-
     /// <summary>
     /// Records, inside the transaction and before the entity is marked as deleted, the change notifications of the
     /// rows the database removes or updates with it: its cascade-deleted descendants and the rows whose reference to
@@ -629,7 +628,6 @@ public abstract class TransactionAgent<TEntity>
         CancellationToken ct) =>
         RunOperationAsync(command, ValidationType.Modify, modification, mode, ct);
 
-
     /// <summary>
     /// Returns the key of the error added when a lock is not obtained: create, delete, or update for both update and
     /// modify.
@@ -677,8 +675,10 @@ public abstract class TransactionAgent<TEntity>
     /// sets the modification code, pre-validates and validates outside any transaction, then runs the remaining steps
     /// in the agent's own transaction, under a savepoint of the caller's transaction, or, with no active transaction in
     /// Ambient mode, raises <see cref="NotInTransactionStateException"/>. Cleans up whenever the operation does not
-    /// complete. Ports <c>ModelTA.createEntityWithTransactionImplementor</c> and its update, delete and modify
-    /// counterparts.
+    /// complete. When the operation does not complete because it raised an exception, an exception raised by the
+    /// cleanup is dropped and the operation's exception propagates unchanged; on every other path an exception raised
+    /// by the cleanup propagates. Ports <c>ModelTA.createEntityWithTransactionImplementor</c> and its update, delete
+    /// and modify counterparts.
     /// </summary>
     private async Task<OperationResult> RunOperationAsync(
         TransactionCommand<TEntity> command,
@@ -695,6 +695,7 @@ public abstract class TransactionAgent<TEntity>
 
         var state = new OperationState(operation, modification);
         var result = new OperationResult();
+        bool handlingFailure = false;
         try
         {
             ClearErrorsOnSubordinateTAs(command);
@@ -732,11 +733,23 @@ public abstract class TransactionAgent<TEntity>
 
             return result;
         }
+        catch
+        {
+            handlingFailure = true;
+            throw;
+        }
         finally
         {
             if (!state.Completed)
             {
-                AbortTransactionCleanup(command, state);
+                if (handlingFailure)
+                {
+                    AbortTransactionCleanupWhileHandlingFailure(command, state);
+                }
+                else
+                {
+                    AbortTransactionCleanup(command, state);
+                }
             }
         }
     }
@@ -905,7 +918,6 @@ public abstract class TransactionAgent<TEntity>
         return applied ? StepOutcome.Applied : StepOutcome.ApplyFailed;
     }
 
-
     /// <summary>
     /// Adds a new model object, unless the agent has only subordinate objects, then creates the subordinate objects.
     /// Ports <c>ModelTA.doCreate</c>.
@@ -1043,21 +1055,43 @@ public abstract class TransactionAgent<TEntity>
     /// Cleans up an operation that did not complete. When the apply step was reached, returns the change tracker to
     /// the snapshot taken immediately before it: every entity tracked then is tracked with the entity state, current
     /// and original values, modified properties, temporary keys and navigations it had then, and every entity first
-    /// tracked since is no longer tracked. Then clears the model object when the operation created it or its
-    /// <see cref="PersistentModel.Id"/> is 0, and runs <see cref="AbortTransactionCleanupForSubordinateObjects"/>.
+    /// tracked since is no longer tracked. Then, also when that restore raises an exception, clears the model object
+    /// when the operation created it or its <see cref="PersistentModel.Id"/> is 0, and runs
+    /// <see cref="AbortTransactionCleanupForSubordinateObjects"/>; an exception the restore raised then propagates.
     /// Ports <c>ModelTA.doAbortTransactionCleanup</c>.
     /// </summary>
     private void AbortTransactionCleanup(TransactionCommand<TEntity> command, OperationState state)
     {
-        state.Snapshot?.Restore(Db);
-
-        if (command.ModelObject is { } modelObject
-            && (ReferenceEquals(modelObject, state.CreatedEntity) || modelObject is PersistentModel { Id: 0 }))
+        try
         {
-            command.ModelObject = null;
+            state.Snapshot?.Restore(Db);
         }
+        finally
+        {
+            if (command.ModelObject is { } modelObject
+                && (ReferenceEquals(modelObject, state.CreatedEntity) || modelObject is PersistentModel { Id: 0 }))
+            {
+                command.ModelObject = null;
+            }
 
-        AbortTransactionCleanupForSubordinateObjects(command);
+            AbortTransactionCleanupForSubordinateObjects(command);
+        }
+    }
+
+    /// <summary>
+    /// Runs <see cref="AbortTransactionCleanup"/> while an exception is being handled. An exception raised by the
+    /// cleanup itself is dropped; the exception being handled propagates.
+    /// </summary>
+    private void AbortTransactionCleanupWhileHandlingFailure(TransactionCommand<TEntity> command, OperationState state)
+    {
+        try
+        {
+            AbortTransactionCleanup(command, state);
+        }
+        catch (Exception)
+        {
+            return;
+        }
     }
 
     /// <summary>Outcome of the lock, edition-check and apply steps of one operation.</summary>
@@ -1134,22 +1168,25 @@ public abstract class TransactionAgent<TEntity>
         /// <summary>
         /// Returns the change tracker of <paramref name="db"/> to this snapshot; reads no rows. Entities that were not
         /// recorded stop being tracked, and a recorded entity that still has its recorded tracking state is left as it
-        /// is. A recorded entity still tracked as the same entity type with its recorded key and temporary values, and
-        /// added exactly when it was recorded as added, gets back in place its recorded current values, entity state,
-        /// original values, modified properties and loaded navigations. Every other recorded entity is tracked again
-        /// together with the entities of its ownership aggregate and, when any of these held a temporary value, with
-        /// every recorded entity that held one: each stops being tracked, gets back while untracked the recorded current
-        /// values and navigation contents, and is tracked again in its recorded entity state with its recorded original
-        /// values, modified properties and loaded navigations. Owners are tracked again before the entities they own
-        /// and, among entities of one ownership depth, deleted entities come first and added entities last; a key or
-        /// foreign key that held a temporary value holds a new temporary value, which the foreign keys of the entities
-        /// referencing it hold too. Every restored entity's navigations then get back the recorded contents. A restored
-        /// unchanged or modified entity whose CLR member held a value other than its original value without the property
-        /// being marked modified holds that value again without the mark. Automatic change detection, cascade deletes and
-        /// orphan deletes are suspended meanwhile and then set back as they were.
+        /// is. A recorded entity still tracked as the same entity type with its recorded key and temporary values, added
+        /// exactly when it was recorded as added, and with each reference navigation recorded as holding no entity or an
+        /// entity that was not recorded still holding it, gets back in place its recorded current values, entity state,
+        /// original values and modified properties. Every other recorded entity is tracked again together with the
+        /// entities of its ownership aggregate and, when any of these held a temporary value, with every recorded entity
+        /// that held one: each stops being tracked, gets back while untracked the recorded current values and navigation
+        /// contents, and is tracked again in its recorded entity state with its recorded original values and modified
+        /// properties. Owners are tracked again before the entities they own and, among entities of one ownership depth,
+        /// deleted entities come first and added entities last; a key or foreign key that held a temporary value holds a
+        /// new temporary value, which the foreign keys of the entities referencing it hold too. Every restored entity's
+        /// navigations then get back the recorded contents and, once every restored entity holds them, the recorded
+        /// loaded state, a reference recorded as not loaded that holds an entity included. A restored unchanged or
+        /// modified entity whose CLR member held a value other than its original value without the property being marked
+        /// modified holds that value again without the mark. Automatic change detection, cascade deletes and orphan
+        /// deletes are suspended meanwhile and then set back as they were.
         /// </summary>
         /// <exception cref="InvalidOperationException">
-        /// A recorded owned entity has no recorded owner, or the change tracker gives no entry for it.
+        /// A recorded owned entity has no recorded owner, or the change tracker gives no entry for it, or a reference
+        /// navigation recorded as not loaded that holds an entity has no writable CLR member.
         /// </exception>
         public void Restore(IErewhonDbContext db)
         {
@@ -1168,11 +1205,14 @@ public abstract class TransactionAgent<TEntity>
                     tracked.Add(entry.Entity, entry);
                 }
 
+                var recorded = new HashSet<object>(
+                    _entities.Select(entity => entity.Entity),
+                    ReferenceEqualityComparer.Instance);
                 var restoredInPlace = new List<TrackedEntity>();
                 var retracked = new HashSet<TrackedEntity>();
                 foreach (TrackedEntity entity in _entities)
                 {
-                    switch (entity.Compare(tracked.GetValueOrDefault(entity.Entity)))
+                    switch (entity.Compare(tracked.GetValueOrDefault(entity.Entity), recorded))
                     {
                         case TrackingDifference.RestorableInPlace:
                             restoredInPlace.Add(entity);
@@ -1225,6 +1265,16 @@ public abstract class TransactionAgent<TEntity>
                 foreach (TrackedEntity entity in ownersFirst)
                 {
                     entity.RestoreNavigations(entries[entity.Entity]);
+                }
+
+                foreach (TrackedEntity entity in restoredInPlace)
+                {
+                    entity.RestoreLoaded(tracked[entity.Entity]);
+                }
+
+                foreach (TrackedEntity entity in ownersFirst)
+                {
+                    entity.RestoreLoaded(entries[entity.Entity]);
                 }
             }
             finally
@@ -1407,13 +1457,16 @@ public abstract class TransactionAgent<TEntity>
 
         /// <summary>
         /// The entity is tracked as the recorded entity type with its recorded key and temporary values, added exactly
-        /// when it was recorded as added, and differs in its entity state, values, modified properties or navigations.
+        /// when it was recorded as added, each reference navigation recorded as holding no entity or an entity that was
+        /// not recorded still holds it, and the entity differs in its entity state, values, modified properties or
+        /// navigations.
         /// </summary>
         RestorableInPlace,
 
         /// <summary>
-        /// The entity is not tracked, is tracked as another entity type, has another key or other temporary values, or
-        /// is added when it was not recorded as added or the reverse.
+        /// The entity is not tracked, is tracked as another entity type, has another key or other temporary values, is
+        /// added when it was not recorded as added or the reverse, or has a reference navigation recorded as holding no
+        /// entity or an entity that was not recorded that holds another value.
         /// </summary>
         RequiresRetracking,
     }
@@ -1485,9 +1538,9 @@ public abstract class TransactionAgent<TEntity>
 
         /// <summary>
         /// Returns how the tracking state of the entity, tracked by <paramref name="entry"/> or untracked when it is
-        /// null, differs from the recorded one.
+        /// null, differs from the recorded one; <paramref name="recorded"/> holds every recorded entity.
         /// </summary>
-        public TrackingDifference Compare(EntityEntry? entry)
+        public TrackingDifference Compare(EntityEntry? entry, IReadOnlySet<object> recorded)
         {
             if (entry is null
                 || entry.Metadata != EntityType
@@ -1505,7 +1558,8 @@ public abstract class TransactionAgent<TEntity>
                 }
             }
 
-            if (!HasRecordedTemporaryValues(entry))
+            if (!HasRecordedTemporaryValues(entry)
+                || Navigations.Any(navigation => navigation.NoLongerHoldsUnrecordedReference(entry, recorded)))
             {
                 return TrackingDifference.RequiresRetracking;
             }
@@ -1557,11 +1611,11 @@ public abstract class TransactionAgent<TEntity>
 
         /// <summary>
         /// Tracks the untracked <paramref name="entry"/>, which holds the recorded current values, again in the recorded
-        /// entity state with the recorded original values and modified properties, and gives its navigations the
-        /// recorded loaded state. An entry recorded as added is marked added; one recorded as deleted is marked deleted
-        /// and gets the recorded original values; any other entry is marked unchanged and gets its recorded values and
-        /// modified properties through <see cref="RestoreTrackedValues"/>, a property that held a temporary value
-        /// keeping the value it holds once tracked.
+        /// entity state with the recorded original values and modified properties; the loaded state of its navigations
+        /// is left to <see cref="RestoreLoaded"/>. An entry recorded as added is marked added; one recorded as deleted is
+        /// marked deleted and gets the recorded original values; any other entry is marked unchanged and gets its
+        /// recorded values and modified properties through <see cref="RestoreTrackedValues"/>, a property that held a
+        /// temporary value keeping the value it holds once tracked.
         /// </summary>
         public void Track(EntityEntry entry)
         {
@@ -1579,15 +1633,13 @@ public abstract class TransactionAgent<TEntity>
                     RestoreTrackedValues(entry, keepTemporaryValues: true);
                     break;
             }
-
-            RestoreLoaded(entry);
         }
 
         /// <summary>
         /// Gives the tracked <paramref name="entry"/>, whose key, temporary values and added state are the recorded
         /// ones, the recorded entity state, current values, original values, modified properties and temporary
-        /// markings, and gives its navigations the recorded loaded state. An entry recorded as added gets back each
-        /// recorded current value it no longer holds; any other entry gets them through
+        /// markings; the loaded state of its navigations is left to <see cref="RestoreLoaded"/>. An entry recorded as
+        /// added gets back each recorded current value it no longer holds; any other entry gets them through
         /// <see cref="RestoreTrackedValues"/>.
         /// </summary>
         public void RestoreInPlace(EntityEntry entry)
@@ -1608,8 +1660,6 @@ public abstract class TransactionAgent<TEntity>
             {
                 RestoreTrackedValues(entry, keepTemporaryValues: false);
             }
-
-            RestoreLoaded(entry);
         }
 
         /// <summary>Gives each navigation of <paramref name="entry"/> the recorded contents.</summary>
@@ -1686,8 +1736,11 @@ public abstract class TransactionAgent<TEntity>
             return true;
         }
 
-        /// <summary>Gives each navigation of <paramref name="entry"/> the recorded loaded state.</summary>
-        private void RestoreLoaded(EntityEntry entry)
+        /// <summary>
+        /// Gives each navigation of <paramref name="entry"/>, which holds its recorded contents, the recorded loaded
+        /// state through <see cref="TrackedNavigation.RestoreLoaded"/>.
+        /// </summary>
+        public void RestoreLoaded(EntityEntry entry)
         {
             foreach (TrackedNavigation navigation in Navigations)
             {
@@ -1815,10 +1868,12 @@ public abstract class TransactionAgent<TEntity>
         }
 
         /// <summary>
-        /// Writes <paramref name="value"/> to the CLR member of <paramref name="property"/> on <paramref name="entity"/>:
-        /// the backing field or property setter the change tracker itself writes through, outside the change tracker.
+        /// Writes <paramref name="value"/> to the CLR member of the property or navigation <paramref name="property"/>
+        /// on <paramref name="entity"/>: the backing field or property setter the change tracker itself writes through,
+        /// outside the change tracker.
         /// </summary>
-        private static void WriteToMember(object entity, IProperty property, object? value)
+        /// <exception cref="InvalidOperationException"><paramref name="property"/> has no writable CLR member.</exception>
+        public static void WriteToMember(object entity, IPropertyBase property, object? value)
         {
             switch (property.GetMemberInfo(forMaterialization: false, forSet: true))
             {
@@ -1832,7 +1887,8 @@ public abstract class TransactionAgent<TEntity>
                     member.SetValue(entity, value);
                     break;
                 default:
-                    throw new InvalidOperationException("A property of a tracked entity has no writable CLR member.");
+                    throw new InvalidOperationException(
+                        "A property or navigation of a tracked entity has no writable CLR member.");
             }
         }
     }
@@ -1878,6 +1934,15 @@ public abstract class TransactionAgent<TEntity>
         }
 
         /// <summary>
+        /// Returns whether this is a reference navigation that held no entity or an entity not in
+        /// <paramref name="recorded"/>, and the navigation of <paramref name="entry"/> holds another value.
+        /// </summary>
+        public bool NoLongerHoldsUnrecordedReference(EntityEntry entry, IReadOnlySet<object> recorded) =>
+            !Navigation.IsCollection
+            && (_value is null || !recorded.Contains(_value))
+            && !ReferenceEquals(entry.Navigation(Navigation).CurrentValue, _value);
+
+        /// <summary>
         /// Makes the navigation of <paramref name="entry"/> hold the recorded entity, or the recorded collection with the
         /// recorded entities in their order. On a tracked entry, a reference that differs from the recorded one is set
         /// through the change tracker, which fixes up the relationship.
@@ -1919,13 +1984,35 @@ public abstract class TransactionAgent<TEntity>
             }
         }
 
-        /// <summary>Gives the navigation of <paramref name="entry"/> the recorded loaded state.</summary>
+        /// <summary>
+        /// Gives the navigation of <paramref name="entry"/> the recorded loaded state when it has another one. A
+        /// reference navigation recorded as not loaded that holds an entity is marked not loaded while its CLR member
+        /// holds <see langword="null"/>, then holds that entity again; both member writes bypass the change tracker, so
+        /// the entity's foreign key, entity state and relationship snapshot are unchanged.
+        /// </summary>
+        /// <exception cref="InvalidOperationException">The reference navigation has no writable CLR member.</exception>
         public void RestoreLoaded(EntityEntry entry)
         {
             NavigationEntry navigation = entry.Navigation(Navigation);
-            if (navigation.IsLoaded != _isLoaded)
+            if (navigation.IsLoaded == _isLoaded)
+            {
+                return;
+            }
+
+            if (_isLoaded || Navigation.IsCollection || navigation.CurrentValue is not { } held)
             {
                 navigation.IsLoaded = _isLoaded;
+                return;
+            }
+
+            TrackedEntity.WriteToMember(entry.Entity, Navigation, null);
+            try
+            {
+                navigation.IsLoaded = false;
+            }
+            finally
+            {
+                TrackedEntity.WriteToMember(entry.Entity, Navigation, held);
             }
         }
 

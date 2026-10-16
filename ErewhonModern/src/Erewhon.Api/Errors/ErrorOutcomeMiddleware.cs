@@ -35,7 +35,9 @@ public sealed record ErrorOutcome(
 /// Turns an exception that escapes the rest of the request pipeline before the response has started into status 500
 /// with an <see cref="ErrorOutcome"/> JSON body, and aborts the request when one escapes after the response has
 /// started. In both cases it writes one error log event, as <see cref="LogOutcome"/> describes, for every outcome
-/// except the lock outcome, and does not rethrow the exception.
+/// except the lock outcome, and does not rethrow the exception. An escaped <see cref="BadHttpRequestException"/>
+/// writes no log event: before the response has started it is answered with its own
+/// <see cref="BadHttpRequestException.StatusCode"/> and an empty body, and after it the request is aborted.
 /// </summary>
 /// <param name="next">The next middleware in the pipeline.</param>
 /// <param name="logger">The logger that receives the error events.</param>
@@ -55,12 +57,15 @@ public sealed class ErrorOutcomeMiddleware(RequestDelegate next, ILogger<ErrorOu
     private readonly ILogger<ErrorOutcomeMiddleware> _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
     /// <summary>
-    /// Runs the rest of the pipeline. When it throws, translates the exception with <see cref="Translate"/> and,
-    /// when <see cref="IsLogged"/> is <see langword="true"/>, writes one event through <see cref="LogOutcome"/>.
-    /// Before the response has started, it then clears the response and writes status 500 with the
-    /// <see cref="ErrorOutcome"/> of the translated exception as <c>application/json</c>; after the response has
-    /// started, it writes nothing more to the response, aborts the request with <see cref="HttpContext.Abort"/> and
-    /// returns without rethrowing.
+    /// Runs the rest of the pipeline. When it throws a <see cref="BadHttpRequestException"/>, writes no log event;
+    /// before the response has started, it clears the response and sets the exception's
+    /// <see cref="BadHttpRequestException.StatusCode"/> with no body; after the response has started, it aborts the
+    /// request with <see cref="HttpContext.Abort"/>; in both cases it returns without rethrowing. When it throws any
+    /// other exception, translates the exception with <see cref="Translate"/> and, when <see cref="IsLogged"/> is
+    /// <see langword="true"/>, writes one event through <see cref="LogOutcome"/>. Before the response has started, it
+    /// then clears the response and writes status 500 with the <see cref="ErrorOutcome"/> of the translated exception
+    /// as <c>application/json</c>; after the response has started, it writes nothing more to the response, aborts the
+    /// request with <see cref="HttpContext.Abort"/> and returns without rethrowing.
     /// </summary>
     /// <param name="context">The HTTP context of the request.</param>
     /// <returns>A task that completes when the response has been produced or the request aborted.</returns>
@@ -71,6 +76,17 @@ public sealed class ErrorOutcomeMiddleware(RequestDelegate next, ILogger<ErrorOu
         try
         {
             await _next(context);
+        }
+        catch (BadHttpRequestException badRequest)
+        {
+            if (context.Response.HasStarted)
+            {
+                context.Abort();
+                return;
+            }
+
+            context.Response.Clear();
+            context.Response.StatusCode = badRequest.StatusCode;
         }
         catch (Exception exception)
         {

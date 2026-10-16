@@ -27,6 +27,17 @@ public static class DependencyInjection
     private const string DefaultSeedDataDirectory = "../../../Erewhon/DataFiles";
     private const int DefaultLockWaitMs = 10000;
 
+    private const string LockSettingRejectedTemplate =
+        "{ConfigurationKey} is {RejectedValue}, which is not a positive integer number of milliseconds; "
+        + "{LockWaitMs} ms is used instead";
+
+    /// <summary>
+    /// The event id, 600 <c>ErewhonLockSettingRejected</c>, of the <see cref="LogLevel.Warning"/> event written for an
+    /// <c>Erewhon:Locks:TimeoutMs</c> or <c>Erewhon:Locks:AllocationTimeoutMs</c> value that is present and not empty
+    /// but is not a positive integer.
+    /// </summary>
+    public static readonly EventId LockSettingRejectedEventId = new(600, "ErewhonLockSettingRejected");
+
     private static readonly EventId[] IgnoredEvents =
     [
         RelationalEventId.ConnectionOpening,
@@ -60,7 +71,10 @@ public static class DependencyInjection
     /// <item><description>
     /// a singleton <see cref="EntityLockSettings"/> with <c>Erewhon:Locks:TimeoutMs</c> and
     /// <c>Erewhon:Locks:AllocationTimeoutMs</c>, each read as a positive integer number of milliseconds and 10000 when
-    /// it is absent, not an integer, zero or negative;
+    /// it is absent, empty, not an integer, zero or negative; when the singleton is first resolved, the provider's
+    /// <see cref="ILoggerFactory"/>, if it has one, receives one <see cref="LogLevel.Warning"/> event with
+    /// <see cref="LockSettingRejectedEventId"/> for each of the two keys whose value is present and not empty but gave
+    /// 10000, naming the key, the value and the 10000 milliseconds used;
     /// </description></item>
     /// <item><description>
     /// a singleton <see cref="SeedSettings"/> with the full path of <c>Erewhon:Seed:DataDirectory</c>
@@ -110,9 +124,15 @@ public static class DependencyInjection
         ArgumentNullException.ThrowIfNull(services);
         ArgumentNullException.ThrowIfNull(configuration);
 
-        services.AddSingleton(new EntityLockSettings(
-            LockTimeoutMs: ReadPositiveMilliseconds(configuration, LockTimeoutKey),
-            AllocationTimeoutMs: ReadPositiveMilliseconds(configuration, AllocationTimeoutKey)));
+        var rejectedLockSettings = new List<KeyValuePair<string, string>>();
+        var lockSettings = new EntityLockSettings(
+            LockTimeoutMs: ReadPositiveMilliseconds(configuration, LockTimeoutKey, rejectedLockSettings),
+            AllocationTimeoutMs: ReadPositiveMilliseconds(configuration, AllocationTimeoutKey, rejectedLockSettings));
+        services.AddSingleton(provider =>
+        {
+            LogRejectedLockSettings(provider.GetService<ILoggerFactory>(), rejectedLockSettings);
+            return lockSettings;
+        });
         services.AddSingleton(new SeedSettings(ResolveSeedDataDirectory(configuration)));
         services.AddSingleton<PostgresErrorMapper>();
         services.AddScoped<ChangeNotificationInterceptor>();
@@ -144,17 +164,57 @@ public static class DependencyInjection
 
     /// <summary>
     /// Returns the value of <paramref name="key"/> as a positive number of milliseconds, or 10000 when the value is
-    /// absent, is not an integer in the invariant culture, or is zero or negative.
+    /// absent or empty, is not an integer in the invariant culture, or is zero or negative. A value that is present and
+    /// not empty but gives 10000 is added to <paramref name="rejected"/> with its key.
     /// </summary>
     /// <param name="configuration">The configuration to read.</param>
     /// <param name="key">The configuration key of the wait.</param>
+    /// <param name="rejected">Receives the key and value of a rejected value.</param>
     /// <returns>The configured wait, or 10000.</returns>
-    private static int ReadPositiveMilliseconds(IConfiguration configuration, string key)
+    private static int ReadPositiveMilliseconds(
+        IConfiguration configuration,
+        string key,
+        ICollection<KeyValuePair<string, string>> rejected)
     {
         var value = configuration[key];
-        return int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var milliseconds) && milliseconds > 0
-            ? milliseconds
-            : DefaultLockWaitMs;
+        if (string.IsNullOrEmpty(value))
+        {
+            return DefaultLockWaitMs;
+        }
+
+        if (int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var milliseconds) && milliseconds > 0)
+        {
+            return milliseconds;
+        }
+
+        rejected.Add(new KeyValuePair<string, string>(key, value));
+        return DefaultLockWaitMs;
+    }
+
+    /// <summary>
+    /// Writes one <see cref="LogLevel.Warning"/> event with <see cref="LockSettingRejectedEventId"/> for each entry of
+    /// <paramref name="rejected"/>, in order, through a logger of the <see cref="EntityLockSettings"/> category, with the
+    /// properties <c>ConfigurationKey</c>, <c>RejectedValue</c> and <c>LockWaitMs</c> (10000). Writes nothing when
+    /// <paramref name="loggerFactory"/> is <see langword="null"/> or <paramref name="rejected"/> is empty.
+    /// </summary>
+    /// <param name="loggerFactory">
+    /// The logger factory of the service provider, or <see langword="null"/> when it has none.
+    /// </param>
+    /// <param name="rejected">The keys and values of the rejected lock settings.</param>
+    private static void LogRejectedLockSettings(
+        ILoggerFactory? loggerFactory,
+        IReadOnlyCollection<KeyValuePair<string, string>> rejected)
+    {
+        if (loggerFactory is null || rejected.Count == 0)
+        {
+            return;
+        }
+
+        var logger = loggerFactory.CreateLogger<EntityLockSettings>();
+        foreach (var (key, value) in rejected)
+        {
+            logger.LogWarning(LockSettingRejectedEventId, LockSettingRejectedTemplate, key, value, DefaultLockWaitMs);
+        }
     }
 
     /// <summary>

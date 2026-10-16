@@ -4,6 +4,7 @@
     <RootNamespace>Erewhon.Api</RootNamespace>
     <AssemblyName>Erewhon.Api</AssemblyName>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <RunWorkingDirectory>$(MSBuildStartupDirectory)</RunWorkingDirectory>
   </PropertyGroup>
 
   <ItemGroup>

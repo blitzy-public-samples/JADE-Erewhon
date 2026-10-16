@@ -3,6 +3,7 @@ using System.Net.Http.Json;
 using System.Text.Json;
 using Erewhon.Api.Rest.Contracts;
 using Erewhon.Application.Abstractions;
+using Erewhon.Application.Domain;
 using Erewhon.Application.Messages;
 using Erewhon.Testing;
 using Microsoft.EntityFrameworkCore;
@@ -160,9 +161,17 @@ public sealed class RestCatalogueTests : ErewhonTestBase
     }
 
     /// <summary>
-    /// With no company, <c>getAgent</c>, <c>getClient</c>, <c>getCompany</c>, <c>postCreateAgent</c>,
-    /// <c>postCreateClient</c>, <c>postCreateRetailSale</c> and <c>postCreateTender</c> each answer 500 with an empty
-    /// body for inputs that would otherwise succeed, and nothing is persisted.
+    /// With no company, each of these requests answers 500 with an empty body: <c>getAgent</c> with the name
+    /// "Test Agent", no name, an empty name, " Test Agent ", "Nobody" and a 200-character name; <c>getClient</c> with
+    /// the name "Test Client", no name, an empty name, three spaces, "Nobody" and a 200-character name;
+    /// <c>getCompany</c>; <c>postCreateAgent</c> and <c>postCreateClient</c> with a complete party named "New Agent" or
+    /// "New Client", the same party with no name, with the e-mail "not-an-email" and with a street of three spaces, and
+    /// a party with every field unset; <c>postCreateRetailSale</c> with client "Test Client" and code numbers 1, 0, 999
+    /// and 2, with no client, client "Nobody" and client " Test Client " and code number 1, and with every field unset;
+    /// <c>postCreateTender</c> with client "Test Client", code number 2 and offers 898.88, 1, 0 and -1, with client
+    /// "Test Client", offer 898.88 and code numbers 0, 999 and 1, with no client and with client "Nobody", code
+    /// number 2 and offer 898.88, and with every field unset. Afterwards no company, agent, client, item, sale or
+    /// tender row exists.
     /// </summary>
     /// <returns>A task that completes when the test has run.</returns>
     [Fact]
@@ -199,10 +208,100 @@ public sealed class RestCatalogueTests : ErewhonTestBase
             },
             ServerError);
 
+        // getAgent with no, an empty, a padded, an unknown and a 200-character name; getClient with no, an empty, a
+        // blank, an unknown and a 200-character name.
+        string longName = new string('N', 200);
+        string[] lookupPaths =
+        [
+            $"{AgentsPath}/by-name",
+            AgentByName(string.Empty),
+            AgentByName(" " + FixtureAgentName + " "),
+            AgentByName("Nobody"),
+            AgentByName(longName),
+            $"{ClientsPath}/by-name",
+            ClientByName(string.Empty),
+            ClientByName("   "),
+            ClientByName("Nobody"),
+            ClientByName(longName),
+        ];
+        foreach (string path in lookupPaths)
+        {
+            await GetEmptyAsync(http, path, ServerError);
+        }
+
+        // postCreateAgent with no name, with every field unset, with an invalid e-mail and with a blank street.
+        AgentDto unnamedAgent = NewAgentDto("New Agent");
+        unnamedAgent.Name = null;
+        AgentDto invalidEmailAgent = NewAgentDto("New Agent");
+        invalidEmailAgent.Email = "not-an-email";
+        AgentDto blankStreetAgent = NewAgentDto("New Agent");
+        blankStreetAgent.Street = "   ";
+        AgentDto[] agents = [unnamedAgent, new AgentDto(), invalidEmailAgent, blankStreetAgent];
+        foreach (AgentDto agent in agents)
+        {
+            await PostEmptyAsync(http, AgentsPath, agent, ServerError);
+        }
+
+        // postCreateClient with no name, with every field unset, with an invalid e-mail and with a blank street.
+        ClientDto unnamedClient = NewClientDto("New Client");
+        unnamedClient.Name = null;
+        ClientDto invalidEmailClient = NewClientDto("New Client");
+        invalidEmailClient.Email = "not-an-email";
+        ClientDto blankStreetClient = NewClientDto("New Client");
+        blankStreetClient.Street = "   ";
+        ClientDto[] clients = [unnamedClient, new ClientDto(), invalidEmailClient, blankStreetClient];
+        foreach (ClientDto client in clients)
+        {
+            await PostEmptyAsync(http, ClientsPath, client, ServerError);
+        }
+
+        // postCreateRetailSale with no, an unknown and a padded client, with code numbers 0 and 999, with the tender
+        // item's number and with every field unset.
+        static RetailSaleRequest NewRetailSaleRequest(string? client, int codeNumber) =>
+            new() { Client = client, CodePrefix = FixtureCategoryPrefix, CodeNumber = codeNumber };
+
+        RetailSaleRequest[] retailSales =
+        [
+            NewRetailSaleRequest(null, RetailItemNumber),
+            NewRetailSaleRequest("Nobody", RetailItemNumber),
+            NewRetailSaleRequest(" " + FixtureClientName + " ", RetailItemNumber),
+            NewRetailSaleRequest(FixtureClientName, 0),
+            NewRetailSaleRequest(FixtureClientName, 999),
+            NewRetailSaleRequest(FixtureClientName, TenderItemNumber),
+            new RetailSaleRequest(),
+        ];
+        foreach (RetailSaleRequest retailSale in retailSales)
+        {
+            await PostEmptyAsync(http, RetailSalesPath, retailSale, ServerError);
+        }
+
+        // postCreateTender with no and an unknown client, with code numbers 0 and 999, with the retail item's number,
+        // with an offer below the reserve, of 0 and negative, and with every field unset.
+        static TenderRequest NewTenderRequest(string? client, int codeNumber, decimal offer) =>
+            new() { Client = client, CodePrefix = FixtureCategoryPrefix, CodeNumber = codeNumber, Offer = offer };
+
+        TenderRequest[] tenders =
+        [
+            NewTenderRequest(null, TenderItemNumber, 898.88m),
+            NewTenderRequest("Nobody", TenderItemNumber, 898.88m),
+            NewTenderRequest(FixtureClientName, 0, 898.88m),
+            NewTenderRequest(FixtureClientName, 999, 898.88m),
+            NewTenderRequest(FixtureClientName, RetailItemNumber, 898.88m),
+            NewTenderRequest(FixtureClientName, TenderItemNumber, 1m),
+            NewTenderRequest(FixtureClientName, TenderItemNumber, 0m),
+            NewTenderRequest(FixtureClientName, TenderItemNumber, -1m),
+            new TenderRequest(),
+        ];
+        foreach (TenderRequest tender in tenders)
+        {
+            await PostEmptyAsync(http, TendersPath, tender, ServerError);
+        }
+
         // No row was written by the requests.
         Assert.False(await ReadDatabaseAsync(db => db.Companies.AsNoTracking().AnyAsync()));
         Assert.False(await ReadDatabaseAsync(db => db.Agents.AsNoTracking().AnyAsync()));
         Assert.False(await ReadDatabaseAsync(db => db.Clients.AsNoTracking().AnyAsync()));
+        Assert.False(await ReadDatabaseAsync(db => db.Items.AsNoTracking().AnyAsync()));
         Assert.False(await ReadDatabaseAsync(db => db.Sales.AsNoTracking().AnyAsync()));
         Assert.False(await ReadDatabaseAsync(db => db.Tenders.AsNoTracking().AnyAsync()));
     }
@@ -278,9 +377,16 @@ public sealed class RestCatalogueTests : ErewhonTestBase
     /// <summary>
     /// The items stored with category <c>CAT1</c> and <see cref="TestPhoto"/> are returned without
     /// <c>categoryPrefix</c> and <c>photo</c>, with their number, name, description, price, region, category name and
-    /// agent: by <c>getItemByCode</c> for item 1 (<c>retailItem</c>) and item 2 (<c>tenderItem</c>, closing seven days
-    /// after the server date), by <c>getItemsByPrice(800, 1000)</c> for both, and inside the <c>item</c> of both
-    /// <c>getSale</c> responses and the <c>tender.tenderItem</c> of the tender sale.
+    /// agent, and with the GUID, listed date as <c>yyyy-MM-dd</c> and agent GUID of the item row read back untracked:
+    /// by <c>getItemByCode</c> for item 1 (<c>retailItem</c>) and item 2 (<c>tenderItem</c>, closing on the closure
+    /// date of <see cref="TestCompanyBuilder.MyTenderItem"/>, which is also the stored closure date), by
+    /// <c>getItemsByPrice(800, 1000)</c> for both in that order, and inside the <c>item</c> of both <c>getSale</c>
+    /// responses and the <c>tender.tenderItem</c> of the tender sale, which also holds the stored closure date. In the
+    /// <c>getItemsByPrice</c> response, item 1's <c>sale</c> is a <c>retailSaleDetail</c> with the GUID, date sold as
+    /// <c>soldDate</c> to the millisecond, sale price, agent commission and client GUID of the retail sale row read
+    /// back untracked, and item 2's <c>sale</c> is the base sale detail, holding only <c>guid</c>, <c>client</c> and
+    /// <c>agentCommission</c>, with the GUID, client GUID and agent commission of the tender sale row read back
+    /// untracked.
     /// </summary>
     /// <returns>A task that completes when the test has run.</returns>
     [Fact]
@@ -288,7 +394,7 @@ public sealed class RestCatalogueTests : ErewhonTestBase
     {
         using HttpClient http = Api.CreateHttpClient();
         long companyId = CompanyId;
-        DateOnly expectedClosureDate = (await GetService<IServerClock>().GetServerDateAsync()).AddDays(7);
+        DateOnly expectedClosureDate = Fixture(Builder.MyTenderItem, nameof(Builder.MyTenderItem)).ClosureDate;
 
         // Stored items hold the category prefix and the photo.
         foreach (int codeNumber in new[] { RetailItemNumber, TenderItemNumber })
@@ -302,48 +408,90 @@ public sealed class RestCatalogueTests : ErewhonTestBase
             Assert.Equal(TestPhoto.ToArray(), stored.Photo);
         }
 
+        // Stored GUIDs, listed dates, closure date and agent GUIDs.
+        StoredItem storedRetailItem = await ReadStoredItemAsync(RetailItemNumber);
+        StoredItem storedTenderItem = await ReadStoredItemAsync(TenderItemNumber);
+        Assert.Null(storedRetailItem.ClosureDate);
+        Assert.Equal(expectedClosureDate, storedTenderItem.ClosureDate);
+
         // getItemByCode.
-        AssertRetailItemFixture(await GetJsonAsync(http, ItemByCode(FixtureCategoryPrefix, RetailItemNumber)));
+        AssertRetailItemFixture(
+            await GetJsonAsync(http, ItemByCode(FixtureCategoryPrefix, RetailItemNumber)),
+            storedRetailItem);
         AssertTenderItemFixture(
             await GetJsonAsync(http, ItemByCode(FixtureCategoryPrefix, TenderItemNumber)),
-            expectedClosureDate);
+            expectedClosureDate,
+            storedTenderItem);
 
-        // getItemsByPrice.
+        // getItemsByPrice, with the sale of each item.
+        StoredRetailSale storedRetailSale = await ReadStoredRetailSaleAsync(RetailItemNumber);
+        StoredTenderSale storedTenderSale = await ReadStoredTenderSaleAsync(TenderItemNumber);
         JsonElement items = await GetJsonAsync(http, ItemsByPrice(800, 1000));
         Assert.Equal(JsonValueKind.Array, items.ValueKind);
         Assert.Collection(
             items.EnumerateArray(),
-            AssertRetailItemFixture,
-            item => AssertTenderItemFixture(item, expectedClosureDate));
+            item =>
+            {
+                AssertRetailItemFixture(item, storedRetailItem);
+                AssertRetailSaleDetail(item.GetProperty("sale"), storedRetailSale);
+            },
+            item =>
+            {
+                AssertTenderItemFixture(item, expectedClosureDate, storedTenderItem);
+                AssertTenderItemSaleDetail(item.GetProperty("sale"), storedTenderSale);
+            });
 
         // getSale: the sold item and the tender's item.
         JsonElement retailSale = await GetJsonAsync(http, SaleByCode(FixtureCategoryPrefix, RetailItemNumber));
         AssertCategoryPrefixAndPhotoUnpopulated(retailSale.GetProperty("item"));
+        AssertItemValues(retailSale.GetProperty("item"), storedRetailItem);
 
         JsonElement tenderSale = await GetJsonAsync(http, SaleByCode(FixtureCategoryPrefix, TenderItemNumber));
         AssertCategoryPrefixAndPhotoUnpopulated(tenderSale.GetProperty("item"));
-        AssertCategoryPrefixAndPhotoUnpopulated(tenderSale.GetProperty("tender").GetProperty("tenderItem"));
+        AssertItemValues(tenderSale.GetProperty("item"), storedTenderItem);
+
+        JsonElement tenderedItem = tenderSale.GetProperty("tender").GetProperty("tenderItem");
+        AssertCategoryPrefixAndPhotoUnpopulated(tenderedItem);
+        AssertItemValues(tenderedItem, storedTenderItem);
+        AssertDate(storedTenderItem.ClosureDate, tenderedItem.GetProperty("closureDate"));
     }
 
     /// <summary>
-    /// The sale shapes of the item and sale responses: retail item 1's <c>sale</c> is a <c>retailSaleDetail</c> with
-    /// <c>price</c> 999.99, a <c>soldDate</c> and the client; tender item 2's <c>sale</c> is the base sale detail,
-    /// holding only <c>guid</c>, <c>client</c> and <c>agentCommission</c>, with no <c>offer</c> or <c>tenderDate</c>;
-    /// the <c>item</c> of each <c>getSale</c> response is the base item, without <c>type</c>, <c>closureDate</c> or
-    /// <c>sale</c>; the <c>tenderSale</c> of item 2 has no <c>offer</c> of its own, and its <c>tender</c> holds the
-    /// offer 889.88, the client and the tender item.
+    /// The sale shapes and values of the item and sale responses, each value compared with the row read back
+    /// untracked: retail item 1's <c>sale</c> is a <c>retailSaleDetail</c> with <c>price</c> 999.99 and the client, and
+    /// with the stored sale's GUID, date sold as <c>soldDate</c> to the millisecond, sale price, agent commission and
+    /// client GUID; tender item 2's <c>sale</c> is the base sale detail, holding only <c>guid</c>, <c>client</c> and
+    /// <c>agentCommission</c> with the stored tender sale's GUID, client GUID and agent commission, and no
+    /// <c>offer</c> or <c>tenderDate</c>; the <c>item</c> of each <c>getSale</c> response is the base item, without
+    /// <c>type</c>, <c>closureDate</c> or <c>sale</c>, with the stored item's GUID, listed date and agent GUID; the
+    /// <c>retailSale</c> of item 1 has the stored GUID, agent commission, client GUID and date sold as
+    /// <c>timestamp</c>; the <c>tenderSale</c> of item 2 has the stored GUID, agent commission and client GUID and no
+    /// <c>offer</c> of its own, and its <c>tender</c> holds the offer 889.88, the client and the tender item, with the
+    /// stored tender's GUID, offer, date tendered as <c>timestamp</c> and client GUID, and a <c>tenderItem</c> with
+    /// item 2's stored GUID, listed date, agent GUID and closure date and the base sale detail as its <c>sale</c>.
+    /// With a commission rate of 12.50 on the category held by the agent, a retail item at 123.45 sold to the client
+    /// at 2024-02-03 04:05:06.789 and a tender item sold to the client through its tender of 345.67 placed at
+    /// 2024-03-04 05:06:07.891 pass the same value checks through <c>getItemByCode</c> and <c>getSale</c>, with
+    /// <c>soldDate</c> and <c>timestamp</c> "2024-02-03T04:05:06.789", <c>tender.timestamp</c>
+    /// "2024-03-04T05:06:07.891", and stored agent commissions 15.43 and 43.21. Their code numbers follow item 2 in
+    /// creation order. <c>getItemsByPrice(100, 300)</c> then answers those two items alone, in code-number order: the
+    /// <c>retailItem</c> at 123.45 and the <c>tenderItem</c> at 234.56 with its stored closure date, each with its
+    /// number and the stored GUID, listed date and agent GUID, and as <c>sale</c> the <c>retailSaleDetail</c> with
+    /// <c>soldDate</c> "2024-02-03T04:05:06.789" and agent commission 15.43 and the base sale detail with agent
+    /// commission 43.21, each with the values of its stored sale. <c>getAllSales</c> answers the four sales in the
+    /// code-number order of their items, item 1, item 2, the retail item and the tender item, each with the values
+    /// checked in its <c>getSale</c> response, including its base <c>item</c>, with <c>timestamp</c>
+    /// "2024-02-03T04:05:06.789" for the third and <c>tender.timestamp</c> "2024-03-04T05:06:07.891" for the fourth.
     /// </summary>
     /// <returns>A task that completes when the test has run.</returns>
     [Fact]
     public async Task Q33_TenderSaleDetailShapes()
     {
         using HttpClient http = Api.CreateHttpClient();
-        long companyId = CompanyId;
-        var storedTenderSale = await ReadDatabaseAsync(db => db.Sales
-            .AsNoTracking()
-            .Where(sale => sale.CompanyId == companyId && sale.Item!.CodeNumber == TenderItemNumber)
-            .Select(sale => new { sale.Guid, sale.AgentCommission })
-            .SingleAsync());
+        StoredItem storedRetailItem = await ReadStoredItemAsync(RetailItemNumber);
+        StoredItem storedTenderItem = await ReadStoredItemAsync(TenderItemNumber);
+        StoredRetailSale storedRetailSale = await ReadStoredRetailSaleAsync(RetailItemNumber);
+        StoredTenderSale storedTenderSale = await ReadStoredTenderSaleAsync(TenderItemNumber);
 
         // Retail item sale detail.
         JsonElement retailItem = await GetJsonAsync(http, ItemByCode(FixtureCategoryPrefix, RetailItemNumber));
@@ -352,32 +500,22 @@ public sealed class RestCatalogueTests : ErewhonTestBase
         Assert.Equal(RetailItemPrice, retailSaleDetail.GetProperty("price").GetDecimal());
         Assert.False(IsUnpopulated(retailSaleDetail, "soldDate"));
         Assert.Equal(FixtureClientName, retailSaleDetail.GetProperty("client").GetProperty("name").GetString());
+        AssertRetailSaleDetail(retailSaleDetail, storedRetailSale);
 
         // Tender item sale detail.
         JsonElement tenderItem = await GetJsonAsync(http, ItemByCode(FixtureCategoryPrefix, TenderItemNumber));
-        JsonElement tenderSaleDetail = tenderItem.GetProperty("sale");
-        Assert.Equal(JsonValueKind.Object, tenderSaleDetail.ValueKind);
-        Assert.Equal(
-            new[] { "agentCommission", "client", "guid" },
-            tenderSaleDetail.EnumerateObject().Select(property => property.Name).Order(StringComparer.Ordinal));
-        Assert.False(tenderSaleDetail.TryGetProperty("type", out _));
-        Assert.Equal(storedTenderSale.Guid, tenderSaleDetail.GetProperty("guid").GetString());
-        Assert.Equal(FixtureClientName, tenderSaleDetail.GetProperty("client").GetProperty("name").GetString());
-        JsonElement agentCommission = tenderSaleDetail.GetProperty("agentCommission");
-        Assert.Equal(JsonValueKind.Number, agentCommission.ValueKind);
-        Assert.Equal(storedTenderSale.AgentCommission, agentCommission.GetDecimal());
-        Assert.True(IsUnpopulated(tenderSaleDetail, "offer"));
-        Assert.True(IsUnpopulated(tenderSaleDetail, "tenderDate"));
+        AssertTenderItemSaleDetail(tenderItem.GetProperty("sale"), storedTenderSale);
 
         // Retail sale item.
         JsonElement retailSale = await GetJsonAsync(http, SaleByCode(FixtureCategoryPrefix, RetailItemNumber));
         Assert.Equal("retailSale", retailSale.GetProperty("type").GetString());
-        AssertBaseItem(retailSale.GetProperty("item"), RetailItemNumber);
+        AssertBaseItem(retailSale.GetProperty("item"), RetailItemNumber, storedRetailItem);
+        AssertRetailSale(retailSale, storedRetailSale);
 
         // Tender sale item, offer and tender.
         JsonElement tenderSale = await GetJsonAsync(http, SaleByCode(FixtureCategoryPrefix, TenderItemNumber));
         Assert.Equal("tenderSale", tenderSale.GetProperty("type").GetString());
-        AssertBaseItem(tenderSale.GetProperty("item"), TenderItemNumber);
+        AssertBaseItem(tenderSale.GetProperty("item"), TenderItemNumber, storedTenderItem);
         Assert.True(IsUnpopulated(tenderSale, "offer"));
 
         JsonElement tender = tenderSale.GetProperty("tender");
@@ -386,6 +524,148 @@ public sealed class RestCatalogueTests : ErewhonTestBase
         JsonElement tenderedItem = tender.GetProperty("tenderItem");
         Assert.Equal(JsonValueKind.Object, tenderedItem.ValueKind);
         Assert.Equal(TenderItemNumber, tenderedItem.GetProperty("number").GetInt32());
+        AssertTenderSale(tenderSale, storedTenderSale, storedTenderItem);
+
+        // A commission rate of 12.50 on the category held by the agent; a retail item at 123.45 sold to the client at
+        // 2024-02-03 04:05:06.789; a tender item with reserve 234.56 closing seven days after item 2, sold to the
+        // client through its tender of 345.67 placed at 2024-03-04 05:06:07.891.
+        Agent agent = Fixture(Builder.MyAgent, nameof(Builder.MyAgent));
+        Client client = Fixture(Builder.MyClient, nameof(Builder.MyClient));
+        ItemCategory category = Fixture(Builder.MyItemCategory, nameof(Builder.MyItemCategory));
+        Region region = Fixture(Builder.MyRegion, nameof(Builder.MyRegion));
+        TenderItem fixtureTenderItem = Fixture(Builder.MyTenderItem, nameof(Builder.MyTenderItem));
+        var dateSold = new DateTime(2024, 2, 3, 4, 5, 6, 789, DateTimeKind.Unspecified);
+        var dateTendered = new DateTime(2024, 3, 4, 5, 6, 7, 891, DateTimeKind.Unspecified);
+
+        await Builder.CreateCommissionRateAsync(category, 12.50m, agent);
+        RetailItem timedRetailItem = await Builder.CreateTestRetailItemAsync(
+            "Timed Retail Item",
+            "A retail item sold at a fixed time",
+            null,
+            region,
+            category,
+            agent,
+            123.45m);
+        await Builder.CreateTestRetailSaleAsync(timedRetailItem, client, dateSold);
+        TenderItem timedTenderItem = await Builder.CreateTestTenderItemAsync(
+            "Timed Tender Item",
+            "A tender item tendered at a fixed time",
+            null,
+            region,
+            category,
+            agent,
+            234.56m,
+            fixtureTenderItem.ClosureDate.AddDays(7));
+        Tender timedTender = await Builder.CreateTestTenderAsync(345.67m, dateTendered, client, timedTenderItem);
+        await Builder.CreateTestTenderSaleAsync(timedTenderItem, timedTender, client);
+
+        StoredItem storedTimedRetailItem = await ReadStoredItemAsync(timedRetailItem.CodeNumber);
+        StoredItem storedTimedTenderItem = await ReadStoredItemAsync(timedTenderItem.CodeNumber);
+        StoredRetailSale storedTimedRetailSale = await ReadStoredRetailSaleAsync(timedRetailItem.CodeNumber);
+        StoredTenderSale storedTimedTenderSale = await ReadStoredTenderSaleAsync(timedTenderItem.CodeNumber);
+        Assert.Equal(dateSold, storedTimedRetailSale.DateSold);
+        Assert.Equal(123.45m, storedTimedRetailSale.SalePrice);
+        Assert.Equal(15.43m, storedTimedRetailSale.AgentCommission);
+        Assert.Equal(dateTendered, storedTimedTenderSale.DateTendered);
+        Assert.Equal(345.67m, storedTimedTenderSale.Offer);
+        Assert.Equal(43.21m, storedTimedTenderSale.AgentCommission);
+
+        // getItemByCode and getSale for the retail item sold at a fixed time.
+        JsonElement timedRetailItemDto = await GetJsonAsync(
+            http,
+            ItemByCode(FixtureCategoryPrefix, timedRetailItem.CodeNumber));
+        Assert.Equal("retailItem", timedRetailItemDto.GetProperty("type").GetString());
+        AssertItemValues(timedRetailItemDto, storedTimedRetailItem);
+        JsonElement timedRetailSaleDetail = timedRetailItemDto.GetProperty("sale");
+        Assert.Equal("2024-02-03T04:05:06.789", timedRetailSaleDetail.GetProperty("soldDate").GetString());
+        AssertRetailSaleDetail(timedRetailSaleDetail, storedTimedRetailSale);
+
+        JsonElement timedRetailSaleDto = await GetJsonAsync(
+            http,
+            SaleByCode(FixtureCategoryPrefix, timedRetailItem.CodeNumber));
+        Assert.Equal("2024-02-03T04:05:06.789", timedRetailSaleDto.GetProperty("timestamp").GetString());
+        AssertRetailSale(timedRetailSaleDto, storedTimedRetailSale);
+        AssertBaseItem(timedRetailSaleDto.GetProperty("item"), timedRetailItem.CodeNumber, storedTimedRetailItem);
+
+        // getItemByCode and getSale for the tender item tendered at a fixed time.
+        JsonElement timedTenderItemDto = await GetJsonAsync(
+            http,
+            ItemByCode(FixtureCategoryPrefix, timedTenderItem.CodeNumber));
+        Assert.Equal("tenderItem", timedTenderItemDto.GetProperty("type").GetString());
+        AssertItemValues(timedTenderItemDto, storedTimedTenderItem);
+        AssertDate(storedTimedTenderItem.ClosureDate, timedTenderItemDto.GetProperty("closureDate"));
+        AssertTenderItemSaleDetail(timedTenderItemDto.GetProperty("sale"), storedTimedTenderSale);
+
+        JsonElement timedTenderSaleDto = await GetJsonAsync(
+            http,
+            SaleByCode(FixtureCategoryPrefix, timedTenderItem.CodeNumber));
+        Assert.Equal(
+            "2024-03-04T05:06:07.891",
+            timedTenderSaleDto.GetProperty("tender").GetProperty("timestamp").GetString());
+        AssertTenderSale(timedTenderSaleDto, storedTimedTenderSale, storedTimedTenderItem);
+        AssertBaseItem(timedTenderSaleDto.GetProperty("item"), timedTenderItem.CodeNumber, storedTimedTenderItem);
+
+        // Code numbers ascend in creation order: item 1, item 2, the retail item, the tender item.
+        Assert.True(TenderItemNumber < timedRetailItem.CodeNumber);
+        Assert.True(timedRetailItem.CodeNumber < timedTenderItem.CodeNumber);
+
+        // getItemsByPrice over the band of the two items sold at a fixed time, with the sale of each item.
+        JsonElement timedItems = await GetJsonAsync(http, ItemsByPrice(100, 300));
+        Assert.Equal(JsonValueKind.Array, timedItems.ValueKind);
+        Assert.Collection(
+            timedItems.EnumerateArray(),
+            item =>
+            {
+                Assert.Equal("retailItem", item.GetProperty("type").GetString());
+                Assert.Equal(timedRetailItem.CodeNumber, item.GetProperty("number").GetInt32());
+                Assert.Equal(123.45m, item.GetProperty("price").GetDecimal());
+                AssertItemValues(item, storedTimedRetailItem);
+                JsonElement sale = item.GetProperty("sale");
+                Assert.Equal("2024-02-03T04:05:06.789", sale.GetProperty("soldDate").GetString());
+                Assert.Equal(15.43m, sale.GetProperty("agentCommission").GetDecimal());
+                AssertRetailSaleDetail(sale, storedTimedRetailSale);
+            },
+            item =>
+            {
+                Assert.Equal("tenderItem", item.GetProperty("type").GetString());
+                Assert.Equal(timedTenderItem.CodeNumber, item.GetProperty("number").GetInt32());
+                Assert.Equal(234.56m, item.GetProperty("price").GetDecimal());
+                AssertItemValues(item, storedTimedTenderItem);
+                AssertDate(storedTimedTenderItem.ClosureDate, item.GetProperty("closureDate"));
+                JsonElement sale = item.GetProperty("sale");
+                Assert.Equal(43.21m, sale.GetProperty("agentCommission").GetDecimal());
+                AssertTenderItemSaleDetail(sale, storedTimedTenderSale);
+            });
+
+        // getAllSales: the four sales in the code-number order of their items, each with its item.
+        JsonElement allSales = await GetJsonAsync(http, SalesPath);
+        Assert.Equal(JsonValueKind.Array, allSales.ValueKind);
+        Assert.Collection(
+            allSales.EnumerateArray(),
+            sale =>
+            {
+                AssertRetailSale(sale, storedRetailSale);
+                AssertBaseItem(sale.GetProperty("item"), RetailItemNumber, storedRetailItem);
+            },
+            sale =>
+            {
+                AssertTenderSale(sale, storedTenderSale, storedTenderItem);
+                AssertBaseItem(sale.GetProperty("item"), TenderItemNumber, storedTenderItem);
+            },
+            sale =>
+            {
+                Assert.Equal("2024-02-03T04:05:06.789", sale.GetProperty("timestamp").GetString());
+                AssertRetailSale(sale, storedTimedRetailSale);
+                AssertBaseItem(sale.GetProperty("item"), timedRetailItem.CodeNumber, storedTimedRetailItem);
+            },
+            sale =>
+            {
+                Assert.Equal(
+                    "2024-03-04T05:06:07.891",
+                    sale.GetProperty("tender").GetProperty("timestamp").GetString());
+                AssertTenderSale(sale, storedTimedTenderSale, storedTimedTenderItem);
+                AssertBaseItem(sale.GetProperty("item"), timedTenderItem.CodeNumber, storedTimedTenderItem);
+            });
     }
 
     /// <summary>Returns the <c>getAgent</c> path for <paramref name="name"/>.</summary>
@@ -501,10 +781,11 @@ public sealed class RestCatalogueTests : ErewhonTestBase
     }
 
     /// <summary>
-    /// Asserts that <paramref name="item"/> is the <c>retailItem</c> 1 "Retail Item", "A retail item for testing", at
-    /// 999.99, with the fixture region, category and agent, and without <c>categoryPrefix</c> and <c>photo</c>.
+    /// Checks that <paramref name="item"/> is the <c>retailItem</c> 1 "Retail Item", "A retail item for testing", at
+    /// 999.99, with the fixture region, category and agent, the GUID, listed date and agent GUID of
+    /// <paramref name="stored"/>, and without <c>categoryPrefix</c> and <c>photo</c>.
     /// </summary>
-    private static void AssertRetailItemFixture(JsonElement item)
+    private static void AssertRetailItemFixture(JsonElement item, StoredItem stored)
     {
         AssertItemFixture(
             item,
@@ -512,15 +793,17 @@ public sealed class RestCatalogueTests : ErewhonTestBase
             RetailItemNumber,
             RetailItemName,
             RetailItemDescription,
-            RetailItemPrice);
+            RetailItemPrice,
+            stored);
     }
 
     /// <summary>
-    /// Asserts that <paramref name="item"/> is the <c>tenderItem</c> 2 "Tender Item", "A tender item for testing", at
-    /// 888.88, closing on <paramref name="expectedClosureDate"/>, with the fixture region, category and agent, and
-    /// without <c>categoryPrefix</c> and <c>photo</c>.
+    /// Checks that <paramref name="item"/> is the <c>tenderItem</c> 2 "Tender Item", "A tender item for testing", at
+    /// 888.88, closing on <paramref name="expectedClosureDate"/>, with the fixture region, category and agent, the
+    /// GUID, listed date, agent GUID and closure date of <paramref name="stored"/>, and without
+    /// <c>categoryPrefix</c> and <c>photo</c>.
     /// </summary>
-    private static void AssertTenderItemFixture(JsonElement item, DateOnly expectedClosureDate)
+    private static void AssertTenderItemFixture(JsonElement item, DateOnly expectedClosureDate, StoredItem stored)
     {
         AssertItemFixture(
             item,
@@ -528,14 +811,17 @@ public sealed class RestCatalogueTests : ErewhonTestBase
             TenderItemNumber,
             TenderItemName,
             TenderItemDescription,
-            TenderItemReserve);
+            TenderItemReserve,
+            stored);
         Assert.Equal(expectedClosureDate, item.GetProperty("closureDate").Deserialize<DateOnly>(Json));
+        AssertDate(stored.ClosureDate, item.GetProperty("closureDate"));
     }
 
     /// <summary>
-    /// Asserts the <c>type</c>, number, name, description and price of <paramref name="item"/>, the region
-    /// "Region Name", the category "Test Category 1" and the agent "Test Agent", and that <c>categoryPrefix</c> and
-    /// <c>photo</c> are not populated.
+    /// Checks the <c>type</c>, number, name, description and price of <paramref name="item"/>, the region
+    /// "Region Name", the category "Test Category 1" and the agent "Test Agent", that <c>categoryPrefix</c> and
+    /// <c>photo</c> are not populated, and that its <c>guid</c>, <c>listedDate</c> and <c>agent.guid</c> are those of
+    /// <paramref name="stored"/>.
     /// </summary>
     private static void AssertItemFixture(
         JsonElement item,
@@ -543,7 +829,8 @@ public sealed class RestCatalogueTests : ErewhonTestBase
         int expectedNumber,
         string expectedName,
         string expectedDescription,
-        decimal expectedPrice)
+        decimal expectedPrice,
+        StoredItem stored)
     {
         Assert.Equal(expectedType, item.GetProperty("type").GetString());
         AssertCategoryPrefixAndPhotoUnpopulated(item);
@@ -554,6 +841,19 @@ public sealed class RestCatalogueTests : ErewhonTestBase
         Assert.Equal(FixtureRegionName, item.GetProperty("region").GetString());
         Assert.Equal(FixtureCategoryName, item.GetProperty("itemCategory").GetString());
         Assert.Equal(FixtureAgentName, item.GetProperty("agent").GetProperty("name").GetString());
+        AssertItemValues(item, stored);
+    }
+
+    /// <summary>
+    /// Checks that the <c>guid</c> of <paramref name="item"/> is the GUID of <paramref name="stored"/>, its
+    /// <c>listedDate</c> the stored listed date as <c>yyyy-MM-dd</c>, and its <c>agent.guid</c> the GUID of the stored
+    /// item's agent.
+    /// </summary>
+    private static void AssertItemValues(JsonElement item, StoredItem stored)
+    {
+        AssertGuid(stored.Guid, item.GetProperty("guid"));
+        AssertDate(stored.ListedDate, item.GetProperty("listedDate"));
+        AssertGuid(stored.AgentGuid, item.GetProperty("agent").GetProperty("guid"));
     }
 
     /// <summary>Asserts that <c>categoryPrefix</c> and <c>photo</c> of <paramref name="item"/> are not populated.</summary>
@@ -565,16 +865,137 @@ public sealed class RestCatalogueTests : ErewhonTestBase
     }
 
     /// <summary>
-    /// Asserts that <paramref name="item"/> is a base item with number <paramref name="expectedNumber"/>: no
-    /// <c>type</c>, and <c>closureDate</c> and <c>sale</c> not populated.
+    /// Checks that <paramref name="item"/> is a base item with number <paramref name="expectedNumber"/>: no
+    /// <c>type</c>, and <c>closureDate</c> and <c>sale</c> not populated; and that its <c>guid</c>,
+    /// <c>listedDate</c> and <c>agent.guid</c> are those of <paramref name="stored"/>.
     /// </summary>
-    private static void AssertBaseItem(JsonElement item, int expectedNumber)
+    private static void AssertBaseItem(JsonElement item, int expectedNumber, StoredItem stored)
     {
         Assert.Equal(JsonValueKind.Object, item.ValueKind);
         Assert.False(item.TryGetProperty("type", out _));
         Assert.Equal(expectedNumber, item.GetProperty("number").GetInt32());
         Assert.True(IsUnpopulated(item, "closureDate"));
         Assert.True(IsUnpopulated(item, "sale"));
+        AssertItemValues(item, stored);
+    }
+
+    /// <summary>
+    /// Checks that <paramref name="sale"/> is a <c>retailSaleDetail</c> whose <c>guid</c>, <c>soldDate</c>,
+    /// <c>price</c>, <c>agentCommission</c> and <c>client.guid</c> are the GUID, date sold, sale price, agent
+    /// commission and client GUID of <paramref name="stored"/>.
+    /// </summary>
+    private static void AssertRetailSaleDetail(JsonElement sale, StoredRetailSale stored)
+    {
+        Assert.Equal("retailSaleDetail", sale.GetProperty("type").GetString());
+        AssertGuid(stored.Guid, sale.GetProperty("guid"));
+        AssertTimestamp(stored.DateSold, sale.GetProperty("soldDate"));
+        Assert.Equal(stored.SalePrice, sale.GetProperty("price").GetDecimal());
+        Assert.Equal(stored.AgentCommission, sale.GetProperty("agentCommission").GetDecimal());
+        AssertGuid(stored.ClientGuid, sale.GetProperty("client").GetProperty("guid"));
+    }
+
+    /// <summary>
+    /// Checks that <paramref name="sale"/> is the base sale detail of a tender item: an object holding only
+    /// <c>agentCommission</c>, <c>client</c> and <c>guid</c>, with no <c>type</c>, with the GUID of
+    /// <paramref name="stored"/>, the client "Test Client" with the stored client GUID and the numeric stored agent
+    /// commission, and with no <c>offer</c> or <c>tenderDate</c>.
+    /// </summary>
+    private static void AssertTenderItemSaleDetail(JsonElement sale, StoredTenderSale stored)
+    {
+        Assert.Equal(JsonValueKind.Object, sale.ValueKind);
+        Assert.Equal(
+            new[] { "agentCommission", "client", "guid" },
+            sale.EnumerateObject().Select(property => property.Name).Order(StringComparer.Ordinal));
+        Assert.False(sale.TryGetProperty("type", out _));
+        AssertGuid(stored.Guid, sale.GetProperty("guid"));
+        Assert.Equal(FixtureClientName, sale.GetProperty("client").GetProperty("name").GetString());
+        AssertGuid(stored.ClientGuid, sale.GetProperty("client").GetProperty("guid"));
+        JsonElement agentCommission = sale.GetProperty("agentCommission");
+        Assert.Equal(JsonValueKind.Number, agentCommission.ValueKind);
+        Assert.Equal(stored.AgentCommission, agentCommission.GetDecimal());
+        Assert.True(IsUnpopulated(sale, "offer"));
+        Assert.True(IsUnpopulated(sale, "tenderDate"));
+    }
+
+    /// <summary>
+    /// Checks that <paramref name="sale"/> is a <c>retailSale</c> whose <c>guid</c>, <c>agentCommission</c>,
+    /// <c>client.guid</c> and <c>timestamp</c> are the GUID, agent commission, client GUID and date sold of
+    /// <paramref name="stored"/>.
+    /// </summary>
+    private static void AssertRetailSale(JsonElement sale, StoredRetailSale stored)
+    {
+        Assert.Equal("retailSale", sale.GetProperty("type").GetString());
+        AssertGuid(stored.Guid, sale.GetProperty("guid"));
+        Assert.Equal(stored.AgentCommission, sale.GetProperty("agentCommission").GetDecimal());
+        AssertGuid(stored.ClientGuid, sale.GetProperty("client").GetProperty("guid"));
+        AssertTimestamp(stored.DateSold, sale.GetProperty("timestamp"));
+    }
+
+    /// <summary>
+    /// Checks that <paramref name="sale"/> is a <c>tenderSale</c> whose <c>guid</c>, <c>agentCommission</c> and
+    /// <c>client.guid</c> are those of <paramref name="stored"/> and whose own <c>offer</c> is not populated; that the
+    /// <c>guid</c>, <c>offer</c>,
+    /// <c>timestamp</c> and <c>client.guid</c> of its <c>tender</c> are the GUID, offer, date tendered and client GUID
+    /// of the stored tender; and that its <c>tender.tenderItem</c> has the GUID, listed date, agent GUID and closure
+    /// date of <paramref name="storedItem"/> and, as its <c>sale</c>, the base sale detail of
+    /// <paramref name="stored"/>.
+    /// </summary>
+    private static void AssertTenderSale(JsonElement sale, StoredTenderSale stored, StoredItem storedItem)
+    {
+        Assert.Equal("tenderSale", sale.GetProperty("type").GetString());
+        AssertGuid(stored.Guid, sale.GetProperty("guid"));
+        Assert.Equal(stored.AgentCommission, sale.GetProperty("agentCommission").GetDecimal());
+        AssertGuid(stored.ClientGuid, sale.GetProperty("client").GetProperty("guid"));
+        Assert.True(IsUnpopulated(sale, "offer"));
+
+        JsonElement tender = sale.GetProperty("tender");
+        AssertGuid(stored.TenderGuid, tender.GetProperty("guid"));
+        Assert.Equal(stored.Offer, tender.GetProperty("offer").GetDecimal());
+        AssertTimestamp(stored.DateTendered, tender.GetProperty("timestamp"));
+        AssertGuid(stored.TenderClientGuid, tender.GetProperty("client").GetProperty("guid"));
+
+        JsonElement tenderItem = tender.GetProperty("tenderItem");
+        AssertItemValues(tenderItem, storedItem);
+        AssertDate(storedItem.ClosureDate, tenderItem.GetProperty("closureDate"));
+        AssertTenderItemSaleDetail(tenderItem.GetProperty("sale"), stored);
+    }
+
+    /// <summary>
+    /// Checks that <paramref name="expected"/> is neither <see langword="null"/> nor empty and that
+    /// <paramref name="value"/> is that string.
+    /// </summary>
+    private static void AssertGuid(string? expected, JsonElement value)
+    {
+        Assert.False(string.IsNullOrEmpty(expected));
+        Assert.Equal(JsonValueKind.String, value.ValueKind);
+        Assert.Equal(expected, value.GetString());
+    }
+
+    /// <summary>
+    /// Checks that <paramref name="expected"/> has a value and that <paramref name="value"/> is that date as the string
+    /// <c>yyyy-MM-dd</c>.
+    /// </summary>
+    private static void AssertDate(DateOnly? expected, JsonElement value)
+    {
+        DateOnly date = Assert.NotNull(expected);
+        Assert.Equal(JsonValueKind.String, value.ValueKind);
+        Assert.Equal(date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture), value.GetString());
+    }
+
+    /// <summary>
+    /// Checks that <paramref name="value"/> is <paramref name="expected"/> as the string
+    /// <c>yyyy-MM-ddTHH:mm:ss</c> followed by the milliseconds without trailing zeros, or by nothing when they are
+    /// zero, and that it reads back as <paramref name="expected"/> with <see cref="DateTimeKind.Unspecified"/>.
+    /// </summary>
+    private static void AssertTimestamp(DateTime expected, JsonElement value)
+    {
+        Assert.Equal(JsonValueKind.String, value.ValueKind);
+        Assert.Equal(
+            expected.ToString("yyyy-MM-dd'T'HH:mm:ss.FFF", CultureInfo.InvariantCulture),
+            value.GetString());
+        DateTime read = value.Deserialize<DateTime>(Json);
+        Assert.Equal(DateTimeKind.Unspecified, read.Kind);
+        Assert.Equal(expected, read);
     }
 
     /// <summary>
@@ -597,6 +1018,14 @@ public sealed class RestCatalogueTests : ErewhonTestBase
     }
 
     /// <summary>
+    /// Returns <paramref name="value"/>, the fixture object of the <see cref="TestCompanyBuilder"/> property
+    /// <paramref name="name"/>, or throws <see cref="InvalidOperationException"/> when it is <see langword="null"/>.
+    /// </summary>
+    private static T Fixture<T>(T? value, string name)
+        where T : class =>
+        value ?? throw new InvalidOperationException($"The fixture {name} is created by {nameof(SetUpAsync)}.");
+
+    /// <summary>
     /// Deletes the fixture company with everything it owns through <see cref="TestCompanyBuilder.DeleteCompanyAsync"/>
     /// and asserts that no company remains.
     /// </summary>
@@ -617,4 +1046,91 @@ public sealed class RestCatalogueTests : ErewhonTestBase
         IErewhonDbContext db = scope.ServiceProvider.GetRequiredService<IErewhonDbContext>();
         return await read(db);
     }
+
+    /// <summary>
+    /// Reads, untracked through <see cref="ReadDatabaseAsync"/>, the GUID, listed date, closure date
+    /// (<see langword="null"/> for a retail item) and agent GUID of the item with code number
+    /// <paramref name="codeNumber"/> in the fixture company.
+    /// </summary>
+    private Task<StoredItem> ReadStoredItemAsync(int codeNumber)
+    {
+        long companyId = CompanyId;
+        return ReadDatabaseAsync(db => db.Items
+            .AsNoTracking()
+            .Where(item => item.CompanyId == companyId && item.CodeNumber == codeNumber)
+            .Select(item => new StoredItem(
+                item.Guid,
+                item.ListedDate,
+                item is TenderItem ? (DateOnly?)((TenderItem)item).ClosureDate : null,
+                item.Agent!.Guid))
+            .SingleAsync());
+    }
+
+    /// <summary>
+    /// Reads, untracked through <see cref="ReadDatabaseAsync"/>, the GUID, date sold, sale price, agent commission and
+    /// client GUID of the retail sale of the item with code number <paramref name="codeNumber"/> in the fixture
+    /// company.
+    /// </summary>
+    private Task<StoredRetailSale> ReadStoredRetailSaleAsync(int codeNumber)
+    {
+        long companyId = CompanyId;
+        return ReadDatabaseAsync(db => db.Sales
+            .AsNoTracking()
+            .OfType<RetailSale>()
+            .Where(sale => sale.CompanyId == companyId && sale.Item!.CodeNumber == codeNumber)
+            .Select(sale => new StoredRetailSale(
+                sale.Guid,
+                sale.DateSold,
+                sale.SalePrice,
+                sale.AgentCommission,
+                sale.Client!.Guid))
+            .SingleAsync());
+    }
+
+    /// <summary>
+    /// Reads, untracked through <see cref="ReadDatabaseAsync"/>, the GUID, agent commission and client GUID of the
+    /// tender sale of the item with code number <paramref name="codeNumber"/> in the fixture company, and the GUID,
+    /// offer, date tendered and client GUID of its tender.
+    /// </summary>
+    private Task<StoredTenderSale> ReadStoredTenderSaleAsync(int codeNumber)
+    {
+        long companyId = CompanyId;
+        return ReadDatabaseAsync(db => db.Sales
+            .AsNoTracking()
+            .OfType<TenderSale>()
+            .Where(sale => sale.CompanyId == companyId && sale.Item!.CodeNumber == codeNumber)
+            .Select(sale => new StoredTenderSale(
+                sale.Guid,
+                sale.AgentCommission,
+                sale.Client!.Guid,
+                sale.Tender!.Guid,
+                sale.Tender.Offer,
+                sale.Tender.DateTendered,
+                sale.Tender.Client!.Guid))
+            .SingleAsync());
+    }
+
+    /// <summary>The GUID, listed date, closure date and agent GUID of a stored item.</summary>
+    private sealed record StoredItem(string Guid, DateOnly ListedDate, DateOnly? ClosureDate, string AgentGuid);
+
+    /// <summary>The GUID, date sold, sale price, agent commission and client GUID of a stored retail sale.</summary>
+    private sealed record StoredRetailSale(
+        string Guid,
+        DateTime DateSold,
+        decimal SalePrice,
+        decimal AgentCommission,
+        string ClientGuid);
+
+    /// <summary>
+    /// The GUID, agent commission and client GUID of a stored tender sale, and the GUID, offer, date tendered and
+    /// client GUID of its tender.
+    /// </summary>
+    private sealed record StoredTenderSale(
+        string Guid,
+        decimal AgentCommission,
+        string ClientGuid,
+        string TenderGuid,
+        decimal Offer,
+        DateTime DateTendered,
+        string TenderClientGuid);
 }

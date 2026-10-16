@@ -20,6 +20,9 @@ using HealthChecks.NpgSql;
 using Microsoft.Extensions.Diagnostics.HealthChecks;
 using Microsoft.OpenApi.Models;
 using Serilog;
+using Serilog.Events;
+using Serilog.Extensions.Logging;
+using Serilog.Formatting.Compact;
 using Swashbuckle.AspNetCore.SwaggerGen;
 
 namespace Erewhon.Api;
@@ -53,14 +56,31 @@ public static class ErewhonHost
     /// <summary>The exit code of a command-line verb that ends because its cancellation token was cancelled.</summary>
     private const int CancelledVerbExitCode = 1;
 
+    /// <summary>The exit code of a process whose host failed to be built, started, run or disposed.</summary>
+    private const int HostFailureExitCode = 1;
+
+    /// <summary>The category of the event that <see cref="LogHostFailure"/> writes.</summary>
+    private const string HostLoggerCategory = "Erewhon.Api.ErewhonHost";
+
+    /// <summary>The message template of the event that <see cref="LogHostFailure"/> writes.</summary>
+    private const string HostFailureTemplate = "The Erewhon host failed; the process exits with code {ExitCode}";
+
+    /// <summary>The event id of the event that <see cref="LogHostFailure"/> writes: 1 <c>ErewhonHostFailed</c>.</summary>
+    private static readonly EventId HostFailureEventId = new(1, "ErewhonHostFailed");
+
     /// <summary>
-    /// Creates the web application builder from <paramref name="args"/>, passes it to <paramref name="configure"/>
+    /// Creates the web application builder from <paramref name="args"/>, with the content root
+    /// <see cref="FindProjectContentRoot"/> returns or, when it returns none, the framework's: the configured
+    /// <c>contentRoot</c>, or the current directory. Passes the builder to <paramref name="configure"/>
     /// before any service is registered, registers every Erewhon service, and builds the application with its whole
-    /// request pipeline and every endpoint mapped. The returned application has not been started.
+    /// request pipeline and every endpoint mapped. Once the application is built, and before the pipeline is mapped,
+    /// <see cref="EntityLockSettings"/> is resolved, which logs each rejected lock setting as
+    /// <c>AddErewhonPersistence</c> describes. The returned application has not been started.
     /// <list type="bullet">
     /// <item><description>
     /// Services: Serilog from the <c>Serilog</c> configuration section plus every Serilog sink, enricher and filter
-    /// registered in dependency injection, leaving the static <see cref="Log.Logger"/> unchanged;
+    /// registered in dependency injection, plus the console sink and levels of <see cref="AddFallbackLogging"/> when
+    /// that section has no <c>WriteTo</c> entry, leaving the static <see cref="Log.Logger"/> unchanged;
     /// <c>AddErewhonApplication</c> and <c>AddErewhonPersistence</c>; the HTTP context accessor; a singleton
     /// <see cref="SessionRegistry"/>; a scoped <see cref="HttpSessionContext"/> as <see cref="ISessionContext"/>; a
     /// singleton <see cref="SignalRNotificationPublisher"/> as <see cref="INotificationPublisher"/>; a singleton
@@ -69,13 +89,18 @@ public static class ErewhonHost
     /// the global <see cref="RestExceptionFilter"/> and no implicit required attribute on non-nullable reference
     /// types; CoreWCF with metadata addresses taken from the request headers; SignalR; Swashbuckle with the
     /// documents <c>rest</c> and <c>app</c>; the PostgreSQL health check <c>postgresql</c>, which reads
-    /// <c>ConnectionStrings:Erewhon</c> each time it runs and reports <c>Unhealthy</c> when the value is absent or
-    /// empty, or when a connection cannot be opened or <c>SELECT 1</c> fails, with a description that names only that
-    /// setting, the exception types and the SQLSTATE, and with no exception or data.
+    /// <c>ConnectionStrings:Erewhon</c> each time it runs, opens its own unpooled connection with it and closes it
+    /// after <c>SELECT 1</c>, and reports <c>Unhealthy</c> when the value is absent or empty, or when the connection
+    /// cannot be opened or <c>SELECT 1</c> fails, with a description that names only that setting, the exception
+    /// types and the SQLSTATE, and with no exception or data.
     /// </description></item>
     /// <item><description>
     /// JSON for controllers, minimal APIs and SignalR: camelCase property names, and enums written as camelCase
     /// strings.
+    /// </description></item>
+    /// <item><description>
+    /// Minimal APIs in every environment: a request whose parameters cannot be bound is answered with the framework's
+    /// status, 400 for a malformed or wrongly typed JSON body, and an empty body, without throwing.
     /// </description></item>
     /// <item><description>
     /// Pipeline, in order: Serilog request logging through the host's logger; <see cref="ErrorOutcomeMiddleware"/>;
@@ -101,58 +126,195 @@ public static class ErewhonHost
     {
         ArgumentNullException.ThrowIfNull(args);
 
-        var builder = WebApplication.CreateBuilder(args);
+        var builder = WebApplication.CreateBuilder(new WebApplicationOptions
+        {
+            Args = args,
+            ContentRootPath = FindProjectContentRoot(args),
+        });
         configure?.Invoke(builder);
 
         AddServices(builder);
 
         var app = builder.Build();
+        _ = app.Services.GetRequiredService<EntityLockSettings>();
         MapPipeline(app);
         return app;
     }
 
     /// <summary>
+    /// Returns the content root of a host that runs from the build output of its project: the nearest folder at or
+    /// above <see cref="AppContext.BaseDirectory"/> that holds the project file named after this assembly,
+    /// <c>Erewhon.Api.csproj</c>.
+    /// </summary>
+    /// <param name="args">The arguments the builder reads as command-line configuration.</param>
+    /// <returns>
+    /// The full path of that folder; <see langword="null"/> when no such folder exists, when <paramref name="args"/>
+    /// gives a <c>contentRoot</c> value, read as command-line configuration, or when the environment variable
+    /// <c>ASPNETCORE_CONTENTROOT</c> or <c>DOTNET_CONTENTROOT</c> is set, even to an empty value.
+    /// </returns>
+    private static string? FindProjectContentRoot(string[] args)
+    {
+        const string AspNetCoreContentRootVariable = "ASPNETCORE_CONTENTROOT";
+        const string DotNetContentRootVariable = "DOTNET_CONTENTROOT";
+        const string ProjectFileExtension = ".csproj";
+
+        var configuredContentRoot = new ConfigurationBuilder().AddCommandLine(args).Build()[HostDefaults.ContentRootKey];
+        if (configuredContentRoot is not null
+            || Environment.GetEnvironmentVariable(AspNetCoreContentRootVariable) is not null
+            || Environment.GetEnvironmentVariable(DotNetContentRootVariable) is not null)
+        {
+            return null;
+        }
+
+        var projectFileName = typeof(ErewhonHost).Assembly.GetName().Name + ProjectFileExtension;
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+        {
+            if (File.Exists(Path.Combine(directory.FullName, projectFileName)))
+            {
+                return directory.FullName;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// Runs the process: when <see cref="CommandLineVerbs.IsVerb"/> recognises <paramref name="args"/>, builds the
-    /// host without command-line configuration, runs the verb through <see cref="CommandLineVerbs.RunAsync"/> without
-    /// starting the web server or the hosted services, and disposes the host; otherwise builds the host from
-    /// <paramref name="args"/>, runs the web server until it shuts down, and disposes the host.
-    /// While the verb runs, SIGINT, SIGTERM and SIGQUIT are handled by <see cref="CancelVerb"/>: the first of them
-    /// cancels the token passed to the verb and the process keeps running until the verb ends; a signal received after
-    /// that gets the runtime's default handling, which ends the process. The signal registrations and the token's
-    /// source are disposed when the verb ends.
+    /// host without command-line configuration and runs the verb through <see cref="RunVerbAsync"/> without starting
+    /// the web server or the hosted services; otherwise builds the host from <paramref name="args"/> and runs the web
+    /// server through <see cref="RunWebServerAsync"/> until it shuts down. The host is disposed afterwards.
+    /// An exception thrown while the host is built, started, run, stopped or disposed is not rethrown:
+    /// <see cref="LogHostFailure"/> writes it as one fatal event, through the host's logger when the host was built
+    /// and is not being disposed, and the process ends with exit code 1.
     /// </summary>
     /// <param name="args">The process arguments.</param>
     /// <returns>
     /// The verb's exit code; 1 when the verb ends with an <see cref="OperationCanceledException"/> after its token was
-    /// cancelled; or 0 once the web server has shut down.
+    /// cancelled; 0 once the web server has shut down; or 1 when building, starting, running, stopping or disposing
+    /// the host threw an exception.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="args"/> is <see langword="null"/>.</exception>
     public static async Task<int> RunAsync(string[] args)
     {
         ArgumentNullException.ThrowIfNull(args);
 
-        if (CommandLineVerbs.IsVerb(args))
+        var isVerb = CommandLineVerbs.IsVerb(args);
+        WebApplication? host = null;
+        int exitCode;
+        try
         {
-            await using var verbHost = Build(Array.Empty<string>());
-            using var cancellation = new CancellationTokenSource();
-            Action<PosixSignalContext> onSignal = context => CancelVerb(context, cancellation);
-            using var interruptRegistration = PosixSignalRegistration.Create(PosixSignal.SIGINT, onSignal);
-            using var terminateRegistration = PosixSignalRegistration.Create(PosixSignal.SIGTERM, onSignal);
-            using var quitRegistration = PosixSignalRegistration.Create(PosixSignal.SIGQUIT, onSignal);
-            try
-            {
-                return await CommandLineVerbs.RunAsync(verbHost.Services, args, Console.Out, cancellation.Token);
-            }
-            catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
-            {
-                return CancelledVerbExitCode;
-            }
+            host = Build(isVerb ? Array.Empty<string>() : args);
+            exitCode = isVerb ? await RunVerbAsync(host, args) : await RunWebServerAsync(host);
+        }
+        catch (Exception failure)
+        {
+            LogHostFailure(host?.Services, failure);
+            exitCode = HostFailureExitCode;
         }
 
-        var app = Build(args);
-        await app.RunAsync();
+        if (host is null)
+        {
+            return exitCode;
+        }
+
+        try
+        {
+            await host.DisposeAsync();
+        }
+        catch (Exception failure)
+        {
+            LogHostFailure(null, failure);
+            exitCode = HostFailureExitCode;
+        }
+
+        return exitCode;
+    }
+
+    /// <summary>
+    /// Runs the command-line verb of <paramref name="args"/> through <see cref="CommandLineVerbs.RunAsync"/> with the
+    /// services of the unstarted <paramref name="host"/>, writing its output to standard output.
+    /// While the verb runs, SIGINT, SIGTERM and SIGQUIT are handled by <see cref="CancelVerb"/>: the first of them
+    /// cancels the token passed to the verb and the process keeps running until the verb ends; a signal received after
+    /// that gets the runtime's default handling, which ends the process. The signal registrations and the token's
+    /// source are disposed when the verb ends.
+    /// </summary>
+    /// <param name="host">The built host whose services run the verb.</param>
+    /// <param name="args">The process arguments; the first is the verb.</param>
+    /// <returns>
+    /// The verb's exit code, or 1 when the verb ends with an <see cref="OperationCanceledException"/> after its token
+    /// was cancelled.
+    /// </returns>
+    private static async Task<int> RunVerbAsync(WebApplication host, string[] args)
+    {
+        using var cancellation = new CancellationTokenSource();
+        Action<PosixSignalContext> onSignal = context => CancelVerb(context, cancellation);
+        using var interruptRegistration = PosixSignalRegistration.Create(PosixSignal.SIGINT, onSignal);
+        using var terminateRegistration = PosixSignalRegistration.Create(PosixSignal.SIGTERM, onSignal);
+        using var quitRegistration = PosixSignalRegistration.Create(PosixSignal.SIGQUIT, onSignal);
+        try
+        {
+            return await CommandLineVerbs.RunAsync(host.Services, args, Console.Out, cancellation.Token);
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+        {
+            return CancelledVerbExitCode;
+        }
+    }
+
+    /// <summary>
+    /// Starts <paramref name="app"/> and waits until it has shut down and its hosted services have stopped, without
+    /// disposing it. A start that ends with an <see cref="OperationCanceledException"/> after the application's
+    /// shutdown was requested, by Ctrl+C or SIGTERM while it starts, ends the run as a shutdown.
+    /// </summary>
+    /// <param name="app">The built, unstarted web application.</param>
+    /// <returns>0 once the application has shut down.</returns>
+    private static async Task<int> RunWebServerAsync(WebApplication app)
+    {
+        try
+        {
+            await app.StartAsync();
+        }
+        catch (OperationCanceledException) when (app.Lifetime.ApplicationStopping.IsCancellationRequested)
+        {
+            return ShutdownExitCode;
+        }
+
+        await app.WaitForShutdownAsync();
         return ShutdownExitCode;
     }
+
+    /// <summary>
+    /// Writes one <c>Critical</c> (Serilog <c>Fatal</c>) event with <see cref="HostFailureEventId"/> under the category
+    /// <c>Erewhon.Api.ErewhonHost</c>, with <paramref name="failure"/> attached and the exit code 1 as its
+    /// <c>ExitCode</c> property. The event goes through the logger factory of <paramref name="services"/> when it is
+    /// given; otherwise through a logger created for the event, which writes it as one compact JSON line to standard
+    /// output and is disposed after it.
+    /// </summary>
+    /// <param name="services">
+    /// The services of the built host while it is not being disposed, or <see langword="null"/>.
+    /// </param>
+    /// <param name="failure">The exception that ended the host.</param>
+    private static void LogHostFailure(IServiceProvider? services, Exception failure)
+    {
+        if (services is not null)
+        {
+            WriteHostFailure(services.GetRequiredService<ILoggerFactory>(), failure);
+            return;
+        }
+
+        using var loggerFactory = new SerilogLoggerFactory(
+            new LoggerConfiguration().WriteTo.Console(new CompactJsonFormatter()).CreateLogger(),
+            dispose: true);
+        WriteHostFailure(loggerFactory, failure);
+    }
+
+    /// <summary>Writes the event of <see cref="LogHostFailure"/> through <paramref name="loggerFactory"/>.</summary>
+    /// <param name="loggerFactory">The factory of the logger that writes the event.</param>
+    /// <param name="failure">The exception that ended the host.</param>
+    private static void WriteHostFailure(ILoggerFactory loggerFactory, Exception failure) =>
+        loggerFactory
+            .CreateLogger(HostLoggerCategory)
+            .LogCritical(HostFailureEventId, failure, HostFailureTemplate, HostFailureExitCode);
 
     /// <summary>
     /// Handles a SIGINT, SIGTERM or SIGQUIT received while a command-line verb runs. When
@@ -182,15 +344,49 @@ public static class ErewhonHost
         context.Cancel = true;
     }
 
+    /// <summary>
+    /// When <paramref name="settings"/> holds no entry under <c>Serilog:WriteTo</c>, adds to
+    /// <paramref name="configuration"/> a console sink that writes each event as one compact JSON line to standard
+    /// output, and the minimum level <c>Warning</c> for each of the sources <c>Microsoft.AspNetCore</c>,
+    /// <c>Microsoft.AspNetCore.Hosting.Diagnostics</c> and <c>Microsoft.EntityFrameworkCore</c> that has no
+    /// <c>Serilog:MinimumLevel:Override</c> value in <paramref name="settings"/>. Otherwise leaves
+    /// <paramref name="configuration"/> unchanged.
+    /// </summary>
+    /// <param name="configuration">The logger configuration that has read <paramref name="settings"/>.</param>
+    /// <param name="settings">The host configuration.</param>
+    private static void AddFallbackLogging(LoggerConfiguration configuration, IConfiguration settings)
+    {
+        const string WriteToSection = "Serilog:WriteTo";
+        const string OverrideSection = "Serilog:MinimumLevel:Override";
+        string[] warningSources =
+            ["Microsoft.AspNetCore", "Microsoft.AspNetCore.Hosting.Diagnostics", "Microsoft.EntityFrameworkCore"];
+
+        if (settings.GetSection(WriteToSection).GetChildren().Any())
+        {
+            return;
+        }
+
+        configuration.WriteTo.Console(new CompactJsonFormatter());
+        foreach (var source in warningSources)
+        {
+            if (settings[$"{OverrideSection}:{source}"] is null)
+            {
+                configuration.MinimumLevel.Override(source, LogEventLevel.Warning);
+            }
+        }
+    }
+
     /// <summary>Registers the logging, layer, session, realtime, closure, SOAP, REST, OpenAPI and health services.</summary>
     /// <param name="builder">The builder whose services are registered.</param>
     private static void AddServices(WebApplicationBuilder builder)
     {
         builder.Host.UseSerilog(
-            (context, services, configuration) => configuration
-                .ReadFrom.Configuration(context.Configuration)
-                .ReadFrom.Services(services)
-                .Enrich.FromLogContext(),
+            (context, services, configuration) => AddFallbackLogging(
+                configuration
+                    .ReadFrom.Configuration(context.Configuration)
+                    .ReadFrom.Services(services)
+                    .Enrich.FromLogContext(),
+                context.Configuration),
             preserveStaticLogger: true);
 
         var services = builder.Services;
@@ -208,6 +404,7 @@ public static class ErewhonHost
         services.AddTransient<ErewhonWebServiceAdmin>();
 
         services.ConfigureHttpJsonOptions(options => ConfigureJson(options.SerializerOptions));
+        services.Configure<RouteHandlerOptions>(options => options.ThrowOnBadRequest = false);
         services
             .AddControllers(options =>
             {
@@ -267,16 +464,32 @@ public static class ErewhonHost
     /// <param name="configuration">The configuration the connection string is read from.</param>
     /// <returns>
     /// A <see cref="MissingConnectionStringHealthCheck"/> when the value is absent or empty; otherwise a
-    /// <see cref="SanitizedDatabaseHealthCheck"/> around an <see cref="NpgSqlHealthCheck"/> that opens a connection
-    /// with the value and runs <c>SELECT 1</c>.
+    /// <see cref="SanitizedDatabaseHealthCheck"/> that, each time it runs, creates an <see cref="NpgSqlHealthCheck"/>
+    /// that opens an unpooled connection with the <see cref="UnpooledConnectionString"/> of the value, runs
+    /// <c>SELECT 1</c> and closes the connection.
     /// </returns>
     private static IHealthCheck CreateDatabaseHealthCheck(IConfiguration configuration)
     {
         var connectionString = configuration.GetConnectionString(ConnectionStringName);
         return string.IsNullOrEmpty(connectionString)
             ? new MissingConnectionStringHealthCheck()
-            : new SanitizedDatabaseHealthCheck(new NpgSqlHealthCheck(new NpgSqlHealthCheckOptions(connectionString)));
+            : new SanitizedDatabaseHealthCheck(() => new NpgSqlHealthCheck(
+                new NpgSqlHealthCheckOptions(UnpooledConnectionString(connectionString))));
     }
+
+    /// <summary>
+    /// Returns <paramref name="connectionString"/> with <c>Pooling</c> and <c>Multiplexing</c> set to
+    /// <see langword="false"/> and every other setting unchanged. A connection opened with the result opens its own
+    /// physical connection to PostgreSQL, never one held by an Npgsql pool, and closes it when the connection closes.
+    /// </summary>
+    /// <param name="connectionString">The connection string to copy.</param>
+    /// <returns>The unpooled copy of <paramref name="connectionString"/>.</returns>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="connectionString"/> is not a valid Npgsql connection string.
+    /// </exception>
+    private static string UnpooledConnectionString(string connectionString) =>
+        new Npgsql.NpgsqlConnectionStringBuilder(connectionString) { Pooling = false, Multiplexing = false }
+            .ConnectionString;
 
     /// <summary>Adds the middleware and maps every endpoint of the Erewhon host, in pipeline order.</summary>
     /// <param name="app">The built application.</param>
@@ -459,25 +672,28 @@ public static class ErewhonHost
     }
 
     /// <summary>
-    /// The database health check that runs an inner check and reports every result other than <c>Healthy</c>, and
-    /// every exception the inner check throws, with a description naming only <c>ConnectionStrings:Erewhon</c>, the
-    /// exception types and the SQLSTATE, and with no exception and no data.
+    /// The database health check that creates and runs an inner check on every run and reports every result other
+    /// than <c>Healthy</c>, and every exception that creating or running the inner check throws, with a description
+    /// naming only <c>ConnectionStrings:Erewhon</c>, the exception types and the SQLSTATE, and with no exception and
+    /// no data.
     /// </summary>
-    /// <param name="inner">The check that opens the connection and runs <c>SELECT 1</c>.</param>
-    private sealed class SanitizedDatabaseHealthCheck(IHealthCheck inner) : IHealthCheck
+    /// <param name="createInner">Creates the check that opens the connection and runs <c>SELECT 1</c>.</param>
+    private sealed class SanitizedDatabaseHealthCheck(Func<IHealthCheck> createInner) : IHealthCheck
     {
         /// <summary>The text between two exception type names in a description.</summary>
         private const string TypeSeparator = " ---> ";
 
-        /// <summary>The check that is run.</summary>
-        private readonly IHealthCheck _inner = inner ?? throw new ArgumentNullException(nameof(inner));
+        /// <summary>Creates the check that is run.</summary>
+        private readonly Func<IHealthCheck> _createInner =
+            createInner ?? throw new ArgumentNullException(nameof(createInner));
 
         /// <summary>
-        /// Runs the inner check with <paramref name="context"/> and <paramref name="cancellationToken"/> and returns a
-        /// <c>Healthy</c> result unchanged. Any other result is replaced by a result of the same status, and an
-        /// exception the inner check throws by a result of the registration's failure status, each with the
-        /// description of <see cref="Describe"/>, no exception and no data. An <see cref="OperationCanceledException"/>
-        /// thrown while <paramref name="cancellationToken"/> is cancelled propagates.
+        /// Creates the inner check, runs it with <paramref name="context"/> and <paramref name="cancellationToken"/>
+        /// and returns a <c>Healthy</c> result unchanged. Any other result is replaced by a result of the same status,
+        /// and an exception that creating or running the inner check throws by a result of the registration's failure
+        /// status, each with the description of <see cref="Describe"/>, no exception and no data. An
+        /// <see cref="OperationCanceledException"/> thrown while <paramref name="cancellationToken"/> is cancelled
+        /// propagates.
         /// </summary>
         /// <param name="context">The context of the health-check run.</param>
         /// <param name="cancellationToken">Cancels the run; passed to the inner check.</param>
@@ -495,7 +711,7 @@ public static class ErewhonHost
             HealthCheckResult result;
             try
             {
-                result = await _inner.CheckHealthAsync(context, cancellationToken);
+                result = await _createInner().CheckHealthAsync(context, cancellationToken);
             }
             catch (Exception exception)
                 when (exception is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
