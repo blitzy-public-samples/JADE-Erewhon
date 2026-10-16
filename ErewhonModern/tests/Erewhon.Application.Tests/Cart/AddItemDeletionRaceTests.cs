@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Data.Common;
+using Erewhon.Api.Errors;
 using Erewhon.Application.Abstractions;
 using Erewhon.Application.Cart;
 using Erewhon.Application.Common;
@@ -204,8 +205,9 @@ public sealed class AddItemDeletionRaceTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// A second add of an item whose retail or tender line the cart already holds → <see cref="InvalidOperationException"/>,
-    /// and the cart still holds the first line object, unchanged.
+    /// A second add of an item whose retail or tender line the cart already holds → <see cref="KeyAlreadyUsedException"/>
+    /// 1310 "Key already used in this dictionary", whose error outcome is headed "Error 1310" with the web exception
+    /// body, and the cart still holds the first line object, unchanged.
     /// </summary>
     /// <param name="tender"><see langword="true"/> for a tender item; <see langword="false"/> for a retail item.</param>
     /// <returns>A task that completes when the case has run.</returns>
@@ -228,9 +230,22 @@ public sealed class AddItemDeletionRaceTests : IAsyncLifetime
             Assert.True(first.Succeeded, first.FullErrorText);
             CartItem firstLine = Assert.Single(cart.Items);
 
-            await Assert.ThrowsAsync<InvalidOperationException>(
+            KeyAlreadyUsedException failure = await Assert.ThrowsAsync<KeyAlreadyUsedException>(
                 () => service.AddItemAsync(cart.SessionId, itemId, fixture.Offer(tender), timeout.Token));
 
+            Assert.Equal(KeyAlreadyUsedException.Code, failure.ErrorCode);
+            Assert.Equal("Key already used in this dictionary", failure.Message);
+            ErrorOutcome outcome = ErrorOutcomeMiddleware.Create(failure);
+            Assert.Equal(ErrorOutcome.KindException, outcome.Kind);
+            Assert.Equal("Error 1310", outcome.Heading);
+            Assert.Equal(
+                MessageCatalog.Get(
+                    MessageKeys.BaseExceptionBodyWeb,
+                    "1310",
+                    "Key already used in this dictionary",
+                    MessageCatalog.Get(MessageKeys.BaseNotAvailable),
+                    string.Empty),
+                outcome.Body);
             Assert.Same(firstLine, Assert.Single(cart.Items));
         }
         finally

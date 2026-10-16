@@ -50,10 +50,13 @@ public static class ShopEndpoints
     /// the session's shop item search.
     /// </description></item>
     /// <item><description>
-    /// <c>POST /shop/search</c>: resets the session's shop item search, sets it from the
-    /// <see cref="ShopSearchRequest"/> with items in the session cart and sold items excluded, runs it, and answers 200
-    /// with a <see cref="ShopSearchResponse"/> whose rows are in code-number order. A low price above a high price,
-    /// both non-zero, fails with the 500 <see cref="ErrorOutcome"/> of error 500002. An item kind that is not a defined
+    /// <c>POST /shop/search</c>: sets the session's shop item search from the <see cref="ShopSearchRequest"/> in the
+    /// order country, region, category, retail-only and tender-only flags, high price, low price, closed-tender flag,
+    /// with items in the session cart and sold items excluded, runs it, and answers 200 with a
+    /// <see cref="ShopSearchResponse"/> whose rows are in code-number order. A low price above a high price, both
+    /// non-zero, fails with the 500 <see cref="ErrorOutcome"/> of error 500002. A price bound beyond
+    /// <c>Decimal[12,2]</c> fails with the 500 <see cref="ErrorOutcome"/> of error 4033, the criteria assigned before
+    /// it holding the request's values and the rest their previous values. An item kind that is not a defined
     /// <see cref="ShopItemKind"/> answers 400 with an empty body and leaves the session's shop item search unchanged.
     /// </description></item>
     /// <item><description>
@@ -252,10 +255,13 @@ public static class ShopEndpoints
     }
 
     /// <summary>
-    /// Resets the session's shop item search, sets it from the request body with cart and sold items excluded, runs it
-    /// for the session, and returns the found items as search rows in the order found. Returns 400 with an empty body,
-    /// leaving the session's shop item search unchanged, when the request's <c>itemKind</c> is not <c>all</c>,
-    /// <c>retail</c> or <c>tender</c>.
+    /// Sets the session's shop item search from the request body, assigning the country, region, category,
+    /// retail-only and tender-only flags, high price, low price and closed-tender flag in that order, then excludes
+    /// cart and sold items, runs the search for the session, and returns the found items as search rows in the order
+    /// found. When an assignment throws, as a price bound beyond <c>Decimal[12,2]</c> does with error 4033, the
+    /// criteria assigned before it hold the request's values, the rest keep their previous values, and no search runs.
+    /// Returns 400 with an empty body, leaving the session's shop item search unchanged, when the request's
+    /// <c>itemKind</c> is not <c>all</c>, <c>retail</c> or <c>tender</c>.
     /// </summary>
     private static async Task<Results<Ok<ShopSearchResponse>, BadRequest, UnauthorizedHttpResult>> SearchAsync(
         [FromBody] ShopSearchRequest request,
@@ -282,7 +288,6 @@ public static class ShopEndpoints
         await gate.WaitAsync(ct);
         try
         {
-            criteria.Initialize();
             criteria.CountryId = request.CountryId;
             criteria.RegionId = request.RegionId;
             criteria.ItemCategoryId = request.ItemCategoryId;

@@ -37,20 +37,28 @@ public sealed class ItemSearchCriteria
     /// The lowest price an item may have, inclusive; 0 sets no lower bound.
     /// The value is stored rounded to 2 decimal places, ties away from zero.
     /// </summary>
+    /// <exception cref="DecimalOverflowException">
+    /// The value set, rounded to 2 decimal places, has a magnitude greater than <see cref="DecimalRules.MaxMoney"/>;
+    /// the bound keeps its previous value.
+    /// </exception>
     public decimal PriceLow
     {
         get => _priceLow;
-        set => _priceLow = DecimalRules.Round2(value);
+        set => _priceLow = DecimalRules.RoundMoney(value);
     }
 
     /// <summary>
     /// The highest price an item may have, inclusive; 0 sets no upper bound.
     /// The value is stored rounded to 2 decimal places, ties away from zero.
     /// </summary>
+    /// <exception cref="DecimalOverflowException">
+    /// The value set, rounded to 2 decimal places, has a magnitude greater than <see cref="DecimalRules.MaxMoney"/>;
+    /// the bound keeps its previous value.
+    /// </exception>
     public decimal PriceHigh
     {
         get => _priceHigh;
-        set => _priceHigh = DecimalRules.Round2(value);
+        set => _priceHigh = DecimalRules.RoundMoney(value);
     }
 
     /// <summary>The row id of the agent an item must have; <see langword="null"/> for any agent.</summary>

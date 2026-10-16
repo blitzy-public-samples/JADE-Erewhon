@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Globalization;
 using Erewhon.Api.Errors;
 using Erewhon.Application.Abstractions;
 using Erewhon.Application.Cart;
@@ -58,6 +59,47 @@ public sealed class BehaviourCatalogueTests : ErewhonTestBase
         { "GIF", Padded(0x47, 0x49, 0x46, 0x38, 0x39, 0x61), false },
         { "No signature", Padded(0x13, 0x37, 0xC0, 0xDE, 0x5A, 0xA5, 0x0F, 0xF0, 0x3C, 0xC3), false },
         { "No photo", null, true },
+    };
+
+    /// <summary>
+    /// B-24 cases: whether the line is a tender line, and an offer whose value rounded to 2 decimal places has a
+    /// magnitude greater than <see cref="DecimalRules.MaxMoney"/>.
+    /// </summary>
+    public static TheoryData<bool, decimal> OfferOverflowCases => new()
+    {
+        { false, 99_999_999_999m },
+        { false, 9_999_999_999.995m },
+        { true, 99_999_999_999m },
+        { true, 9_999_999_999.995m },
+    };
+
+    /// <summary>
+    /// <see cref="DecimalRules.RoundMoney"/> cases within <c>Decimal[12,2]</c>: the value and the value it returns.
+    /// </summary>
+    public static TheoryData<decimal, decimal> RoundMoneyCases => new()
+    {
+        { 9_999_999_999.99m, 9_999_999_999.99m },
+        { -9_999_999_999.99m, -9_999_999_999.99m },
+        { 9_999_999_999.994m, 9_999_999_999.99m },
+        { -9_999_999_999.994m, -9_999_999_999.99m },
+        { 175.555m, 175.56m },
+        { -175.555m, -175.56m },
+        { 0m, 0m },
+    };
+
+    /// <summary>
+    /// <see cref="DecimalRules.RoundMoney"/> cases beyond <c>Decimal[12,2]</c>: values whose magnitude, rounded to 2
+    /// decimal places, is greater than <see cref="DecimalRules.MaxMoney"/>.
+    /// </summary>
+    public static TheoryData<decimal> RoundMoneyOverflowCases => new()
+    {
+        9_999_999_999.995m,
+        -9_999_999_999.995m,
+        10_000_000_000m,
+        -10_000_000_000m,
+        99_999_999_999m,
+        decimal.MaxValue,
+        decimal.MinValue,
     };
 
     private long CompanyId => Builder.MyCompany?.Id
@@ -965,6 +1007,101 @@ public sealed class BehaviourCatalogueTests : ErewhonTestBase
         Assert.Equal(fixture.Client.Id, sale.ClientId);
     }
 
+    /// <summary>
+    /// B-24 (D-16, D-169): an offer of 99999999999 or 9999999999.995 on a retail item at 100.00 or a tender item with reserve
+    /// 100.00 → <see cref="DecimalOverflowException"/> 4033 "Result of expression overflows Decimal precision", whose
+    /// error outcome is headed "Error 4033" with the web exception body; the cart stays empty.
+    /// </summary>
+    /// <param name="tender"><see langword="true"/> for a tender item; <see langword="false"/> for a retail item.</param>
+    /// <param name="offer">The offer added with the item.</param>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Theory]
+    [MemberData(nameof(OfferOverflowCases))]
+    public async Task B24_OfferBeyondDecimal12_2Overflows(bool tender, decimal offer)
+    {
+        Assert.Equal(4033, DecimalOverflowException.Code);
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        DateOnly today = await ServerDateAsync();
+        long itemId = tender
+            ? (await NewTenderItemAsync(fixture, 100.00m, today.AddDays(5))).Id
+            : (await NewRetailItemAsync(fixture, 100.00m)).Id;
+        Session.SetClient(fixture.Client.Id);
+
+        DecimalOverflowException failure = await Assert.ThrowsAsync<DecimalOverflowException>(
+            () => Cart.AddItemAsync(SessionId, itemId, offer));
+
+        Assert.Equal(DecimalOverflowException.Code, failure.ErrorCode);
+        Assert.Equal("Result of expression overflows Decimal precision", failure.Message);
+        ErrorOutcome outcome = ErrorOutcomeMiddleware.Create(failure);
+        Assert.Equal(ErrorOutcome.KindException, outcome.Kind);
+        Assert.Equal("Error 4033", outcome.Heading);
+        Assert.Equal(
+            Text(
+                MessageKeys.BaseExceptionBodyWeb,
+                "4033",
+                "Result of expression overflows Decimal precision",
+                Text(MessageKeys.BaseNotAvailable),
+                string.Empty),
+            outcome.Body);
+        Assert.Contains("Error: Result of expression overflows Decimal precision (4033)", outcome.Body);
+        Assert.True(GetService<ICartStore>().GetCart(SessionId).IsEmpty);
+    }
+
+    /// <summary>
+    /// B-24 (D-16, D-169): an offer of 9999999999.99 on a tender item with reserve 100.00 → added, the line holding the offer
+    /// 9999999999.99.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B24_OfferAtDecimal12_2LimitIsAdded()
+    {
+        CatalogueFixture fixture = await ArrangeCatalogueAsync();
+        DateOnly today = await ServerDateAsync();
+        TenderItem tenderItem = await NewTenderItemAsync(fixture, 100.00m, today.AddDays(5));
+        Session.SetClient(fixture.Client.Id);
+
+        OperationResult result = await Cart.AddItemAsync(SessionId, tenderItem.Id, 9_999_999_999.99m);
+
+        Assert.True(result.Succeeded, result.FullErrorText);
+        CartItem line = Assert.Single(GetService<ICartStore>().GetCart(SessionId).Items);
+        Assert.Equal(tenderItem.Id, line.ItemId);
+        Assert.True(line.IsTender);
+        Assert.Equal(9_999_999_999.99m, line.Offer);
+    }
+
+    /// <summary>
+    /// B-24 (D-16, D-169): <see cref="DecimalRules.MaxMoney"/> is <see cref="DecimalRules.Precision"/> nines with
+    /// <see cref="DecimalRules.Scale"/> of them after the decimal point; <see cref="DecimalRules.RoundMoney"/> of a
+    /// value whose rounded magnitude is at most that → the value rounded to 2 decimal places, ties away from zero.
+    /// </summary>
+    /// <param name="value">The value rounded.</param>
+    /// <param name="expected">The value <see cref="DecimalRules.RoundMoney"/> returns.</param>
+    [Theory]
+    [MemberData(nameof(RoundMoneyCases))]
+    public void B24_DecimalRulesRoundMoneyKeepsValuesWithinDecimal12_2(decimal value, decimal expected)
+    {
+        Assert.Equal(
+            new string('9', DecimalRules.Precision - DecimalRules.Scale) + "." + new string('9', DecimalRules.Scale),
+            DecimalRules.MaxMoney.ToString(CultureInfo.InvariantCulture));
+
+        Assert.Equal(expected, DecimalRules.RoundMoney(value));
+    }
+
+    /// <summary>
+    /// B-24 (D-16, D-169): <see cref="DecimalRules.RoundMoney"/> of a value whose magnitude, rounded to 2 decimal places, is
+    /// greater than <see cref="DecimalRules.MaxMoney"/> → <see cref="DecimalOverflowException"/> 4033.
+    /// </summary>
+    /// <param name="value">The value rounded.</param>
+    [Theory]
+    [MemberData(nameof(RoundMoneyOverflowCases))]
+    public void B24_DecimalRulesRoundMoneyRejectsValuesBeyondDecimal12_2(decimal value)
+    {
+        DecimalOverflowException failure = Assert.Throws<DecimalOverflowException>(() => DecimalRules.RoundMoney(value));
+
+        Assert.Equal(DecimalOverflowException.Code, failure.ErrorCode);
+        Assert.Equal(DecimalOverflowException.Text, failure.Message);
+    }
+
     /// <summary>B-25: removing no item from the cart → the single error <c>$NoItemSelected</c>.</summary>
     /// <returns>A task that completes when the case has run.</returns>
     [Fact]
@@ -1630,6 +1767,47 @@ public sealed class BehaviourCatalogueTests : ErewhonTestBase
         Exception? noBound = await Record.ExceptionAsync(
             () => search.DoSearchAsync(new ItemSearchCriteria { PriceLow = 0m, PriceHigh = 800m }, SessionId));
         Assert.Null(noBound);
+    }
+
+    /// <summary>
+    /// B-35 (D-16, D-169): with the bounds 100 and 600 set, setting <see cref="ItemSearchCriteria.PriceLow"/> or
+    /// <see cref="ItemSearchCriteria.PriceHigh"/> to 99999999999 → <see cref="DecimalOverflowException"/> 4033, whose
+    /// error outcome is headed "Error 4033", and both bounds keep 100 and 600; setting that bound to 9999999999.99 →
+    /// stored.
+    /// </summary>
+    /// <param name="upper">
+    /// <see langword="true"/> to set <see cref="ItemSearchCriteria.PriceHigh"/>; <see langword="false"/> to set
+    /// <see cref="ItemSearchCriteria.PriceLow"/>.
+    /// </param>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void B35_PriceBoundBeyondDecimal12_2Overflows(bool upper)
+    {
+        var criteria = new ItemSearchCriteria { PriceLow = 100m, PriceHigh = 600m };
+        void SetBound(decimal value)
+        {
+            if (upper)
+            {
+                criteria.PriceHigh = value;
+            }
+            else
+            {
+                criteria.PriceLow = value;
+            }
+        }
+
+        DecimalOverflowException failure = Assert.Throws<DecimalOverflowException>(() => SetBound(99_999_999_999m));
+
+        Assert.Equal(DecimalOverflowException.Code, failure.ErrorCode);
+        Assert.Equal("Error 4033", ErrorOutcomeMiddleware.Create(failure).Heading);
+        Assert.Equal(100m, criteria.PriceLow);
+        Assert.Equal(600m, criteria.PriceHigh);
+
+        SetBound(9_999_999_999.99m);
+
+        Assert.Equal(9_999_999_999.99m, upper ? criteria.PriceHigh : criteria.PriceLow);
+        Assert.Equal(upper ? 100m : 600m, upper ? criteria.PriceLow : criteria.PriceHigh);
     }
 
     /// <summary>

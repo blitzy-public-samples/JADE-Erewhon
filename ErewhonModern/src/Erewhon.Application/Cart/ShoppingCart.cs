@@ -1,3 +1,5 @@
+using Erewhon.Application.Common;
+
 namespace Erewhon.Application.Cart;
 
 /// <summary>
@@ -74,7 +76,7 @@ public sealed class ShoppingCart
     /// <summary>Adds a line for the line's item id. The cart keeps the given line object itself.</summary>
     /// <param name="item">The line to add.</param>
     /// <exception cref="ArgumentNullException"><paramref name="item"/> is null.</exception>
-    /// <exception cref="InvalidOperationException">
+    /// <exception cref="KeyAlreadyUsedException">
     /// The cart already holds a line for the item id; the cart is left unchanged.
     /// </exception>
     public void Add(CartItem item)
@@ -84,7 +86,7 @@ public sealed class ShoppingCart
         {
             if (!_lines.TryAdd(item.ItemId, item))
             {
-                throw new InvalidOperationException("Key already used in this dictionary");
+                throw new KeyAlreadyUsedException();
             }
         }
     }

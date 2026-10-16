@@ -221,7 +221,11 @@ public sealed class ShoppingCartService : TransactionAgent<ShoppingCart>
     /// <exception cref="ArgumentNullException"><paramref name="sessionId"/> is <see langword="null"/>.</exception>
     /// <exception cref="ArgumentException"><paramref name="sessionId"/> is empty.</exception>
     /// <exception cref="StringTooLongException">The item code is longer than 11 characters.</exception>
-    /// <exception cref="InvalidOperationException">
+    /// <exception cref="DecimalOverflowException">
+    /// The offer rounded to 2 decimal places has a magnitude greater than <see cref="DecimalRules.MaxMoney"/>; no line
+    /// is added.
+    /// </exception>
+    /// <exception cref="KeyAlreadyUsedException">
     /// The cart already holds a line for the item; that line stays and the item is not read again.
     /// </exception>
     public async Task<OperationResult> AddItemAsync(
@@ -269,7 +273,7 @@ public sealed class ShoppingCartService : TransactionAgent<ShoppingCart>
         FieldLengths.Check(code, FieldLengths.CartItemCode, "code");
 
         long clientId = _session.ClientId ?? 0;
-        decimal storedOffer = DecimalRules.Round2(offer);
+        decimal storedOffer = DecimalRules.RoundMoney(offer);
         CartItem line;
 
         if (item is TenderItem)
@@ -412,7 +416,6 @@ public sealed class ShoppingCartService : TransactionAgent<ShoppingCart>
 
         return new CartView(cart.SessionId, rows, CartTotal(lines, items), lines.Count == 0, lines.Count);
     }
-
 
     /// <summary>
     /// Checks out the lines the session cart holds when the checkout starts, in one transaction of its own: each retail

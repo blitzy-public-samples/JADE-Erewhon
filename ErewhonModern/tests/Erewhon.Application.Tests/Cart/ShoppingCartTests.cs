@@ -1,4 +1,5 @@
 using Erewhon.Application.Cart;
+using Erewhon.Application.Common;
 
 namespace Erewhon.Application.Tests.Cart;
 
@@ -174,6 +175,22 @@ public sealed class ShoppingCartTests
         Assert.Throws<ArgumentException>("items", () => cart.RemoveLines(new[] { held[0], null!, held[1] }));
 
         Assert.Equal(held, cart.Items);
+    }
+
+    [Fact]
+    public void AddOfHeldItemIdThrowsKeyAlreadyUsedAndKeepsHeldLine()
+    {
+        var cart = new ShoppingCart("session-a");
+        var held = RetailLine(1);
+        cart.Add(held);
+        cart.Add(RetailLine(2));
+
+        var failure = Assert.Throws<KeyAlreadyUsedException>(() => cart.Add(RetailLine(1)));
+
+        Assert.Equal(1310, failure.ErrorCode);
+        Assert.Equal("Key already used in this dictionary", failure.Message);
+        Assert.Equal(new long[] { 1, 2 }, cart.Items.Select(line => line.ItemId));
+        Assert.Same(held, cart.Items[0]);
     }
 
     private static CartItem RetailLine(long itemId) => new()
