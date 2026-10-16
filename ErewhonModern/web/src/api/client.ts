@@ -1,5 +1,5 @@
 // HTTP access to Erewhon.Api for the React app: the shared request configuration, the session header, the request
-// methods and the errors they throw for responses other than 2xx.
+// methods and the errors they throw for responses other than 2xx and for transport failures.
 
 import type { ErrorOutcome, ErrorOutcomeKind } from './types';
 
@@ -9,8 +9,11 @@ export interface ApiConfig {
   baseUrl: string;
   /** Session id sent in the {@link SESSION_HEADER} header; null sends no session header. */
   sessionId: string | null;
-  /** Called on every HTTP 401 response before {@link UnauthorizedError} is thrown; null calls nothing. */
-  onUnauthorized: (() => void) | null;
+  /**
+   * Called on every HTTP 401 response before {@link UnauthorizedError} is thrown, with the session id the request sent
+   * in the {@link SESSION_HEADER} header, or null when the request sent no session header; null calls nothing.
+   */
+  onUnauthorized: ((sessionId: string | null) => void) | null;
 }
 
 /** Name of the request header that carries the session id. */
@@ -83,6 +86,26 @@ export class ErrorOutcomeError extends Error {
   }
 }
 
+/**
+ * Thrown when `fetch` rejects for a constructed request, or when reading the response body rejects; `cause` holds
+ * the original rejection.
+ */
+export class NetworkError extends Error {
+  /** HTTP method of the request. */
+  readonly method: string;
+  /** Request path as passed to {@link api}. */
+  readonly path: string;
+  /** Rejection of `fetch` or of the response body read. */
+  declare readonly cause: unknown;
+
+  constructor(method: string, path: string, cause: unknown) {
+    super(`Network failure for ${method} ${path}`, { cause });
+    this.name = 'NetworkError';
+    this.method = method;
+    this.path = path;
+  }
+}
+
 function isErrorOutcomeKind(value: unknown): value is ErrorOutcomeKind {
   return ERROR_OUTCOME_KINDS.some((kind) => kind === value);
 }
@@ -113,10 +136,20 @@ function parseErrorBody(text: string): unknown {
   }
 }
 
+/** Resolves to the result of `operation`, or rejects with a {@link NetworkError} holding its rejection. */
+async function transport<T>(method: HttpMethod, path: string, operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error: unknown) {
+    throw new NetworkError(method, path, error);
+  }
+}
+
 function send(method: HttpMethod, path: string, body: unknown, mode: 'json'): Promise<unknown>;
 function send(method: HttpMethod, path: string, body: unknown, mode: 'blob'): Promise<Blob>;
 async function send(method: HttpMethod, path: string, body: unknown, mode: ResponseMode): Promise<unknown> {
   const { baseUrl, sessionId } = getApiConfig();
+  const sentSessionId = typeof sessionId === 'string' && sessionId !== '' ? sessionId : null;
   const headers: Record<string, string> = { Accept: JSON_CONTENT_TYPE };
   const init: RequestInit = { method, headers };
 
@@ -125,27 +158,28 @@ async function send(method: HttpMethod, path: string, body: unknown, mode: Respo
     init.body = JSON.stringify(body);
   }
 
-  if (typeof sessionId === 'string' && sessionId !== '') {
-    headers[SESSION_HEADER] = sessionId;
+  if (sentSessionId !== null) {
+    headers[SESSION_HEADER] = sentSessionId;
   }
 
-  const response = await fetch(`${baseUrl}${path}`, init);
+  const request = new Request(`${baseUrl}${path}`, init);
+  const response = await transport(method, path, () => fetch(request));
 
   if (response.status === 401) {
-    getApiConfig().onUnauthorized?.();
+    getApiConfig().onUnauthorized?.(sentSessionId);
     throw new UnauthorizedError();
   }
 
   if (response.ok) {
     if (mode === 'blob') {
-      return response.blob();
+      return transport(method, path, () => response.blob());
     }
 
     if (response.status === 204) {
       return undefined;
     }
 
-    const text = await response.text();
+    const text = await transport(method, path, () => response.text());
     if (text === '') {
       return undefined;
     }
@@ -154,7 +188,7 @@ async function send(method: HttpMethod, path: string, body: unknown, mode: Respo
     return parsed;
   }
 
-  const errorBody = parseErrorBody(await response.text());
+  const errorBody = parseErrorBody(await transport(method, path, () => response.text()));
 
   if (response.status === 500 && isErrorOutcome(errorBody)) {
     throw new ErrorOutcomeError({ kind: errorBody.kind, heading: errorBody.heading, body: errorBody.body });
@@ -167,9 +201,12 @@ async function send(method: HttpMethod, path: string, body: unknown, mode: Respo
  * Request methods for `/api/app/**`. Each takes an absolute path that already holds its encoded query string, sends
  * it to {@link ApiConfig.baseUrl} with `Accept: application/json` and, when the configuration holds a session id,
  * the {@link SESSION_HEADER} header. A body argument other than undefined is sent as JSON with
- * `Content-Type: application/json`. A rejected `fetch` rejects unchanged. On HTTP 401 the method calls
- * {@link ApiConfig.onUnauthorized} and throws {@link UnauthorizedError}; on HTTP 500 with an {@link ErrorOutcome}
- * body it throws {@link ErrorOutcomeError}; on every other status outside 2xx it throws {@link ApiError}.
+ * `Content-Type: application/json`. A URL or header value that cannot form a request rejects with the `TypeError`
+ * of the `Request` constructor. A rejected `fetch`, or a rejected read of the response body, throws
+ * {@link NetworkError}. On HTTP 401 the method calls the {@link ApiConfig.onUnauthorized} configured when the response
+ * arrives, with the session id the request sent or null when it sent none, and throws {@link UnauthorizedError}; on
+ * HTTP 500 with an {@link ErrorOutcome} body it throws {@link ErrorOutcomeError}; on every other status outside 2xx it
+ * throws {@link ApiError}.
  */
 export const api = {
   /** Sends GET and resolves to the parsed JSON body, or undefined for HTTP 204 or an empty body. */

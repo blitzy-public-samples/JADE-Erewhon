@@ -28,16 +28,19 @@ export interface SessionContextValue {
   session: SessionState | null;
   /**
    * Sends `request` to POST /api/app/sessions and resolves to the response unchanged. A response with `succeeded` and
-   * a non-empty `sessionId` replaces the current session; any other response leaves it as it is. A rejected request
-   * rejects unchanged and leaves the session as it is.
+   * a non-empty `sessionId` replaces the current session only when no other logon, no logout, no clear, no HTTP 401
+   * clear and no unmount of the provider has happened since this logon started; any other response leaves the
+   * session as it is. A rejected request rejects unchanged and leaves the session as it is.
    */
   logon: (request: CreateSessionRequest) => Promise<CreateSessionResponse>;
   /**
-   * Ends the current session through DELETE /api/app/sessions/current and then clears it. An HTTP 401 resolves; any
-   * other error rejects after the session is cleared. With no current session, clears it without a request.
+   * Ends the current session through DELETE /api/app/sessions/current; a logon still pending then commits nothing.
+   * After the request settles, clears the session only when the session it ended is still current and the provider
+   * is still mounted. An HTTP 401 resolves; any other error rejects after that clear. With no current session, clears
+   * it at once without a request.
    */
   logout: () => Promise<void>;
-  /** Clears the current session without a request. */
+  /** Clears the current session without a request; a logon still pending then commits nothing. */
   clearSession: () => void;
 }
 
@@ -146,10 +149,13 @@ function readStoredSession(): SessionState | null {
   return stored;
 }
 
-/** Stores the six fields of `session` as JSON, or removes the stored session when `session` is null. */
+/**
+ * Removes the stored session and then, when `session` is not null, stores its six fields as JSON. When the write
+ * fails, no session is stored.
+ */
 function writeStoredSession(session: SessionState | null): void {
+  removeStoredSession();
   if (session === null) {
-    removeStoredSession();
     return;
   }
 
@@ -179,16 +185,27 @@ function ignoreRealtimeFailure(): undefined {
  * - The first render starts with `initialSession` when it is given, null included, and otherwise with the session
  *   restored from session storage, and configures the API client with that session id and the 401 callback before
  *   any child renders.
- * - Every change of the session configures the API client's session id first, then stores the session in session
- *   storage, then re-renders.
- * - An HTTP 401 from any request through the API client clears the session.
+ * - Every change of the session configures the API client's session id first, then replaces the stored session in
+ *   session storage, then re-renders.
+ * - An HTTP 401 through the API client clears the session while the provider is mounted, only when the request sent
+ *   the current session's id; a 401 for a request that sent an earlier session's id or no session id changes nothing.
+ * - A logon commits its response only while no later logon, logout, clear, HTTP 401 clear or unmount has followed
+ *   its start. A logout clears only the session it ended, and only while the provider is mounted. After unmount,
+ *   neither a pending logon or logout nor an HTTP 401 changes the API client, session storage or state.
  * - While a session exists, the hub connection of its id is open; with no session it is closed, and it is closed when
  *   the provider unmounts.
  */
 export function SessionProvider({ children, initialSession }: SessionProviderProps) {
   const commitRef = useRef<((next: SessionState | null) => void) | null>(null);
+  const actionGenerationRef = useRef(0);
+  const mountedRef = useRef(false);
 
-  const onUnauthorized = useCallback((): void => {
+  const onUnauthorized = useCallback((sentSessionId: string | null): void => {
+    if (!mountedRef.current || sentSessionId === null || sentSessionId !== currentSessionIdRef.current) {
+      return;
+    }
+
+    actionGenerationRef.current += 1;
     commitRef.current?.(null);
   }, []);
 
@@ -215,6 +232,14 @@ export function SessionProvider({ children, initialSession }: SessionProviderPro
   }, [commit]);
 
   useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      actionGenerationRef.current += 1;
+    };
+  }, []);
+
+  useEffect(() => {
     configureApiClient({ sessionId: session?.sessionId ?? null, onUnauthorized });
     writeStoredSession(session);
   }, [session, onUnauthorized]);
@@ -238,9 +263,16 @@ export function SessionProvider({ children, initialSession }: SessionProviderPro
 
   const logon = useCallback(
     async (request: CreateSessionRequest): Promise<CreateSessionResponse> => {
+      actionGenerationRef.current += 1;
+      const generation = actionGenerationRef.current;
       const response = await api.post<CreateSessionResponse>('/api/app/sessions', request);
 
-      if (response.succeeded && typeof response.sessionId === 'string' && response.sessionId !== '') {
+      if (
+        generation === actionGenerationRef.current &&
+        response.succeeded &&
+        typeof response.sessionId === 'string' &&
+        response.sessionId !== ''
+      ) {
         commit({
           sessionId: response.sessionId,
           area: response.area,
@@ -257,7 +289,9 @@ export function SessionProvider({ children, initialSession }: SessionProviderPro
   );
 
   const logout = useCallback(async (): Promise<void> => {
-    if (currentSessionIdRef.current === null) {
+    actionGenerationRef.current += 1;
+    const loggedOutSessionId = currentSessionIdRef.current;
+    if (loggedOutSessionId === null) {
       commit(null);
       return;
     }
@@ -269,11 +303,14 @@ export function SessionProvider({ children, initialSession }: SessionProviderPro
         throw error;
       }
     } finally {
-      commit(null);
+      if (mountedRef.current && currentSessionIdRef.current === loggedOutSessionId) {
+        commit(null);
+      }
     }
   }, [commit]);
 
   const clearSession = useCallback((): void => {
+    actionGenerationRef.current += 1;
     commit(null);
   }, [commit]);
 
