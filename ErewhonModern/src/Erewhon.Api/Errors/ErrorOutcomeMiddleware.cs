@@ -32,8 +32,10 @@ public sealed record ErrorOutcome(
 }
 
 /// <summary>
-/// Turns an exception that escapes the rest of the request pipeline into status 500 with an <see cref="ErrorOutcome"/>
-/// JSON body, and writes one error log event for every outcome except the lock outcome.
+/// Turns an exception that escapes the rest of the request pipeline before the response has started into status 500
+/// with an <see cref="ErrorOutcome"/> JSON body, and rethrows one that escapes after the response has started. In both
+/// cases it writes one error log event, as <see cref="LogOutcome"/> describes, for every outcome except the lock
+/// outcome.
 /// </summary>
 /// <param name="next">The next middleware in the pipeline.</param>
 /// <param name="logger">The logger that receives the error events.</param>
@@ -46,17 +48,18 @@ public sealed class ErrorOutcomeMiddleware(RequestDelegate next, ILogger<ErrorOu
         "Unhandled exception {ErrorCode}: {ErrorText} (error item {ErrorItem})";
 
     private const string SessionLogTemplate =
-        "Unhandled exception {ErrorCode}: {ErrorText} (error item {ErrorItem}) in session {SessionId}, role {Role}, agent {AgentId}, client {ClientId}";
+        "Unhandled exception {ErrorCode}: {ErrorText} (error item {ErrorItem}) for role {Role}, agent {AgentId}, client {ClientId}";
 
     private readonly RequestDelegate _next = next ?? throw new ArgumentNullException(nameof(next));
 
     private readonly ILogger<ErrorOutcomeMiddleware> _logger = logger ?? throw new ArgumentNullException(nameof(logger));
 
     /// <summary>
-    /// Runs the rest of the pipeline. When it throws before the response has started, clears the response and writes
-    /// status 500 with the <see cref="ErrorOutcome"/> of the exception as <c>application/json</c>, after logging it
-    /// when <see cref="IsLogged"/> is <see langword="true"/>. An exception thrown after the response has started
-    /// propagates unchanged.
+    /// Runs the rest of the pipeline. When it throws, translates the exception with <see cref="Translate"/> and,
+    /// when <see cref="IsLogged"/> is <see langword="true"/>, writes one event through <see cref="LogOutcome"/>.
+    /// Before the response has started, it then clears the response and writes status 500 with the
+    /// <see cref="ErrorOutcome"/> of the translated exception as <c>application/json</c>; after the response has
+    /// started, it rethrows the original exception unchanged and writes nothing to the response.
     /// </summary>
     /// <param name="context">The HTTP context of the request.</param>
     /// <returns>A task that completes when the response has been produced.</returns>
@@ -68,17 +71,22 @@ public sealed class ErrorOutcomeMiddleware(RequestDelegate next, ILogger<ErrorOu
         {
             await _next(context);
         }
-        catch (Exception exception) when (!context.Response.HasStarted)
+        catch (Exception exception)
         {
             var services = context.RequestServices;
             var translated = Translate(exception, services?.GetService<PostgresErrorMapper>());
-            var outcome = Create(translated);
 
             if (IsLogged(translated))
             {
                 LogOutcome(_logger, translated, services?.GetService<ISessionContext>());
             }
 
+            if (context.Response.HasStarted)
+            {
+                throw;
+            }
+
+            var outcome = Create(translated);
             context.Response.Clear();
             context.Response.StatusCode = StatusCodes.Status500InternalServerError;
             await context.Response.WriteAsJsonAsync(outcome, context.RequestAborted);
@@ -182,9 +190,16 @@ public sealed class ErrorOutcomeMiddleware(RequestDelegate next, ILogger<ErrorOu
     }
 
     /// <summary>
-    /// Writes one error event with <see cref="UnhandledExceptionEventId"/> and <paramref name="translated"/> attached,
-    /// carrying the properties <c>ErrorCode</c>, <c>ErrorText</c> and <c>ErrorItem</c>, plus <c>SessionId</c>,
-    /// <c>Role</c>, <c>AgentId</c> and <c>ClientId</c> when <paramref name="session"/> has a session.
+    /// Writes one error event with <see cref="UnhandledExceptionEventId"/>, carrying the properties
+    /// <c>ErrorCode</c>, <c>ErrorText</c> and <c>ErrorItem</c>, plus <c>Role</c>, <c>AgentId</c> and
+    /// <c>ClientId</c> when <paramref name="session"/> has a session. <c>ErrorCode</c> and <c>ErrorItem</c> are the
+    /// error code and error item of the exception outcome; <c>ErrorText</c> is the message of an
+    /// <see cref="IJadeException"/> and the full name of the exception type for any other exception. The attached
+    /// exception has <c>ErrorText</c> as its message and no inner exception; its string form lists
+    /// <paramref name="translated"/>, its inner exceptions and the inner exceptions of any
+    /// <see cref="AggregateException"/>, depth first, each as its type's full name, followed for an
+    /// <see cref="IJadeException"/> by its error code and message, and by its stack trace when it has one; its
+    /// stack trace is the first stack trace in that list.
     /// </summary>
     /// <param name="logger">The logger that receives the event.</param>
     /// <param name="translated">The exception returned by <see cref="Translate"/>.</param>
@@ -197,24 +212,24 @@ public sealed class ErrorOutcomeMiddleware(RequestDelegate next, ILogger<ErrorOu
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(translated);
 
-        var (code, text, item) = Describe(translated);
+        var (code, text, item) = DescribeForLog(translated);
+        var diagnostic = new SanitizedException(translated, text);
         if (session is { HasSession: true })
         {
             logger.LogError(
                 UnhandledExceptionEventId,
-                translated,
+                diagnostic,
                 SessionLogTemplate,
                 code,
                 text,
                 item,
-                session.SessionId,
                 session.Role,
                 session.AgentId,
                 session.ClientId);
         }
         else
         {
-            logger.LogError(UnhandledExceptionEventId, translated, LogTemplate, code, text, item);
+            logger.LogError(UnhandledExceptionEventId, diagnostic, LogTemplate, code, text, item);
         }
     }
 
@@ -265,6 +280,65 @@ public sealed class ErrorOutcomeMiddleware(RequestDelegate next, ILogger<ErrorOu
         return (code, text, item);
     }
 
+    private static (string Code, string Text, string Item) DescribeForLog(Exception exception)
+    {
+        var (code, _, item) = Describe(exception);
+        var text = exception is IJadeException ? exception.Message : TypeName(exception);
+        return (code, text, item);
+    }
+
     private static string HResultText(Exception exception) =>
         exception.HResult.ToString(CultureInfo.InvariantCulture);
+
+    private static string TypeName(Exception exception)
+    {
+        var type = exception.GetType();
+        return type.FullName ?? type.Name;
+    }
+
+    /// <summary>
+    /// The exception attached to an error event: its message is the logged error text, it has no inner exception,
+    /// and it renders the exception chain of the translated exception as type names, the error code and message of
+    /// each <see cref="IJadeException"/>, and stack traces.
+    /// </summary>
+    private sealed class SanitizedException : Exception
+    {
+        private const string InnerSeparator = " ---> ";
+
+        private readonly string _rendering;
+
+        private readonly string? _stackTrace;
+
+        public SanitizedException(Exception translated, string text)
+            : base(text)
+        {
+            var segments = new List<string>();
+            string? stackTrace = null;
+            foreach (var step in Chain(translated))
+            {
+                var segment = Header(step);
+                if (step.StackTrace is { } trace)
+                {
+                    segment += Environment.NewLine + trace;
+                    stackTrace ??= trace;
+                }
+
+                segments.Add(segment);
+            }
+
+            _rendering = string.Join(Environment.NewLine + InnerSeparator, segments);
+            _stackTrace = stackTrace;
+        }
+
+        public override string? StackTrace => _stackTrace;
+
+        public override string ToString() => _rendering;
+
+        private static string Header(Exception exception) =>
+            exception is IJadeException jade
+                ? string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{TypeName(exception)} ({jade.ErrorCode}): {exception.Message}")
+                : TypeName(exception);
+    }
 }

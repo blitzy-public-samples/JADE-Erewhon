@@ -1,4 +1,5 @@
 using CoreWCF;
+using Erewhon.Api.Errors;
 using Erewhon.Api.Soap.Contracts;
 using Erewhon.Application.Common;
 using Erewhon.Application.Domain;
@@ -6,7 +7,9 @@ using Erewhon.Application.Messages;
 using Erewhon.Application.Projections;
 using Erewhon.Application.Services;
 using Erewhon.Application.Transactions;
+using Erewhon.Persistence;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace Erewhon.Api.Soap;
 
@@ -15,7 +18,11 @@ namespace Erewhon.Api.Soap;
 /// photo of a client's purchased retail items, and address updates of an existing agent or client. Ports JADE
 /// <c>ErewhonWebService</c>. Each operation runs in its own dependency-injection scope. The first agent or client
 /// lookup of an operation reads the bound company, after the DTO checks of <c>updateAgentWithDTO</c> and
-/// <c>updateClientWithDTO</c>; a <see cref="NoCompanyException"/> from that read faults unchanged.
+/// <c>updateClientWithDTO</c>; a <see cref="NoCompanyException"/> from that read, like every other exception from the
+/// operation or from disposing its scope except <see cref="StringTooLongException"/> and
+/// <see cref="FaultException"/>, is passed to <see cref="Report"/>, which writes one error event with event id 500 for
+/// every outcome except the lock outcome of an <see cref="ErewhonLockException"/>, and then propagates unchanged to
+/// CoreWCF's generic fault.
 /// </summary>
 [ServiceBehavior(
     Name = "ErewhonWebService",
@@ -171,20 +178,52 @@ public sealed class ErewhonWebService : IErewhonWebService
         });
 
     /// <summary>
-    /// Runs <paramref name="operation"/> with the service provider of a new scope, disposing the scope afterwards. A
-    /// <see cref="StringTooLongException"/> becomes a fault whose reason is its message and error number, e.g.
-    /// <c>String too long (1035)</c>; every other exception propagates unchanged.
+    /// Runs <paramref name="operation"/> with the service provider of a new scope, disposing the scope afterwards; the
+    /// scope's <see cref="ILogger{TCategoryName}"/> of this service and its <see cref="PostgresErrorMapper"/> are
+    /// resolved before the operation runs. A <see cref="StringTooLongException"/> becomes a fault whose reason is its
+    /// message and error number, e.g. <c>String too long (1035)</c>; a <see cref="FaultException"/> propagates
+    /// unchanged; every other exception, from the operation or from disposing the scope, is passed once to
+    /// <see cref="Report"/>, which writes one error event with event id 500 for every outcome except the lock outcome
+    /// of an <see cref="ErewhonLockException"/>, and then propagates unchanged to CoreWCF's generic fault.
     /// </summary>
     private async Task<T> InvokeAsync<T>(Func<IServiceProvider, Task<T>> operation)
     {
+        ILogger<ErewhonWebService>? logger = null;
+        PostgresErrorMapper? mapper = null;
         try
         {
             await using AsyncServiceScope scope = _scopeFactory.CreateAsyncScope();
-            return await operation(scope.ServiceProvider);
+            logger = scope.ServiceProvider.GetService<ILogger<ErewhonWebService>>();
+            mapper = scope.ServiceProvider.GetService<PostgresErrorMapper>();
+            try
+            {
+                return await operation(scope.ServiceProvider);
+            }
+            catch (StringTooLongException ex)
+            {
+                throw Fault(ex.Message, ex.ErrorCode);
+            }
         }
-        catch (StringTooLongException ex)
+        catch (Exception ex) when (ex is not FaultException)
         {
-            throw Fault(ex.Message, ex.ErrorCode);
+            Report(logger, mapper, ex);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Translates <paramref name="exception"/> with <see cref="ErrorOutcomeMiddleware.Translate"/> and
+    /// <paramref name="mapper"/>, or with no mapper when it is <see langword="null"/>, and, when
+    /// <see cref="ErrorOutcomeMiddleware.IsLogged"/> is <see langword="true"/> for the result and
+    /// <paramref name="logger"/> is not <see langword="null"/>, writes its error event to <paramref name="logger"/>
+    /// with <see cref="ErrorOutcomeMiddleware.LogOutcome"/> and no session.
+    /// </summary>
+    private static void Report(ILogger? logger, PostgresErrorMapper? mapper, Exception exception)
+    {
+        Exception translated = ErrorOutcomeMiddleware.Translate(exception, mapper);
+        if (logger is not null && ErrorOutcomeMiddleware.IsLogged(translated))
+        {
+            ErrorOutcomeMiddleware.LogOutcome(logger, translated, null);
         }
     }
 

@@ -1,11 +1,14 @@
 using CoreWCF;
+using Erewhon.Api.Errors;
 using Erewhon.Api.Soap.Contracts;
 using Erewhon.Application.Common;
 using Erewhon.Application.Domain;
 using Erewhon.Application.Messages;
 using Erewhon.Application.Services;
 using Erewhon.Application.Transactions;
+using Erewhon.Persistence;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 
 namespace Erewhon.Api.Soap;
 
@@ -14,8 +17,10 @@ namespace Erewhon.Api.Soap;
 /// by name through <see cref="AgentService"/> and <see cref="ClientService"/>, each operation in its own
 /// dependency-injection scope. The name lookup of each operation reads the bound company, before the duplicate or
 /// not-found check and before any field-length check. A value longer than its field faults with the reason
-/// <c>String too long (1035)</c>; every other exception, including <see cref="NoCompanyException"/>, faults
-/// unchanged.
+/// <c>String too long (1035)</c>; every other exception from the operation or from disposing its scope except
+/// <see cref="FaultException"/>, including <see cref="NoCompanyException"/>, is passed to <see cref="Report"/>, which
+/// writes one error event with event id 500 for every outcome except the lock outcome of an
+/// <see cref="ErewhonLockException"/>, and then propagates unchanged to CoreWCF's generic fault.
 /// </summary>
 [ServiceBehavior(
     Name = "ErewhonWebServiceAdmin",
@@ -183,20 +188,53 @@ public sealed class ErewhonWebServiceAdmin : IErewhonWebServiceAdmin
     }
 
     /// <summary>
-    /// Runs <paramref name="operation"/> in a new dependency-injection scope and returns its result; a
+    /// Runs <paramref name="operation"/> in a new dependency-injection scope and returns its result, disposing the
+    /// scope afterwards; the scope's <see cref="ILogger{TCategoryName}"/> of this service and its
+    /// <see cref="PostgresErrorMapper"/> are resolved before the operation runs. A
     /// <see cref="StringTooLongException"/> becomes a fault whose reason is the exception text followed by its error
-    /// number in parentheses.
+    /// number in parentheses; a <see cref="FaultException"/> propagates unchanged; every other exception, from the
+    /// operation or from disposing the scope, is passed once to <see cref="Report"/>, which writes one error event with
+    /// event id 500 for every outcome except the lock outcome of an <see cref="ErewhonLockException"/>, and then
+    /// propagates unchanged to CoreWCF's generic fault.
     /// </summary>
     private async Task<DTOResult> InvokeAsync(Func<IServiceProvider, Task<DTOResult>> operation)
     {
-        await using AsyncServiceScope scope = _scopeFactory.CreateAsyncScope();
+        ILogger<ErewhonWebServiceAdmin>? logger = null;
+        PostgresErrorMapper? mapper = null;
         try
         {
-            return await operation(scope.ServiceProvider);
+            await using AsyncServiceScope scope = _scopeFactory.CreateAsyncScope();
+            logger = scope.ServiceProvider.GetService<ILogger<ErewhonWebServiceAdmin>>();
+            mapper = scope.ServiceProvider.GetService<PostgresErrorMapper>();
+            try
+            {
+                return await operation(scope.ServiceProvider);
+            }
+            catch (StringTooLongException ex)
+            {
+                throw new FaultException(new FaultReason($"{ex.Message} ({ex.ErrorCode})"));
+            }
         }
-        catch (StringTooLongException ex)
+        catch (Exception ex) when (ex is not FaultException)
         {
-            throw new FaultException(new FaultReason($"{ex.Message} ({ex.ErrorCode})"));
+            Report(logger, mapper, ex);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Translates <paramref name="exception"/> with <see cref="ErrorOutcomeMiddleware.Translate"/> and
+    /// <paramref name="mapper"/>, or with no mapper when it is <see langword="null"/>, and, when
+    /// <see cref="ErrorOutcomeMiddleware.IsLogged"/> is <see langword="true"/> for the result and
+    /// <paramref name="logger"/> is not <see langword="null"/>, writes its error event to <paramref name="logger"/>
+    /// with <see cref="ErrorOutcomeMiddleware.LogOutcome"/> and no session.
+    /// </summary>
+    private static void Report(ILogger? logger, PostgresErrorMapper? mapper, Exception exception)
+    {
+        Exception translated = ErrorOutcomeMiddleware.Translate(exception, mapper);
+        if (logger is not null && ErrorOutcomeMiddleware.IsLogged(translated))
+        {
+            ErrorOutcomeMiddleware.LogOutcome(logger, translated, null);
         }
     }
 
