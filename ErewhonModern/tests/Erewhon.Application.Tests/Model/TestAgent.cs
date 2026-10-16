@@ -36,8 +36,8 @@ public sealed class TestAgent : ErewhonTestBase
     }
 
     /// <summary>
-    /// A rate of 15 on "Art" created for an agent holding a rate of 25 on "Abstractions" leaves the agent with 2 rates,
-    /// the last, in category name order, at 15.
+    /// A rate of 25 on "Abstractions" created for the agent leaves it with that one rate, and a rate of 15 on "Art"
+    /// then created for it leaves it with 2 rates, the last, in category name order, at 15.
     /// </summary>
     /// <returns>A task that completes when the test has run.</returns>
     [Fact]
@@ -48,6 +48,11 @@ public sealed class TestAgent : ErewhonTestBase
             "Abstractions", "ABST", "Items that do not model real world observables");
         ItemCategory itemCategory2 = await Builder.CreateItemCategoryAsync("Art", "ARTS", "Pictures and Paintings");
         await Builder.CreateCommissionRateAsync(itemCategory1, 25m, MyAgent);
+
+        // Assert
+        CommissionRate initialRate = Assert.Single(CommissionRatesByCategoryName(await ReadAgentAsync()));
+        Assert.Equal(itemCategory1.Id, initialRate.ItemCategoryId);
+        Assert.Equal(25m, initialRate.Percentage);
 
         // Act
         const decimal percentage = 15m;

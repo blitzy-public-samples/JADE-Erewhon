@@ -97,7 +97,8 @@ public sealed class TestCompany : ErewhonTestBase
 
     /// <summary>
     /// The company holds no tender sale; closing tenders at the server date then awards the tender item, which closes
-    /// on that date, and reports 1 tender closed.
+    /// on that date, and reports 1 tender closed. The company then holds exactly one tender sale, of the fixture tender
+    /// item to the fixture client through the fixture tender, and the fixture tender item is sold by that sale.
     /// </summary>
     /// <returns>A task that completes when the test has run.</returns>
     [Fact]
@@ -115,6 +116,28 @@ public sealed class TestCompany : ErewhonTestBase
         int tendersClosedCount = await GetService<TenderClosureService>().CloseTendersAtDateAsync(date);
 
         Assert.Equal(1, tendersClosedCount);
+
+        List<TenderSale> tenderSales = await Db.Sales
+            .AsNoTracking()
+            .Where(sale => sale.CompanyId == MyCompany.Id)
+            .OfType<TenderSale>()
+            .ToListAsync();
+        TenderSale tenderSale = Assert.Single(tenderSales);
+
+        Assert.Equal(MyTenderItem.Id, tenderSale.ItemId);
+        Assert.Equal(MyTender.Id, tenderSale.TenderId);
+        Assert.Equal(MyClient.Id, tenderSale.ClientId);
+
+        long tenderItemId = MyTenderItem.Id;
+        TenderItem tenderItem = await Db.Items
+            .AsNoTracking()
+            .OfType<TenderItem>()
+            .Include(item => item.Sale)
+            .SingleAsync(stored => stored.Id == tenderItemId);
+
+        Assert.True(tenderItem.IsSold);
+        Assert.NotNull(tenderItem.Sale);
+        Assert.Equal(tenderSale.Id, tenderItem.Sale.Id);
     }
 
     /// <summary><c>hasClientWithThisName</c> finds the name of the fixture client.</summary>
@@ -436,7 +459,6 @@ public sealed class TestCompany : ErewhonTestBase
         Assert.Equal(timestamp, retailSale.DateSold);
     }
 
-
     /// <summary>
     /// Creating the tender item 3141 "Tender Item" ("This is an item that can be tendered on"), reserve 99.01, closing
     /// on the server date, with no photo, in the fixture region and category and sold by the fixture agent, stores the
@@ -644,4 +666,3 @@ public sealed class TestCompany : ErewhonTestBase
     private static InvalidOperationException FixtureMissing(string fixture) =>
         new($"The fixture {fixture} is created by {nameof(SetUpAsync)}.");
 }
-
