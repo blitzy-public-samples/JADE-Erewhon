@@ -1,17 +1,23 @@
+using System.Data.Common;
 using System.Globalization;
+using System.Text;
 using System.Text.RegularExpressions;
 using Erewhon.Api.Cli;
 using Erewhon.Application.Abstractions;
 using Erewhon.Application.Common;
 using Erewhon.Application.Domain;
 using Erewhon.Application.Messages;
+using Erewhon.Application.Notifications;
 using Erewhon.Persistence;
 using Erewhon.Persistence.Seed;
 using Erewhon.Testing;
 using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
 using Npgsql;
 using Serilog.Events;
+using Serilog.Formatting.Compact;
 using Xunit;
 
 [assembly: CollectionBehavior(DisableTestParallelization = true)]
@@ -31,6 +37,11 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
     private const string FieldSeparator = ", ";
     private const string Space = " ";
     private const string Sentinel = "\u0001duration\u0001";
+    private const string ConnectionSentinel = "Host=secret-host;Username=secret-user";
+    private const string RollbackWarningTemplate = "The seed load transaction could not be rolled back.";
+    private const string EndLineWarningTemplate = "The end line of seed data file {SeedFile} was not written.";
+    private const string SeedFileProperty = "SeedFile";
+    private const string SourceContextProperty = "SourceContext";
 
     private const string LocationsFile = "Locations.txt";
     private const string AgentsFile = "Agents.txt";
@@ -42,6 +53,10 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
     private const string AgentRatesFile = "AgentRates.txt";
     private const string TendersFile = "Tenders.txt";
     private const string RetailSalesFile = "RetailSales.txt";
+
+    private const string MissingPhotoFile = "missing-photo.jpg";
+    private const int ItemGuidToken = 0;
+    private const int ItemPhotoToken = 3;
 
     private static readonly string[] DataFileOrder =
     [
@@ -359,6 +374,50 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A load from a copy of the data directory whose first <paramref name="itemsFile"/> data line holds a 40-character
+    /// GUID and names a photo file that does not exist fails with error 1035 on the <c>Guid</c> field, not with a
+    /// missing-file error; afterwards no company or item exists.
+    /// </summary>
+    /// <param name="itemsFile">The item data file whose first data line is rewritten.</param>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Theory]
+    [InlineData(RetailItemsFile)]
+    [InlineData(TenderItemsFile)]
+    public async Task OverlongItemGuidFailsBeforePhotoRead(string itemsFile)
+    {
+        string directory = Path.Combine(
+            Path.GetTempPath(),
+            "erewhon-seed-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            foreach (string file in Directory.EnumerateFiles(_dataDirectory))
+            {
+                File.Copy(file, Path.Combine(directory, Path.GetFileName(file)));
+            }
+
+            RewriteFirstItemLine(Path.Combine(directory, itemsFile), FieldLengths.Guid + 1, MissingPhotoFile);
+            Assert.False(File.Exists(Path.Combine(directory, MissingPhotoFile)));
+
+            // D-41: the GUID is checked where it is assigned, before the code number, the lookups and the photo.
+            StringTooLongException exception =
+                await Assert.ThrowsAsync<StringTooLongException>(() => LoadAsync(directory));
+            Assert.Equal(1035, exception.ErrorCode);
+            Assert.Equal("Guid", exception.FieldName);
+            Assert.Equal(FieldLengths.Guid, exception.MaxLength);
+            Assert.Equal(FieldLengths.Guid + 1, exception.ActualLength);
+
+            TableCounts counts = await CountTablesAsync();
+            Assert.Equal(0, counts.Companies);
+            Assert.Equal(0, counts.Items);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    /// <summary>
     /// The lines written to the output writer equal <see cref="SeedLoadResult.OutputLines"/> and follow the loader's
     /// sequence: the created company; per data file in load order a <c>Loading &lt;path&gt;...</c> line, its record
     /// lines and its summary line with the count and an elapsed time; the closing line; the tender sales built; and the
@@ -477,6 +536,126 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// After one load, a load from an existing directory holding a copy of the data files fails with error 1035 on the
+    /// <c>DataDirectory</c> field (at most 301 characters, 302 given) when the directory is named by its
+    /// <paramref name="pathLength"/>-character path followed by <paramref name="suffix"/>, with
+    /// <paramref name="padding"/> on both sides, so that the trimmed path followed by <c>/</c> unless it ends with
+    /// <c>/</c> is 302 characters long; afterwards the loaded company is the only company and holds the seed counts.
+    /// </summary>
+    /// <param name="pathLength">The length of the directory's full path, without a trailing separator.</param>
+    /// <param name="suffix">The text written after the path.</param>
+    /// <param name="padding">The spaces written before and after the path.</param>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Theory]
+    [InlineData(301, "", "")]
+    [InlineData(301, "/", " ")]
+    public async Task OverlongDataDirectoryFailsBeforePurge(int pathLength, string suffix, string padding)
+    {
+        await LoadAsync();
+        long companyId = Assert.Single(await CompanyIdsAsync());
+
+        string root = Path.Combine(
+            Path.GetTempPath(),
+            "erewhon-seed-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string directory = CreateDataFilesCopy(root, pathLength);
+
+            // D-41: the 302-character directory path fails before the purge.
+            StringTooLongException exception = await Assert.ThrowsAsync<StringTooLongException>(
+                () => LoadAsync(padding + directory + suffix + padding));
+            Assert.Equal(1035, exception.ErrorCode);
+            Assert.Equal("DataDirectory", exception.FieldName);
+            Assert.Equal(301, exception.MaxLength);
+            Assert.Equal(302, exception.ActualLength);
+
+            Assert.Equal(companyId, Assert.Single(await CompanyIdsAsync()));
+            AssertSeedCounts(await CountTablesAsync());
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// A load from an existing directory holding a copy of the data files loads the seed counts and builds one tender
+    /// sale when the directory is named by its <paramref name="pathLength"/>-character path followed by
+    /// <paramref name="suffix"/>, with <paramref name="padding"/> on both sides, so that the trimmed path followed by
+    /// <c>/</c> unless it ends with <c>/</c> is 301 characters long.
+    /// </summary>
+    /// <param name="pathLength">The length of the directory's full path, without a trailing separator.</param>
+    /// <param name="suffix">The text written after the path.</param>
+    /// <param name="padding">The spaces written before and after the path.</param>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Theory]
+    [InlineData(300, "", "")]
+    [InlineData(300, "/", "")]
+    [InlineData(300, "", "  ")]
+    public async Task DataDirectoryOf301CharactersLoads(int pathLength, string suffix, string padding)
+    {
+        string root = Path.Combine(
+            Path.GetTempPath(),
+            "erewhon-seed-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture));
+        Directory.CreateDirectory(root);
+        try
+        {
+            string directory = CreateDataFilesCopy(root, pathLength);
+
+            (SeedLoadResult result, _) = await LoadAsync(padding + directory + suffix + padding);
+
+            Assert.Equal(1, result.TenderSalesBuilt);
+            AssertSeedCounts(await CountTablesAsync());
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// The CLI <c>seed .</c> verb, run with a current directory whose full path is 400 characters long and holds a copy
+    /// of the data files, exits with 0, writes the <c>Loading</c> line of <c>Locations.txt</c> under that full path and
+    /// loads the seed counts. The current directory is restored afterwards.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task RelativeDataDirectoryInDeepCurrentDirectoryLoads()
+    {
+        string root = Path.Combine(
+            Path.GetTempPath(),
+            "erewhon-seed-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture));
+        Directory.CreateDirectory(root);
+        string previousDirectory = Directory.GetCurrentDirectory();
+        try
+        {
+            Directory.SetCurrentDirectory(CreateDataFilesCopy(root, 400));
+            string currentDirectory = Directory.GetCurrentDirectory();
+            Assert.True(currentDirectory.Length > 301, currentDirectory);
+
+            using var writer = new StringWriter(CultureInfo.InvariantCulture);
+            int exitCode = await CommandLineVerbs.RunAsync(
+                Host.Services,
+                new[] { CommandLineVerbs.SeedVerb, "." },
+                writer);
+
+            // D-41: the length check applies to the operand as given, not to its full path.
+            Assert.Equal(0, exitCode);
+            Assert.Contains(
+                MessageCatalog.Get(MessageKeys.Loading, Path.Combine(currentDirectory, LocationsFile)),
+                writer.ToString(),
+                StringComparison.Ordinal);
+            AssertSeedCounts(await CountTablesAsync());
+        }
+        finally
+        {
+            Directory.SetCurrentDirectory(previousDirectory);
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    /// <summary>
     /// The post-load closure at the server date awards exactly one tender item: the winner GUID, whose shifted closure
     /// date is the load date. Every other due tender item stays unsold, and no tender item that is not due is sold.
     /// </summary>
@@ -520,6 +699,181 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
     }
 
     /// <summary>
+    /// A load from a copy of the data directory whose output writer throws on the first <c>Loading &lt;path&gt;...</c>
+    /// line, the one for <c>Locations.txt</c>, fails with that writer's exception; afterwards the copy's
+    /// <c>Locations.txt</c> is closed: it opens for read and write access shared with no other handle.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task DataFileClosedWhenLoadingLineFails()
+    {
+        string directory = Path.Combine(
+            Path.GetTempPath(),
+            "erewhon-seed-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            foreach (string file in Directory.EnumerateFiles(_dataDirectory))
+            {
+                File.Copy(file, Path.Combine(directory, Path.GetFileName(file)));
+            }
+
+            (string loadingPrefix, _) = SplitAtSentinel(MessageCatalog.Get(MessageKeys.Loading, Sentinel));
+            string locationsPath = Path.Combine(Path.GetFullPath(directory), LocationsFile);
+            await using AsyncServiceScope scope = Host.Services.CreateAsyncScope();
+            InitialDataLoader loader = scope.ServiceProvider.GetRequiredService<InitialDataLoader>();
+            using var writer = new FailingLineWriter(loadingPrefix);
+
+            Exception exception = await Assert.ThrowsAnyAsync<Exception>(
+                () => loader.LoadAsync(directory, writer, CancellationToken.None));
+            Assert.Same(writer.Failure, exception);
+            Assert.Equal(MessageCatalog.Get(MessageKeys.Loading, locationsPath), writer.FailedLine);
+
+            // D-114: the file opened before the failed Loading line is closed.
+            using var exclusive = new FileStream(locationsPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None);
+            Assert.True(exclusive.CanWrite);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// A load from a directory that holds only <c>Locations.txt</c> fails with <see cref="FileNotFoundException"/> for
+    /// <c>Agents.txt</c>; the output holds the <c>Loading &lt;path&gt;...</c> line of <c>Locations.txt</c>, none for
+    /// <c>Agents.txt</c>, and ends with the <c>Database Initialized in &lt;n&gt; seconds</c> line.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task MissingDataFileWritesNoLoadingLine()
+    {
+        string directory = Path.Combine(
+            Path.GetTempPath(),
+            "erewhon-seed-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture));
+        Directory.CreateDirectory(directory);
+        try
+        {
+            File.Copy(Path.Combine(_dataDirectory, LocationsFile), Path.Combine(directory, LocationsFile));
+            string fullDirectory = Path.GetFullPath(directory);
+            await using AsyncServiceScope scope = Host.Services.CreateAsyncScope();
+            InitialDataLoader loader = scope.ServiceProvider.GetRequiredService<InitialDataLoader>();
+            using var writer = new StringWriter(CultureInfo.InvariantCulture);
+
+            FileNotFoundException exception = await Assert.ThrowsAsync<FileNotFoundException>(
+                () => loader.LoadAsync(directory, writer, CancellationToken.None));
+            Assert.Equal(Path.Combine(fullDirectory, AgentsFile), exception.FileName);
+
+            // D-114: each data file is opened before its Loading line is written.
+            string[] lines = writer.ToString().Split(Environment.NewLine)[..^1];
+            Assert.Contains(MessageCatalog.Get(MessageKeys.Loading, Path.Combine(fullDirectory, LocationsFile)), lines);
+            Assert.DoesNotContain(MessageCatalog.Get(MessageKeys.Loading, Path.Combine(fullDirectory, AgentsFile)), lines);
+            (string initializedPrefix, _) =
+                SplitAtSentinel(MessageCatalog.Get(MessageKeys.DatabaseInitialized, Sentinel));
+            Assert.StartsWith(initializedPrefix, lines[^1], StringComparison.Ordinal);
+        }
+        finally
+        {
+            Directory.Delete(directory, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// A load from a directory that holds only <c>Locations.txt</c>, on a host where the count query of the
+    /// <c>Agents.txt</c> end line and the rollback of the load transaction each fail with an exception whose message,
+    /// inner <see cref="NpgsqlException"/> and data hold connection text, fails with the
+    /// <see cref="FileNotFoundException"/> of <c>Agents.txt</c> and publishes no notification. The loader writes exactly
+    /// two Warning events, one per clean-up failure, the end-line event with <c>SeedFile</c> = <c>Agents.txt</c>. Neither
+    /// event holds the connection text or a failure message in its rendered message, its properties, its attached
+    /// exception or its compact JSON form; the attached exception has the failure's type name as its message, no inner
+    /// exception and no data, and renders the failure chain as type names.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task CleanupFailuresLoggedWithoutFailureText()
+    {
+        var faults = new SeedFaults { FailRollback = true };
+        var logSink = new CollectingLogSink();
+        var publisher = new RecordingNotificationPublisher();
+        await using ErewhonApiHost host = await StartFaultingHostAsync(faults, logSink, publisher);
+
+        string partialDirectory = Path.Combine(
+            Path.GetTempPath(),
+            "erewhon-seed-" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture));
+        Directory.CreateDirectory(partialDirectory);
+        try
+        {
+            File.Copy(Path.Combine(_dataDirectory, LocationsFile), Path.Combine(partialDirectory, LocationsFile));
+            (string locationsEndPrefix, _) = SplitAtSentinel(
+                MessageCatalog.Get(MessageKeys.LocationsLoaded, _expected.NumberOfLocations, Sentinel));
+            using var writer = new ArmingLineWriter(locationsEndPrefix, faults.FailNextCommand);
+
+            // D-114 (4), (5): the missing file's exception propagates past both clean-up failures.
+            FileNotFoundException failure = await Assert.ThrowsAsync<FileNotFoundException>(
+                () => LoadOnHostAsync(host, partialDirectory, writer, CancellationToken.None));
+            Assert.EndsWith(AgentsFile, failure.FileName, StringComparison.Ordinal);
+            Assert.True(writer.Armed, "The Locations.txt end line was not written.");
+            Assert.False(faults.CommandFailurePending, "No database command ran after the Locations.txt end line.");
+            Assert.Empty(publisher.EntityChanges);
+
+            List<LogEvent> warnings = logSink.Events
+                .Where(logEvent => logEvent.Level == LogEventLevel.Warning && IsFromCategory(logEvent, typeof(InitialDataLoader)))
+                .ToList();
+            Assert.Equal(2, warnings.Count);
+            LogEvent endLineEvent = Assert.Single(warnings, logEvent => logEvent.MessageTemplate.Text == EndLineWarningTemplate);
+            LogEvent rollbackEvent = Assert.Single(warnings, logEvent => logEvent.MessageTemplate.Text == RollbackWarningTemplate);
+            Assert.Equal(new ScalarValue(AgentsFile), endLineEvent.Properties[SeedFileProperty]);
+            Assert.DoesNotContain(SeedFileProperty, rollbackEvent.Properties.Keys);
+
+            Assert.All(new[] { endLineEvent, rollbackEvent }, AssertCarriesNoFailureText);
+        }
+        finally
+        {
+            Directory.Delete(partialDirectory, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// When the token of a load is cancelled as the commit of the load transaction returns, the committed load's
+    /// notifications are still published, among them <c>Company</c> Added for the loaded company and <c>Agent</c> Added
+    /// for each of its 8 agents; the load then writes the closing line and fails with
+    /// <see cref="OperationCanceledException"/> in the post-load closure, and the loaded rows stay committed with no
+    /// tender sale built.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task NotificationsPublishedWhenCancelledAfterCommit()
+    {
+        var faults = new SeedFaults();
+        var publisher = new RecordingNotificationPublisher();
+        await using ErewhonApiHost host = await StartFaultingHostAsync(faults, new CollectingLogSink(), publisher);
+        using var cancellation = new CancellationTokenSource();
+        faults.CancelAfterNextCommit(cancellation);
+        using var writer = new StringWriter(CultureInfo.InvariantCulture);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => LoadOnHostAsync(host, _dataDirectory, writer, cancellation.Token));
+        Assert.True(cancellation.IsCancellationRequested, "The load transaction did not commit.");
+        Assert.Contains(MessageCatalog.Get(MessageKeys.ClosingTendersSever), writer.ToString(), StringComparison.Ordinal);
+
+        // B-64: the committed batch is published after the commit, whatever the load's token.
+        long companyId = Assert.Single(await CompanyIdsAsync());
+        IReadOnlyList<ChangeEvent> published = publisher.EntityChanges;
+        Assert.Contains(
+            published,
+            change => change.EntityType == nameof(Company) && change.Id == companyId && change.Kind == ChangeKind.Added);
+        Assert.Equal(8, published.Count(change => change.EntityType == nameof(Agent) && change.Kind == ChangeKind.Added));
+
+        TableCounts counts = await CountTablesAsync();
+        Assert.Equal(8, counts.Agents);
+        Assert.Equal(20, counts.Clients);
+        Assert.Equal(106, counts.Items);
+        Assert.Equal(100, counts.Tenders);
+        Assert.Equal(19, counts.RetailSales);
+        Assert.Equal(0, counts.TenderSales);
+    }
+
+    /// <summary>
     /// Runs <see cref="InitialDataLoader.LoadAsync"/> in a new scope of the host over <paramref name="directory"/>, or
     /// over <c>Erewhon/DataFiles</c>, writing to a new string writer.
     /// </summary>
@@ -530,6 +884,133 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
         using var writer = new StringWriter(CultureInfo.InvariantCulture);
         SeedLoadResult result = await loader.LoadAsync(directory ?? _dataDirectory, writer, CancellationToken.None);
         return (result, writer.ToString());
+    }
+
+    /// <summary>
+    /// Starts a second host on the test database, with the seed data directory set to <c>Erewhon/DataFiles</c> and every
+    /// log event collected in <paramref name="logSink"/>, whose <see cref="IUnitOfWork"/> and database commands carry the
+    /// faults of <paramref name="faults"/> and whose notification publisher is <paramref name="publisher"/>. The caller
+    /// disposes it.
+    /// </summary>
+    private Task<ErewhonApiHost> StartFaultingHostAsync(
+        SeedFaults faults,
+        CollectingLogSink logSink,
+        RecordingNotificationPublisher publisher) =>
+        ErewhonApiHost.StartAsync(new ErewhonApiHostOptions
+        {
+            ConnectionString = _database.ConnectionString,
+            LogSink = logSink,
+            Settings = new Dictionary<string, string?> { [SeedDataDirectoryKey] = _dataDirectory },
+            ConfigureServices = services =>
+            {
+                ServiceDescriptor unitOfWork = services.Single(descriptor => descriptor.ServiceType == typeof(IUnitOfWork));
+                Type unitOfWorkType = unitOfWork.ImplementationType
+                    ?? throw new InvalidOperationException("IUnitOfWork is not registered with an implementation type.");
+                services.Replace(ServiceDescriptor.Describe(
+                    typeof(IUnitOfWork),
+                    provider => new FaultingUnitOfWork(
+                        (IUnitOfWork)ActivatorUtilities.CreateInstance(provider, unitOfWorkType),
+                        faults),
+                    unitOfWork.Lifetime));
+
+                ServiceDescriptor contextOptions = services.Single(
+                    descriptor => descriptor.ServiceType == typeof(DbContextOptions<ErewhonDbContext>));
+                Func<IServiceProvider, object> createContextOptions = contextOptions.ImplementationFactory
+                    ?? throw new InvalidOperationException("The ErewhonDbContext options are not registered with a factory.");
+                var interceptor = new FailingCommandInterceptor(faults);
+                services.Replace(ServiceDescriptor.Describe(
+                    typeof(DbContextOptions<ErewhonDbContext>),
+                    provider => new DbContextOptionsBuilder<ErewhonDbContext>(
+                            (DbContextOptions<ErewhonDbContext>)createContextOptions(provider))
+                        .AddInterceptors(interceptor)
+                        .Options,
+                    contextOptions.Lifetime));
+
+                services.Replace(ServiceDescriptor.Singleton<INotificationPublisher>(publisher));
+            },
+        });
+
+    /// <summary>
+    /// Runs <see cref="InitialDataLoader.LoadAsync"/> over <paramref name="directory"/> in a new scope of
+    /// <paramref name="host"/>, writing to <paramref name="writer"/>.
+    /// </summary>
+    private static async Task<SeedLoadResult> LoadOnHostAsync(
+        ErewhonApiHost host,
+        string directory,
+        TextWriter writer,
+        CancellationToken ct)
+    {
+        await using AsyncServiceScope scope = host.Services.CreateAsyncScope();
+        InitialDataLoader loader = scope.ServiceProvider.GetRequiredService<InitialDataLoader>();
+        return await loader.LoadAsync(directory, writer, ct);
+    }
+
+    /// <summary>
+    /// Returns an <see cref="InvalidOperationException"/> naming <paramref name="operation"/> whose message, inner
+    /// <see cref="NpgsqlException"/> message and data each hold <see cref="ConnectionSentinel"/>.
+    /// </summary>
+    private static InvalidOperationException ConnectionFailure(string operation)
+    {
+        var failure = new InvalidOperationException(
+            operation + " failed on " + ConnectionSentinel,
+            new NpgsqlException("Failed to connect to " + ConnectionSentinel));
+        failure.Data["ConnectionString"] = ConnectionSentinel;
+        return failure;
+    }
+
+    /// <summary>Whether the log event's <c>SourceContext</c> is the full name of <paramref name="category"/>.</summary>
+    private static bool IsFromCategory(LogEvent logEvent, Type category) =>
+        logEvent.Properties.TryGetValue(SourceContextProperty, out LogEventPropertyValue? value)
+        && value is ScalarValue { Value: string source }
+        && source == category.FullName;
+
+    /// <summary>
+    /// The event's rendered message, property values, compact JSON form and attached exception hold neither
+    /// <see cref="ConnectionSentinel"/> nor the text of a <see cref="ConnectionFailure"/>; the attached exception has the
+    /// full name of <see cref="InvalidOperationException"/> as its message, no inner exception and no data, and its
+    /// string form starts with that name and lists the inner <see cref="NpgsqlException"/> by type name.
+    /// </summary>
+    private static void AssertCarriesNoFailureText(LogEvent logEvent)
+    {
+        using var json = new StringWriter(CultureInfo.InvariantCulture);
+        new CompactJsonFormatter().Format(logEvent, json);
+        Exception attached = Assert.IsAssignableFrom<Exception>(logEvent.Exception);
+        string[] texts =
+        [
+            logEvent.RenderMessage(CultureInfo.InvariantCulture),
+            .. logEvent.Properties.Values.Select(value => value.ToString()),
+            json.ToString(),
+            attached.Message,
+            attached.ToString(),
+        ];
+        Assert.All(texts, text =>
+        {
+            Assert.DoesNotContain("secret", text, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain(" failed on ", text, StringComparison.Ordinal);
+            Assert.DoesNotContain("Failed to connect", text, StringComparison.Ordinal);
+        });
+
+        string failureType = typeof(InvalidOperationException).FullName!;
+        Assert.Equal(failureType, attached.Message);
+        Assert.Null(attached.InnerException);
+        Assert.Empty(attached.Data);
+        Assert.StartsWith(failureType, attached.ToString(), StringComparison.Ordinal);
+        Assert.Contains(" ---> " + typeof(NpgsqlException).FullName, attached.ToString(), StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Rewrites the first data line of the Latin-1 item data file <paramref name="path"/>: its GUID token is padded with
+    /// zeros to <paramref name="guidLength"/> characters and its photo token becomes <paramref name="photoFileName"/>.
+    /// </summary>
+    private static void RewriteFirstItemLine(string path, int guidLength, string photoFileName)
+    {
+        string[] lines = File.ReadAllLines(path, Encoding.Latin1);
+        int index = Array.FindIndex(lines, line => line.Trim().Length > 0 && !line.TrimStart().StartsWith('#'));
+        string[] tokens = lines[index].Split('\t');
+        tokens[ItemGuidToken] = tokens[ItemGuidToken].Trim().PadRight(guidLength, '0');
+        tokens[ItemPhotoToken] = photoFileName;
+        lines[index] = string.Join('\t', tokens);
+        File.WriteAllLines(path, lines, Encoding.Latin1);
     }
 
     /// <summary>Reads the database server date in a new scope of the host.</summary>
@@ -620,6 +1101,39 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
     /// <summary>Reads the company ids in ascending order.</summary>
     private Task<List<long>> CompanyIdsAsync() =>
         QueryAsync(db => db.Companies.OrderBy(company => company.Id).Select(company => company.Id).ToListAsync());
+
+    /// <summary>
+    /// Creates, under the existing directory <paramref name="root"/>, nested directories of names of at most 200
+    /// characters whose innermost full path is exactly <paramref name="length"/> characters long, copies the files of
+    /// <c>Erewhon/DataFiles</c> into the innermost one and returns its path, which ends with no separator.
+    /// </summary>
+    private string CreateDataFilesCopy(string root, int length)
+    {
+        const int MaxNameLength = 200;
+        Assert.True(length - root.Length >= 2, root);
+
+        string path = root;
+        while (path.Length < length)
+        {
+            int remaining = length - path.Length - 1;
+            int nameLength = Math.Min(MaxNameLength, remaining);
+            if (remaining - nameLength == 1)
+            {
+                nameLength--;
+            }
+
+            path = path + Path.DirectorySeparatorChar + new string('d', nameLength);
+        }
+
+        Assert.Equal(length, path.Length);
+        Directory.CreateDirectory(path);
+        foreach (string file in Directory.EnumerateFiles(_dataDirectory))
+        {
+            File.Copy(file, Path.Combine(path, Path.GetFileName(file)));
+        }
+
+        return path;
+    }
 
     /// <summary>
     /// Returns the day offset of the load: the first retail item's loaded listed date less its file listed date, which
@@ -1080,6 +1594,36 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
     /// <summary>Joins the fields with <c>", "</c>; a null field is empty.</summary>
     private static string Join(params string?[] fields) => string.Join(FieldSeparator, fields);
 
+    /// <summary>
+    /// A string writer that throws <see cref="Failure"/> for the first line written that starts with a prefix, and
+    /// writes every other line.
+    /// </summary>
+    /// <param name="failingPrefix">The prefix of the line that fails.</param>
+    private sealed class FailingLineWriter(string failingPrefix) : StringWriter(CultureInfo.InvariantCulture)
+    {
+        /// <summary>The exception thrown for the failing line.</summary>
+        public IOException Failure { get; } = new("The output line could not be written.");
+
+        /// <summary>The line that failed; <see langword="null"/> until a line fails.</summary>
+        public string? FailedLine { get; private set; }
+
+        /// <summary>
+        /// Throws <see cref="Failure"/> when no line has failed yet and <paramref name="value"/> starts with the
+        /// prefix; otherwise writes <paramref name="value"/> and a line end.
+        /// </summary>
+        /// <param name="value">The line to write.</param>
+        public override void WriteLine(string? value)
+        {
+            if (FailedLine is null && value is not null && value.StartsWith(failingPrefix, StringComparison.Ordinal))
+            {
+                FailedLine = value;
+                throw Failure;
+            }
+
+            base.WriteLine(value);
+        }
+    }
+
     /// <summary>The rows of every table, read untracked.</summary>
     private sealed record SeedSnapshot(
         IReadOnlyList<Company> Companies,
@@ -1113,4 +1657,209 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
         int Sales,
         int RetailSales,
         int TenderSales);
+
+    /// <summary>
+    /// The faults a host from <see cref="StartFaultingHostAsync"/> injects. A rollback fault applies to every rollback;
+    /// the commit and command faults each apply once, to the next commit or database command after they are set.
+    /// </summary>
+    private sealed class SeedFaults
+    {
+        private CancellationTokenSource? _cancelAfterCommit;
+        private int _failNextCommand;
+
+        /// <summary>Whether every rollback throws a <see cref="ConnectionFailure"/> after rolling back.</summary>
+        public bool FailRollback { get; init; }
+
+        /// <summary>Whether a command fault is set and no database command has taken it yet.</summary>
+        public bool CommandFailurePending => Volatile.Read(ref _failNextCommand) != 0;
+
+        /// <summary>Makes the next commit cancel <paramref name="source"/> once it has committed.</summary>
+        /// <param name="source">The source to cancel.</param>
+        public void CancelAfterNextCommit(CancellationTokenSource source) =>
+            Volatile.Write(ref _cancelAfterCommit, source);
+
+        /// <summary>Makes the next database command throw a <see cref="ConnectionFailure"/> instead of running.</summary>
+        public void FailNextCommand() => Volatile.Write(ref _failNextCommand, 1);
+
+        /// <summary>Returns the source set by <see cref="CancelAfterNextCommit"/>, if any, and clears it.</summary>
+        /// <returns>The source to cancel, or <see langword="null"/>.</returns>
+        public CancellationTokenSource? TakeCancelAfterCommit() => Interlocked.Exchange(ref _cancelAfterCommit, null);
+
+        /// <summary>Returns whether a command fault was set, and clears it.</summary>
+        /// <returns><see langword="true"/> when the calling command fails.</returns>
+        public bool TakeFailNextCommand() => Interlocked.Exchange(ref _failNextCommand, 0) != 0;
+    }
+
+    /// <summary>
+    /// A unit of work that runs every call on <paramref name="inner"/>; after a commit it cancels the source taken from
+    /// <see cref="SeedFaults.TakeCancelAfterCommit"/>, and after a rollback it throws a <see cref="ConnectionFailure"/>
+    /// when <see cref="SeedFaults.FailRollback"/> is set.
+    /// </summary>
+    /// <param name="inner">The unit of work registered by the host.</param>
+    /// <param name="faults">The faults to inject.</param>
+    private sealed class FaultingUnitOfWork(IUnitOfWork inner, SeedFaults faults) : IUnitOfWork
+    {
+        /// <inheritdoc/>
+        public bool HasActiveTransaction => inner.HasActiveTransaction;
+
+        /// <inheritdoc/>
+        public Task BeginAsync(CancellationToken ct = default) => inner.BeginAsync(ct);
+
+        /// <inheritdoc/>
+        public async Task CommitAsync(CancellationToken ct = default)
+        {
+            await inner.CommitAsync(ct);
+            faults.TakeCancelAfterCommit()?.Cancel();
+        }
+
+        /// <inheritdoc/>
+        public async Task RollbackAsync(CancellationToken ct = default)
+        {
+            await inner.RollbackAsync(ct);
+            if (faults.FailRollback)
+            {
+                throw ConnectionFailure("Rollback");
+            }
+        }
+
+        /// <inheritdoc/>
+        public Task CreateSavepointAsync(string name, CancellationToken ct = default) =>
+            inner.CreateSavepointAsync(name, ct);
+
+        /// <inheritdoc/>
+        public Task RollbackToSavepointAsync(string name, CancellationToken ct = default) =>
+            inner.RollbackToSavepointAsync(name, ct);
+
+        /// <inheritdoc/>
+        public Task ReleaseSavepointAsync(string name, CancellationToken ct = default) =>
+            inner.ReleaseSavepointAsync(name, ct);
+    }
+
+    /// <summary>
+    /// A command interceptor that throws a <see cref="ConnectionFailure"/> in place of the reader, scalar or non-query
+    /// command that takes the fault set by <see cref="SeedFaults.FailNextCommand"/>, and lets every other command run.
+    /// </summary>
+    /// <param name="faults">The faults to inject.</param>
+    private sealed class FailingCommandInterceptor(SeedFaults faults) : DbCommandInterceptor
+    {
+        /// <inheritdoc/>
+        public override ValueTask<InterceptionResult<DbDataReader>> ReaderExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<DbDataReader> result,
+            CancellationToken cancellationToken = default)
+        {
+            ThrowWhenFaulted();
+            return base.ReaderExecutingAsync(command, eventData, result, cancellationToken);
+        }
+
+        /// <inheritdoc/>
+        public override ValueTask<InterceptionResult<object>> ScalarExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<object> result,
+            CancellationToken cancellationToken = default)
+        {
+            ThrowWhenFaulted();
+            return base.ScalarExecutingAsync(command, eventData, result, cancellationToken);
+        }
+
+        /// <inheritdoc/>
+        public override ValueTask<InterceptionResult<int>> NonQueryExecutingAsync(
+            DbCommand command,
+            CommandEventData eventData,
+            InterceptionResult<int> result,
+            CancellationToken cancellationToken = default)
+        {
+            ThrowWhenFaulted();
+            return base.NonQueryExecutingAsync(command, eventData, result, cancellationToken);
+        }
+
+        /// <summary>Throws a <see cref="ConnectionFailure"/> when this command takes the command fault.</summary>
+        private void ThrowWhenFaulted()
+        {
+            if (faults.TakeFailNextCommand())
+            {
+                throw ConnectionFailure("Command");
+            }
+        }
+    }
+
+    /// <summary>
+    /// A notification publisher that keeps every entity change handed to it, in order. A call whose token is cancelled
+    /// returns a cancelled task and keeps nothing.
+    /// </summary>
+    private sealed class RecordingNotificationPublisher : INotificationPublisher
+    {
+        private readonly object _gate = new();
+        private readonly List<ChangeEvent> _entityChanges = [];
+
+        /// <summary>A snapshot of every entity change kept, in the order handed over.</summary>
+        public IReadOnlyList<ChangeEvent> EntityChanges
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _entityChanges.ToArray();
+                }
+            }
+        }
+
+        /// <inheritdoc/>
+        public Task PublishEntityChangesAsync(IReadOnlyList<ChangeEvent> events, CancellationToken ct = default)
+        {
+            ArgumentNullException.ThrowIfNull(events);
+            if (ct.IsCancellationRequested)
+            {
+                return Task.FromCanceled(ct);
+            }
+
+            lock (_gate)
+            {
+                _entityChanges.AddRange(events);
+            }
+
+            return Task.CompletedTask;
+        }
+
+        /// <inheritdoc/>
+        public Task PublishCartItemDeletedAsync(string sessionId, long itemId, CancellationToken ct = default) =>
+            ct.IsCancellationRequested ? Task.FromCanceled(ct) : Task.CompletedTask;
+
+        /// <inheritdoc/>
+        public Task PublishSaveOutstandingChangesAsync(
+            string sessionId,
+            string entityType,
+            long id,
+            CancellationToken ct = default) =>
+            ct.IsCancellationRequested ? Task.FromCanceled(ct) : Task.CompletedTask;
+    }
+
+    /// <summary>
+    /// A string writer that writes every line and calls <paramref name="arm"/> once, just after writing the first line
+    /// that starts with <paramref name="armingPrefix"/>.
+    /// </summary>
+    /// <param name="armingPrefix">The prefix of the line that arms.</param>
+    /// <param name="arm">The action called for that line.</param>
+    private sealed class ArmingLineWriter(string armingPrefix, Action arm) : StringWriter(CultureInfo.InvariantCulture)
+    {
+        /// <summary>Whether a line starting with the prefix has been written.</summary>
+        public bool Armed { get; private set; }
+
+        /// <summary>
+        /// Writes <paramref name="value"/> and a line end, then calls the arming action when no line has armed yet and
+        /// <paramref name="value"/> starts with the prefix.
+        /// </summary>
+        /// <param name="value">The line to write.</param>
+        public override void WriteLine(string? value)
+        {
+            base.WriteLine(value);
+            if (!Armed && value is not null && value.StartsWith(armingPrefix, StringComparison.Ordinal))
+            {
+                Armed = true;
+                arm();
+            }
+        }
+    }
 }

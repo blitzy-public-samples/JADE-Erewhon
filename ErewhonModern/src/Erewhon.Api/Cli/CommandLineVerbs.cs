@@ -124,8 +124,8 @@ public static class CommandLineVerbs
 
     /// <summary>
     /// Writes the example command line and returns 1 unless <paramref name="args"/> holds exactly one operand; returns
-    /// 0 without loading for an empty operand; otherwise loads the directory named by the operand through
-    /// <see cref="InitialDataLoader.LoadAsync"/> and returns 0.
+    /// 0 without loading for an empty operand; otherwise loads the directory named by the operand, passed as given to
+    /// <see cref="InitialDataLoader.LoadAsync"/>, and returns 0.
     /// </summary>
     /// <param name="scopedServices">The services of the verb's scope.</param>
     /// <param name="args">The process arguments; the first is the verb.</param>
@@ -151,33 +151,8 @@ public static class CommandLineVerbs
         }
 
         InitialDataLoader loader = scopedServices.GetRequiredService<InitialDataLoader>();
-        await loader.LoadAsync(ResolveDataDirectory(operand), output, ct);
+        await loader.LoadAsync(operand, output, ct);
         return SucceededExitCode;
-    }
-
-    /// <summary>
-    /// Returns the operand unchanged when it holds only spaces; otherwise the full path of the operand trimmed of
-    /// spaces, resolved against the current directory, or the trimmed operand when it cannot be made a full path.
-    /// </summary>
-    /// <param name="operand">The non-empty directory operand of <c>seed</c>.</param>
-    /// <returns>The directory path passed to the loader.</returns>
-    private static string ResolveDataDirectory(string operand)
-    {
-        string trimmed = JadeValues.TrimBlanks(operand);
-        if (trimmed.Length == 0)
-        {
-            return operand;
-        }
-
-        try
-        {
-            return Path.GetFullPath(trimmed);
-        }
-        catch (Exception invalidPath) when (
-            invalidPath is ArgumentException or NotSupportedException or PathTooLongException)
-        {
-            return trimmed;
-        }
     }
 
     /// <summary>

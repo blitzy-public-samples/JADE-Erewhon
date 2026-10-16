@@ -48,6 +48,9 @@ public sealed class InitialDataLoader
     private const string Space = " ";
     private const string NullObjectReferenceText = "Null object reference";
     private const int MillisecondsPerSecond = 1000;
+    private const int DataDirectoryMaxLength = 301;
+    private const char ForwardSlash = '/';
+    private const char BackSlash = '\\';
 
     private static readonly DateOnly OffsetStartDate = new(2000, 1, 1);
 
@@ -142,11 +145,17 @@ public sealed class InitialDataLoader
     /// directory that is not configured fails as an empty path does.
     /// </summary>
     /// <param name="output">The writer that receives each output line; <see cref="Console.Out"/> when <see langword="null"/>.</param>
-    /// <param name="ct">Token that cancels the load.</param>
+    /// <param name="ct">
+    /// Token that cancels the load; the publication of the committed load's notifications ignores it.
+    /// </param>
     /// <returns>The number of tender sales the post-load closure built and every line written.</returns>
     /// <exception cref="ErewhonException">
     /// The configured directory is missing, empty, not a valid path or not an existing directory (500004), or a
     /// company still exists after the purge (500003).
+    /// </exception>
+    /// <exception cref="StringTooLongException">
+    /// The configured directory exists and its path, trimmed of spaces and followed by <c>/</c> unless it ends with
+    /// <c>/</c> or <c>\</c>, is longer than 301 characters (1035); nothing is deleted.
     /// </exception>
     public Task<SeedLoadResult> LoadConfiguredAsync(TextWriter? output = null, CancellationToken ct = default) =>
         LoadAsync(_settings.DataDirectory ?? string.Empty, output, ct);
@@ -154,7 +163,10 @@ public sealed class InitialDataLoader
     /// <summary>
     /// Loads the seed data files of <paramref name="directoryPath"/>:
     /// <list type="number">
-    /// <item><description>Validates the directory path, trimmed of spaces.</description></item>
+    /// <item><description>
+    /// Validates the directory path, trimmed of spaces, and checks that it, followed by <c>/</c> unless it ends with
+    /// <c>/</c> or <c>\</c>, is at most 301 characters long.
+    /// </description></item>
     /// <item><description>Reads the server date once; it is the load date.</description></item>
     /// <item><description>Deletes the lowest-id company, with everything it owns, in its own transaction.</description></item>
     /// <item><description>
@@ -166,14 +178,26 @@ public sealed class InitialDataLoader
     /// </list>
     /// The final line <c>Database Initialized in &lt;n&gt; seconds</c> is written whether or not the load succeeds.
     /// </summary>
-    /// <param name="directoryPath">The path of the directory holding the seed data files.</param>
+    /// <param name="directoryPath">
+    /// The path of the directory holding the seed data files; a relative path is resolved against the current
+    /// directory.
+    /// </param>
     /// <param name="output">The writer that receives each output line; <see cref="Console.Out"/> when <see langword="null"/>.</param>
-    /// <param name="ct">Token that cancels the load.</param>
+    /// <param name="ct">
+    /// Token that cancels the load; the publication of the committed load's notifications ignores it.
+    /// </param>
     /// <returns>The number of tender sales the post-load closure built and every line written.</returns>
     /// <exception cref="ErewhonException">
     /// The directory path is <see langword="null"/>, empty, not a valid path or not an existing directory (500004), or
     /// a company still exists after the purge (500003).
     /// </exception>
+    /// <exception cref="StringTooLongException">
+    /// The directory exists and its path as given, trimmed of spaces and followed by <c>/</c> unless it ends with
+    /// <c>/</c> or <c>\</c>, is longer than 301 characters (1035); nothing is deleted. Or an item line's GUID or name
+    /// is longer than its declared length (1035), raised before the item's code number is allocated or its photo file
+    /// read; the load transaction rolls back.
+    /// </exception>
+    /// <exception cref="FileNotFoundException">A data file, or a photo file an item line names, does not exist.</exception>
     /// <exception cref="NoCompanyException">The loader's company was not created.</exception>
     /// <exception cref="InvalidOperationException">
     /// An agent rate names an item category, or a percentage, that no stored category or rate has.
@@ -209,13 +233,20 @@ public sealed class InitialDataLoader
     }
 
     /// <summary>
-    /// Returns the full path of <paramref name="directoryPath"/>, trimmed of spaces, ending with a directory separator.
-    /// Ports <c>InitialDataLoader.validateDirectoryPath</c>.
+    /// Returns the full path of <paramref name="directoryPath"/>, trimmed of spaces, ending with a directory separator,
+    /// once the trimmed path names an existing directory and, followed by <c>/</c> unless it ends with <c>/</c> or
+    /// <c>\</c>, is at most 301 characters long. A relative path is resolved against the current directory; the length
+    /// is that of the path as given, not of its full path. Ports <c>InitialDataLoader.validateDirectoryPath</c> and the
+    /// assignment of its result to the <c>String[301]</c> attribute <c>dirPath</c>.
     /// </summary>
     /// <param name="directoryPath">The directory path to validate.</param>
     /// <returns>The full path of the existing directory, ending with a directory separator.</returns>
     /// <exception cref="ErewhonException">
     /// The trimmed path is empty, is not a valid path or does not name an existing directory (500004).
+    /// </exception>
+    /// <exception cref="StringTooLongException">
+    /// The trimmed path names an existing directory and, followed by <c>/</c> unless it ends with <c>/</c> or
+    /// <c>\</c>, is longer than 301 characters (1035, field <c>DataDirectory</c>).
     /// </exception>
     private static string ValidateDirectoryPath(string? directoryPath)
     {
@@ -240,6 +271,11 @@ public sealed class InitialDataLoader
         {
             throw new ErewhonException(ErewhonException.InvalidDirectoryPath);
         }
+
+        string dirPath = returnDirPath.EndsWith(ForwardSlash) || returnDirPath.EndsWith(BackSlash)
+            ? returnDirPath
+            : returnDirPath + ForwardSlash;
+        FieldLengths.Check(dirPath, DataDirectoryMaxLength, nameof(SeedRun.DataDirectory));
 
         return Path.EndsInDirectorySeparator(fullPath) ? fullPath : fullPath + Path.DirectorySeparatorChar;
     }
@@ -268,13 +304,14 @@ public sealed class InitialDataLoader
 
     /// <summary>
     /// Begins the load transaction, creates the company, sets the date offset, loads the ten data files in
-    /// <see cref="SeedFileNames.LoadOrder"/> and commits; then publishes the queued notifications and clears the change
-    /// tracker. On failure rolls the transaction back, discards the queued notifications, clears the change tracker
-    /// and rethrows.
+    /// <see cref="SeedFileNames.LoadOrder"/> and commits; then publishes the queued notifications with
+    /// <see cref="CancellationToken.None"/> and clears the change tracker, also when publication throws. A failure before
+    /// the commit returns rolls the transaction back, discards the queued notifications, clears the change tracker and
+    /// rethrows.
     /// </summary>
     /// <param name="run">The state of the running load.</param>
     /// <param name="currentDate">The load date.</param>
-    /// <param name="ct">Token that cancels the load.</param>
+    /// <param name="ct">Token that cancels the load up to the return of the commit; publication ignores it.</param>
     /// <returns>A task that completes when the load has committed and its notifications are published.</returns>
     private async Task LoadInTransactionAsync(SeedRun run, DateOnly currentDate, CancellationToken ct)
     {
@@ -298,13 +335,21 @@ public sealed class InitialDataLoader
             throw;
         }
 
-        await _notificationQueue.FlushAsync(ct);
-        _db.ChangeTracker.Clear();
+        try
+        {
+            await _notificationQueue.FlushAsync(CancellationToken.None);
+        }
+        finally
+        {
+            _db.ChangeTracker.Clear();
+        }
     }
 
     /// <summary>
     /// Rolls back the load transaction when it is still active, discards the queued notifications and clears the change
-    /// tracker. A failure of the rollback itself is logged and not thrown.
+    /// tracker. A failure of the rollback itself is not thrown: it is logged as one Warning event with the fixed text
+    /// <c>The seed load transaction could not be rolled back.</c>, which has no message property, and a
+    /// <see cref="SanitizedException"/> of the failure attached in its place.
     /// </summary>
     /// <returns>A task that completes when the load's state is discarded.</returns>
     private async Task RollBackLoadAsync()
@@ -318,7 +363,9 @@ public sealed class InitialDataLoader
         }
         catch (Exception rollbackFailure)
         {
-            _logger?.LogWarning(rollbackFailure, "The seed load transaction could not be rolled back.");
+            _logger?.LogWarning(
+                new SanitizedException(rollbackFailure),
+                "The seed load transaction could not be rolled back.");
         }
         finally
         {
@@ -1011,7 +1058,8 @@ public sealed class InitialDataLoader
     /// Sets the item values of <paramref name="command"/> from <paramref name="item"/>, in this order: the GUID, a code
     /// number allocated for the bound company, the description, the agent, the region and the category found by name,
     /// the bytes of the photo file (none when the line names no photo), the price, the name and the shifted listed
-    /// date.
+    /// date. The GUID is checked against <see cref="FieldLengths.Guid"/> as it is set, before the code number is
+    /// allocated, and the name against <see cref="FieldLengths.ItemName"/> as it is set, after the photo and the price.
     /// </summary>
     /// <typeparam name="TCommand">The item command type.</typeparam>
     /// <param name="command">The new command to populate.</param>
@@ -1019,6 +1067,11 @@ public sealed class InitialDataLoader
     /// <param name="run">The state of the running load.</param>
     /// <param name="ct">Token that cancels the reads.</param>
     /// <returns><paramref name="command"/>, populated.</returns>
+    /// <exception cref="StringTooLongException">
+    /// The GUID is longer than <see cref="FieldLengths.Guid"/> characters (field <c>Guid</c>), or the name is longer
+    /// than <see cref="FieldLengths.ItemName"/> characters (field <c>Name</c>); that value and the values after it are
+    /// not set.
+    /// </exception>
     private async Task<TCommand> PopulateItemCommandAsync<TCommand>(
         TCommand command,
         ItemLine item,
@@ -1026,6 +1079,7 @@ public sealed class InitialDataLoader
         CancellationToken ct)
         where TCommand : ItemCommand
     {
+        FieldLengths.Check(item.Guid, FieldLengths.Guid, nameof(ItemCommand.Guid));
         command.Guid = item.Guid;
         command.CodeNumber = await _itemCodeAllocator.AllocateNextCodeNumberAsync(run.CompanyId, ct);
         command.Description = item.FullDescription;
@@ -1034,34 +1088,44 @@ public sealed class InitialDataLoader
         command.ItemCategoryId = await FindItemCategoryIdAsync(run.CompanyId, item.CategoryName, ct);
         command.Photo = item.PhotoToken is null ? null : await File.ReadAllBytesAsync(item.PhotoFileName, ct);
         command.Price = item.Price;
+        FieldLengths.Check(item.ShortDescription, FieldLengths.ItemName, nameof(ItemCommand.Name));
         command.Name = item.ShortDescription;
         command.ListedDate = Shift(item.ListedDate, run.DateOffset);
         return command;
     }
 
     /// <summary>
-    /// Opens the data file <paramref name="fileName"/> of the load's directory, writes
-    /// <c>Loading &lt;path&gt;...</c>, and returns the file's data lines.
+    /// Returns the data lines of the data file <paramref name="fileName"/> of the load's directory. When the
+    /// enumeration starts, opens the file, then writes <c>Loading &lt;path&gt;...</c>. The file is closed when the
+    /// enumeration completes or its enumerator is disposed, and before a failure of that write propagates.
     /// </summary>
     /// <param name="run">The state of the running load.</param>
     /// <param name="fileName">The data file name.</param>
     /// <returns>The data lines of the file, read as the enumeration proceeds.</returns>
-    /// <exception cref="FileNotFoundException">The file does not exist; nothing is written.</exception>
+    /// <exception cref="FileNotFoundException">
+    /// The file does not exist, raised when the enumeration starts; nothing is written.
+    /// </exception>
     private IEnumerable<string> OpenDataFile(SeedRun run, string fileName)
     {
         string path = Path.Combine(run.DataDirectory, fileName);
-        IEnumerable<string> lines = DataFileReader.ReadDataLines(path);
+        using IEnumerator<string> lines = DataFileReader.ReadDataLines(path).GetEnumerator();
         Write(run, MessageCatalog.Get(MessageKeys.Loading, path));
-        return lines;
+        while (lines.MoveNext())
+        {
+            yield return lines.Current;
+        }
     }
 
     /// <summary>
     /// Writes the end line of a loader. When the loader completed, a failure to build the line propagates; when the
-    /// loader is failing, such a failure is logged and the line is not written.
+    /// loader is failing, such a failure is not thrown and the line is not written: the failure is logged as one
+    /// Warning event with the text <c>The end line of seed data file {SeedFile} was not written.</c>, the property
+    /// <c>SeedFile</c> set to <paramref name="fileName"/>, and a <see cref="SanitizedException"/> of the failure
+    /// attached in its place.
     /// </summary>
     /// <param name="run">The state of the running load.</param>
     /// <param name="loaderCompleted">Whether every line of the file was loaded.</param>
-    /// <param name="fileName">The data file name, for the log.</param>
+    /// <param name="fileName">The data file name, one of <see cref="SeedFileNames.LoadOrder"/>, for the log.</param>
     /// <param name="buildEndLine">Builds the end line.</param>
     /// <returns>A task that completes when the line is written or dropped.</returns>
     private async Task WriteEndLineAsync(
@@ -1083,7 +1147,7 @@ public sealed class InitialDataLoader
         catch (Exception endLineFailure)
         {
             _logger?.LogWarning(
-                endLineFailure,
+                new SanitizedException(endLineFailure),
                 "The end line of seed data file {SeedFile} was not written.",
                 fileName);
         }
@@ -1244,6 +1308,109 @@ public sealed class InitialDataLoader
     /// <summary>Returns <paramref name="value"/> as invariant-culture text.</summary>
     private static string Invariant(long value) => value.ToString(CultureInfo.InvariantCulture);
 
+    /// <summary>
+    /// The exception attached to a Warning event of the loader in place of the failure the event reports. Its message
+    /// is the message of an <see cref="IJadeException"/> failure and the full name of the failure's type for any other
+    /// failure; it has no inner exception and no data. Its string form lists the failure, its inner exceptions and the
+    /// inner exceptions of any <see cref="AggregateException"/>, depth first, each as its type's full name, followed for
+    /// an <see cref="IJadeException"/> by <c>(&lt;error code&gt;): &lt;message&gt;</c>, and by its stack trace when it
+    /// has one; its stack trace is the first stack trace in that list. No other exception message, and no data of any
+    /// exception in the chain, is carried.
+    /// </summary>
+    private sealed class SanitizedException : Exception
+    {
+        private const string InnerSeparator = " ---> ";
+
+        private readonly string _rendering;
+
+        private readonly string? _stackTrace;
+
+        /// <summary>Creates the rendering of <paramref name="failure"/> and its exception chain.</summary>
+        /// <param name="failure">The failure the Warning event reports.</param>
+        /// <exception cref="ArgumentNullException"><paramref name="failure"/> is <see langword="null"/>.</exception>
+        public SanitizedException(Exception failure)
+            : base(MessageOf(failure))
+        {
+            var segments = new List<string>();
+            string? stackTrace = null;
+            foreach (Exception step in Chain(failure))
+            {
+                string segment = Header(step);
+                if (step.StackTrace is { } trace)
+                {
+                    segment += Environment.NewLine + trace;
+                    stackTrace ??= trace;
+                }
+
+                segments.Add(segment);
+            }
+
+            _rendering = string.Join(Environment.NewLine + InnerSeparator, segments);
+            _stackTrace = stackTrace;
+        }
+
+        /// <summary>The first stack trace of the rendered chain, or <see langword="null"/> when none has one.</summary>
+        public override string? StackTrace => _stackTrace;
+
+        /// <summary>Returns the rendered chain.</summary>
+        /// <returns>The type names, JADE error codes and messages, and stack traces of the chain.</returns>
+        public override string ToString() => _rendering;
+
+        /// <summary>
+        /// Returns the message of an <see cref="IJadeException"/> and the full name of the type of any other exception.
+        /// </summary>
+        private static string MessageOf(Exception failure)
+        {
+            ArgumentNullException.ThrowIfNull(failure);
+            return failure is IJadeException ? failure.Message : TypeName(failure);
+        }
+
+        /// <summary>
+        /// Returns <paramref name="exception"/>, then, depth first, the inner exceptions of an
+        /// <see cref="AggregateException"/> or the inner exception of any other exception.
+        /// </summary>
+        private static IEnumerable<Exception> Chain(Exception exception)
+        {
+            var pending = new Stack<Exception>();
+            pending.Push(exception);
+            while (pending.Count > 0)
+            {
+                Exception current = pending.Pop();
+                yield return current;
+
+                if (current is AggregateException aggregate)
+                {
+                    for (int index = aggregate.InnerExceptions.Count - 1; index >= 0; index--)
+                    {
+                        pending.Push(aggregate.InnerExceptions[index]);
+                    }
+                }
+                else if (current.InnerException is { } inner)
+                {
+                    pending.Push(inner);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Returns the full type name of <paramref name="exception"/>, followed for an <see cref="IJadeException"/> by
+        /// <c>(&lt;error code&gt;): &lt;message&gt;</c>.
+        /// </summary>
+        private static string Header(Exception exception) =>
+            exception is IJadeException jade
+                ? string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{TypeName(exception)} ({jade.ErrorCode}): {exception.Message}")
+                : TypeName(exception);
+
+        /// <summary>Returns the full name of the type of <paramref name="exception"/>.</summary>
+        private static string TypeName(Exception exception)
+        {
+            Type type = exception.GetType();
+            return type.FullName ?? type.Name;
+        }
+    }
+
     /// <summary>The state of one running load: its output, its lines, its directory, its company and its date offset.</summary>
     /// <param name="output">The writer that receives each output line.</param>
     private sealed class SeedRun(TextWriter output)
@@ -1340,4 +1507,3 @@ public sealed class InitialDataLoader
         }
     }
 }
-

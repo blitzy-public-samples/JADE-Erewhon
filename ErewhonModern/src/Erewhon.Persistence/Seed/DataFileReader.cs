@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Globalization;
 using System.Text;
 using Erewhon.Application.Common;
@@ -41,8 +42,9 @@ public static class DataFileReader
     /// <param name="filePath">The path of the file to read.</param>
     /// <returns>
     /// The data lines in file order. LF, CR LF and CR end a line, and a last line without a line end is
-    /// returned. The file is opened by this call and closed when the enumeration completes or its
-    /// enumerator is disposed.
+    /// returned. The file is opened by this call and is owned by the first enumerator of the sequence: it is
+    /// closed when that enumeration completes or that enumerator is disposed, whether or not the enumeration
+    /// has started. Each later enumerator opens the file again and owns that opening in the same way.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="filePath"/> is <see langword="null"/>.</exception>
     /// <exception cref="FileNotFoundException">The file does not exist.</exception>
@@ -50,7 +52,7 @@ public static class DataFileReader
     public static IEnumerable<string> ReadDataLines(string filePath)
     {
         ArgumentNullException.ThrowIfNull(filePath);
-        return SelectDataLines(File.ReadLines(filePath, Encoding.Latin1));
+        return new DataLineSequence(filePath);
     }
 
     /// <summary>
@@ -172,17 +174,79 @@ public static class DataFileReader
             : null;
     }
 
-    private static IEnumerable<string> SelectDataLines(IEnumerable<string> rawLines)
+    /// <summary>Opens a file as Latin-1 text and returns an enumerator of its lines that owns the open file.</summary>
+    /// <param name="filePath">The path of the file to open.</param>
+    /// <returns>The enumerator of the file's lines; disposing it closes the file.</returns>
+    private static IEnumerator<string> OpenRawLines(string filePath) =>
+        File.ReadLines(filePath, Encoding.Latin1).GetEnumerator();
+
+    /// <summary>The data lines of one file, which is opened when the sequence is created.</summary>
+    private sealed class DataLineSequence : IEnumerable<string>
     {
-        foreach (string rawLine in rawLines)
+        private readonly string _filePath;
+        private IEnumerator<string>? _openedRawLines;
+
+        /// <summary>Opens <paramref name="filePath"/> as Latin-1 text.</summary>
+        /// <param name="filePath">The path of the file to open.</param>
+        public DataLineSequence(string filePath)
         {
-            string line = JadeValues.TrimBlanks(rawLine);
-            if (line.Length == 0 || line[FirstIndexInLine - 1] == LineSkipDelimiter)
+            _filePath = filePath;
+            _openedRawLines = OpenRawLines(filePath);
+        }
+
+        /// <summary>
+        /// Returns an enumerator of the data lines that owns an open file: the first call takes the file opened by the
+        /// constructor, each later call opens the file again.
+        /// </summary>
+        /// <returns>The enumerator; disposing it closes its file.</returns>
+        public IEnumerator<string> GetEnumerator()
+        {
+            IEnumerator<string> rawLines = _openedRawLines ?? OpenRawLines(_filePath);
+            _openedRawLines = null;
+            return new DataLineEnumerator(rawLines);
+        }
+
+        /// <inheritdoc/>
+        IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
+    }
+
+    /// <summary>
+    /// Enumerates the data lines of an open file's lines: each line with leading and trailing spaces removed,
+    /// omitting lines that are empty after that or that start with <see cref="LineSkipDelimiter"/>.
+    /// </summary>
+    /// <param name="rawLines">The enumerator of the file's lines, owned and disposed by this enumerator.</param>
+    private sealed class DataLineEnumerator(IEnumerator<string> rawLines) : IEnumerator<string>
+    {
+        /// <summary>The current data line; empty before the first data line.</summary>
+        public string Current { get; private set; } = string.Empty;
+
+        /// <inheritdoc/>
+        object IEnumerator.Current => Current;
+
+        /// <summary>Advances to the next data line.</summary>
+        /// <returns><see langword="true"/> when a data line was read; <see langword="false"/> at the end of the file.</returns>
+        public bool MoveNext()
+        {
+            while (rawLines.MoveNext())
             {
-                continue;
+                string line = JadeValues.TrimBlanks(rawLines.Current);
+                if (line.Length == 0 || line[FirstIndexInLine - 1] == LineSkipDelimiter)
+                {
+                    continue;
+                }
+
+                Current = line;
+                return true;
             }
 
-            yield return line;
+            return false;
         }
+
+        /// <summary>Not supported: the lines are read once.</summary>
+        /// <exception cref="NotSupportedException">Always.</exception>
+        public void Reset() => throw new NotSupportedException();
+
+        /// <summary>Closes the file.</summary>
+        public void Dispose() => rawLines.Dispose();
     }
 }
