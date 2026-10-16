@@ -22,6 +22,8 @@ public sealed class PostgresDatabase
 
     private const string DefaultMaintenanceDatabase = "postgres";
 
+    private const int SessionTerminationWaitMs = 5000;
+
     private static readonly Regex DatabaseNamePattern = new(
         @"^[a-z0-9_]{1,63}\z",
         RegexOptions.CultureInvariant);
@@ -119,7 +121,9 @@ public sealed class PostgresDatabase
 
     /// <summary>
     /// Drops this database, ending every session connected to it, and creates it again empty. Every idle pooled
-    /// connection of this process is closed first.
+    /// connection of this process is closed first. When <c>DROP DATABASE ... WITH (FORCE)</c> fails with SQLSTATE
+    /// <c>42501</c>, the role's other sessions on the database are terminated and the database is dropped without
+    /// <c>FORCE</c>, which also ends any autovacuum worker connected to it (D-136).
     /// </summary>
     /// <param name="ct">Cancels the drop and create commands.</param>
     /// <returns>A task that completes when the empty database exists.</returns>
@@ -135,7 +139,16 @@ public sealed class PostgresDatabase
 
         await using var connection = new NpgsqlConnection(maintenanceConnectionString);
         await connection.OpenAsync(ct);
-        await ExecuteAsync(connection, $"DROP DATABASE IF EXISTS \"{DatabaseName}\" WITH (FORCE)", ct);
+        try
+        {
+            await ExecuteAsync(connection, $"DROP DATABASE IF EXISTS \"{DatabaseName}\" WITH (FORCE)", ct);
+        }
+        catch (PostgresException refused) when (refused.SqlState == PostgresErrorCodes.InsufficientPrivilege)
+        {
+            await TerminateOwnSessionsAsync(connection, ct);
+            await ExecuteAsync(connection, $"DROP DATABASE IF EXISTS \"{DatabaseName}\"", ct);
+        }
+
         await ExecuteAsync(connection, $"CREATE DATABASE \"{DatabaseName}\"", ct);
     }
 
@@ -229,6 +242,21 @@ public sealed class PostgresDatabase
                 $"'{databaseName}' is not a database name of 1 to 63 lower-case letters, digits and underscores.",
                 parameterName);
         }
+    }
+
+    /// <summary>
+    /// Terminates every other session of the current role on this database, waiting up to
+    /// <see cref="SessionTerminationWaitMs"/> for each to exit.
+    /// </summary>
+    private async Task TerminateOwnSessionsAsync(NpgsqlConnection connection, CancellationToken ct)
+    {
+        await using var command = new NpgsqlCommand(
+            "SELECT pg_terminate_backend(pid, @wait) FROM pg_stat_activity "
+            + "WHERE datname = @database AND usename = current_user AND pid <> pg_backend_pid()",
+            connection);
+        command.Parameters.AddWithValue("wait", (long)SessionTerminationWaitMs);
+        command.Parameters.AddWithValue("database", DatabaseName);
+        await command.ExecuteNonQueryAsync(ct);
     }
 
     private static async Task ExecuteAsync(NpgsqlConnection connection, string sql, CancellationToken ct)
