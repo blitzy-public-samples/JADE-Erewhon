@@ -1,5 +1,5 @@
-import { Fragment, useEffect, useId, useRef } from 'react';
-import type { ChangeEvent, CSSProperties } from 'react';
+import { Fragment, useEffect, useId, useRef, useState } from 'react';
+import type { ChangeEvent, CSSProperties, FocusEvent, KeyboardEvent, MouseEvent } from 'react';
 import type { AddressFields as AddressValue } from '../api/types';
 
 export type { AddressValue };
@@ -55,6 +55,9 @@ const WHITE_SPACE_CHARACTERS = '\r\n\t \u0000';
 const GAP = '0.1875rem';
 const LABEL_COLUMN = '3.75rem';
 const INPUT_BORDER_COLOR = '#AEAEAE';
+const INPUT_HOVER_BORDER_COLOR = 'rgb(128, 128, 128)';
+const INPUT_PRESSED_BORDER_COLOR = 'rgb(0, 80, 160)';
+const FOCUS_OUTLINE = '2px solid rgb(0, 80, 160)';
 const MANDATORY_CORNER_COLOR = '#ED1C24';
 const MANDATORY_CORNER_SIZE = '6px';
 
@@ -118,6 +121,9 @@ const styles = {
     gridColumn: '2 / -1',
   },
   input: inputStyle,
+  inputHover: { ...inputStyle, borderColor: INPUT_HOVER_BORDER_COLOR },
+  inputPressed: { ...inputStyle, borderColor: INPUT_PRESSED_BORDER_COLOR },
+  inputFocus: { outline: FOCUS_OUTLINE, outlineOffset: 0 },
   inputDisabled: { ...inputStyle, color: '#808080' },
   mandatoryCorner: {
     position: 'absolute',
@@ -130,6 +136,29 @@ const styles = {
     pointerEvents: 'none',
   },
 } satisfies Record<string, CSSProperties>;
+
+/** Returns whether `element` matches `:focus-visible`, and `true` when the selector throws. */
+function matchesFocusVisible(element: Element): boolean {
+  try {
+    return element.matches(':focus-visible');
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Returns the style of an enabled input: the pressed, hovered or plain border, in that order of
+ * precedence, with the focus outline added when `focusVisible` is true.
+ */
+function enabledInputStyle(pressed: boolean, hovered: boolean, focusVisible: boolean): CSSProperties {
+  let style: CSSProperties = styles.input;
+  if (pressed) {
+    style = styles.inputPressed;
+  } else if (hovered) {
+    style = styles.inputHover;
+  }
+  return focusVisible ? { ...style, ...styles.inputFocus } : style;
+}
 
 /**
  * Strips CR, LF, Tab, Space and NUL from both ends of `text`; characters between the first and
@@ -173,10 +202,18 @@ export function trimAddress(address: AddressValue): AddressValue {
  * and Email have `aria-required="true"` and a red top-left corner; Fax and URL have neither.
  * `disabled` disables every input and greys its text. A change of `focusField` to an address
  * focus value focuses the matching input.
+ *
+ * An enabled input has a rgb(128, 128, 128) border while the pointer is over it and a
+ * rgb(0, 80, 160) border while the primary mouse button is held on it. Focused with
+ * `:focus-visible`, checked again on every key release in it, it has a 2px rgb(0, 80, 160)
+ * outline drawn against its border. Disabled inputs show none of these states.
  */
 export function AddressFields(props: AddressFieldsProps) {
   const { value, onChange, disabled = false, focusField = null } = props;
   const idPrefix = useId();
+  const [hoveredField, setHoveredField] = useState<AddressField | null>(null);
+  const [pressedField, setPressedField] = useState<AddressField | null>(null);
+  const [focusVisibleField, setFocusVisibleField] = useState<AddressField | null>(null);
   const inputRefs = {
     street: useRef<HTMLInputElement>(null),
     city: useRef<HTMLInputElement>(null),
@@ -197,9 +234,36 @@ export function AddressFields(props: AddressFieldsProps) {
     }
   }, [focusField]);
 
+  useEffect(() => {
+    if (disabled) {
+      setHoveredField(null);
+      setPressedField(null);
+      setFocusVisibleField(null);
+    }
+  }, [disabled]);
+
+  function updateFocusVisible(
+    event: FocusEvent<HTMLInputElement> | KeyboardEvent<HTMLInputElement>,
+    field: AddressField,
+  ) {
+    setFocusVisibleField(matchesFocusVisible(event.currentTarget) ? field : null);
+  }
+
+  function handleMouseLeave(field: AddressField) {
+    setHoveredField((current) => (current === field ? null : current));
+    setPressedField((current) => (current === field ? null : current));
+  }
+
+  function handleMouseDown(event: MouseEvent<HTMLInputElement>, field: AddressField) {
+    if (event.button === 0) {
+      setPressedField(field);
+    }
+  }
+
   function renderField(field: AddressField, cellStyle: CSSProperties = styles.inputCell) {
     const spec = FIELD_SPECS[field];
     const id = `${idPrefix}${field}`;
+    const enabled = !disabled;
     return (
       <Fragment key={field}>
         <label htmlFor={id} style={styles.label}>
@@ -216,10 +280,25 @@ export function AddressFields(props: AddressFieldsProps) {
             maxLength={spec.maxLength}
             disabled={disabled}
             aria-required={spec.mandatory ? 'true' : undefined}
-            style={disabled ? styles.inputDisabled : styles.input}
+            style={
+              enabled
+                ? enabledInputStyle(
+                    pressedField === field,
+                    hoveredField === field,
+                    focusVisibleField === field,
+                  )
+                : styles.inputDisabled
+            }
             onChange={(event: ChangeEvent<HTMLInputElement>) => {
               onChange({ ...value, [field]: event.target.value });
             }}
+            onMouseEnter={enabled ? () => setHoveredField(field) : undefined}
+            onMouseLeave={enabled ? () => handleMouseLeave(field) : undefined}
+            onMouseDown={enabled ? (event) => handleMouseDown(event, field) : undefined}
+            onMouseUp={enabled ? () => setPressedField(null) : undefined}
+            onFocus={enabled ? (event) => updateFocusVisible(event, field) : undefined}
+            onKeyUp={enabled ? (event) => updateFocusVisible(event, field) : undefined}
+            onBlur={() => setFocusVisibleField((current) => (current === field ? null : current))}
           />
           {spec.mandatory && <span aria-hidden="true" style={styles.mandatoryCorner} />}
         </span>

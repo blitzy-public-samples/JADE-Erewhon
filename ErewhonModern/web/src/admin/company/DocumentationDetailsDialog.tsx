@@ -1,8 +1,8 @@
 import { useEffect, useId, useRef, useState } from 'react';
-import type { CSSProperties, KeyboardEvent, ReactElement } from 'react';
+import type { CSSProperties, FocusEvent, KeyboardEvent, ReactElement } from 'react';
 import { ApiError, api } from '../../api/client';
 import type { DocumentationDetailsResponse } from '../../api/types';
-import { useMessageBox } from '../../components/MessageBox';
+import { DialogButton, useMessageBox } from '../../components/MessageBox';
 
 interface DocumentationDetailsDialogProps {
   /** Documented class as the documentation candidate carries it: `Agent` or `Region`. */
@@ -13,12 +13,29 @@ interface DocumentationDetailsDialogProps {
   onClose: () => void;
 }
 
+/** How a documentation request ended: with the details, with a 404, or with any other failure. */
+type LoadOutcome = 'loaded' | 'notFound' | 'failed';
+
 interface LoadedDetails {
   /** Request path the outcome belongs to. */
   path: string;
+  /** How the request for the path ended. */
+  outcome: LoadOutcome;
   /** Documentation returned for the path; null when the request failed. */
   details: DocumentationDetailsResponse | null;
 }
+
+interface DownloadState {
+  /** Documentation path the download belongs to. */
+  path: string;
+  /** True while the RTF request is outstanding. */
+  pending: boolean;
+  /** Text of the status line for the download. */
+  status: string;
+}
+
+/** One of the two preformatted blocks. */
+type DocumentationBlock = 'text' | 'rtf';
 
 const DIALOG_CAPTION = 'Display Documentor Details';
 const TEXT_CAPTION = 'Document as Text';
@@ -27,6 +44,12 @@ const CLOSE_CAPTION = 'Close';
 const RTF_EXTENSION = '.rtf';
 const FOCUSABLE_SELECTOR = 'button:not(:disabled), [tabindex]:not([tabindex="-1"])';
 const BORDER = '1px solid rgb(128, 128, 128)';
+const LOADING_STATUS = 'Loading documentation.';
+const LOAD_STATUSES: Record<LoadOutcome, string> = {
+  loaded: 'Documentation loaded.',
+  notFound: 'No documentation found.',
+  failed: 'Documentation could not be loaded.',
+};
 
 const OVERLAY_STYLE: CSSProperties = {
   position: 'fixed',
@@ -97,6 +120,17 @@ const DETAILS_STYLE: CSSProperties = {
   overflowWrap: 'anywhere',
 };
 
+const DETAILS_FOCUS_STYLE: CSSProperties = {
+  ...DETAILS_STYLE,
+  outline: '2px solid rgb(0, 80, 160)',
+  outlineOffset: '1px',
+};
+
+const STATUS_STYLE: CSSProperties = {
+  fontSize: '0.875rem',
+  overflowWrap: 'anywhere',
+};
+
 const BUTTON_ROW_STYLE: CSSProperties = {
   display: 'flex',
   flexWrap: 'wrap',
@@ -104,12 +138,34 @@ const BUTTON_ROW_STYLE: CSSProperties = {
   gap: '0.5rem',
 };
 
-const BUTTON_STYLE: CSSProperties = {
-  minInlineSize: '5rem',
-  paddingBlock: '0.25rem',
-  paddingInline: '0.75rem',
-  overflowWrap: 'anywhere',
-};
+/** Returns the status text while `fileName` is being downloaded. */
+function downloadingStatus(fileName: string): string {
+  return `Downloading ${fileName}.`;
+}
+
+/** Returns the status text once `fileName` has been fetched and saved. */
+function downloadedStatus(fileName: string): string {
+  return `${fileName} downloaded.`;
+}
+
+/** Returns the status text when the download of `fileName` answers 404. */
+function downloadNotFoundStatus(fileName: string): string {
+  return `${fileName} was not found.`;
+}
+
+/** Returns the status text when the download of `fileName` fails in any other way. */
+function downloadFailedStatus(fileName: string): string {
+  return `${fileName} could not be downloaded.`;
+}
+
+/** Returns whether `element` matches `:focus-visible`, and `true` when the selector throws. */
+function matchesFocusVisible(element: Element): boolean {
+  try {
+    return element.matches(':focus-visible');
+  } catch {
+    return true;
+  }
+}
 
 /** Returns the path of GET /api/app/admin/documentation/{type}/{id}. */
 function documentationPath(entityType: string, id: number): string {
@@ -152,19 +208,30 @@ function saveBlob(blob: Blob, fileName: string): void {
  * "Document as Text" and as unrendered Rich Text Format source under "Document as RTF".
  *
  * On mount, and whenever `entityType` or `id` changes, both blocks are emptied and the documentation is read from
- * GET /api/app/admin/documentation/{type}/{id}. A 404 leaves both blocks empty; an `ErrorOutcomeError` is shown in a
- * message box, an `UnauthorizedError` shows nothing, and any other error rejects unhandled. Once the
- * documentation is loaded, a button captioned `<name>.rtf` downloads GET .../{type}/{id}/rtf as `<name>.rtf`, with
- * the same error handling. The Close button and Escape call `onClose`.
+ * GET /api/app/admin/documentation/{type}/{id}; the blocks stay empty and the container of the two sections has
+ * `aria-busy="true"` until that request answers, and an answer to an earlier request is ignored. A 404 leaves both
+ * blocks empty; an `ErrorOutcomeError` is shown in a message box, an `UnauthorizedError` shows nothing, and any other
+ * error rejects unhandled. Once the documentation is loaded, a button captioned `<name>.rtf` downloads
+ * GET .../{type}/{id}/rtf as `<name>.rtf`, with the same error handling. While a download is outstanding the button
+ * has `aria-disabled="true"` and ignores clicks; a change of `entityType` or `id`, or unmounting, ends that wait
+ * without cancelling the request. The Close button and Escape call `onClose`.
+ *
+ * A polite status line reports the documentation request as loading, loaded, not found or failed, and then each
+ * download as in progress, downloaded, not found or failed; it is empty on the first render.
  *
  * The Close button is focused on mount, Tab and Shift+Tab wrap within the dialog, and the element focused before the
- * dialog opened gets the focus back when the dialog closes and nothing else has taken it.
+ * dialog opened gets the focus back when the dialog closes and nothing else has taken it. A block focused with
+ * `:focus-visible`, checked again on every key release in it, has a 2px rgb(0, 80, 160) outline.
  */
 export function DocumentationDetailsDialog(props: DocumentationDetailsDialogProps): ReactElement {
   const { entityType, id, onClose } = props;
   const path = documentationPath(entityType, id);
   const { element: messageBox, showError } = useMessageBox();
   const [loaded, setLoaded] = useState<LoadedDetails | null>(null);
+  const [download, setDownload] = useState<DownloadState | null>(null);
+  const [statusShown, setStatusShown] = useState(false);
+  const [focusVisibleBlock, setFocusVisibleBlock] = useState<DocumentationBlock | null>(null);
+  const activeDownloadRef = useRef<object | null>(null);
   const panelRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const textHeadingId = useId();
@@ -172,19 +239,21 @@ export function DocumentationDetailsDialog(props: DocumentationDetailsDialogProp
 
   useEffect(() => {
     let active = true;
+    setLoaded(null);
 
     api.get<DocumentationDetailsResponse>(path).then(
       (response) => {
         if (active) {
-          setLoaded({ path, details: response });
+          setLoaded({ path, outcome: 'loaded', details: response });
         }
       },
       (error: unknown) => {
         if (!active) {
           return undefined;
         }
-        setLoaded({ path, details: null });
-        return isNotFound(error) ? undefined : showError(error);
+        const notFound = isNotFound(error);
+        setLoaded({ path, outcome: notFound ? 'notFound' : 'failed', details: null });
+        return notFound ? undefined : showError(error);
       },
     );
 
@@ -192,6 +261,18 @@ export function DocumentationDetailsDialog(props: DocumentationDetailsDialogProp
       active = false;
     };
   }, [path, showError]);
+
+  useEffect(() => {
+    setDownload(null);
+
+    return () => {
+      activeDownloadRef.current = null;
+    };
+  }, [path]);
+
+  useEffect(() => {
+    setStatusShown(true);
+  }, []);
 
   useEffect(() => {
     const previous = document.activeElement;
@@ -211,6 +292,13 @@ export function DocumentationDetailsDialog(props: DocumentationDetailsDialogProp
   const isCurrent = loaded !== null && loaded.path === path;
   const details = isCurrent ? loaded.details : null;
   const fileName = details === null ? '' : `${details.name}${RTF_EXTENSION}`;
+  const currentDownload = download !== null && download.path === path ? download : null;
+  const downloadPending = currentDownload !== null && currentDownload.pending;
+
+  let status = LOADING_STATUS;
+  if (isCurrent) {
+    status = currentDownload === null ? LOAD_STATUSES[loaded.outcome] : currentDownload.status;
+  }
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>): void => {
     if (event.key === 'Escape') {
@@ -247,14 +335,43 @@ export function DocumentationDetailsDialog(props: DocumentationDetailsDialogProp
     }
   };
 
+  const updateFocusVisibleBlock = (
+    event: FocusEvent<HTMLPreElement> | KeyboardEvent<HTMLPreElement>,
+    block: DocumentationBlock,
+  ): void => {
+    setFocusVisibleBlock(matchesFocusVisible(event.currentTarget) ? block : null);
+  };
+
   const handleDownload = async (downloadName: string): Promise<void> => {
+    if (activeDownloadRef.current !== null) {
+      return;
+    }
+
+    const token = {};
+    activeDownloadRef.current = token;
+    setDownload({ path, pending: true, status: downloadingStatus(downloadName) });
+
+    let outcome = downloadedStatus(downloadName);
+    let failure: { error: unknown } | null = null;
     try {
       const blob = await api.blob(`${path}/rtf`);
       saveBlob(blob, downloadName);
     } catch (error: unknown) {
-      if (!isNotFound(error)) {
-        await showError(error);
+      if (isNotFound(error)) {
+        outcome = downloadNotFoundStatus(downloadName);
+      } else {
+        outcome = downloadFailedStatus(downloadName);
+        failure = { error };
       }
+    } finally {
+      if (activeDownloadRef.current === token) {
+        activeDownloadRef.current = null;
+        setDownload({ path, pending: false, status: outcome });
+      }
+    }
+
+    if (failure !== null) {
+      await showError(failure.error);
     }
   };
 
@@ -265,18 +382,23 @@ export function DocumentationDetailsDialog(props: DocumentationDetailsDialogProp
         role="dialog"
         aria-modal="true"
         aria-label={DIALOG_CAPTION}
-        aria-busy={!isCurrent}
         tabIndex={-1}
         style={PANEL_STYLE}
         onKeyDown={handleKeyDown}
       >
         <h2 style={TITLE_STYLE}>{DIALOG_CAPTION}</h2>
-        <div style={SECTIONS_STYLE}>
+        <div aria-busy={!isCurrent} style={SECTIONS_STYLE}>
           <section aria-labelledby={textHeadingId} style={SECTION_STYLE}>
             <h3 id={textHeadingId} style={SECTION_HEADING_STYLE}>
               {TEXT_CAPTION}
             </h3>
-            <pre tabIndex={0} style={DETAILS_STYLE}>
+            <pre
+              tabIndex={0}
+              style={focusVisibleBlock === 'text' ? DETAILS_FOCUS_STYLE : DETAILS_STYLE}
+              onFocus={(event) => updateFocusVisibleBlock(event, 'text')}
+              onKeyUp={(event) => updateFocusVisibleBlock(event, 'text')}
+              onBlur={() => setFocusVisibleBlock(null)}
+            >
               {details === null ? '' : details.text}
             </pre>
           </section>
@@ -284,20 +406,29 @@ export function DocumentationDetailsDialog(props: DocumentationDetailsDialogProp
             <h3 id={rtfHeadingId} style={SECTION_HEADING_STYLE}>
               {RTF_CAPTION}
             </h3>
-            <pre tabIndex={0} style={DETAILS_STYLE}>
+            <pre
+              tabIndex={0}
+              style={focusVisibleBlock === 'rtf' ? DETAILS_FOCUS_STYLE : DETAILS_STYLE}
+              onFocus={(event) => updateFocusVisibleBlock(event, 'rtf')}
+              onKeyUp={(event) => updateFocusVisibleBlock(event, 'rtf')}
+              onBlur={() => setFocusVisibleBlock(null)}
+            >
               {details === null ? '' : details.rtf}
             </pre>
           </section>
         </div>
+        <div role="status" style={STATUS_STYLE}>
+          {statusShown ? status : ''}
+        </div>
         <div style={BUTTON_ROW_STYLE}>
           {details !== null && (
-            <button type="button" style={BUTTON_STYLE} onClick={() => void handleDownload(fileName)}>
+            <DialogButton aria-disabled={downloadPending} onClick={() => void handleDownload(fileName)}>
               {fileName}
-            </button>
+            </DialogButton>
           )}
-          <button ref={closeButtonRef} type="button" style={BUTTON_STYLE} onClick={() => onClose()}>
+          <DialogButton ref={closeButtonRef} onClick={() => onClose()}>
             {CLOSE_CAPTION}
-          </button>
+          </DialogButton>
         </div>
       </div>
       {messageBox}

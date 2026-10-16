@@ -1,5 +1,13 @@
-import { useCallback, useEffect, useId, useRef, useState } from 'react';
-import type { CSSProperties, KeyboardEvent, MouseEvent, ReactElement, SyntheticEvent } from 'react';
+import { forwardRef, useCallback, useEffect, useId, useRef, useState } from 'react';
+import type {
+  CSSProperties,
+  FocusEvent,
+  KeyboardEvent,
+  MouseEvent,
+  ReactElement,
+  ReactNode,
+  SyntheticEvent,
+} from 'react';
 import { createPortal } from 'react-dom';
 import type { ErrorOutcome } from '../api/types';
 import { ErrorOutcomeError, UnauthorizedError } from '../api/client';
@@ -127,15 +135,139 @@ const MESSAGE_STYLE: CSSProperties = {
 
 const BUTTON_ROW_STYLE: CSSProperties = {
   display: 'flex',
+  flexWrap: 'wrap',
   justifyContent: 'flex-end',
   gap: '0.5rem',
 };
+
+const BUTTON_ACTIVE_BORDER_COLOR = 'rgb(0, 80, 160)';
 
 const BUTTON_STYLE: CSSProperties = {
   minInlineSize: '5rem',
   paddingBlock: '0.25rem',
   paddingInline: '0.75rem',
+  overflowWrap: 'anywhere',
+  borderWidth: '1px',
+  borderStyle: 'solid',
+  borderColor: 'rgb(128, 128, 128)',
+  borderRadius: '2px',
+  backgroundColor: 'rgb(240, 240, 240)',
+  color: 'black',
+  cursor: 'pointer',
 };
+
+const BUTTON_HOVER_STYLE: CSSProperties = {
+  ...BUTTON_STYLE,
+  borderColor: BUTTON_ACTIVE_BORDER_COLOR,
+  backgroundColor: 'rgb(229, 241, 251)',
+};
+
+const BUTTON_PRESSED_STYLE: CSSProperties = {
+  ...BUTTON_STYLE,
+  borderColor: BUTTON_ACTIVE_BORDER_COLOR,
+  backgroundColor: 'rgb(204, 228, 247)',
+};
+
+const BUTTON_DISABLED_STYLE: CSSProperties = {
+  ...BUTTON_STYLE,
+  borderColor: 'rgb(191, 191, 191)',
+  color: 'rgb(109, 109, 109)',
+  cursor: 'default',
+};
+
+const BUTTON_FOCUS_STYLE: CSSProperties = {
+  outline: '2px solid rgb(0, 80, 160)',
+  outlineOffset: '1px',
+};
+
+/** Returns whether `element` matches `:focus-visible`, and `true` when the selector throws. */
+function matchesFocusVisible(element: Element): boolean {
+  try {
+    return element.matches(':focus-visible');
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Returns the style of a {@link DialogButton}: the disabled, pressed, hovered or base appearance, in that order of
+ * precedence, with the focus outline added when `focusVisible` is true.
+ */
+function dialogButtonStyle(
+  disabled: boolean,
+  pressed: boolean,
+  hovered: boolean,
+  focusVisible: boolean,
+): CSSProperties {
+  let style = BUTTON_STYLE;
+  if (disabled) {
+    style = BUTTON_DISABLED_STYLE;
+  } else if (pressed) {
+    style = BUTTON_PRESSED_STYLE;
+  } else if (hovered) {
+    style = BUTTON_HOVER_STYLE;
+  }
+  return focusVisible ? { ...style, ...BUTTON_FOCUS_STYLE } : style;
+}
+
+/** Properties of {@link DialogButton}. */
+export interface DialogButtonProps {
+  /** Caption of the button. */
+  children: ReactNode;
+  /** Called when the button is clicked while `aria-disabled` is not true. */
+  onClick: () => void;
+  /** When true, the button keeps its tab stop, ignores clicks and shows its disabled appearance. */
+  'aria-disabled'?: boolean;
+}
+
+/**
+ * Push button of the message boxes and dialogs, of type `button`. A click calls `onClick` unless `aria-disabled` is
+ * true. The button has a rgb(240, 240, 240) background, black text and a 1px rgb(128, 128, 128) border; while the
+ * pointer is over it the background is rgb(229, 241, 251) and the border rgb(0, 80, 160), and while the primary mouse
+ * button is held on it the background is rgb(204, 228, 247). Focused with `:focus-visible`, which is checked again on
+ * every key release, it has a 2px rgb(0, 80, 160) outline 1px outside its border. With `aria-disabled` true it shows
+ * rgb(109, 109, 109) text, a rgb(191, 191, 191) border and no hover or pressed state.
+ */
+export const DialogButton = forwardRef<HTMLButtonElement, DialogButtonProps>(function DialogButton(props, ref) {
+  const { children, onClick, 'aria-disabled': disabled = false } = props;
+  const [hovered, setHovered] = useState(false);
+  const [pressed, setPressed] = useState(false);
+  const [focusVisible, setFocusVisible] = useState(false);
+
+  const updateFocusVisible = (event: FocusEvent<HTMLButtonElement> | KeyboardEvent<HTMLButtonElement>): void => {
+    setFocusVisible(matchesFocusVisible(event.currentTarget));
+  };
+
+  return (
+    <button
+      ref={ref}
+      type="button"
+      aria-disabled={disabled ? 'true' : undefined}
+      style={dialogButtonStyle(disabled, pressed, hovered, focusVisible)}
+      onClick={() => {
+        if (!disabled) {
+          onClick();
+        }
+      }}
+      onMouseEnter={() => setHovered(true)}
+      onMouseLeave={() => {
+        setHovered(false);
+        setPressed(false);
+      }}
+      onMouseDown={(event: MouseEvent<HTMLButtonElement>) => {
+        if (event.button === 0) {
+          setPressed(true);
+        }
+      }}
+      onMouseUp={() => setPressed(false)}
+      onFocus={updateFocusVisible}
+      onKeyUp={updateFocusVisible}
+      onBlur={() => setFocusVisible(false)}
+    >
+      {children}
+    </button>
+  );
+});
 
 function stopPropagation(event: SyntheticEvent): void {
   event.stopPropagation();
@@ -254,15 +386,13 @@ export function MessageBox(
         </div>
         <div style={BUTTON_ROW_STYLE}>
           {results.map((result, index) => (
-            <button
+            <DialogButton
               key={result}
               ref={index === 0 ? firstButtonRef : undefined}
-              type="button"
-              style={BUTTON_STYLE}
               onClick={() => onClose(result)}
             >
               {BUTTON_CAPTIONS[result]}
-            </button>
+            </DialogButton>
           ))}
         </div>
       </div>
