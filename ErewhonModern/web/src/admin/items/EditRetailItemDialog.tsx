@@ -339,16 +339,19 @@ const SIDE_COLUMN_STYLE: CSSProperties = {
 
 const KIND_GROUP_STYLE: CSSProperties = {
   ...FIELDSET_STYLE,
-  display: 'flex',
-  flexDirection: 'column',
-  gap: GAP,
-};
-
-const KIND_FIELD_STYLE: CSSProperties = {
   display: 'grid',
   gridTemplateColumns: `${LABEL_COLUMN} minmax(0, 6.9375rem)`,
   alignItems: 'center',
   columnGap: GAP,
+  rowGap: GAP,
+};
+
+/** One kind-specific field: a row of the kind group's grid, its label and input in the group's two columns. */
+const KIND_FIELD_STYLE: CSSProperties = {
+  display: 'grid',
+  gridColumn: '1 / -1',
+  gridTemplateColumns: 'subgrid',
+  alignItems: 'center',
 };
 
 const LABEL_STYLE: CSSProperties = {
