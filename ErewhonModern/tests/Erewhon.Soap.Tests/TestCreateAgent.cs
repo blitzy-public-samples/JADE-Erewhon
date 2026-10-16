@@ -1,9 +1,12 @@
 using System.ServiceModel;
+using Erewhon.Application.Abstractions;
 using Erewhon.Application.Common;
 using Erewhon.Application.Domain;
 using Erewhon.Application.Messages;
+using Erewhon.Application.Services;
 using Erewhon.SoapClient.Admin;
 using Erewhon.Testing;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Erewhon.Soap.Tests;
 
@@ -78,7 +81,7 @@ public sealed class TestCreateAgent : ErewhonTestBase
         DTOResult result = await Client.createAgentAsync(
             agentName, AgentStreet, AgentCity, AgentCountry, AgentPhone, AgentFax, AgentEmail, AgentWebsite);
 
-        // Assert
+        // Verify
         Assert.Equal(expectedError, result.statusCode);
         Assert.Equal(expectedErrorCount, result.allErrors?.Length ?? 0);
 
@@ -88,7 +91,8 @@ public sealed class TestCreateAgent : ErewhonTestBase
     }
 
     /// <summary>
-    /// <c>createAgent</c> with a new name and a valid address answers 201 with the new agent's GUID and no errors.
+    /// <c>createAgent</c> with a new name and a valid address answers 201 with the new agent's GUID and no errors. The
+    /// test's company then holds an agent with that name, the seven submitted address fields and the returned GUID.
     /// </summary>
     /// <returns>A task that completes when the test has run.</returns>
     [Fact]
@@ -101,11 +105,41 @@ public sealed class TestCreateAgent : ErewhonTestBase
         DTOResult result = await Client.createAgentAsync(
             agentName, AgentStreet, AgentCity, AgentCountry, AgentPhone, AgentFax, AgentEmail, AgentWebsite);
 
-        // Assert
+        // Verify
         Assert.NotNull(result);
         Assert.False(JadeValues.IsNull(result.guid));
         Assert.Equal(0, result.allErrors?.Length ?? 0);
         Assert.Equal(expectedStatus, result.statusCode);
+
+        Agent? agent = await FindAgentAsync(agentName);
+        Assert.NotNull(agent);
+        Assert.Equal(agentName, agent.Name);
+        Assert.Equal(AgentStreet, agent.Address.Street);
+        Assert.Equal(AgentCity, agent.Address.City);
+        Assert.Equal(AgentCountry, agent.Address.Country);
+        Assert.Equal(AgentPhone, agent.Address.Phone);
+        Assert.Equal(AgentFax, agent.Address.Fax);
+        Assert.Equal(AgentEmail, agent.Address.Email);
+        Assert.Equal(AgentWebsite, agent.Address.WebSite);
+        Assert.Equal(result.guid, agent.Guid);
+    }
+
+    /// <summary>
+    /// Returns the agent of the test's company named <paramref name="name"/>, with its address, read in a new scope of
+    /// <see cref="ErewhonTestBase.Api"/>; <see langword="null"/> when the company holds no such agent.
+    /// </summary>
+    /// <param name="name">The agent name, used as given.</param>
+    /// <returns>The stored agent, or <see langword="null"/>.</returns>
+    /// <exception cref="InvalidOperationException">The test's company was not created.</exception>
+    private async Task<Agent?> FindAgentAsync(string name)
+    {
+        long companyId = Builder.MyCompany?.Id
+            ?? throw new InvalidOperationException("The test company has not been created.");
+
+        await using AsyncServiceScope scope = Api.Services.CreateAsyncScope();
+        scope.ServiceProvider.GetRequiredService<ICompanyContext>().Bind(companyId);
+
+        return await scope.ServiceProvider.GetRequiredService<AgentService>().FindByNameAsync(name);
     }
 
     /// <summary>

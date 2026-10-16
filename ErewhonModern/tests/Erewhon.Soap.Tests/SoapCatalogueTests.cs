@@ -7,6 +7,7 @@ using Erewhon.Application.Messages;
 using Erewhon.Application.Services;
 using Erewhon.Testing;
 using Microsoft.Extensions.DependencyInjection;
+using Npgsql;
 using Admin = Erewhon.SoapClient.Admin;
 using WebService = Erewhon.SoapClient.WebService;
 
@@ -14,11 +15,12 @@ namespace Erewhon.Soap.Tests;
 
 /// <summary>
 /// The SOAP behaviour-catalogue entries, and parts of entries, that no JADE SOAP test pins, run over the real
-/// <c>ErewhonWebService</c> and <c>ErewhonWebServiceAdmin</c> endpoints through the generated clients: B-51, the status
-/// constants and the absence of status 403 from every reachable operation outcome; the SOAP cases of B-22, error 1035
-/// for a street longer than its 51 characters; and B-47 with Q-13, the photo <c>getPhoto</c> returns among a client's
-/// sales, that of the last retail sale whose item has a photo. Each test starts from
-/// <see cref="TestCompanyBuilder.CreateTestDataAsync"/>.
+/// <c>ErewhonWebService</c> and <c>ErewhonWebServiceAdmin</c> endpoints through the generated clients: B-50, status
+/// 500 with <c>$CouldNotDeleteAgent</c> or <c>$CouldNotDeleteClient</c> when <c>deleteAgent</c> or
+/// <c>deleteClient</c> cannot take the company's agent or client lock; B-51, the status constants and the absence of
+/// status 403 from every reachable operation outcome; the SOAP cases of B-22, error 1035 for a street longer than its
+/// 51 characters; and B-47 with Q-13, the photo <c>getPhoto</c> returns among a client's sales, that of the last
+/// retail sale whose item has a photo. Each test starts from <see cref="TestCompanyBuilder.CreateTestDataAsync"/>.
 /// </summary>
 public sealed class SoapCatalogueTests : ErewhonTestBase
 {
@@ -31,7 +33,37 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
     private const string NewClientName = "Dariush Kamran";
     private const string PhotoClientName = "Aroha Ngata";
     private const string StringTooLongFault = "String too long (1035)";
+    private const string NoStoredGuid = "(no stored GUID)";
+    private const string LockTimeoutKey = "Erewhon:Locks:TimeoutMs";
+    private const string ShortLockWaitMs = "500";
     private const int OverLongStreetLength = 60;
+
+    private static readonly SoapAddress FixtureAgentAddress = new(
+        FixtureStreet,
+        "City",
+        "Country",
+        "Phone",
+        "Fax",
+        "agent@email.com",
+        "www.website.com");
+
+    private static readonly SoapAddress FixtureClientAddress = new(
+        FixtureStreet,
+        "City",
+        "Country",
+        "Phone",
+        "Fax",
+        "client@email.com",
+        "www.website.com");
+
+    private static readonly SoapAddress ShaldonAddress = new(
+        "238 Ness Drive",
+        "Shaldon",
+        "United Kingdon",
+        "01626 873480",
+        "01626 476764",
+        "tabai@shaldon.uk",
+        "www.shaldon.uk");
 
     private static readonly SoapAddress TamilNaduAddress = new(
         "1, TVS School Road",
@@ -80,7 +112,13 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
     /// below is 403: <c>updateAgent</c>, <c>updateAgentWithDTO</c>, <c>updateClient</c> and <c>updateClientWithDTO</c>
     /// for an unknown name (404), a valid address (200) and an empty street (400); <c>createAgent</c> and
     /// <c>createClient</c> for an existing name (409), a new name (201) and an empty name (400); <c>deleteAgent</c>
-    /// and <c>deleteClient</c> for an unknown name (404) and the name created before (200).
+    /// and <c>deleteClient</c> for an unknown name (404) and the name created before (200). Each outcome also carries
+    /// its GUID: the fixture agent's or client's GUID for a 200 update, the GUID stored for the new row for a 201
+    /// create, and none for every other outcome. After each call the company's stored agents (agent operations) or
+    /// clients (client operations), read in a new scope, hold the expected names, seven address values and GUIDs: a
+    /// 200 update stores the sent address under the unchanged name and GUID, a 201 create adds a row with the sent name
+    /// and address and the returned GUID, a 200 delete removes the row, and every other outcome leaves the rows as the
+    /// previous call left them.
     /// </summary>
     /// <returns>A task that completes when the sweep has run.</returns>
     [Fact]
@@ -95,7 +133,28 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
         Assert.Equal(201, SoapStatusCodes.StatusCreated);
         Assert.Equal(200, SoapStatusCodes.StatusSuccess);
 
-        SoapAddress emptyStreet = TamilNaduAddress with { Street = string.Empty };
+        var fixtureAgent = Builder.MyAgent;
+        var fixtureClient = Builder.MyClient;
+        Assert.NotNull(fixtureAgent);
+        Assert.NotNull(fixtureClient);
+        Assert.False(JadeValues.IsNull(fixtureAgent.Guid));
+        Assert.False(JadeValues.IsNull(fixtureClient.Guid));
+
+        string agentGuid = fixtureAgent.Guid;
+        string clientGuid = fixtureClient.Guid;
+        var agentAtFixture = new StoredParty(FixtureAgentName, FixtureAgentAddress, agentGuid);
+        StoredParty agentAtTamilNadu = agentAtFixture with { Address = TamilNaduAddress };
+        StoredParty agentAtShaldon = agentAtFixture with { Address = ShaldonAddress };
+        var clientAtFixture = new StoredParty(FixtureClientName, FixtureClientAddress, clientGuid);
+        StoredParty clientAtTamilNadu = clientAtFixture with { Address = TamilNaduAddress };
+        StoredParty clientAtShaldon = clientAtFixture with { Address = ShaldonAddress };
+
+        string? createdAgentGuid = null;
+        string? createdClientGuid = null;
+        StoredParty CreatedAgent() => new(NewAgentName, FunchalAddress, createdAgentGuid);
+        StoredParty CreatedClient() => new(NewClientName, MashhadAddress, createdClientGuid);
+
+        SoapAddress emptyStreet = FunchalAddress with { Street = string.Empty };
         string streetRequired = MessageCatalog.Get(MessageKeys.AddressStreetRequired);
 
         SweepStep[] steps =
@@ -103,104 +162,193 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
             new("updateAgent: unknown agent",
                 SoapStatusCodes.ErrorNotFound,
                 [MessageCatalog.Get(MessageKeys.AgentNameNotFound, UnknownAgentName)],
-                async () => Read(await UpdateAgentAsync(UnknownAgentName, TamilNaduAddress))),
+                async () => Read(await UpdateAgentAsync(UnknownAgentName, TamilNaduAddress)),
+                ReadStoredAgentsAsync,
+                _ => null,
+                () => [agentAtFixture]),
             new("updateAgent: valid address",
                 SoapStatusCodes.StatusSuccess,
                 [],
-                async () => Read(await UpdateAgentAsync(FixtureAgentName, TamilNaduAddress))),
+                async () => Read(await UpdateAgentAsync(FixtureAgentName, TamilNaduAddress)),
+                ReadStoredAgentsAsync,
+                _ => agentGuid,
+                () => [agentAtTamilNadu]),
             new("updateAgent: empty street",
                 SoapStatusCodes.ErrorBadRequest,
                 [streetRequired],
-                async () => Read(await UpdateAgentAsync(FixtureAgentName, emptyStreet))),
+                async () => Read(await UpdateAgentAsync(FixtureAgentName, emptyStreet)),
+                ReadStoredAgentsAsync,
+                _ => null,
+                () => [agentAtTamilNadu]),
             new("updateAgentWithDTO: unknown agent",
                 SoapStatusCodes.ErrorNotFound,
                 [MessageCatalog.Get(MessageKeys.AgentNameNotFound, UnknownAgentName)],
-                async () => Read(await WebClient.updateAgentWithDTOAsync(AgentDto(UnknownAgentName, TamilNaduAddress)))),
+                async () => Read(await WebClient.updateAgentWithDTOAsync(AgentDto(UnknownAgentName, TamilNaduAddress))),
+                ReadStoredAgentsAsync,
+                _ => null,
+                () => [agentAtTamilNadu]),
             new("updateAgentWithDTO: valid address",
                 SoapStatusCodes.StatusSuccess,
                 [],
-                async () => Read(await WebClient.updateAgentWithDTOAsync(AgentDto(FixtureAgentName, TamilNaduAddress)))),
+                async () => Read(await WebClient.updateAgentWithDTOAsync(AgentDto(FixtureAgentName, ShaldonAddress))),
+                ReadStoredAgentsAsync,
+                _ => agentGuid,
+                () => [agentAtShaldon]),
             new("updateAgentWithDTO: empty street",
                 SoapStatusCodes.ErrorBadRequest,
                 [streetRequired],
-                async () => Read(await WebClient.updateAgentWithDTOAsync(AgentDto(FixtureAgentName, emptyStreet)))),
+                async () => Read(await WebClient.updateAgentWithDTOAsync(AgentDto(FixtureAgentName, emptyStreet))),
+                ReadStoredAgentsAsync,
+                _ => null,
+                () => [agentAtShaldon]),
             new("updateClient: unknown client",
                 SoapStatusCodes.ErrorNotFound,
                 [MessageCatalog.Get(MessageKeys.ClientNameNotFound, UnknownClientName)],
-                async () => Read(await UpdateClientAsync(UnknownClientName, TamilNaduAddress))),
+                async () => Read(await UpdateClientAsync(UnknownClientName, TamilNaduAddress)),
+                ReadStoredClientsAsync,
+                _ => null,
+                () => [clientAtFixture]),
             new("updateClient: valid address",
                 SoapStatusCodes.StatusSuccess,
                 [],
-                async () => Read(await UpdateClientAsync(FixtureClientName, TamilNaduAddress))),
+                async () => Read(await UpdateClientAsync(FixtureClientName, TamilNaduAddress)),
+                ReadStoredClientsAsync,
+                _ => clientGuid,
+                () => [clientAtTamilNadu]),
             new("updateClient: empty street",
                 SoapStatusCodes.ErrorBadRequest,
                 [streetRequired],
-                async () => Read(await UpdateClientAsync(FixtureClientName, emptyStreet))),
+                async () => Read(await UpdateClientAsync(FixtureClientName, emptyStreet)),
+                ReadStoredClientsAsync,
+                _ => null,
+                () => [clientAtTamilNadu]),
             new("updateClientWithDTO: unknown client",
                 SoapStatusCodes.ErrorNotFound,
                 [MessageCatalog.Get(MessageKeys.ClientNameNotFound, UnknownClientName)],
-                async () => Read(await WebClient.updateClientWithDTOAsync(ClientDto(UnknownClientName, TamilNaduAddress)))),
+                async () => Read(await WebClient.updateClientWithDTOAsync(ClientDto(UnknownClientName, TamilNaduAddress))),
+                ReadStoredClientsAsync,
+                _ => null,
+                () => [clientAtTamilNadu]),
             new("updateClientWithDTO: valid address",
                 SoapStatusCodes.StatusSuccess,
                 [],
-                async () => Read(await WebClient.updateClientWithDTOAsync(ClientDto(FixtureClientName, TamilNaduAddress)))),
+                async () => Read(await WebClient.updateClientWithDTOAsync(ClientDto(FixtureClientName, ShaldonAddress))),
+                ReadStoredClientsAsync,
+                _ => clientGuid,
+                () => [clientAtShaldon]),
             new("updateClientWithDTO: empty street",
                 SoapStatusCodes.ErrorBadRequest,
                 [streetRequired],
-                async () => Read(await WebClient.updateClientWithDTOAsync(ClientDto(FixtureClientName, emptyStreet)))),
+                async () => Read(await WebClient.updateClientWithDTOAsync(ClientDto(FixtureClientName, emptyStreet))),
+                ReadStoredClientsAsync,
+                _ => null,
+                () => [clientAtShaldon]),
             new("createAgent: existing agent",
                 SoapStatusCodes.ErrorConflict,
                 [MessageCatalog.Get(MessageKeys.AgentNameAlreadyExists, FixtureAgentName)],
-                async () => Read(await CreateAgentAsync(FixtureAgentName, FunchalAddress))),
+                async () => Read(await CreateAgentAsync(FixtureAgentName, FunchalAddress)),
+                ReadStoredAgentsAsync,
+                _ => null,
+                () => [agentAtShaldon]),
             new("createAgent: new agent",
                 SoapStatusCodes.StatusCreated,
                 [],
-                async () => Read(await CreateAgentAsync(NewAgentName, FunchalAddress))),
+                async () =>
+                {
+                    DtoOutcome outcome = Read(await CreateAgentAsync(NewAgentName, FunchalAddress));
+                    createdAgentGuid = outcome.Guid;
+                    return outcome;
+                },
+                ReadStoredAgentsAsync,
+                stored => StoredGuidOf(stored, NewAgentName),
+                () => [CreatedAgent(), agentAtShaldon]),
             new("createAgent: empty name",
                 SoapStatusCodes.ErrorBadRequest,
                 [MessageCatalog.Get(MessageKeys.AgentNameRequired)],
-                async () => Read(await CreateAgentAsync(string.Empty, FunchalAddress))),
+                async () => Read(await CreateAgentAsync(string.Empty, FunchalAddress)),
+                ReadStoredAgentsAsync,
+                _ => null,
+                () => [CreatedAgent(), agentAtShaldon]),
             new("createClient: existing client",
                 SoapStatusCodes.ErrorConflict,
                 [MessageCatalog.Get(MessageKeys.ClientNameAlreadyExists, FixtureClientName)],
-                async () => Read(await CreateClientAsync(FixtureClientName, MashhadAddress))),
+                async () => Read(await CreateClientAsync(FixtureClientName, MashhadAddress)),
+                ReadStoredClientsAsync,
+                _ => null,
+                () => [clientAtShaldon]),
             new("createClient: new client",
                 SoapStatusCodes.StatusCreated,
                 [],
-                async () => Read(await CreateClientAsync(NewClientName, MashhadAddress))),
+                async () =>
+                {
+                    DtoOutcome outcome = Read(await CreateClientAsync(NewClientName, MashhadAddress));
+                    createdClientGuid = outcome.Guid;
+                    return outcome;
+                },
+                ReadStoredClientsAsync,
+                stored => StoredGuidOf(stored, NewClientName),
+                () => [CreatedClient(), clientAtShaldon]),
             new("createClient: empty name",
                 SoapStatusCodes.ErrorBadRequest,
                 [MessageCatalog.Get(MessageKeys.ClientNameRequired)],
-                async () => Read(await CreateClientAsync(string.Empty, MashhadAddress))),
+                async () => Read(await CreateClientAsync(string.Empty, MashhadAddress)),
+                ReadStoredClientsAsync,
+                _ => null,
+                () => [CreatedClient(), clientAtShaldon]),
             new("deleteAgent: unknown agent",
                 SoapStatusCodes.ErrorNotFound,
                 [MessageCatalog.Get(MessageKeys.AgentNameNotFound, UnknownAgentName)],
-                async () => Read(await AdminClient.deleteAgentAsync(UnknownAgentName))),
+                async () => Read(await AdminClient.deleteAgentAsync(UnknownAgentName)),
+                ReadStoredAgentsAsync,
+                _ => null,
+                () => [CreatedAgent(), agentAtShaldon]),
             new("deleteAgent: created agent",
                 SoapStatusCodes.StatusSuccess,
                 [],
-                async () => Read(await AdminClient.deleteAgentAsync(NewAgentName))),
+                async () => Read(await AdminClient.deleteAgentAsync(NewAgentName)),
+                ReadStoredAgentsAsync,
+                _ => null,
+                () => [agentAtShaldon]),
             new("deleteClient: unknown client",
                 SoapStatusCodes.ErrorNotFound,
                 [MessageCatalog.Get(MessageKeys.ClientNameNotFound, UnknownClientName)],
-                async () => Read(await AdminClient.deleteClientAsync(UnknownClientName))),
+                async () => Read(await AdminClient.deleteClientAsync(UnknownClientName)),
+                ReadStoredClientsAsync,
+                _ => null,
+                () => [CreatedClient(), clientAtShaldon]),
             new("deleteClient: created client",
                 SoapStatusCodes.StatusSuccess,
                 [],
-                async () => Read(await AdminClient.deleteClientAsync(NewClientName))),
+                async () => Read(await AdminClient.deleteClientAsync(NewClientName)),
+                ReadStoredClientsAsync,
+                _ => null,
+                () => [clientAtShaldon]),
         ];
 
+        var expected = new List<SweepOutcome>(steps.Length);
         var actual = new List<SweepOutcome>(steps.Length);
         foreach (SweepStep step in steps)
         {
             DtoOutcome outcome = await step.Call();
-            actual.Add(new SweepOutcome(step.Branch, outcome.StatusCode, JoinErrors(outcome.Errors)));
+            IReadOnlyList<StoredParty> stored = await step.ReadStored();
+
+            actual.Add(new SweepOutcome(
+                step.Branch,
+                outcome.StatusCode,
+                JoinErrors(outcome.Errors),
+                NormalizedGuid(outcome.Guid),
+                DescribeStored(stored)));
+            expected.Add(new SweepOutcome(
+                step.Branch,
+                step.ExpectedStatusCode,
+                JoinErrors(step.ExpectedErrors),
+                NormalizedGuid(step.ExpectedGuid(stored)),
+                DescribeStored(step.ExpectedStored())));
         }
 
-        // Each branch returns its expected status code and errors, in sweep order.
-        Assert.Equal(
-            steps.Select(step => new SweepOutcome(step.Branch, step.ExpectedStatusCode, JoinErrors(step.ExpectedErrors))),
-            actual);
+        // Each branch returns its expected status code, errors and GUID and leaves the expected stored rows,
+        // in sweep order.
+        Assert.Equal(expected, actual);
 
         // No reached branch returns 403.
         Assert.All(actual, outcome =>
@@ -208,6 +356,70 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
             Assert.NotEqual(SoapStatusCodes.ErrorUnauthorized, outcome.StatusCode);
             Assert.NotEqual(SoapStatusCodes.ErrorForbidden, outcome.StatusCode);
         });
+    }
+
+    /// <summary>
+    /// <c>deleteAgent</c> for the fixture agent "Test Agent", sent to an API whose <c>Erewhon:Locks:TimeoutMs</c> is
+    /// 500 while another database session holds the advisory lock <c>Company.allAgents:&lt;companyId&gt;</c>, returns
+    /// status 500, not 403, with the single error "Could not delete the Agent Test Agent" and no GUID; once the lock is
+    /// released the company's only stored agent is "Test Agent" with its fixture address and GUID.
+    /// </summary>
+    /// <returns>A task that completes when the result and the stored agents have been checked.</returns>
+    [Fact]
+    public async Task B50_DeleteAgentLockTimeoutIs500()
+    {
+        var company = Builder.MyCompany;
+        var fixtureAgent = Builder.MyAgent;
+        Assert.NotNull(company);
+        Assert.NotNull(fixtureAgent);
+
+        Admin.DTOResult result = await DeleteWhileLockHeldAsync(
+            LockNames.CompanyAllAgents(company.Id),
+            admin => admin.deleteAgentAsync(FixtureAgentName));
+
+        Assert.Equal(SoapStatusCodes.ErrorServerError, result.statusCode);
+        string error = Assert.Single(result.allErrors ?? []);
+        Assert.Equal(MessageCatalog.Get(MessageKeys.CouldNotDeleteAgent, FixtureAgentName), error);
+        Assert.Equal("Could not delete the Agent Test Agent", error);
+        Assert.True(JadeValues.IsNull(result.guid), $"Expected no GUID, got '{result.guid}'.");
+        Assert.NotEqual(SoapStatusCodes.ErrorUnauthorized, result.statusCode);
+        Assert.NotEqual(SoapStatusCodes.ErrorForbidden, result.statusCode);
+
+        Assert.Equal(
+            new[] { new StoredParty(FixtureAgentName, FixtureAgentAddress, fixtureAgent.Guid) },
+            await ReadStoredAgentsAsync());
+    }
+
+    /// <summary>
+    /// <c>deleteClient</c> for the fixture client "Test Client", sent to an API whose <c>Erewhon:Locks:TimeoutMs</c> is
+    /// 500 while another database session holds the advisory lock <c>Company.allClients:&lt;companyId&gt;</c>, returns
+    /// status 500, not 403, with the single error "Could not delete the Client Test Client" and no GUID; once the lock
+    /// is released the company's only stored client is "Test Client" with its fixture address and GUID.
+    /// </summary>
+    /// <returns>A task that completes when the result and the stored clients have been checked.</returns>
+    [Fact]
+    public async Task B50_DeleteClientLockTimeoutIs500()
+    {
+        var company = Builder.MyCompany;
+        var fixtureClient = Builder.MyClient;
+        Assert.NotNull(company);
+        Assert.NotNull(fixtureClient);
+
+        Admin.DTOResult result = await DeleteWhileLockHeldAsync(
+            LockNames.CompanyAllClients(company.Id),
+            admin => admin.deleteClientAsync(FixtureClientName));
+
+        Assert.Equal(SoapStatusCodes.ErrorServerError, result.statusCode);
+        string error = Assert.Single(result.allErrors ?? []);
+        Assert.Equal(MessageCatalog.Get(MessageKeys.CouldNotDeleteClient, FixtureClientName), error);
+        Assert.Equal("Could not delete the Client Test Client", error);
+        Assert.True(JadeValues.IsNull(result.guid), $"Expected no GUID, got '{result.guid}'.");
+        Assert.NotEqual(SoapStatusCodes.ErrorUnauthorized, result.statusCode);
+        Assert.NotEqual(SoapStatusCodes.ErrorForbidden, result.statusCode);
+
+        Assert.Equal(
+            new[] { new StoredParty(FixtureClientName, FixtureClientAddress, fixtureClient.Guid) },
+            await ReadStoredClientsAsync());
     }
 
     /// <summary>
@@ -263,7 +475,8 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
         Assert.Contains(StringTooLongFault, fault.Reason.ToString(), StringComparison.Ordinal);
 
         // The stored address is unchanged.
-        Assert.Equal(FixtureStreet, await ReadStoredAgentStreetAsync(agent.Name));
+        StoredParty stored = Assert.Single(await ReadStoredAgentsAsync(), party => party.Name == agent.Name);
+        Assert.Equal(FixtureStreet, stored.Address.Street);
     }
 
     /// <summary>
@@ -428,6 +641,24 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
         }
     }
 
+    /// <summary>
+    /// Releases the advisory lock <c>pg_advisory_unlock(hashtextextended(lockName, 0))</c> held by
+    /// <paramref name="holder"/>, then disposes the connection, also when the release fails.
+    /// </summary>
+    private static async Task ReleaseAdvisoryLockAsync(NpgsqlConnection holder, string lockName)
+    {
+        try
+        {
+            await using var release = new NpgsqlCommand("SELECT pg_advisory_unlock(hashtextextended(@name, 0))", holder);
+            release.Parameters.AddWithValue("name", lockName);
+            await release.ExecuteNonQueryAsync();
+        }
+        finally
+        {
+            await holder.DisposeAsync();
+        }
+    }
+
     /// <summary>Returns a street of 60 characters, longer than the 51 of <c>Address.street</c>.</summary>
     private static string OverLongStreet() => new('S', OverLongStreetLength);
 
@@ -459,14 +690,43 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
             website = address.Website,
         };
 
-    /// <summary>Returns the status code and errors of a web service result.</summary>
-    private static DtoOutcome Read(WebService.DTOResult result) => new(result.statusCode, result.allErrors ?? []);
+    /// <summary>Returns the status code, errors and GUID of a web service result.</summary>
+    private static DtoOutcome Read(WebService.DTOResult result) =>
+        new(result.statusCode, result.allErrors ?? [], result.guid);
 
-    /// <summary>Returns the status code and errors of an admin service result.</summary>
-    private static DtoOutcome Read(Admin.DTOResult result) => new(result.statusCode, result.allErrors ?? []);
+    /// <summary>Returns the status code, errors and GUID of an admin service result.</summary>
+    private static DtoOutcome Read(Admin.DTOResult result) =>
+        new(result.statusCode, result.allErrors ?? [], result.guid);
 
     /// <summary>Returns <paramref name="errors"/> in order, separated by <c> | </c>.</summary>
     private static string JoinErrors(IReadOnlyList<string> errors) => string.Join(" | ", errors);
+
+    /// <summary>
+    /// Returns <see langword="null"/> when <paramref name="guid"/> is JADE-null (null or empty), otherwise the GUID.
+    /// </summary>
+    private static string? NormalizedGuid(string? guid) => JadeValues.IsNull(guid) ? null : guid;
+
+    /// <summary>
+    /// Returns the GUID of the entry of <paramref name="stored"/> named <paramref name="name"/>, or
+    /// <see cref="NoStoredGuid"/> when there is no such entry or its GUID is JADE-null.
+    /// </summary>
+    private static string StoredGuidOf(IReadOnlyList<StoredParty> stored, string name) =>
+        stored.FirstOrDefault(party => party.Name == name)?.Guid is { } guid && !JadeValues.IsNull(guid)
+            ? guid
+            : NoStoredGuid;
+
+    /// <summary>
+    /// Returns the entries of <paramref name="stored"/> in order, separated by <c> ; </c>, each with a JADE-null GUID
+    /// written as <see langword="null"/>.
+    /// </summary>
+    private static string DescribeStored(IReadOnlyList<StoredParty> stored) =>
+        string.Join(" ; ", stored.Select(party => party with { Guid = NormalizedGuid(party.Guid) }));
+
+    /// <summary>
+    /// Returns the seven values of <paramref name="address"/> in the order of an operation's parameters.
+    /// </summary>
+    private static SoapAddress StoredAddress(Address address) =>
+        new(address.Street, address.City, address.Country, address.Phone, address.Fax, address.Email, address.WebSite);
 
     /// <summary>Returns 10:00:00 on <paramref name="date"/>.</summary>
     private static DateTime TenAm(DateOnly date) => date.ToDateTime(new TimeOnly(10, 0, 0));
@@ -495,11 +755,89 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
             name, address.Street, address.City, address.Country, address.Phone, address.Fax, address.Email, address.Website);
 
     /// <summary>
-    /// Returns the stored street of the agent named <paramref name="name"/> in the fixture company, read through
-    /// <see cref="AgentService.FindByNameAsync"/> in a new scope of <see cref="ErewhonTestBase.Api"/>, or
-    /// <see langword="null"/> when there is no such agent.
+    /// Starts a further API over <see cref="ErewhonTestBase.Database"/> with <c>Erewhon:Locks:TimeoutMs</c> set to
+    /// <see cref="ShortLockWaitMs"/>, holds the advisory lock <paramref name="lockName"/> from a separate connection,
+    /// calls <paramref name="delete"/> with an <c>ErewhonWebServiceAdmin</c> client of that API and returns its result.
+    /// Afterwards releases the lock, closes the client, aborting it when it is faulted or fails to close, and disposes
+    /// the API, also when a step fails.
     /// </summary>
-    private async Task<string?> ReadStoredAgentStreetAsync(string name)
+    private async Task<Admin.DTOResult> DeleteWhileLockHeldAsync(
+        string lockName,
+        Func<Admin.ErewhonWebServiceAdminClient, Task<Admin.DTOResult>> delete)
+    {
+        await using ErewhonApiHost host = await StartDedicatedHostAsync(
+            new Dictionary<string, string?> { [LockTimeoutKey] = ShortLockWaitMs });
+
+        Admin.ErewhonWebServiceAdminClient admin = host.CreateSoapClientFactory().CreateAdminClient();
+        try
+        {
+            NpgsqlConnection holder = await HoldAdvisoryLockAsync(lockName);
+            try
+            {
+                return await delete(admin);
+            }
+            finally
+            {
+                await ReleaseAdvisoryLockAsync(holder, lockName);
+            }
+        }
+        finally
+        {
+            await CloseClientAsync(admin);
+        }
+    }
+
+    /// <summary>
+    /// Opens an unpooled connection to <see cref="ErewhonTestBase.Database"/> that holds the session-level advisory lock
+    /// <c>pg_advisory_lock(hashtextextended(lockName, 0))</c> and returns it; disposes the connection when the lock
+    /// cannot be taken.
+    /// </summary>
+    private async Task<NpgsqlConnection> HoldAdvisoryLockAsync(string lockName)
+    {
+        var holder = new NpgsqlConnection(
+            new NpgsqlConnectionStringBuilder(Database.ConnectionString) { Pooling = false }.ConnectionString);
+        try
+        {
+            await holder.OpenAsync();
+            await using var hold = new NpgsqlCommand("SELECT pg_advisory_lock(hashtextextended(@name, 0))", holder);
+            hold.Parameters.AddWithValue("name", lockName);
+            await hold.ExecuteNonQueryAsync();
+            return holder;
+        }
+        catch
+        {
+            await holder.DisposeAsync();
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Returns the stored agents of the fixture company in name order, each with its name, seven address values and
+    /// GUID, read through <see cref="AgentService.GetAgentsAsync"/> in a new scope of <see cref="ErewhonTestBase.Api"/>.
+    /// </summary>
+    private Task<IReadOnlyList<StoredParty>> ReadStoredAgentsAsync() =>
+        ReadStoredAsync(async services =>
+            (await services.GetRequiredService<AgentService>().GetAgentsAsync())
+                .Select(agent => new StoredParty(agent.Name, StoredAddress(agent.Address), agent.Guid))
+                .ToList());
+
+    /// <summary>
+    /// Returns the stored clients of the fixture company in name order, each with its name, seven address values and
+    /// GUID, read through <see cref="ClientService.GetClientsAsync"/> in a new scope of <see cref="ErewhonTestBase.Api"/>.
+    /// </summary>
+    private Task<IReadOnlyList<StoredParty>> ReadStoredClientsAsync() =>
+        ReadStoredAsync(async services =>
+            (await services.GetRequiredService<ClientService>().GetClientsAsync())
+                .Select(client => new StoredParty(client.Name, StoredAddress(client.Address), client.Guid))
+                .ToList());
+
+    /// <summary>
+    /// Runs <paramref name="read"/> over a new scope of <see cref="ErewhonTestBase.Api"/> bound to the fixture company
+    /// and returns its result, disposing the scope afterwards.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">The fixture company has not been created.</exception>
+    private async Task<IReadOnlyList<StoredParty>> ReadStoredAsync(
+        Func<IServiceProvider, Task<IReadOnlyList<StoredParty>>> read)
     {
         var company = Builder.MyCompany ?? throw new InvalidOperationException(
             $"The fixture company is created by {nameof(SetUpAsync)}.");
@@ -507,8 +845,7 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
         await using AsyncServiceScope scope = Api.Services.CreateAsyncScope();
         scope.ServiceProvider.GetRequiredService<ICompanyContext>().Bind(company.Id);
 
-        var agent = await scope.ServiceProvider.GetRequiredService<AgentService>().FindByNameAsync(name);
-        return agent?.Address.Street;
+        return await read(scope.ServiceProvider);
     }
 
     /// <summary>
@@ -566,16 +903,29 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
         string Email,
         string Website);
 
-    /// <summary>The status code and errors of one <c>DTOResult</c>.</summary>
-    private sealed record DtoOutcome(int StatusCode, IReadOnlyList<string> Errors);
+    /// <summary>The name, seven address values and GUID of one stored agent or client.</summary>
+    private sealed record StoredParty(string Name, SoapAddress Address, string? Guid);
 
-    /// <summary>One branch of the B-51 sweep: its expected status code and errors, and the call that reaches it.</summary>
+    /// <summary>The status code, errors and GUID of one <c>DTOResult</c>.</summary>
+    private sealed record DtoOutcome(int StatusCode, IReadOnlyList<string> Errors, string? Guid);
+
+    /// <summary>
+    /// One branch of the B-51 sweep: its expected status code and errors, the call that reaches it, the read of the
+    /// stored rows it acts on, its expected GUID given the rows read after the call, and the rows expected after the
+    /// call.
+    /// </summary>
     private sealed record SweepStep(
         string Branch,
         int ExpectedStatusCode,
         IReadOnlyList<string> ExpectedErrors,
-        Func<Task<DtoOutcome>> Call);
+        Func<Task<DtoOutcome>> Call,
+        Func<Task<IReadOnlyList<StoredParty>>> ReadStored,
+        Func<IReadOnlyList<StoredParty>, string?> ExpectedGuid,
+        Func<IReadOnlyList<StoredParty>> ExpectedStored);
 
-    /// <summary>The status code and joined errors one branch of the B-51 sweep returned or is expected to return.</summary>
-    private sealed record SweepOutcome(string Branch, int StatusCode, string Errors);
+    /// <summary>
+    /// The status code, joined errors, GUID (<see langword="null"/> when JADE-null) and described stored rows one branch
+    /// of the B-51 sweep returned or is expected to return.
+    /// </summary>
+    private sealed record SweepOutcome(string Branch, int StatusCode, string Errors, string? Guid, string Stored);
 }

@@ -1,9 +1,12 @@
 using System.ServiceModel;
+using Erewhon.Application.Abstractions;
 using Erewhon.Application.Common;
 using Erewhon.Application.Domain;
 using Erewhon.Application.Messages;
+using Erewhon.Application.Services;
 using Erewhon.SoapClient.Admin;
 using Erewhon.Testing;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace Erewhon.Soap.Tests;
 
@@ -74,14 +77,17 @@ public sealed class TestCreateClient : ErewhonTestBase
         DTOResult result = await AdminClient.createClientAsync(
             ClientName, ClientStreet, ClientCity, ClientCountry, ClientPhone, ClientFax, ClientEmail, ClientWebsite);
 
-        // Assert
+        // Verify
         Assert.Equal(ExpectedError, result.statusCode);
         string error = Assert.Single(result.allErrors ?? []);
         Assert.Equal(MessageCatalog.Get(MessageKeys.ClientNameAlreadyExists, ClientName), error);
         Assert.Equal("Client Dariush Kamran already exists", error);
     }
 
-    /// <summary>Calling <c>createClient</c> for a new client answers 201 with the client's GUID and no errors.</summary>
+    /// <summary>
+    /// Calling <c>createClient</c> for a new client answers 201 with the client's GUID and no errors. The test's
+    /// company then holds a client with that name, the seven submitted address fields and the returned GUID.
+    /// </summary>
     /// <returns>A task that completes when the test has run.</returns>
     [Fact]
     public async Task testValidClient()
@@ -92,11 +98,41 @@ public sealed class TestCreateClient : ErewhonTestBase
         DTOResult result = await AdminClient.createClientAsync(
             ClientName, ClientStreet, ClientCity, ClientCountry, ClientPhone, ClientFax, ClientEmail, ClientWebsite);
 
-        // Assert
+        // Verify
         Assert.NotNull(result);
         Assert.False(JadeValues.IsNull(result.guid));
         Assert.Equal(ExpectedStatus, result.statusCode);
         Assert.False((result.allErrors?.Length ?? 0) > 0);
+
+        Client? client = await FindClientAsync(ClientName);
+        Assert.NotNull(client);
+        Assert.Equal(ClientName, client.Name);
+        Assert.Equal(ClientStreet, client.Address.Street);
+        Assert.Equal(ClientCity, client.Address.City);
+        Assert.Equal(ClientCountry, client.Address.Country);
+        Assert.Equal(ClientPhone, client.Address.Phone);
+        Assert.Equal(ClientFax, client.Address.Fax);
+        Assert.Equal(ClientEmail, client.Address.Email);
+        Assert.Equal(ClientWebsite, client.Address.WebSite);
+        Assert.Equal(result.guid, client.Guid);
+    }
+
+    /// <summary>
+    /// Returns the client of the test's company named <paramref name="name"/>, with its address, read in a new scope
+    /// of <see cref="ErewhonTestBase.Api"/>; <see langword="null"/> when the company holds no such client.
+    /// </summary>
+    /// <param name="name">The client name, used as given.</param>
+    /// <returns>The stored client, or <see langword="null"/>.</returns>
+    /// <exception cref="InvalidOperationException">The test's company was not created.</exception>
+    private async Task<Client?> FindClientAsync(string name)
+    {
+        long companyId = Builder.MyCompany?.Id
+            ?? throw new InvalidOperationException("The test company has not been created.");
+
+        await using AsyncServiceScope scope = Api.Services.CreateAsyncScope();
+        scope.ServiceProvider.GetRequiredService<ICompanyContext>().Bind(companyId);
+
+        return await scope.ServiceProvider.GetRequiredService<ClientService>().FindByNameAsync(name);
     }
 
     /// <summary>

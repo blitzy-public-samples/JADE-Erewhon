@@ -1,5 +1,6 @@
 using System.ServiceModel;
 using Erewhon.Application.Abstractions;
+using Erewhon.Application.Common;
 using Erewhon.Application.Domain;
 using Erewhon.Application.Messages;
 using Erewhon.Application.Services;
@@ -40,7 +41,7 @@ public sealed class TestDeleteClient : ErewhonTestBase
         // Act
         DTOResult dtoResult = await WebServiceAdmin.deleteClientAsync(ClientName);
 
-        // Assert
+        // Verify
         Assert.Equal(ExpectedError, dtoResult.statusCode);
         string error = Assert.Single(dtoResult.allErrors);
         Assert.Equal(MessageCatalog.Get(MessageKeys.ClientNameNotFound, ClientName), error);
@@ -48,7 +49,8 @@ public sealed class TestDeleteClient : ErewhonTestBase
     }
 
     /// <summary>
-    /// Deleting an existing client returns status 200 with no errors, and the client's name is no longer found.
+    /// Deleting an existing client returns status 200 with no errors and no GUID, and the client's name is no longer
+    /// found.
     /// </summary>
     [Fact]
     public async Task testValidClient()
@@ -73,10 +75,11 @@ public sealed class TestDeleteClient : ErewhonTestBase
         // Act
         DTOResult dtoResult = await WebServiceAdmin.deleteClientAsync(client.Name);
 
-        // Assert
+        // Verify
         Assert.NotNull(dtoResult);
         Assert.Equal(0, dtoResult.allErrors?.Length ?? 0);
         Assert.Equal(ExpectedStatus, dtoResult.statusCode);
+        Assert.True(JadeValues.IsNull(dtoResult.guid));
         Assert.False(await ClientExistsAsync(client.Name));
     }
 
