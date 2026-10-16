@@ -31,7 +31,7 @@ No JADE installation, JADE runtime, JADE INI file or JADECare Start component is
 | `/hubs/erewhon` | The SignalR hub. Its `session` query value must name a registered session (D-12, D-39) |
 | `/swagger`, `/swagger/rest/swagger.json`, `/swagger/app/swagger.json` | The Swagger UI and the two OpenAPI documents, served in every environment (D-25, D-124) |
 | `/healthz` | The database health check (section 5) |
-| Any other path | A static file from `src/Erewhon.Api/wwwroot`; a path without a file extension gets `index.html` (the React client) |
+| Any other path | A static file from `src/Erewhon.Api/wwwroot`. A path without a file extension that no row above answers gets 404 with an empty body when its first segment is `api`, `soap`, `hubs`, `swagger` or `healthz`, compared case-insensitively, and `index.html` (the React client) otherwise (D-124) |
 
 `wwwroot` is written by the React build, `(cd web && npm ci && npm run build)`. It is not committed.
 
@@ -146,6 +146,8 @@ The first argument after `--` selects a verb, compared case-sensitively. A verb 
 
 A verb that fails with an exception exits with 1 and writes one `ErewhonUnhandledException` error event, with the verb as its `Verb` property (section 6.2, D-146). The lock outcome is not logged: when the `seed` post-load closure cannot obtain a tender item's row lock within `Erewhon:Locks:TimeoutMs` (`55P03`), the verb exits with 1 without an event (B-38); the loaded data and the awards made before the lock stay. A wrong `seed` operand count is a usage error: `$ExampleCommandLine` on standard output, exit code 1 and no log event. A cancellation requested by the caller ends the verb without a log event.
 
+Ctrl+C (SIGINT), SIGTERM or SIGQUIT while a verb runs cancels the verb (D-124). The database command in progress is cancelled, the open transaction is rolled back, the session ends, and the process exits with code 1, without the failing verb's error log event. A step that does not observe the cancellation finishes first; the item-code read of the allocator waits at most `Erewhon:Locks:AllocationTimeoutMs`. A `seed` cancelled after its purge has committed leaves no company, and running `seed` again loads the data. A second signal after the first ends the process at once, with exit code 130 for SIGINT or 143 for SIGTERM, without rolling back; PostgreSQL rolls the transaction back once the session notices the closed connection, which for a session waiting on a lock is when that wait ends; section 7.5 ends such a session sooner.
+
 `<data dir>` is trimmed of spaces and resolved against the process's current directory, which `dotnet run` sets to `src/Erewhon.Api` (section 2.2). From a checkout, name the repository's data files with an absolute path or with `../../../Erewhon/DataFiles`. The 301-character limit applies to `<data dir>` as given, after trimming and with its trailing separator, not to the resolved path: a short relative path is accepted however deep the current directory is, and a longer path to an existing directory fails with error 1035 before anything is deleted.
 
 The interactive load, `POST /api/app/setup/load-data`, runs the same loader on `Erewhon:Seed:DataDirectory`. It runs only while no company exists and answers 409 otherwise (D-43, D-117).
@@ -229,6 +231,7 @@ When `seed` runs from the command line, standard output carries each loader line
 | A REST `DTO*` field longer than its length (D-41) | Status 500 with an empty body | No (D-63) |
 | A `postCreateAgent` or `postCreateClient` request whose body is absent, empty or JSON `null`, with or without a company. A chunked request that sends no data fails model binding instead (400). `docs/rest-api.md` sections `postCreateAgent` and `postCreateClient` give each outcome of the two operations | Status 500 with an empty body | No (D-63) |
 | Any other unhandled exception | Status 500 with `{"kind": "exception", ...}` | Yes |
+| An unhandled exception thrown after the response has started | The response ends early: nothing more is written and the request is aborted. The HTTP request event reports the status the response started with (D-64) | Yes, except for the tender-closure row-lock outcome |
 
 The three lock outcomes are B-38 (D-07, D-64). Every response with status 500 also gets the HTTP request event at `Error` level.
 

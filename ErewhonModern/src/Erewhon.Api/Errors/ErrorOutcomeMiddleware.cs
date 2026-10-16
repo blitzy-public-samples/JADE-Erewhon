@@ -33,9 +33,9 @@ public sealed record ErrorOutcome(
 
 /// <summary>
 /// Turns an exception that escapes the rest of the request pipeline before the response has started into status 500
-/// with an <see cref="ErrorOutcome"/> JSON body, and rethrows one that escapes after the response has started. In both
-/// cases it writes one error log event, as <see cref="LogOutcome"/> describes, for every outcome except the lock
-/// outcome.
+/// with an <see cref="ErrorOutcome"/> JSON body, and aborts the request when one escapes after the response has
+/// started. In both cases it writes one error log event, as <see cref="LogOutcome"/> describes, for every outcome
+/// except the lock outcome, and does not rethrow the exception.
 /// </summary>
 /// <param name="next">The next middleware in the pipeline.</param>
 /// <param name="logger">The logger that receives the error events.</param>
@@ -59,10 +59,11 @@ public sealed class ErrorOutcomeMiddleware(RequestDelegate next, ILogger<ErrorOu
     /// when <see cref="IsLogged"/> is <see langword="true"/>, writes one event through <see cref="LogOutcome"/>.
     /// Before the response has started, it then clears the response and writes status 500 with the
     /// <see cref="ErrorOutcome"/> of the translated exception as <c>application/json</c>; after the response has
-    /// started, it rethrows the original exception unchanged and writes nothing to the response.
+    /// started, it writes nothing more to the response, aborts the request with <see cref="HttpContext.Abort"/> and
+    /// returns without rethrowing.
     /// </summary>
     /// <param name="context">The HTTP context of the request.</param>
-    /// <returns>A task that completes when the response has been produced.</returns>
+    /// <returns>A task that completes when the response has been produced or the request aborted.</returns>
     public async Task InvokeAsync(HttpContext context)
     {
         ArgumentNullException.ThrowIfNull(context);
@@ -83,7 +84,8 @@ public sealed class ErrorOutcomeMiddleware(RequestDelegate next, ILogger<ErrorOu
 
             if (context.Response.HasStarted)
             {
-                throw;
+                context.Abort();
+                return;
             }
 
             var outcome = Create(translated);
