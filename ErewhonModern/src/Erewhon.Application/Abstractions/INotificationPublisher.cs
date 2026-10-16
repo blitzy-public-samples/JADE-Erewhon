@@ -18,7 +18,7 @@ public interface INotificationPublisher
     /// </summary>
     /// <param name="events">The committed changes to announce, in the order they are sent.</param>
     /// <param name="ct">Cancels the sending.</param>
-    /// <returns>A task that completes when every message has been handed to the hub.</returns>
+    /// <returns>A task that completes when every message has been accepted for delivery.</returns>
     Task PublishEntityChangesAsync(IReadOnlyList<ChangeEvent> events, CancellationToken ct = default);
 
     /// <summary>
@@ -29,7 +29,7 @@ public interface INotificationPublisher
     /// <param name="sessionId">Id of the session whose cart held the deleted item.</param>
     /// <param name="itemId">Internal row id of the deleted item.</param>
     /// <param name="ct">Cancels the sending.</param>
-    /// <returns>A task that completes when the message has been handed to the hub.</returns>
+    /// <returns>A task that completes when the message has been accepted for delivery.</returns>
     Task PublishCartItemDeletedAsync(string sessionId, long itemId, CancellationToken ct = default);
 
     /// <summary>
@@ -41,6 +41,6 @@ public interface INotificationPublisher
     /// <param name="entityType">Domain type name of the row being edited, such as <c>Agent</c>.</param>
     /// <param name="id">Internal row id of the row being edited.</param>
     /// <param name="ct">Cancels the sending.</param>
-    /// <returns>A task that completes when the message has been handed to the hub.</returns>
+    /// <returns>A task that completes when the message has been accepted for delivery.</returns>
     Task PublishSaveOutstandingChangesAsync(string sessionId, string entityType, long id, CancellationToken ct = default);
 }

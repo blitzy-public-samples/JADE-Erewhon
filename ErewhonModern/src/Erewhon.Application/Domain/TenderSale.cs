@@ -18,12 +18,14 @@ public class TenderSale : Sale
 
     /// <summary>Returns the date the winning tender was placed, <see cref="Domain.Tender.GetDate"/>.</summary>
     /// <returns>The sale date.</returns>
-    /// <exception cref="InvalidOperationException"><see cref="Tender"/> is not loaded.</exception>
+    /// <exception cref="NoCompanyException"><see cref="TenderId"/> is <see langword="null"/> or 0.</exception>
+    /// <exception cref="InvalidOperationException"><see cref="TenderId"/> is set and <see cref="Tender"/> is not loaded.</exception>
     public override DateOnly? GetDate() => RequireTender().GetDate();
 
     /// <summary>Returns the time the winning tender was placed, <see cref="Domain.Tender.GetTime"/>.</summary>
     /// <returns>The sale time.</returns>
-    /// <exception cref="InvalidOperationException"><see cref="Tender"/> is not loaded.</exception>
+    /// <exception cref="NoCompanyException"><see cref="TenderId"/> is <see langword="null"/> or 0.</exception>
+    /// <exception cref="InvalidOperationException"><see cref="TenderId"/> is set and <see cref="Tender"/> is not loaded.</exception>
     public TimeOnly GetTime() => RequireTender().GetTime();
 
     /// <summary>
@@ -34,7 +36,11 @@ public class TenderSale : Sale
     /// with id 7; the code part is empty when the item has no category.
     /// </summary>
     /// <returns>The debug string.</returns>
-    /// <exception cref="InvalidOperationException"><see cref="Tender"/>, <see cref="Sale.Item"/> or <see cref="Sale.Client"/> is not loaded.</exception>
+    /// <exception cref="NoCompanyException"><see cref="TenderId"/> is <see langword="null"/> or 0.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// <see cref="TenderId"/> is set and <see cref="Tender"/> is not loaded, or <see cref="Sale.Item"/> or
+    /// <see cref="Sale.Client"/> is not loaded.
+    /// </exception>
     public override string GetDebugString()
     {
         var tender = RequireTender();
@@ -48,8 +54,20 @@ public class TenderSale : Sale
             + item.GetCode() + " (" + item.Name + "), " + client.Name;
     }
 
-    private Tender RequireTender() =>
-        Tender ?? throw new InvalidOperationException("TenderSale.Tender is not loaded.");
+    private Tender RequireTender()
+    {
+        if (Tender is not null)
+        {
+            return Tender;
+        }
+
+        if (JadeValues.IsNull(TenderId))
+        {
+            throw new NoCompanyException();
+        }
+
+        throw new InvalidOperationException("TenderSale.Tender is not loaded.");
+    }
 
     private Item RequireItem() =>
         Item ?? throw new InvalidOperationException("TenderSale.Item is not loaded.");

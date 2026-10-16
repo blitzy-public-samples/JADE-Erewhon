@@ -161,9 +161,9 @@ public sealed class ItemSearch(
     /// <exception cref="ErewhonException">
     /// Error <see cref="ErewhonException.MinHigherThanMax"/>: both prices are non-zero and the low price is above the high price.
     /// </exception>
-    /// <exception cref="NoCompanyException">No company is bound.</exception>
-    /// <exception cref="NullReferenceException">
-    /// <see cref="ItemSearchCriteria.CountryId"/> is set and an item reaching the country check has no region.
+    /// <exception cref="NoCompanyException">
+    /// No company is bound, or <see cref="ItemSearchCriteria.CountryId"/> is set and an item reaching the country check
+    /// has no region.
     /// </exception>
     public async Task<IReadOnlyList<Item>> DoSearchAsync(
         ItemSearchCriteria criteria,
@@ -411,9 +411,13 @@ public sealed class ItemSearch(
     /// <param name="cart">The cart whose lines are excluded; <see langword="null"/> for no cart lines.</param>
     /// <returns><see langword="true"/> when <paramref name="item"/> matches; otherwise <see langword="false"/>.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="criteria"/> or <paramref name="item"/> is <see langword="null"/>.</exception>
-    /// <exception cref="NullReferenceException">
+    /// <exception cref="NoCompanyException">
     /// <see cref="ItemSearchCriteria.CountryId"/> is set, <paramref name="item"/> passes the checks before the country
     /// check and has no region.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// <see cref="ItemSearchCriteria.CountryId"/> is set, <paramref name="item"/> passes the checks before the country
+    /// check, and its <see cref="Item.RegionId"/> is set but its <see cref="Item.Region"/> is not loaded.
     /// </exception>
     public static bool ItemMatchesSearch(
         ItemSearchCriteria criteria,
@@ -464,7 +468,7 @@ public sealed class ItemSearch(
         }
 
         if (criteria.CountryId is not null
-            && item.Region!.CountryId != criteria.CountryId)
+            && RequireRegion(item).CountryId != criteria.CountryId)
         {
             return false;
         }
@@ -506,5 +510,29 @@ public sealed class ItemSearch(
         }
 
         return true;
+    }
+
+    /// <summary>Returns the region of <paramref name="item"/>.</summary>
+    /// <param name="item">The item whose region is read.</param>
+    /// <returns>The loaded <see cref="Item.Region"/>.</returns>
+    /// <exception cref="NoCompanyException">
+    /// <paramref name="item"/> has no region: its <see cref="Item.RegionId"/> is <see langword="null"/> or 0.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// <see cref="Item.RegionId"/> is set and <see cref="Item.Region"/> is not loaded.
+    /// </exception>
+    private static Region RequireRegion(Item item)
+    {
+        if (item.Region is not null)
+        {
+            return item.Region;
+        }
+
+        if (JadeValues.IsNull(item.RegionId))
+        {
+            throw new NoCompanyException();
+        }
+
+        throw new InvalidOperationException("Item.Region is not loaded.");
     }
 }

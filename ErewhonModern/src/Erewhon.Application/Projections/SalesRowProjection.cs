@@ -43,9 +43,13 @@ public sealed record SalesRowProjection(
     /// <param name="sale">The sale to project.</param>
     /// <returns>The row of <paramref name="sale"/>.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="sale"/> is <see langword="null"/>.</exception>
+    /// <exception cref="Common.NoCompanyException">
+    /// <paramref name="sale"/> is a tender sale with no tender: its <see cref="TenderSale.TenderId"/> is
+    /// <see langword="null"/> or 0.
+    /// </exception>
     /// <exception cref="InvalidOperationException">
     /// <see cref="Sale.Client"/> or <see cref="Sale.Item"/> is not loaded, or <paramref name="sale"/> is a tender sale
-    /// whose <see cref="TenderSale.Tender"/> is not loaded.
+    /// whose <see cref="TenderSale.TenderId"/> is set and whose <see cref="TenderSale.Tender"/> is not loaded.
     /// </exception>
     public static SalesRowProjection From(Sale sale)
     {

@@ -100,9 +100,11 @@ public abstract class TransactionCommand<TEntity>
 /// The transaction-agent template: persists one entity, and its subordinate objects, through the steps of JADE
 /// <c>ModelTA</c> in their order. Each operation starts a new <see cref="OperationResult"/>, checks field lengths,
 /// pre-validates and validates outside any database transaction, then takes the locks, applies the change, saves and
-/// commits. In <see cref="TransactionMode.Own"/> mode those last steps run in one transaction begun by the agent and
-/// queued notifications are published after the commit; in <see cref="TransactionMode.Ambient"/> mode they run inside
-/// the caller's transaction under the <c>ta_locks</c> savepoint, or raise
+/// commits. In <see cref="TransactionMode.Own"/> mode those last steps run in one transaction begun by the agent, whose
+/// lock waits, for the advisory locks and for the row locks its writes take, are bounded by
+/// <c>Erewhon:Locks:TimeoutMs</c> from its begin, and queued notifications are published after the commit; in
+/// <see cref="TransactionMode.Ambient"/> mode they run inside the caller's transaction under the <c>ta_locks</c>
+/// savepoint, or raise
 /// <see cref="NotInTransactionStateException"/> at the first write when no transaction is active. Any operation that
 /// does not complete is rolled back, and the change tracker is returned to the entities, entity states, values and
 /// navigations it held immediately before the apply step.
@@ -152,7 +154,10 @@ public abstract class TransactionAgent<TEntity>
     /// <summary>The unit of work that begins, commits and rolls back the agent's transactions and savepoints.</summary>
     protected IUnitOfWork Uow { get; }
 
-    /// <summary>The advisory locks taken in <see cref="AcquireLocksAsync"/>; ports <c>ModelTA.tryLockingObject</c>.</summary>
+    /// <summary>
+    /// The advisory locks taken in <see cref="AcquireLocksAsync"/>, and the lock-wait bound of an Own-mode
+    /// transaction; ports <c>ModelTA.tryLockingObject</c>.
+    /// </summary>
     protected IEntityLocks Locks { get; }
 
     /// <summary>The database server clock, read by pre-validation defaults.</summary>
@@ -755,9 +760,10 @@ public abstract class TransactionAgent<TEntity>
     }
 
     /// <summary>
-    /// Begins a transaction, takes the locks, applies the change, saves and commits, then publishes the queued
-    /// notifications. A failed step rolls back, discards the queued notifications and adds its error; an exception
-    /// rolls back and discards likewise, then propagates. Ports <c>CommitTransactionTI</c>.
+    /// Begins a transaction, bounds its lock waits through <see cref="IEntityLocks.ApplyLockTimeoutAsync"/>, takes the
+    /// locks, applies the change, saves and commits, then publishes the queued notifications. A failed step rolls
+    /// back, discards the queued notifications and adds its error; an exception rolls back and discards likewise, then
+    /// propagates. Ports <c>CommitTransactionTI</c>.
     /// </summary>
     private async Task RunInOwnTransactionAsync(
         TransactionCommand<TEntity> command,
@@ -770,6 +776,7 @@ public abstract class TransactionAgent<TEntity>
         StepOutcome outcome;
         try
         {
+            await Locks.ApplyLockTimeoutAsync(ct);
             outcome = await LockAndApplyAsync(command, state, result, ct);
             if (outcome == StepOutcome.Applied)
             {

@@ -1633,6 +1633,61 @@ public sealed class BehaviourCatalogueTests : ErewhonTestBase
     }
 
     /// <summary>
+    /// B-35 (D-17): over the items I1 to I6 of <see cref="ArrangeSearchAsync"/>, the unsold retail item I7 (K1/G1 700,
+    /// code number 70) listed in region R3 of N1, then R3 deleted through <see cref="RegionService"/>, which leaves I7
+    /// with no region. A search with country N1 or N2 → <see cref="NoCompanyException"/> 1090 "Null object reference",
+    /// whose error outcome is the web exception body titled "Error 1090"; the same search with no criteria → I1, I2, I3
+    /// and I7; with region R1 → I1.
+    /// </summary>
+    /// <returns>A task that completes when the case has run.</returns>
+    [Fact]
+    public async Task B35_CountryFilterOnItemWithoutRegionRaises1090()
+    {
+        SearchFixture fixture = await ArrangeSearchAsync();
+        Region r3 = await Builder.CreateTestRegionAsync("Region R3", fixture.N1);
+        RetailItem i7 = await NewRetailItemAsync(fixture.G1, fixture.K1, r3, 700m);
+        await UpdateItemAsync(i7.Id, command => command.CodeNumber = 70);
+        OperationResult regionDeleted = await InNewScopeAsync(
+            services => services.GetRequiredService<RegionService>().DeleteByIdAsync(r3.Id));
+        Assert.True(regionDeleted.Succeeded, regionDeleted.FullErrorText);
+        Assert.Null((await ReadItemAsync(i7.Id)).RegionId);
+        var labels = new Dictionary<long, string>(fixture.Labels) { [i7.Id] = "I7" };
+        ItemSearch search = GetService<ItemSearch>();
+
+        foreach (Country country in new[] { fixture.N1, fixture.N2 })
+        {
+            NoCompanyException failure = await Assert.ThrowsAsync<NoCompanyException>(
+                () => search.DoSearchAsync(new ItemSearchCriteria { CountryId = country.Id }, SessionId));
+
+            Assert.Equal(1090, failure.ErrorCode);
+            Assert.Equal("Null object reference", failure.Message);
+            ErrorOutcome outcome = ErrorOutcomeMiddleware.Create(failure);
+            Assert.Equal(ErrorOutcome.KindException, outcome.Kind);
+            Assert.Equal("Error 1090", outcome.Heading);
+            Assert.Equal(Text(MessageKeys.BaseExceptionHeading, "1090"), outcome.Heading);
+            Assert.Equal(
+                Text(
+                    MessageKeys.BaseExceptionBodyWeb,
+                    "1090",
+                    "Null object reference",
+                    Text(MessageKeys.BaseNotAvailable),
+                    string.Empty),
+                outcome.Body);
+            Assert.Contains("Error: Null object reference (1090)", outcome.Body);
+        }
+
+        var unfiltered = new ItemSearchCriteria();
+        IReadOnlyList<Item> all = await search.DoSearchAsync(unfiltered, SessionId);
+        Assert.Equal("I1 I2 I3 I7", Labels(all.Select(item => item.Id), labels));
+        Assert.Equal(all.Select(item => item.Id), unfiltered.ResultItemIds);
+
+        var byRegion = new ItemSearchCriteria { RegionId = fixture.R1.Id };
+        IReadOnlyList<Item> inRegion = await search.DoSearchAsync(byRegion, SessionId);
+        Assert.Equal("I1", Labels(inRegion.Select(item => item.Id), labels));
+        Assert.Equal(inRegion.Select(item => item.Id), byRegion.ResultItemIds);
+    }
+
+    /// <summary>
     /// B-36 (Q-21): over the items I1 to I6 of <see cref="ArrangeSearchAsync"/>, created from I6 down to I1 and then
     /// given the code numbers 10 to 60 in label order, with every criterion set, agent G1, client Z and
     /// include-items-in-cart among them, and results held, <see cref="ItemSearchCriteria.Initialize"/> keeps the agent,

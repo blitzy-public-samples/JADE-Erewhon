@@ -1,4 +1,6 @@
+using System.Globalization;
 using System.ServiceModel;
+using Erewhon.Api.Errors;
 using Erewhon.Api.Soap;
 using Erewhon.Application.Abstractions;
 using Erewhon.Application.Common;
@@ -8,6 +10,7 @@ using Erewhon.Application.Services;
 using Erewhon.Testing;
 using Microsoft.Extensions.DependencyInjection;
 using Npgsql;
+using Serilog.Events;
 using Admin = Erewhon.SoapClient.Admin;
 using WebService = Erewhon.SoapClient.WebService;
 
@@ -19,8 +22,10 @@ namespace Erewhon.Soap.Tests;
 /// 500 with <c>$CouldNotDeleteAgent</c> or <c>$CouldNotDeleteClient</c> when <c>deleteAgent</c> or
 /// <c>deleteClient</c> cannot take the company's agent or client lock; B-51, the status constants and the absence of
 /// status 403 from every reachable operation outcome; the SOAP cases of B-22, error 1035 for a street longer than its
-/// 51 characters; and B-47 with Q-13, the photo <c>getPhoto</c> returns among a client's sales, that of the last
-/// retail sale whose item has a photo. Each test starts from <see cref="TestCompanyBuilder.CreateTestDataAsync"/>.
+/// 51 characters; B-47 with Q-13, the photo <c>getPhoto</c> returns among a client's sales, that of the last
+/// retail sale whose item has a photo; and the unknown-name outcomes of B-45, B-47 and B-48 for a name holding the NUL
+/// character, with the fault each of those operations gives for such a name when no company exists. Each test starts
+/// from <see cref="TestCompanyBuilder.CreateTestDataAsync"/>.
 /// </summary>
 public sealed class SoapCatalogueTests : ErewhonTestBase
 {
@@ -37,6 +42,8 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
     private const string LockTimeoutKey = "Erewhon:Locks:TimeoutMs";
     private const string ShortLockWaitMs = "500";
     private const int OverLongStreetLength = 60;
+    private const string EventIdProperty = "EventId";
+    private const string ErrorCodeProperty = "ErrorCode";
 
     private static readonly SoapAddress FixtureAgentAddress = new(
         FixtureStreet,
@@ -106,6 +113,74 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
 
     private Agent FixtureAgent =>
         Builder.MyAgent ?? throw new InvalidOperationException($"The fixture agent is created by {nameof(SetUpAsync)}.");
+
+    /// <summary>An <c>ErewhonWebService</c> operation that looks an agent or a client up by the name it is sent.</summary>
+    public enum NameLookupOperation
+    {
+        /// <summary><c>getAgent</c>.</summary>
+        GetAgent,
+
+        /// <summary><c>getClient</c>.</summary>
+        GetClient,
+
+        /// <summary><c>getPhoto</c>.</summary>
+        GetPhoto,
+
+        /// <summary><c>updateAgent</c>.</summary>
+        UpdateAgent,
+
+        /// <summary><c>updateAgentWithDTO</c>.</summary>
+        UpdateAgentWithDto,
+
+        /// <summary><c>updateClient</c>.</summary>
+        UpdateClient,
+
+        /// <summary><c>updateClientWithDTO</c>.</summary>
+        UpdateClientWithDto,
+    }
+
+    /// <summary>Where the NUL character sits in the fixture agent's or client's name.</summary>
+    public enum NulPlacement
+    {
+        /// <summary>In place of the name's space: "Test\0Agent", "Test\0Client".</summary>
+        InPlaceOfSpace,
+
+        /// <summary>After the name's last character: "Test Agent\0", "Test Client\0".</summary>
+        AfterName,
+    }
+
+    /// <summary>Every <see cref="NameLookupOperation"/> with every <see cref="NulPlacement"/>.</summary>
+    public static TheoryData<NameLookupOperation, NulPlacement> NulNameLookups
+    {
+        get
+        {
+            var data = new TheoryData<NameLookupOperation, NulPlacement>();
+            foreach (NameLookupOperation operation in Enum.GetValues<NameLookupOperation>())
+            {
+                foreach (NulPlacement placement in Enum.GetValues<NulPlacement>())
+                {
+                    data.Add(operation, placement);
+                }
+            }
+
+            return data;
+        }
+    }
+
+    /// <summary>Every <see cref="NameLookupOperation"/>.</summary>
+    public static TheoryData<NameLookupOperation> NameLookupOperations
+    {
+        get
+        {
+            var data = new TheoryData<NameLookupOperation>();
+            foreach (NameLookupOperation operation in Enum.GetValues<NameLookupOperation>())
+            {
+                data.Add(operation);
+            }
+
+            return data;
+        }
+    }
 
     /// <summary>
     /// Every status constant holds its JADE value, and no outcome of the eight <c>DTOResult</c> operations reached
@@ -575,6 +650,76 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
     }
 
     /// <summary>
+    /// <paramref name="operation"/> sent the fixture agent's name (agent operations) or the fixture client's name
+    /// (client operations) with the NUL character at <paramref name="placement"/> gives the unknown-name outcome:
+    /// <c>getAgent</c>, <c>getClient</c> and <c>getPhoto</c> return <see langword="null"/>; <c>updateAgent</c> and
+    /// <c>updateAgentWithDTO</c> return status 404 with the single error <c>$AgentNameNotFound</c> of the sent name and
+    /// no GUID, and <c>updateClient</c> and <c>updateClientWithDTO</c> the same with <c>$ClientNameNotFound</c>.
+    /// Afterwards the company's only stored agent and client hold their fixture names, addresses and GUIDs, and the API
+    /// has written no error-level event.
+    /// </summary>
+    /// <param name="operation">The operation called.</param>
+    /// <param name="placement">Where the NUL character sits in the name sent.</param>
+    /// <returns>A task that completes when the outcome, the stored rows and the log have been checked.</returns>
+    [Theory]
+    [MemberData(nameof(NulNameLookups))]
+    public async Task B45_NameWithNulCharacterIsNotFound(NameLookupOperation operation, NulPlacement placement)
+    {
+        Agent fixtureAgent = FixtureAgent;
+        Client fixtureClient = Builder.MyClient ?? throw new InvalidOperationException(
+            $"The fixture client is created by {nameof(SetUpAsync)}.");
+        string name = NulName(operation, placement);
+        Assert.Contains("\0", name, StringComparison.Ordinal);
+
+        object? returned = await CallWithNameAsync(operation, name);
+
+        if (NotFoundKey(operation) is { } notFoundKey)
+        {
+            WebService.DTOResult result = Assert.IsType<WebService.DTOResult>(returned);
+            Assert.Equal(SoapStatusCodes.ErrorNotFound, result.statusCode);
+            string error = Assert.Single(result.allErrors ?? []);
+            Assert.Equal(MessageCatalog.Get(notFoundKey, name), error);
+            Assert.True(JadeValues.IsNull(result.guid), $"Expected no GUID, got '{result.guid}'.");
+        }
+        else
+        {
+            Assert.Null(returned);
+        }
+
+        Assert.Equal(
+            new[] { new StoredParty(FixtureAgentName, FixtureAgentAddress, fixtureAgent.Guid) },
+            await ReadStoredAgentsAsync());
+        Assert.Equal(
+            new[] { new StoredParty(FixtureClientName, FixtureClientAddress, fixtureClient.Guid) },
+            await ReadStoredClientsAsync());
+        Assert.Empty(LogSink.ErrorEvents);
+    }
+
+    /// <summary>
+    /// With no company, <paramref name="operation"/> sent "Test\0Agent" (agent operations) or "Test\0Client" (client
+    /// operations) faults, and the API writes one <see cref="ErrorOutcomeMiddleware.UnhandledExceptionEventId"/> event,
+    /// whose error code is 1090, that of <see cref="NoCompanyException"/>.
+    /// </summary>
+    /// <param name="operation">The operation called.</param>
+    /// <returns>A task that completes when the fault and the logged event have been checked.</returns>
+    [Theory]
+    [MemberData(nameof(NameLookupOperations))]
+    public async Task B45_NameWithNulCharacterWithoutCompanyFaults(NameLookupOperation operation)
+    {
+        var company = Builder.MyCompany ?? throw new InvalidOperationException(
+            $"The fixture company is created by {nameof(SetUpAsync)}.");
+        await Builder.DeleteCompanyAsync(company.Id);
+        string name = NulName(operation, NulPlacement.InPlaceOfSpace);
+
+        await Assert.ThrowsAnyAsync<FaultException>(() => CallWithNameAsync(operation, name));
+
+        LogEvent unhandled = Assert.Single(LogSink.Events, IsUnhandledExceptionEvent);
+        Assert.Equal(
+            new ScalarValue(NoCompanyException.Code.ToString(CultureInfo.InvariantCulture)),
+            unhandled.Properties[ErrorCodeProperty]);
+    }
+
+    /// <summary>
     /// Builds <see cref="TestCompanyBuilder.CreateTestDataAsync"/>, which creates and binds its own company, then
     /// creates both SOAP clients from one factory addressed to <see cref="ErewhonTestBase.Api"/>.
     /// </summary>
@@ -662,6 +807,56 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
     /// <summary>Returns a street of 60 characters, longer than the 51 of <c>Address.street</c>.</summary>
     private static string OverLongStreet() => new('S', OverLongStreetLength);
 
+    /// <summary>
+    /// Returns the fixture agent's name for an agent operation, or the fixture client's name for a client operation,
+    /// with the NUL character at <paramref name="placement"/>.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="operation"/> or <paramref name="placement"/> is not a declared value.
+    /// </exception>
+    private static string NulName(NameLookupOperation operation, NulPlacement placement)
+    {
+        string fixtureName = operation switch
+        {
+            NameLookupOperation.GetAgent
+                or NameLookupOperation.UpdateAgent
+                or NameLookupOperation.UpdateAgentWithDto => FixtureAgentName,
+            NameLookupOperation.GetClient
+                or NameLookupOperation.GetPhoto
+                or NameLookupOperation.UpdateClient
+                or NameLookupOperation.UpdateClientWithDto => FixtureClientName,
+            _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, null),
+        };
+
+        return placement switch
+        {
+            NulPlacement.InPlaceOfSpace => fixtureName.Replace(' ', '\0'),
+            NulPlacement.AfterName => fixtureName + '\0',
+            _ => throw new ArgumentOutOfRangeException(nameof(placement), placement, null),
+        };
+    }
+
+    /// <summary>
+    /// Returns the message key of the error a <c>DTOResult</c> of <paramref name="operation"/> carries for an unknown
+    /// name, or <see langword="null"/> for an operation that returns <see langword="null"/> for one.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="operation"/> is not a declared value.</exception>
+    private static string? NotFoundKey(NameLookupOperation operation) =>
+        operation switch
+        {
+            NameLookupOperation.GetAgent or NameLookupOperation.GetClient or NameLookupOperation.GetPhoto => null,
+            NameLookupOperation.UpdateAgent or NameLookupOperation.UpdateAgentWithDto => MessageKeys.AgentNameNotFound,
+            NameLookupOperation.UpdateClient or NameLookupOperation.UpdateClientWithDto => MessageKeys.ClientNameNotFound,
+            _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, null),
+        };
+
+    /// <summary>Returns whether the event's <c>EventId</c> is <see cref="ErrorOutcomeMiddleware.UnhandledExceptionEventId"/>.</summary>
+    private static bool IsUnhandledExceptionEvent(LogEvent logEvent) =>
+        logEvent.Properties.TryGetValue(EventIdProperty, out LogEventPropertyValue? eventId)
+        && eventId is StructureValue structure
+        && structure.Properties.Any(property =>
+            property.Name == "Id" && Equals(property.Value, new ScalarValue(ErrorOutcomeMiddleware.UnhandledExceptionEventId.Id)));
+
     /// <summary>Returns the agent data for <paramref name="name"/> at <paramref name="address"/>, with no GUID.</summary>
     private static WebService.DTOAgent AgentDto(string name, SoapAddress address) =>
         new()
@@ -743,6 +938,25 @@ public sealed class SoapCatalogueTests : ErewhonTestBase
     private Task<WebService.DTOResult> UpdateClientAsync(string name, SoapAddress address) =>
         WebClient.updateClientAsync(
             name, address.Street, address.City, address.Country, address.Phone, address.Fax, address.Email, address.Website);
+
+    /// <summary>
+    /// Calls <paramref name="operation"/> with <paramref name="name"/>, and for an update with the seven values of
+    /// <see cref="TamilNaduAddress"/>, and returns what it returns: a <c>DTOAgent</c>, <c>DTOClient</c> or
+    /// <c>DTOPhoto</c> or <see langword="null"/> for a lookup, a <c>DTOResult</c> for an update.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="operation"/> is not a declared value.</exception>
+    private async Task<object?> CallWithNameAsync(NameLookupOperation operation, string name) =>
+        operation switch
+        {
+            NameLookupOperation.GetAgent => await WebClient.getAgentAsync(name),
+            NameLookupOperation.GetClient => await WebClient.getClientAsync(name),
+            NameLookupOperation.GetPhoto => await WebClient.getPhotoAsync(name),
+            NameLookupOperation.UpdateAgent => await UpdateAgentAsync(name, TamilNaduAddress),
+            NameLookupOperation.UpdateAgentWithDto => await WebClient.updateAgentWithDTOAsync(AgentDto(name, TamilNaduAddress)),
+            NameLookupOperation.UpdateClient => await UpdateClientAsync(name, TamilNaduAddress),
+            NameLookupOperation.UpdateClientWithDto => await WebClient.updateClientWithDTOAsync(ClientDto(name, TamilNaduAddress)),
+            _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, null),
+        };
 
     /// <summary>Calls <c>createAgent</c> with <paramref name="name"/> and the seven values of <paramref name="address"/>.</summary>
     private Task<Admin.DTOResult> CreateAgentAsync(string name, SoapAddress address) =>

@@ -725,7 +725,9 @@ public sealed class RetailSaleService : TransactionAgent<Sale>
     /// <param name="ct">Token that cancels the read.</param>
     /// <returns>The rows.</returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="showFor"/> is not a defined value.</exception>
-    /// <exception cref="InvalidOperationException">A listed tender sale has no winning tender.</exception>
+    /// <exception cref="NoCompanyException">
+    /// A listed tender sale has no winning tender: its <see cref="TenderSale.TenderId"/> is <see langword="null"/>.
+    /// </exception>
     public async Task<IReadOnlyList<SalesRowProjection>> GetSalesRowsAsync(
         SalesShowFor showFor,
         long? id,

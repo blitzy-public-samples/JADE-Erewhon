@@ -171,8 +171,9 @@ public sealed class AgentService : TransactionAgent<Agent>
     /// <summary>
     /// Returns the agent of the bound company whose name equals <paramref name="name"/> exactly, with case and
     /// untrimmed, or <see langword="null"/> when there is none or <paramref name="name"/> is <see langword="null"/>
-    /// or empty. A name longer than 81 characters finds no agent. The bound company is read before the name is
-    /// looked at. Ports <c>app.myCompany.allAgents[name]</c>.
+    /// or empty. A name longer than 81 characters finds no agent. A name that contains the NUL character (U+0000)
+    /// finds no agent and is not sent to the database. The bound company is read before the name is looked at, for
+    /// every name. Ports <c>app.myCompany.allAgents[name]</c>.
     /// </summary>
     /// <param name="name">The agent name to look up, used as given.</param>
     /// <param name="ct">Token that cancels the read.</param>
@@ -182,7 +183,7 @@ public sealed class AgentService : TransactionAgent<Agent>
     {
         long companyId = await CurrentCompanyIdAsync(ct);
 
-        if (JadeValues.IsNull(name))
+        if (JadeValues.IsNull(name) || name.AsSpan().Contains('\0'))
         {
             return null;
         }

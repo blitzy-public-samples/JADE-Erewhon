@@ -17,11 +17,12 @@ public sealed record EntityLockSettings(int LockTimeoutMs = 10000, int Allocatio
 
 /// <summary>
 /// Takes the named advisory locks and the item row locks of <see cref="IEntityLocks"/> on the connection of an
-/// <see cref="ErewhonDbContext"/>, inside the transaction that context currently has open.
-/// Each lock is keyed in the database as <c>hashtextextended(name, 0)</c> of the full lock name. Before each wait the
-/// transaction's <c>lock_timeout</c> is set, as <c>SET LOCAL</c> does, to the matching value of
-/// <see cref="EntityLockSettings"/>; the setting lasts until the transaction ends or is rolled back to a savepoint
-/// created before it was set.
+/// <see cref="ErewhonDbContext"/>, inside the transaction that context currently has open, and bounds that
+/// transaction's lock waits.
+/// Each lock is keyed in the database as <c>hashtextextended(name, 0)</c> of the full lock name. Before each wait, and
+/// in <see cref="ApplyLockTimeoutAsync"/>, the transaction's <c>lock_timeout</c> is set, as <c>SET LOCAL</c> does, to
+/// the matching value of <see cref="EntityLockSettings"/>; the setting lasts until the transaction ends or is rolled
+/// back to a savepoint created before it was set.
 /// A wait that expires reports SQLSTATE <c>55P03</c> and a detected deadlock reports <c>40P01</c>; both leave the
 /// transaction aborted for the caller to roll back.
 /// One instance serves one dependency-injection scope, together with the context of that scope.
@@ -39,6 +40,21 @@ public sealed class PostgresEntityLocks(ErewhonDbContext db, EntityLockSettings 
     private readonly EntityLockSettings _settings = ValidateSettings(settings);
 
     private readonly PostgresErrorMapper _mapper = mapper ?? throw new ArgumentNullException(nameof(mapper));
+
+    /// <summary>
+    /// Sets the transaction's <c>lock_timeout</c> to <see cref="EntityLockSettings.LockTimeoutMs"/> with
+    /// <c>set_config('lock_timeout', '&lt;milliseconds&gt;ms', true)</c>, which bounds every later lock wait of the
+    /// transaction, its writes' row locks included.
+    /// </summary>
+    /// <param name="ct">Token that cancels the operation.</param>
+    /// <returns>A task that completes when the setting is applied.</returns>
+    /// <exception cref="InvalidOperationException">The context has no active transaction.</exception>
+    public async Task ApplyLockTimeoutAsync(CancellationToken ct = default)
+    {
+        EnsureTransaction();
+
+        await SetLockTimeoutAsync(_settings.LockTimeoutMs, ct);
+    }
 
     /// <summary>
     /// Sets the transaction's <c>lock_timeout</c> to <see cref="EntityLockSettings.LockTimeoutMs"/> and takes the

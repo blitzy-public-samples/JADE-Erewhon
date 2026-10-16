@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using Erewhon.Api.Errors;
@@ -21,11 +22,13 @@ using Serilog.Events;
 namespace Erewhon.Api.Tests.CrossCutting;
 
 /// <summary>
-/// Characterises the outcome of a request the framework cannot bind or read. The HTTP cases build and start the real
-/// API on Kestrel over the assembly database in the Production environment, in the Development environment, and in
-/// the Production environment with the minimal-API route handlers set to throw on a bad request, send one app request
-/// with a body that cannot be bound, and read the events the host's Serilog logger received. The middleware cases run
-/// <see cref="ErrorOutcomeMiddleware"/> alone over a request delegate that throws.
+/// Characterises the outcome of a request the framework cannot route, bind or read. The HTTP cases build and start the
+/// real API on Kestrel over the assembly database in the Production environment, in the Development environment, and
+/// in the Production environment with the minimal-API route handlers set to throw on a bad request, send one app
+/// request with a body that cannot be bound, and read the events the host's Serilog logger received. The routing cases
+/// start it in the Production environment and send one request whose method, content type or body the endpoints of its
+/// path do not serve, or whose path no endpoint matches. The middleware cases run <see cref="ErrorOutcomeMiddleware"/>
+/// alone over a request delegate that throws.
 /// </summary>
 public sealed class BadRequestOutcomeTests
 {
@@ -108,6 +111,37 @@ public sealed class BadRequestOutcomeTests
         }
     }
 
+    /// <summary>
+    /// Each request the framework answers before any route handler runs: the method, the path, the session, the
+    /// content type and the body (<see langword="null"/> for none), the status and the <c>Allow</c> header's methods
+    /// joined with <c>", "</c> (empty for none).
+    /// </summary>
+    public static TheoryData<string, string, RequestSession, string?, string?, HttpStatusCode, string> UnroutedRequests =>
+        new()
+        {
+            { "PUT", "api/rest/agents", RequestSession.None, null, null, HttpStatusCode.MethodNotAllowed, "GET, POST" },
+            { "HEAD", "api/rest/agents/by-name", RequestSession.None, null, null, HttpStatusCode.MethodNotAllowed, "GET" },
+            { "POST", "api/app/about", RequestSession.Administrator, null, null, HttpStatusCode.MethodNotAllowed, "GET" },
+            {
+                "PUT", "api/app/admin/tenders/97", RequestSession.Administrator, null, null,
+                HttpStatusCode.MethodNotAllowed, "DELETE, GET"
+            },
+            {
+                "POST", SessionsPath, RequestSession.None, "text/plain", "{\"area\":\"shop\",\"userName\":\"Elaine Lee\"}",
+                HttpStatusCode.UnsupportedMediaType, string.Empty
+            },
+            {
+                "POST", AgentsPath, RequestSession.Administrator, null, "{\"name\":\"QA\"}",
+                HttpStatusCode.UnsupportedMediaType, string.Empty
+            },
+            { "POST", AgentsPath, RequestSession.Administrator, null, null, HttpStatusCode.BadRequest, string.Empty },
+            {
+                "POST", CartItemsPath, RequestSession.Client, "text/plain", "{\"itemId\":82,\"offer\":1}",
+                HttpStatusCode.UnsupportedMediaType, string.Empty
+            },
+            { "GET", "api/rest/nope", RequestSession.None, null, null, HttpStatusCode.NotFound, string.Empty },
+        };
+
     /// <summary>The statuses of the <see cref="BadHttpRequestException"/> cases.</summary>
     public static TheoryData<int> BadRequestStatusCodes => new()
     {
@@ -163,6 +197,57 @@ public sealed class BadRequestOutcomeTests
                     && HasProperty(logEvent, RequestPathProperty, "/" + path));
             Assert.Equal(LogEventLevel.Information, summary.Level);
             Assert.Equal(new ScalarValue(StatusCodes.Status400BadRequest), summary.Properties[StatusCodeProperty]);
+        }
+        finally
+        {
+            await StopAsync(app);
+        }
+    }
+
+    /// <summary>
+    /// A request whose path an endpoint serves with other methods only is answered 405 with an <c>Allow</c> header that
+    /// lists them; one with a content type an app endpoint that reads a JSON body does not accept, or with a body and no
+    /// content type, 415; one to such an endpoint with no body and no content type, 400; and one whose path no endpoint
+    /// matches, 404. Each answer has an empty body and no content type.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(UnroutedRequests))]
+    public async Task UnroutedRequestIsAnsweredWithItsStatusAndAnEmptyBody(
+        string method,
+        string path,
+        RequestSession session,
+        string? contentType,
+        string? body,
+        HttpStatusCode status,
+        string allow)
+    {
+        WebApplication app = await StartHostAsync(HostMode.Production, new CollectingLogSink());
+        try
+        {
+            using var client = new HttpClient { BaseAddress = BaseAddress(app) };
+            using var request = new HttpRequestMessage(new HttpMethod(method), path);
+            if (body is not null)
+            {
+                request.Content = new ByteArrayContent(Encoding.UTF8.GetBytes(body));
+            }
+
+            if (contentType is not null)
+            {
+                request.Content ??= new ByteArrayContent([]);
+                request.Content.Headers.ContentType = MediaTypeHeaderValue.Parse(contentType);
+            }
+
+            if (CreateSession(app.Services.GetRequiredService<SessionRegistry>(), session) is { } sessionId)
+            {
+                request.Headers.Add(SessionMiddleware.HeaderName, sessionId);
+            }
+
+            using HttpResponseMessage response = await client.SendAsync(request);
+
+            Assert.Equal(status, response.StatusCode);
+            Assert.Equal(allow, string.Join(", ", response.Content.Headers.Allow));
+            Assert.Empty(await response.Content.ReadAsByteArrayAsync());
+            Assert.Null(response.Content.Headers.ContentType);
         }
         finally
         {

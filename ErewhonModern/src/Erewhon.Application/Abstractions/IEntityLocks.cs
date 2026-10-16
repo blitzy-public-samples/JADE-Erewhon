@@ -2,7 +2,8 @@ namespace Erewhon.Application.Abstractions;
 
 /// <summary>
 /// Takes the named advisory locks and the item row locks that transaction agents, item-code allocation and
-/// tender closure hold on the shared Erewhon database connection.
+/// tender closure hold on the shared Erewhon database connection, and bounds the lock waits of the active
+/// transaction on that connection.
 /// Every member requires an active transaction on that connection (<see cref="IUnitOfWork.HasActiveTransaction"/>)
 /// and throws <see cref="InvalidOperationException"/> when none is open.
 /// Lock names have the form <c>&lt;Owner&gt;.&lt;collection&gt;:&lt;ownerId&gt;</c>, as built by
@@ -11,6 +12,17 @@ namespace Erewhon.Application.Abstractions;
 /// </summary>
 public interface IEntityLocks
 {
+    /// <summary>
+    /// Sets the <c>lock_timeout</c> of the active transaction to <c>Erewhon:Locks:TimeoutMs</c> milliseconds (default
+    /// 10000). Every later lock wait in the transaction, for an advisory lock or for a row lock one of its writes
+    /// takes, then ends with SQLSTATE <c>55P03</c> once it has lasted that long. The setting lasts until the
+    /// transaction commits or rolls back, or until a rollback to a savepoint created before it was set.
+    /// </summary>
+    /// <param name="ct">Token that cancels the operation.</param>
+    /// <returns>A task that completes when the setting is applied.</returns>
+    /// <exception cref="InvalidOperationException">No transaction is active on the shared connection.</exception>
+    Task ApplyLockTimeoutAsync(CancellationToken ct = default);
+
     /// <summary>
     /// Tries to take the exclusive transaction-level advisory lock with the given name, waiting at most
     /// <c>Erewhon:Locks:TimeoutMs</c> milliseconds (default 10000) for it. An obtained lock is held until the

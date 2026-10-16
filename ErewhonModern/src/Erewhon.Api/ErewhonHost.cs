@@ -86,12 +86,14 @@ public static class ErewhonHost
     /// <c>AddErewhonApplication</c> and <c>AddErewhonPersistence</c>; the HTTP context accessor; a singleton
     /// <see cref="SessionRegistry"/>; a scoped <see cref="HttpSessionContext"/> as <see cref="ISessionContext"/>; a
     /// singleton <see cref="SignalRNotificationPublisher"/> as <see cref="INotificationPublisher"/>; a singleton
-    /// <see cref="ClosureScheduleRegistry"/> and the hosted <see cref="TenderClosureScheduleService"/>; transient
+    /// <see cref="ClosureScheduleRegistry"/>; a singleton <see cref="HubConnectionRegistry"/>; the hosted
+    /// <see cref="TenderClosureScheduleService"/>; transient
     /// <see cref="ErewhonWebService"/> and <see cref="ErewhonWebServiceAdmin"/>; the controllers of this assembly with
     /// the global <see cref="RestExceptionFilter"/>, no implicit required attribute on non-nullable reference types,
     /// and string action parameters bound from the query string keeping the value as sent
     /// (<see cref="QueryStringAsSentMetadataProvider"/>); CoreWCF with metadata addresses taken from the request
-    /// headers; SignalR; Swashbuckle with the
+    /// headers and each SOAP request body checked against its action's request message by
+    /// <see cref="SoapRequestContractBehavior"/>; SignalR; Swashbuckle with the
     /// documents <c>rest</c> and <c>app</c>; the PostgreSQL health check <c>postgresql</c>, which reads
     /// <c>ConnectionStrings:Erewhon</c> each time it runs, opens its own unpooled connection with it and closes it
     /// after <c>SELECT 1</c>, and reports <c>Unhealthy</c> when the value is absent or empty, or when the connection
@@ -110,10 +112,16 @@ public static class ErewhonHost
     /// Pipeline, in order: Serilog request logging through the host's logger; <see cref="ErrorOutcomeMiddleware"/>;
     /// static files; the OpenAPI
     /// documents at <c>/swagger/{document}/swagger.json</c> and the UI at <c>/swagger</c>;
-    /// <see cref="SessionMiddleware"/>; the two SOAP endpoints on SOAP 1.1 <c>BasicHttpBinding</c> with WSDL at
-    /// <c>?wsdl</c>; the REST controllers; the app endpoint groups under <c>/api/app</c>; the hub at
+    /// <see cref="SessionMiddleware"/>; <see cref="SoapHttpMethodMiddleware"/>, answering 405 with
+    /// <c>Allow: GET, POST</c> to every method other than <c>GET</c> and <c>POST</c> on the two SOAP paths and below
+    /// them; the two SOAP endpoints on SOAP 1.1 <c>BasicHttpBinding</c> with WSDL at <c>?wsdl</c>; the REST
+    /// controllers; the app endpoint groups under <c>/api/app</c>; the hub at
     /// <c>/hubs/erewhon</c>; the health check at <c>/healthz</c>, answering <c>Healthy</c> with 200 or
-    /// <c>Unhealthy</c> with 503; 404 with an empty body for every other path without a file extension whose first
+    /// <c>Unhealthy</c> with 503. A request whose path an endpoint serves with other methods only, <c>HEAD</c> and
+    /// <c>OPTIONS</c> included, answers 405 with an <c>Allow</c> header that lists those methods and an empty body. A
+    /// request to an app endpoint that reads a JSON body answers 415 with an empty body when the endpoint does not
+    /// accept its <c>Content-Type</c>, or when it has a body and no <c>Content-Type</c>. Only a request that no
+    /// endpoint matches reaches the fallbacks: 404 with an empty body for a path without a file extension whose first
     /// segment is <c>api</c>, <c>soap</c>, <c>hubs</c>, <c>swagger</c> or <c>healthz</c>, compared case-insensitively;
     /// and <c>index.html</c> for every other path without a file extension.
     /// </description></item>
@@ -409,6 +417,7 @@ public static class ErewhonHost
         services.AddScoped<ISessionContext, HttpSessionContext>();
         services.AddSingleton<INotificationPublisher, SignalRNotificationPublisher>();
         services.AddSingleton<ClosureScheduleRegistry>();
+        services.AddSingleton<HubConnectionRegistry>();
         services.AddHostedService<TenderClosureScheduleService>();
         services.AddTransient<ErewhonWebService>();
         services.AddTransient<ErewhonWebServiceAdmin>();
@@ -428,6 +437,7 @@ public static class ErewhonHost
         services.AddServiceModelServices();
         services.AddServiceModelMetadata();
         services.AddSingleton<IServiceBehavior, UseRequestHeadersForMetadataAddressBehavior>();
+        services.AddSingleton<IServiceBehavior, SoapRequestContractBehavior>();
 
         services
             .AddSignalR()
@@ -502,7 +512,11 @@ public static class ErewhonHost
         new Npgsql.NpgsqlConnectionStringBuilder(connectionString) { Pooling = false, Multiplexing = false }
             .ConnectionString;
 
-    /// <summary>Adds the middleware and maps every endpoint of the Erewhon host, in pipeline order.</summary>
+    /// <summary>
+    /// Adds the middleware and maps every endpoint of the Erewhon host, in pipeline order. The reserved 404 fallbacks
+    /// and the <c>index.html</c> fallback are endpoints of a second routing pass, added last, that runs only for a
+    /// request to which the application's routing selected no endpoint.
+    /// </summary>
     /// <param name="app">The built application.</param>
     private static void MapPipeline(WebApplication app)
     {
@@ -519,6 +533,8 @@ public static class ErewhonHost
 
         app.UseMiddleware<SessionMiddleware>();
 
+        app.UseMiddleware<SoapHttpMethodMiddleware>(
+            (IReadOnlyList<PathString>)[new PathString(WebServicePath), new PathString(WebServiceAdminPath)]);
         app.UseServiceModel(serviceBuilder =>
         {
             serviceBuilder.AddService<ErewhonWebService>();
@@ -550,16 +566,24 @@ public static class ErewhonHost
 
         app.MapHub<ErewhonHub>(ErewhonHub.Path);
         app.MapHealthChecks(HealthCheckPath);
-        foreach (var prefix in ReservedPathPrefixes)
-        {
-            app.MapFallback($"{prefix}/{ReservedFallbackPattern}", static context =>
-            {
-                context.Response.StatusCode = StatusCodes.Status404NotFound;
-                return Task.CompletedTask;
-            });
-        }
 
-        app.MapFallbackToFile(SpaFallbackFile);
+        app.UseWhen(static context => context.GetEndpoint() is null, static unmatched =>
+        {
+            unmatched.UseRouting();
+            unmatched.UseEndpoints(static endpoints =>
+            {
+                foreach (var prefix in ReservedPathPrefixes)
+                {
+                    endpoints.MapFallback($"{prefix}/{ReservedFallbackPattern}", static context =>
+                    {
+                        context.Response.StatusCode = StatusCodes.Status404NotFound;
+                        return Task.CompletedTask;
+                    });
+                }
+
+                endpoints.MapFallbackToFile(SpaFallbackFile);
+            });
+        });
     }
 
     /// <summary>Sets camelCase property names and adds the camelCase string enum converter.</summary>
