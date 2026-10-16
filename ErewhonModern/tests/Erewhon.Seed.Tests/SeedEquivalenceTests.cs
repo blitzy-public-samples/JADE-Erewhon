@@ -1,16 +1,23 @@
 using System.Data.Common;
+using System.Diagnostics;
 using System.Globalization;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using Erewhon.Api.Cli;
+using Erewhon.Api.Realtime;
+using Erewhon.Api.Sessions;
 using Erewhon.Application.Abstractions;
 using Erewhon.Application.Common;
 using Erewhon.Application.Domain;
 using Erewhon.Application.Messages;
 using Erewhon.Application.Notifications;
+using Erewhon.Application.Services;
 using Erewhon.Persistence;
 using Erewhon.Persistence.Seed;
 using Erewhon.Testing;
+using Microsoft.AspNetCore.SignalR.Client;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Diagnostics;
 using Microsoft.Extensions.DependencyInjection;
@@ -80,6 +87,9 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
         RegexOptions.CultureInvariant);
 
     private static readonly Regex WholeSeconds = new(@"^\d+$", RegexOptions.CultureInvariant);
+
+    private static readonly TimeSpan HubDeliveryTimeout = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan HubRoundTimeout = TimeSpan.FromSeconds(5);
 
     private readonly PostgresDatabase _database = PostgresDatabase.ForAssembly(typeof(SeedEquivalenceTests).Assembly);
     private readonly CollectingLogSink _logSink = new();
@@ -782,11 +792,13 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
     /// A load from a directory that holds only <c>Locations.txt</c>, on a host where the count query of the
     /// <c>Agents.txt</c> end line and the rollback of the load transaction each fail with an exception whose message,
     /// inner <see cref="NpgsqlException"/> and data hold connection text, fails with the
-    /// <see cref="FileNotFoundException"/> of <c>Agents.txt</c> and publishes no notification. The loader writes exactly
-    /// two Warning events, one per clean-up failure, the end-line event with <c>SeedFile</c> = <c>Agents.txt</c>. Neither
-    /// event holds the connection text or a failure message in its rendered message, its properties, its attached
-    /// exception or its compact JSON form; the attached exception has the failure's type name as its message, no inner
-    /// exception and no data, and renders the failure chain as type names.
+    /// <see cref="FileNotFoundException"/> of <c>Agents.txt</c> and publishes no notification: a second SignalR session
+    /// on that host receives, after the company round trip of <see cref="JoinAllGroupAsync"/>, only the <c>Company</c>
+    /// Added and Deleted of the company round trip that follows the load. The loader writes exactly two Warning events,
+    /// one per clean-up failure, the end-line event with <c>SeedFile</c> = <c>Agents.txt</c>. Neither event holds the
+    /// connection text or a failure message in its rendered message, its properties, its attached exception or its
+    /// compact JSON form; the attached exception has the failure's type name as its message, no inner exception and no
+    /// data, and renders the failure chain as type names.
     /// </summary>
     /// <returns>A task that completes when the case has run.</returns>
     [Fact]
@@ -794,8 +806,9 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
     {
         var faults = new SeedFaults { FailRollback = true };
         var logSink = new CollectingLogSink();
-        var publisher = new RecordingNotificationPublisher();
-        await using ErewhonApiHost host = await StartFaultingHostAsync(faults, logSink, publisher);
+        await using ErewhonApiHost host = await StartFaultingHostAsync(faults, logSink);
+        await using EntityChangeListener listener = await EntityChangeListener.ConnectAsync(host);
+        int loadStart = await JoinAllGroupAsync(host, listener);
 
         string partialDirectory = Path.Combine(
             Path.GetTempPath(),
@@ -814,7 +827,10 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
             Assert.EndsWith(AgentsFile, failure.FileName, StringComparison.Ordinal);
             Assert.True(writer.Armed, "The Locations.txt end line was not written.");
             Assert.False(faults.CommandFailurePending, "No database command ran after the Locations.txt end line.");
-            Assert.Empty(publisher.EntityChanges);
+            (long sentinelId, int sentinelEnd) = await CompanyRoundTripAsync(host, listener);
+            Assert.Equal(
+                new[] { CompanyChange(sentinelId, ChangeKind.Added), CompanyChange(sentinelId, ChangeKind.Deleted) },
+                listener.Snapshot()[loadStart..sentinelEnd]);
 
             List<LogEvent> warnings = logSink.Events
                 .Where(logEvent => logEvent.Level == LogEventLevel.Warning && IsFromCategory(logEvent, typeof(InitialDataLoader)))
@@ -834,19 +850,21 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// When the token of a load is cancelled as the commit of the load transaction returns, the committed load's
-    /// notifications are still published, among them <c>Company</c> Added for the loaded company and <c>Agent</c> Added
-    /// for each of its 8 agents; the load then writes the closing line and fails with
-    /// <see cref="OperationCanceledException"/> in the post-load closure, and the loaded rows stay committed with no
-    /// tender sale built.
+    /// When the token of a load is cancelled as the commit of the load transaction returns, the load writes the closing
+    /// line and fails with <see cref="OperationCanceledException"/> in the post-load closure, and the loaded rows stay
+    /// committed with no tender sale built. The committed load's notifications are still published: after the load the
+    /// loaded company is deleted with <see cref="DeleteCompanyAndWaitAsync"/>, and a second SignalR session on that host
+    /// receives, between the company round trip of <see cref="JoinAllGroupAsync"/> and that deletion's <c>Company</c>
+    /// Deleted, <c>Company</c> Added for the loaded company and exactly 8 <c>Agent</c> Added.
     /// </summary>
     /// <returns>A task that completes when the case has run.</returns>
     [Fact]
     public async Task NotificationsPublishedWhenCancelledAfterCommit()
     {
         var faults = new SeedFaults();
-        var publisher = new RecordingNotificationPublisher();
-        await using ErewhonApiHost host = await StartFaultingHostAsync(faults, new CollectingLogSink(), publisher);
+        await using ErewhonApiHost host = await StartFaultingHostAsync(faults, new CollectingLogSink());
+        await using EntityChangeListener listener = await EntityChangeListener.ConnectAsync(host);
+        int loadStart = await JoinAllGroupAsync(host, listener);
         using var cancellation = new CancellationTokenSource();
         faults.CancelAfterNextCommit(cancellation);
         using var writer = new StringWriter(CultureInfo.InvariantCulture);
@@ -856,14 +874,7 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
         Assert.True(cancellation.IsCancellationRequested, "The load transaction did not commit.");
         Assert.Contains(MessageCatalog.Get(MessageKeys.ClosingTendersSever), writer.ToString(), StringComparison.Ordinal);
 
-        // B-64: the committed batch is published after the commit, whatever the load's token.
         long companyId = Assert.Single(await CompanyIdsAsync());
-        IReadOnlyList<ChangeEvent> published = publisher.EntityChanges;
-        Assert.Contains(
-            published,
-            change => change.EntityType == nameof(Company) && change.Id == companyId && change.Kind == ChangeKind.Added);
-        Assert.Equal(8, published.Count(change => change.EntityType == nameof(Agent) && change.Kind == ChangeKind.Added));
-
         TableCounts counts = await CountTablesAsync();
         Assert.Equal(8, counts.Agents);
         Assert.Equal(20, counts.Clients);
@@ -871,6 +882,12 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
         Assert.Equal(100, counts.Tenders);
         Assert.Equal(19, counts.RetailSales);
         Assert.Equal(0, counts.TenderSales);
+
+        // B-64: the committed batch is published after the commit, whatever the load's token.
+        int loadEnd = await DeleteCompanyAndWaitAsync(host, listener, companyId);
+        EntityChangedMessage[] published = listener.Snapshot()[loadStart..loadEnd];
+        Assert.Contains(CompanyChange(companyId, ChangeKind.Added), published);
+        Assert.Equal(8, published.Count(message => message.EntityType == nameof(Agent) && message.Kind == ChangeKind.Added));
     }
 
     /// <summary>
@@ -888,14 +905,12 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
 
     /// <summary>
     /// Starts a second host on the test database, with the seed data directory set to <c>Erewhon/DataFiles</c> and every
-    /// log event collected in <paramref name="logSink"/>, whose <see cref="IUnitOfWork"/> and database commands carry the
-    /// faults of <paramref name="faults"/> and whose notification publisher is <paramref name="publisher"/>. The caller
-    /// disposes it.
+    /// log event collected in <paramref name="logSink"/>, whose <see cref="ErewhonDbContext"/> options add a
+    /// <see cref="FailingCommandInterceptor"/> and a <see cref="FaultingTransactionInterceptor"/> over
+    /// <paramref name="faults"/>. Every other service is the host's own, the unit of work and the SignalR notification
+    /// publisher included. The caller disposes it.
     /// </summary>
-    private Task<ErewhonApiHost> StartFaultingHostAsync(
-        SeedFaults faults,
-        CollectingLogSink logSink,
-        RecordingNotificationPublisher publisher) =>
+    private Task<ErewhonApiHost> StartFaultingHostAsync(SeedFaults faults, CollectingLogSink logSink) =>
         ErewhonApiHost.StartAsync(new ErewhonApiHostOptions
         {
             ConnectionString = _database.ConnectionString,
@@ -903,30 +918,19 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
             Settings = new Dictionary<string, string?> { [SeedDataDirectoryKey] = _dataDirectory },
             ConfigureServices = services =>
             {
-                ServiceDescriptor unitOfWork = services.Single(descriptor => descriptor.ServiceType == typeof(IUnitOfWork));
-                Type unitOfWorkType = unitOfWork.ImplementationType
-                    ?? throw new InvalidOperationException("IUnitOfWork is not registered with an implementation type.");
-                services.Replace(ServiceDescriptor.Describe(
-                    typeof(IUnitOfWork),
-                    provider => new FaultingUnitOfWork(
-                        (IUnitOfWork)ActivatorUtilities.CreateInstance(provider, unitOfWorkType),
-                        faults),
-                    unitOfWork.Lifetime));
-
                 ServiceDescriptor contextOptions = services.Single(
                     descriptor => descriptor.ServiceType == typeof(DbContextOptions<ErewhonDbContext>));
                 Func<IServiceProvider, object> createContextOptions = contextOptions.ImplementationFactory
                     ?? throw new InvalidOperationException("The ErewhonDbContext options are not registered with a factory.");
-                var interceptor = new FailingCommandInterceptor(faults);
+                var commandInterceptor = new FailingCommandInterceptor(faults);
+                var transactionInterceptor = new FaultingTransactionInterceptor(faults);
                 services.Replace(ServiceDescriptor.Describe(
                     typeof(DbContextOptions<ErewhonDbContext>),
                     provider => new DbContextOptionsBuilder<ErewhonDbContext>(
                             (DbContextOptions<ErewhonDbContext>)createContextOptions(provider))
-                        .AddInterceptors(interceptor)
+                        .AddInterceptors(commandInterceptor, transactionInterceptor)
                         .Options,
                     contextOptions.Lifetime));
-
-                services.Replace(ServiceDescriptor.Singleton<INotificationPublisher>(publisher));
             },
         });
 
@@ -944,6 +948,90 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
         InitialDataLoader loader = scope.ServiceProvider.GetRequiredService<InitialDataLoader>();
         return await loader.LoadAsync(directory, writer, ct);
     }
+
+    /// <summary>
+    /// Creates the company "Jade Software Corporation" with <see cref="TestCompanyBuilder.CreateCompanyAsync"/> in a new
+    /// scope of <paramref name="host"/>, deletes it with <see cref="TestCompanyBuilder.DeleteCompanyAsync"/> in the same
+    /// scope, and returns its id.
+    /// </summary>
+    private static async Task<long> CreateAndDeleteCompanyAsync(ErewhonApiHost host)
+    {
+        await using AsyncServiceScope scope = host.Services.CreateAsyncScope();
+        var builder = new TestCompanyBuilder(scope.ServiceProvider);
+        Company company = await builder.CreateCompanyAsync();
+        await builder.DeleteCompanyAsync(company.Id);
+        return company.Id;
+    }
+
+    /// <summary>
+    /// Repeats <see cref="CreateAndDeleteCompanyAsync"/> on <paramref name="host"/>, waiting at most
+    /// <see cref="HubRoundTimeout"/> after each round for its <c>Company</c> Deleted, until <paramref name="listener"/>
+    /// has received <c>Company</c> Added and then <c>Company</c> Deleted for one round's company; fails when no round
+    /// has done so within <see cref="HubDeliveryTimeout"/>. Returns the number of messages received up to and including
+    /// that <c>Company</c> Deleted.
+    /// </summary>
+    private static async Task<int> JoinAllGroupAsync(ErewhonApiHost host, EntityChangeListener listener)
+    {
+        Stopwatch elapsed = Stopwatch.StartNew();
+        while (true)
+        {
+            long companyId = await CreateAndDeleteCompanyAsync(host);
+            TimeSpan wait = TimeSpan.FromTicks(
+                Math.Clamp((HubDeliveryTimeout - elapsed.Elapsed).Ticks, 0, HubRoundTimeout.Ticks));
+            int deleted = await listener.WaitForAsync(CompanyChange(companyId, ChangeKind.Deleted), wait);
+            if (deleted >= 0 && listener.Snapshot()[..deleted].Contains(CompanyChange(companyId, ChangeKind.Added)))
+            {
+                return deleted + 1;
+            }
+
+            if (elapsed.Elapsed >= HubDeliveryTimeout)
+            {
+                Assert.Fail($"The SignalR session received no Company Added and Deleted pair within {HubDeliveryTimeout}.");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Runs <see cref="CreateAndDeleteCompanyAsync"/> on <paramref name="host"/> and waits at most
+    /// <see cref="HubDeliveryTimeout"/> until <paramref name="listener"/> has received that company's <c>Company</c>
+    /// Deleted, failing when it has not. Returns the company id and the number of messages received up to and including
+    /// that <c>Company</c> Deleted.
+    /// </summary>
+    private static async Task<(long CompanyId, int End)> CompanyRoundTripAsync(
+        ErewhonApiHost host,
+        EntityChangeListener listener)
+    {
+        long companyId = await CreateAndDeleteCompanyAsync(host);
+        int deleted = await listener.WaitForAsync(CompanyChange(companyId, ChangeKind.Deleted), HubDeliveryTimeout);
+        Assert.True(
+            deleted >= 0,
+            $"The SignalR session received no Company Deleted for company {companyId} within {HubDeliveryTimeout}.");
+        return (companyId, deleted + 1);
+    }
+
+    /// <summary>
+    /// Deletes company <paramref name="companyId"/> with <see cref="TestCompanyBuilder.DeleteCompanyAsync"/> in a new
+    /// scope of <paramref name="host"/> and waits at most <see cref="HubDeliveryTimeout"/> until
+    /// <paramref name="listener"/> has received its <c>Company</c> Deleted, failing when it has not. Returns the number
+    /// of messages received up to and including that <c>Company</c> Deleted.
+    /// </summary>
+    private static async Task<int> DeleteCompanyAndWaitAsync(
+        ErewhonApiHost host,
+        EntityChangeListener listener,
+        long companyId)
+    {
+        await using AsyncServiceScope scope = host.Services.CreateAsyncScope();
+        await new TestCompanyBuilder(scope.ServiceProvider).DeleteCompanyAsync(companyId);
+        int deleted = await listener.WaitForAsync(CompanyChange(companyId, ChangeKind.Deleted), HubDeliveryTimeout);
+        Assert.True(
+            deleted >= 0,
+            $"The SignalR session received no Company Deleted for company {companyId} within {HubDeliveryTimeout}.");
+        return deleted + 1;
+    }
+
+    /// <summary>Returns the <see cref="EntityChangedMessage"/> of a <c>Company</c> change.</summary>
+    private static EntityChangedMessage CompanyChange(long companyId, ChangeKind kind) =>
+        new(nameof(Company), companyId, kind);
 
     /// <summary>
     /// Returns an <see cref="InvalidOperationException"/> naming <paramref name="operation"/> whose message, inner
@@ -1659,8 +1747,10 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
         int TenderSales);
 
     /// <summary>
-    /// The faults a host from <see cref="StartFaultingHostAsync"/> injects. A rollback fault applies to every rollback;
-    /// the commit and command faults each apply once, to the next commit or database command after they are set.
+    /// The faults that the <see cref="FailingCommandInterceptor"/> and <see cref="FaultingTransactionInterceptor"/> of a
+    /// host from <see cref="StartFaultingHostAsync"/> inject at the EF Core command and transaction boundaries. A rollback
+    /// fault applies to every rollback; the commit and command faults each apply once, to the next commit or database
+    /// command after they are set.
     /// </summary>
     private sealed class SeedFaults
     {
@@ -1688,51 +1778,6 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
         /// <summary>Returns whether a command fault was set, and clears it.</summary>
         /// <returns><see langword="true"/> when the calling command fails.</returns>
         public bool TakeFailNextCommand() => Interlocked.Exchange(ref _failNextCommand, 0) != 0;
-    }
-
-    /// <summary>
-    /// A unit of work that runs every call on <paramref name="inner"/>; after a commit it cancels the source taken from
-    /// <see cref="SeedFaults.TakeCancelAfterCommit"/>, and after a rollback it throws a <see cref="ConnectionFailure"/>
-    /// when <see cref="SeedFaults.FailRollback"/> is set.
-    /// </summary>
-    /// <param name="inner">The unit of work registered by the host.</param>
-    /// <param name="faults">The faults to inject.</param>
-    private sealed class FaultingUnitOfWork(IUnitOfWork inner, SeedFaults faults) : IUnitOfWork
-    {
-        /// <inheritdoc/>
-        public bool HasActiveTransaction => inner.HasActiveTransaction;
-
-        /// <inheritdoc/>
-        public Task BeginAsync(CancellationToken ct = default) => inner.BeginAsync(ct);
-
-        /// <inheritdoc/>
-        public async Task CommitAsync(CancellationToken ct = default)
-        {
-            await inner.CommitAsync(ct);
-            faults.TakeCancelAfterCommit()?.Cancel();
-        }
-
-        /// <inheritdoc/>
-        public async Task RollbackAsync(CancellationToken ct = default)
-        {
-            await inner.RollbackAsync(ct);
-            if (faults.FailRollback)
-            {
-                throw ConnectionFailure("Rollback");
-            }
-        }
-
-        /// <inheritdoc/>
-        public Task CreateSavepointAsync(string name, CancellationToken ct = default) =>
-            inner.CreateSavepointAsync(name, ct);
-
-        /// <inheritdoc/>
-        public Task RollbackToSavepointAsync(string name, CancellationToken ct = default) =>
-            inner.RollbackToSavepointAsync(name, ct);
-
-        /// <inheritdoc/>
-        public Task ReleaseSavepointAsync(string name, CancellationToken ct = default) =>
-            inner.ReleaseSavepointAsync(name, ct);
     }
 
     /// <summary>
@@ -1786,54 +1831,161 @@ public sealed class SeedEquivalenceTests : IAsyncLifetime
     }
 
     /// <summary>
-    /// A notification publisher that keeps every entity change handed to it, in order. A call whose token is cancelled
-    /// returns a cancelled task and keeps nothing.
+    /// A transaction interceptor that, once a transaction has committed, cancels the source taken from
+    /// <see cref="SeedFaults.TakeCancelAfterCommit"/>, and, once a transaction has rolled back, throws a
+    /// <see cref="ConnectionFailure"/> when <see cref="SeedFaults.FailRollback"/> is set. Only the asynchronous commit and
+    /// rollback carry the faults.
     /// </summary>
-    private sealed class RecordingNotificationPublisher : INotificationPublisher
+    /// <param name="faults">The faults to inject.</param>
+    private sealed class FaultingTransactionInterceptor(SeedFaults faults) : DbTransactionInterceptor
     {
-        private readonly object _gate = new();
-        private readonly List<ChangeEvent> _entityChanges = [];
-
-        /// <summary>A snapshot of every entity change kept, in the order handed over.</summary>
-        public IReadOnlyList<ChangeEvent> EntityChanges
+        /// <inheritdoc/>
+        public override Task TransactionCommittedAsync(
+            DbTransaction transaction,
+            TransactionEndEventData eventData,
+            CancellationToken cancellationToken = default)
         {
-            get
+            faults.TakeCancelAfterCommit()?.Cancel();
+            return base.TransactionCommittedAsync(transaction, eventData, cancellationToken);
+        }
+
+        /// <inheritdoc/>
+        public override Task TransactionRolledBackAsync(
+            DbTransaction transaction,
+            TransactionEndEventData eventData,
+            CancellationToken cancellationToken = default)
+        {
+            if (faults.FailRollback)
             {
+                throw ConnectionFailure("Rollback");
+            }
+
+            return base.TransactionRolledBackAsync(transaction, eventData, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// A SignalR client of the hub of one host that keeps every <see cref="ErewhonHub.EntityChanged"/> message it
+    /// receives, in arrival order. It connects with an Administrator session of the admin area registered in the host's
+    /// <see cref="SessionRegistry"/>; disposing it stops and disposes the connection.
+    /// </summary>
+    private sealed class EntityChangeListener : IAsyncDisposable
+    {
+        private const string UserName = "Administrator";
+
+        private readonly object _gate = new();
+        private readonly List<EntityChangedMessage> _messages = [];
+        private readonly HubConnection _connection;
+        private TaskCompletionSource _received = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>
+        /// Creates a listener that keeps the <see cref="ErewhonHub.EntityChanged"/> messages of
+        /// <paramref name="connection"/>.
+        /// </summary>
+        /// <param name="connection">The connection, not yet started.</param>
+        private EntityChangeListener(HubConnection connection)
+        {
+            _connection = connection;
+            _connection.On<EntityChangedMessage>(ErewhonHub.EntityChanged, Receive);
+        }
+
+        /// <summary>
+        /// Registers an Administrator session of the admin area in the <see cref="SessionRegistry"/> of
+        /// <paramref name="host"/>, connects to <see cref="ErewhonApiHost.HubUrl"/> of that session with the JSON
+        /// protocol reading enum values as camel-case strings, and returns the listener once the connection has started.
+        /// A connection that fails to start is disposed. The caller disposes the listener.
+        /// </summary>
+        /// <param name="host">The host whose hub is connected to.</param>
+        /// <returns>The started listener.</returns>
+        public static async Task<EntityChangeListener> ConnectAsync(ErewhonApiHost host)
+        {
+            SessionEntry session = host.Services.GetRequiredService<SessionRegistry>()
+                .Create(LogonArea.Admin, SessionRole.Administrator, null, null, UserName);
+            HubConnection connection = new HubConnectionBuilder()
+                .WithUrl(host.HubUrl(session.SessionId))
+                .AddJsonProtocol(options => options.PayloadSerializerOptions.Converters.Add(
+                    new JsonStringEnumConverter(JsonNamingPolicy.CamelCase)))
+                .Build();
+            var listener = new EntityChangeListener(connection);
+            try
+            {
+                await connection.StartAsync();
+            }
+            catch
+            {
+                await connection.DisposeAsync();
+                throw;
+            }
+
+            return listener;
+        }
+
+        /// <summary>Returns a copy of the messages received so far, in arrival order.</summary>
+        /// <returns>The messages.</returns>
+        public EntityChangedMessage[] Snapshot()
+        {
+            lock (_gate)
+            {
+                return _messages.ToArray();
+            }
+        }
+
+        /// <summary>
+        /// Returns the index of the first received message equal to <paramref name="message"/>, waiting for it at most
+        /// <paramref name="timeout"/>; returns -1 when it has not been received by then.
+        /// </summary>
+        /// <param name="message">The message to wait for.</param>
+        /// <param name="timeout">The longest wait.</param>
+        /// <returns>The index of the message in arrival order, or -1.</returns>
+        public async Task<int> WaitForAsync(EntityChangedMessage message, TimeSpan timeout)
+        {
+            using var timeoutSource = new CancellationTokenSource(timeout);
+            while (true)
+            {
+                Task received;
                 lock (_gate)
                 {
-                    return _entityChanges.ToArray();
+                    int index = _messages.IndexOf(message);
+                    if (index >= 0)
+                    {
+                        return index;
+                    }
+
+                    received = _received.Task;
+                }
+
+                try
+                {
+                    await received.WaitAsync(timeoutSource.Token);
+                }
+                catch (OperationCanceledException) when (timeoutSource.IsCancellationRequested)
+                {
+                    lock (_gate)
+                    {
+                        return _messages.IndexOf(message);
+                    }
                 }
             }
         }
 
-        /// <inheritdoc/>
-        public Task PublishEntityChangesAsync(IReadOnlyList<ChangeEvent> events, CancellationToken ct = default)
-        {
-            ArgumentNullException.ThrowIfNull(events);
-            if (ct.IsCancellationRequested)
-            {
-                return Task.FromCanceled(ct);
-            }
+        /// <summary>Stops and disposes the connection.</summary>
+        /// <returns>A task that completes when the connection is disposed.</returns>
+        public ValueTask DisposeAsync() => _connection.DisposeAsync();
 
+        /// <summary>Keeps <paramref name="message"/> and completes the pending wait signal.</summary>
+        /// <param name="message">The received message.</param>
+        private void Receive(EntityChangedMessage message)
+        {
+            TaskCompletionSource received;
             lock (_gate)
             {
-                _entityChanges.AddRange(events);
+                _messages.Add(message);
+                received = _received;
+                _received = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             }
 
-            return Task.CompletedTask;
+            received.SetResult();
         }
-
-        /// <inheritdoc/>
-        public Task PublishCartItemDeletedAsync(string sessionId, long itemId, CancellationToken ct = default) =>
-            ct.IsCancellationRequested ? Task.FromCanceled(ct) : Task.CompletedTask;
-
-        /// <inheritdoc/>
-        public Task PublishSaveOutstandingChangesAsync(
-            string sessionId,
-            string entityType,
-            long id,
-            CancellationToken ct = default) =>
-            ct.IsCancellationRequested ? Task.FromCanceled(ct) : Task.CompletedTask;
     }
 
     /// <summary>
