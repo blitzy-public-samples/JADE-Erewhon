@@ -91,7 +91,8 @@ public sealed class FacadeTestSettings
 /// The facade's own <c>ConfigureKestrel</c> callback binds its listeners from the <c>Facade:*Port</c>
 /// settings this factory supplies, replacing the dynamic URL that <c>UseKestrel()</c> sets.
 /// <see cref="StartAsync"/> verifies the bound addresses. Disposal stops the host, within the facade's own
-/// 5 s shutdown timeout, and releases the ports.
+/// 5 s shutdown timeout, and releases the ports; a host whose start failed has already been disposed by
+/// <see cref="CreateHost"/>.
 /// </para>
 /// </remarks>
 public sealed class FacadeFactory : WebApplicationFactory<global::Program>
@@ -102,6 +103,23 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
 
     // A raw client gives up after this long, so a facade that hangs fails the test instead of stalling it.
     private static readonly TimeSpan RawClientTimeout = TimeSpan.FromSeconds(15);
+
+    // One start attempt may take this long. No request timeout applies before the facade listens, so an
+    // entry point or hosted service that blocks would otherwise stall the whole suite; past this limit the
+    // test fails with a fixed message instead. A healthy start takes well under a second. A start-up that
+    // blocks costs one such limit, because every later start fails at once while the abandoned attempt is
+    // in flight (_abandonedStarts), however many tests start a facade. The suite therefore finishes, and
+    // writes the TRX naming each failure, well inside the 600 s suite limit of tests/run-tests.sh, which
+    // stops the run without a TRX. An abandoned attempt that ends, and whose factory is then disposed,
+    // lets later starts run again.
+    private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(20);
+
+    // Start attempts abandoned on the start-up limit or the token whose StartServer has not yet ended or
+    // whose factory is not yet disposed. While one is in flight a new start would wait out a limit of its
+    // own, and a host it builds could be captured by the host-building interception WebApplicationFactory
+    // may still hold for the abandoned attempt, so StartAsync fails at once instead. Changed only through
+    // Interlocked.
+    private static int _abandonedStarts;
 
     private readonly KeyValuePair<string, string?>[] _settings;
 
@@ -143,14 +161,24 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
     /// Starts the facade on real Kestrel listeners and returns once it has bound exactly
     /// <see cref="RestPort"/>, <see cref="SoapPort"/> and <see cref="AdminPort"/> on 127.0.0.1. A port taken
     /// by another process between drawing and binding is retried with fresh ports, up to three attempts.
+    /// Each attempt must finish within a 20 s start-up limit, and none begins while an earlier abandoned
+    /// attempt is still in flight.
     /// </summary>
     /// <param name="settings">The routing targets and extra settings.</param>
-    /// <param name="ct">Cancels start-up before an attempt begins.</param>
+    /// <param name="ct">
+    /// Cancels start-up, before an attempt begins or while one runs. An attempt that cancellation or the
+    /// start-up limit abandons keeps running until the facade's synchronous start-up returns, and its
+    /// factory is disposed only then; until that disposal has ended, every start fails at once.
+    /// </param>
     /// <returns>The started factory; the caller disposes it.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="settings"/> is null.</exception>
     /// <exception cref="InvalidOperationException">
-    /// Every attempt found a port in use, or the facade bound other addresses than the ones allocated.
+    /// An earlier start attempt, abandoned on the start-up limit or on cancellation, has not yet ended and
+    /// had its factory disposed, so no factory was constructed; every attempt found a port in use; or the
+    /// facade bound other addresses than the ones allocated.
     /// </exception>
+    /// <exception cref="TimeoutException">An attempt did not finish within the start-up limit.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
     public static async Task<FacadeFactory> StartAsync(FacadeTestSettings settings, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(settings);
@@ -158,15 +186,34 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
         for (int attempt = 1; attempt <= MaxStartAttempts; attempt++)
         {
             ct.ThrowIfCancellationRequested();
+            if (Volatile.Read(ref _abandonedStarts) > 0)
+            {
+                throw new InvalidOperationException("an earlier facade start-up is still running");
+            }
+
             var factory = new FacadeFactory(settings);
+            Task? start = null;
             try
             {
                 factory.UseKestrel();
 
-                // StartServer runs the facade's entry point and starts its host synchronously.
-                await Task.Run(factory.StartServer, ct);
+                // StartServer runs the facade's entry point and starts its host synchronously. Nothing can
+                // interrupt it once it runs: the start-up limit and the token end only this wait for it.
+                start = Task.Run(factory.StartServer, ct);
+                await start.WaitAsync(StartupTimeout, ct);
                 factory.VerifyBinding();
                 return factory;
+            }
+            catch (Exception exception) when (start is not null && WaitEndedFirst(start, exception))
+            {
+                // Disposing now would race the start-up still in flight.
+                DisposeWhenFinished(start, factory);
+                if (exception is OperationCanceledException)
+                {
+                    throw;
+                }
+
+                throw new TimeoutException("facade did not start within the start-up limit");
             }
             catch (Exception exception) when (IsAddressInUse(exception))
             {
@@ -328,6 +375,47 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
         builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(_settings));
     }
 
+    /// <inheritdoc />
+    /// <remarks>
+    /// The base factory keeps a host only once it has started, so a host whose start fails, for example on
+    /// a <c>Facade:WsdlPath</c> that cannot be resolved, is disposed here and the failure rethrown
+    /// unchanged. The facade's entry point is finished with the host by then: its failure reaches the start
+    /// only once it has completed, and a host its <c>RunAsync</c> already disposed, as after a port found in
+    /// use, is disposed again harmlessly.
+    /// </remarks>
+    protected override IHost CreateHost(IHostBuilder builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        var recorder = new BuiltHostRecorder(builder);
+        try
+        {
+            return base.CreateHost(recorder);
+        }
+        catch
+        {
+            if (recorder.BuiltHost is { } host)
+            {
+                DisposeHost(host);
+            }
+
+            throw;
+        }
+    }
+
+    // As RunAsync does, the asynchronous form is used when the host offers it. Blocking on it is safe here:
+    // CreateHost already blocks on the host's start, and the host's own Dispose blocks the same way.
+    private static void DisposeHost(IHost host)
+    {
+        if (host is IAsyncDisposable asyncDisposable)
+        {
+            asyncDisposable.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+        else
+        {
+            host.Dispose();
+        }
+    }
+
     private void VerifyBinding()
     {
         ICollection<string>? addresses = Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()?.Addresses;
@@ -446,6 +534,48 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
         return false;
     }
 
+    // True when the wait for a start attempt ended on its own start-up limit or token, so StartServer may
+    // still be running; false when the wait rethrew the attempt's own failure or cancellation.
+    private static bool WaitEndedFirst(Task start, Exception exception) =>
+        exception is TimeoutException or OperationCanceledException
+        && !start.IsCanceled
+        && !(start.Exception is { } failure && failure.InnerExceptions.Contains(exception));
+
+    // Disposes the factory of an abandoned start attempt once StartServer returns or throws, never while it
+    // runs, and holds _abandonedStarts from now until that disposal has ended, whatever its outcome.
+    // Nothing awaits either task, and the test that abandoned the attempt has already failed, so reading
+    // the attempt's exception and the disposal's observes a failed start or disposal, and neither surfaces
+    // later as an unobserved task exception.
+    private static void DisposeWhenFinished(Task start, FacadeFactory factory)
+    {
+        Interlocked.Increment(ref _abandonedStarts);
+        _ = start.ContinueWith<Task>(
+                async finished =>
+                {
+                    try
+                    {
+                        _ = finished.Exception;
+                        await factory.DisposeAsync();
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref _abandonedStarts);
+                    }
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.None,
+                TaskScheduler.Default)
+            .Unwrap()
+            .ContinueWith(
+                disposal =>
+                {
+                    _ = disposal.Exception;
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.None,
+                TaskScheduler.Default);
+    }
+
     private static bool IsTransportFailure(Exception exception, CancellationToken ct) =>
         exception is HttpRequestException or IOException
         || (exception is OperationCanceledException && !ct.IsCancellationRequested);
@@ -515,6 +645,59 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
         {
             string[] copied = [.. values];
             merged[name] = merged.TryGetValue(name, out string[]? existing) ? [.. existing, .. copied] : copied;
+        }
+    }
+
+    // Passes every call through to the factory's host builder and keeps the host its Build returns, so
+    // that CreateHost can dispose a host the base implementation built but could not start.
+    private sealed class BuiltHostRecorder : IHostBuilder
+    {
+        private readonly IHostBuilder _inner;
+
+        public BuiltHostRecorder(IHostBuilder inner) => _inner = inner;
+
+        public IHost? BuiltHost { get; private set; }
+
+        public IDictionary<object, object> Properties => _inner.Properties;
+
+        public IHost Build() => BuiltHost = _inner.Build();
+
+        public IHostBuilder ConfigureAppConfiguration(Action<HostBuilderContext, IConfigurationBuilder> configureDelegate)
+        {
+            _inner.ConfigureAppConfiguration(configureDelegate);
+            return this;
+        }
+
+        public IHostBuilder ConfigureContainer<TContainerBuilder>(Action<HostBuilderContext, TContainerBuilder> configureDelegate)
+        {
+            _inner.ConfigureContainer(configureDelegate);
+            return this;
+        }
+
+        public IHostBuilder ConfigureHostConfiguration(Action<IConfigurationBuilder> configureDelegate)
+        {
+            _inner.ConfigureHostConfiguration(configureDelegate);
+            return this;
+        }
+
+        public IHostBuilder ConfigureServices(Action<HostBuilderContext, IServiceCollection> configureDelegate)
+        {
+            _inner.ConfigureServices(configureDelegate);
+            return this;
+        }
+
+        public IHostBuilder UseServiceProviderFactory<TContainerBuilder>(IServiceProviderFactory<TContainerBuilder> factory)
+            where TContainerBuilder : notnull
+        {
+            _inner.UseServiceProviderFactory(factory);
+            return this;
+        }
+
+        public IHostBuilder UseServiceProviderFactory<TContainerBuilder>(Func<HostBuilderContext, IServiceProviderFactory<TContainerBuilder>> factory)
+            where TContainerBuilder : notnull
+        {
+            _inner.UseServiceProviderFactory(factory);
+            return this;
         }
     }
 }

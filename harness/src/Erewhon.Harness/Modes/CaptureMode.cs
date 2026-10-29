@@ -12,6 +12,7 @@ using Erewhon.Harness.Checks;
 using Erewhon.Harness.Compare;
 using Erewhon.Harness.Http;
 using Erewhon.Harness.Lifecycle;
+using Erewhon.Harness.Report;
 
 namespace Erewhon.Harness.Modes;
 
@@ -41,7 +42,9 @@ namespace Erewhon.Harness.Modes;
 /// atomically, so a capture that fails or is cancelled once it has begun writing leaves no manifest beside
 /// the partial baseline. An empty-state bracket reset that is not confirmed stops the capture once the
 /// bracket's seed restore has been attempted, and no manifest is written. Every line this mode prints
-/// starts with <see cref="SourceLabels.ConsolePrefix"/>.
+/// starts with <see cref="SourceLabels.ConsolePrefix"/>, readiness lines included. It announces the
+/// readiness wait with its limit, and prints one progress line per case (position, case id, status and
+/// outcome), never a request path, body or header.
 /// The exit code is 0 when the manifest was written, even when some cases were not captured (replay
 /// reports each as <c>not-captured</c>), and 1 otherwise, a refused or stopped capture included;
 /// <see cref="RunAsync"/> never throws.</para>
@@ -124,7 +127,11 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
             return 1;
         }
 
-        using (var readiness = new Readiness(_options, _stdout))
+        // The wait can last the whole readiness limit, so it is announced; the URL is never quoted.
+        Log(string.Create(
+            CultureInfo.InvariantCulture,
+            $"waiting up to {_options.ReadinessTimeout.TotalSeconds:0} s for the {Component} admin listener"));
+        using (var readiness = new Readiness(_options, _stdout, SourceLabels.ConsolePrefix + " "))
         {
             var notReady = await readiness.WaitAsync(Component, _options.Backend.AdminUrl, ct).ConfigureAwait(false);
             if (notReady is not null)
@@ -176,19 +183,24 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
                     return 1;
                 }
 
+                // One line per case, so a slow capture shows which case last completed. It names the
+                // position, case id, status and outcome only: request paths carry personal names, and
+                // bodies and headers are response content.
+                var position = matrix.PositionOf(definition.Id);
+                var progress = Progress(position, matrix.PlannedCaseCount);
                 if (!response.Answered || response.Status is not int status)
                 {
                     notCaptured.Add(definition.Id);
-                    Log($"WARN {definition.Id} not captured: {response.NoResponse} {response.Detail}");
+                    Log($"WARN {progress} {definition.Id} not captured: {response.NoResponse} {response.Detail}");
                     continue;
                 }
 
-                var position = matrix.PositionOf(definition.Id);
                 var record = BuildRecord(definition, position, status, response, binaryOperationId);
                 await store.WriteRecordAsync(record, response.Body, ct).ConfigureAwait(false);
                 records.Add(record);
                 bodies[definition.Id] = response.Body;
-                CheckPlannedOutcome(definition, status, response.Body);
+                var outcome = CheckPlannedOutcome(definition, status, response.Body) ? "captured" : "captured, not as planned";
+                Log(string.Create(CultureInfo.InvariantCulture, $"{progress} {definition.Id}: status {status}, {outcome}"));
             }
 
             wsdlCaptured = await CaptureWsdlAsync(runner, store, soapUri, timeout, ct).ConfigureAwait(false);
@@ -324,9 +336,10 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
         };
     }
 
-    // The empty-state case is bracketed by an empty reset before it and a seed reset after it, the latter
-    // whatever the case obtained, so nothing after it runs against the empty state. Each bracket reset that
-    // is not confirmed is added to unconfirmed, which ends the capture.
+    // The empty-state case is bracketed by an empty reset before it and a seed reset after it. The empty
+    // reset runs inside the protected block, so once it has started the seed reset runs whatever happens
+    // (the case failing, the capture being cancelled included), and nothing after it runs against the
+    // empty state. Each bracket reset that is not confirmed is added to unconfirmed, which ends the capture.
     private async Task<CaseResponse> SendCaseAsync(
         CaseRunner runner,
         StateReset reset,
@@ -342,18 +355,44 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
             return await runner.SendAsync(baseUri, definition.Request, timeout, ct).ConfigureAwait(false);
         }
 
-        LogResetFailures(await reset
-            .ResetAsync(ResetPoints.Before(definition.Id), AdminRoutes.ResetStateEmpty, expectations, ct)
-            .ConfigureAwait(false), unconfirmed);
         try
         {
+            LogResetFailures(await reset
+                .ResetAsync(ResetPoints.Before(definition.Id), AdminRoutes.ResetStateEmpty, expectations, ct)
+                .ConfigureAwait(false), unconfirmed);
             return await runner.SendAsync(baseUri, definition.Request, timeout, ct).ConfigureAwait(false);
         }
         finally
         {
+            await RestoreSeedAsync(reset, expectations, definition.Id, unconfirmed).ConfigureAwait(false);
+        }
+    }
+
+    // The seed reset closing the empty-state bracket. It takes CancellationToken.None rather than the
+    // capture's token, so it still runs after a cancellation; it stays bounded because StateReset bounds
+    // each of its at most three admin requests by HarnessOptions.RequestTimeout. It never throws, so the
+    // case's own failure or the cancellation propagates unchanged: a mismatch is logged like every other
+    // reset's, and any other failure of the restore on a line of its own. Either way the restore is not
+    // confirmed, so it is added to unconfirmed and ends the capture.
+    private async Task RestoreSeedAsync(
+        StateReset reset,
+        ResetExpectations expectations,
+        string caseId,
+        ICollection<StateResetResult> unconfirmed)
+    {
+        var point = ResetPoints.After(caseId);
+        try
+        {
             LogResetFailures(await reset
-                .ResetAsync(ResetPoints.After(definition.Id), AdminRoutes.ResetStateSeed, expectations, ct)
+                .ResetAsync(point, AdminRoutes.ResetStateSeed, expectations, CancellationToken.None)
                 .ConfigureAwait(false), unconfirmed);
+        }
+        catch (Exception ex)
+        {
+            Log($"WARN seed restoration after {caseId} failed: {ReplayMode.Describe(ex)}");
+            unconfirmed.Add(new StateResetResult(
+                [new FailureItem(FailureItemIds.Reset(point), FailureItemIds.ExceptionNature(ex))],
+                After: null));
         }
     }
 
@@ -392,11 +431,14 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
     }
 
     // Console only: the baseline records what the stand-in answered, and an outcome other than the planned
-    // one is the execution agent's to judge, never a reason to alter or drop the record.
-    private void CheckPlannedOutcome(CaseDefinition definition, int status, byte[] body)
+    // one is the execution agent's to judge, never a reason to alter or drop the record. Prints a WARN line
+    // per deviation and returns true when there was none.
+    private bool CheckPlannedOutcome(CaseDefinition definition, int status, byte[] body)
     {
+        var asPlanned = true;
         if (status != definition.ExpectedStatus)
         {
+            asPlanned = false;
             Log(string.Create(
                 CultureInfo.InvariantCulture,
                 $"WARN {definition.Id} status {status} expected {definition.ExpectedStatus}"));
@@ -404,23 +446,47 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
 
         if (definition.ExpectedResultStatusCode is not int expectedCode)
         {
-            return;
+            return asPlanned;
         }
 
         if (ReadResultStatusCode(body, out var problem) is not int observedCode)
         {
             Log($"WARN {definition.Id} result statusCode unreadable: {problem}");
+            return false;
         }
-        else if (observedCode != expectedCode)
+
+        if (observedCode != expectedCode)
         {
             Log(string.Create(
                 CultureInfo.InvariantCulture,
                 $"WARN {definition.Id} result statusCode {observedCode} expected {expectedCode}"));
+            return false;
         }
+
+        return asPlanned;
     }
 
-    private static int? ReadResultStatusCode(byte[] body, out string problem)
+    // "012/056": the case's position among the planned cases, numbered as its record's file name is.
+    private static string Progress(int position, int planned) =>
+        string.Create(CultureInfo.InvariantCulture, $"{position:D3}/{planned:D3}");
+
+    /// <summary>Reads the SOAP <c>DTOResult</c> <c>statusCode</c> of a captured response body.</summary>
+    /// <remarks>
+    /// The problem is a fixed classification, with at most the exception's type name: response bodies
+    /// carry personal data (names, addresses, email), and both the element's text and a parser message
+    /// (which quotes offending tokens) are body content. The exact body stays only in the baseline record.
+    /// </remarks>
+    /// <param name="body">The raw response body.</param>
+    /// <param name="problem">
+    /// Empty when a code was read; otherwise why not: <c>the body is not XML (&lt;exception type&gt;)</c>,
+    /// <c>the body has no statusCode element</c> or <c>statusCode is not an integer</c>.
+    /// </param>
+    /// <returns>The first <c>statusCode</c> element's integer value, or null when none could be read.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="body"/> is null.</exception>
+    internal static int? ReadResultStatusCode(byte[] body, out string problem)
     {
+        ArgumentNullException.ThrowIfNull(body);
+
         XDocument document;
         try
         {
@@ -430,7 +496,7 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
         }
         catch (XmlException ex)
         {
-            problem = $"the body is not XML ({ex.Message})";
+            problem = $"the body is not XML ({ex.GetType().Name})";
             return null;
         }
 
@@ -447,7 +513,7 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
         // xsd:int collapses surrounding whitespace.
         if (!int.TryParse(element.Value.Trim(), NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var code))
         {
-            problem = $"{ResultStatusCodeElement} '{element.Value}' is not an integer";
+            problem = $"{ResultStatusCodeElement} is not an integer";
             return null;
         }
 
@@ -618,7 +684,7 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
     {
         foreach (var failure in conformance.Failures)
         {
-            Log($"gap {failure.ItemId} {failure.Nature}");
+            Log($"gap {FailureItemDisplay.Describe(failure)}");
         }
 
         var counts = conformance.Counts;
@@ -672,7 +738,7 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
     {
         foreach (var failure in result.Failures)
         {
-            Log($"WARN {failure.ItemId} {failure.Nature}");
+            Log($"WARN {FailureItemDisplay.Describe(failure)}");
         }
 
         if (!result.Succeeded)

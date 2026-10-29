@@ -6,6 +6,7 @@ using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using Erewhon.Contracts;
 using Microsoft.Win32.SafeHandles;
 
@@ -48,7 +49,12 @@ namespace Erewhon.Harness.Baseline;
 /// <para>Reads verify what they return: every record must sit at the path its own members name, and its
 /// body must match its <c>bodySha256</c>, so replay never compares against a damaged baseline. Each body is
 /// read once: <see cref="ReadEntries"/> returns the verified bytes with their record, and
-/// <see cref="ReadBodyBytes"/> verifies the bytes it returns.</para>
+/// <see cref="ReadBodyBytes"/> verifies the bytes it returns. <see cref="ReadRecordIndexAsync"/> and
+/// <see cref="ReadEntryAsync(BaselineRecordKey, CancellationToken)"/> split that work for a caller that must
+/// hold one case at a time: the index checks every record and keeps only its <see cref="BaselineRecordKey"/>,
+/// which holds no request or response, and the per-case reader later reads one key's record and body once and
+/// verifies both. A <c>bodyText</c> is unescaped into memory its record alone references, never into a pooled
+/// buffer, so dropping a record or entry releases its body.</para>
 /// <para>Every file read and write also has an asynchronous form that takes a
 /// <see cref="CancellationToken"/>, passes it to the file I/O and observes it before each record file.
 /// Deletes stay synchronous, because file deletion has no asynchronous form;
@@ -66,6 +72,9 @@ public sealed class BaselineStore
     private const string SoapCasePrefix = "SOAP-";
     private const int MinPosition = 1;
     private const int MaxPosition = 999;
+
+    // The JSON member of a request and of a response that holds its body as text.
+    private const string BodyTextMember = "bodyText";
 
     // The one temporary file the manifest is published through, beside it in baseline/. Its name is fixed,
     // so an interrupted publication leaves at most this file, which the next one replaces.
@@ -85,6 +94,12 @@ public sealed class BaselineStore
         CommentHandling = JsonCommentHandling.Skip,
         AllowTrailingCommas = false,
     };
+
+    // The options every read uses: SerializerOptions, except that each bodyText is read by
+    // UnpooledTextConverter. The built-in converter unescapes a string into an array rented from
+    // ArrayPool<byte>.Shared, and the pool keeps a body-sized array on every thread that parsed a large body,
+    // so the memory of a body would outlive the record that held it.
+    private static readonly JsonSerializerOptions ReadOptions = CreateReadOptions();
 
     private readonly HarnessOptions options;
 
@@ -844,6 +859,94 @@ public sealed class BaselineStore
     }
 
     /// <summary>
+    /// The key of every record under <c>baseline/records/rest</c> and <c>baseline/records/soap</c>, read without
+    /// blocking, in replay order, after every record check of <see cref="ReadRecords"/> but without reading or
+    /// hashing a body.
+    /// </summary>
+    /// <remarks>
+    /// <para>Each record must hold every required member and sit in the directory of its case id's surface under
+    /// the file name its order, method and case number give. It holds its body either as <c>bodyText</c> or as
+    /// a <c>bodyFile</c> naming its own <c>.body.bin</c>, never both, and no two records may share an order or a
+    /// case id. A missing records directory holds no records.</para>
+    /// <para>Each record file is parsed and checked on its own and reduced to its key at once, so one parsed
+    /// record, with its <c>bodyText</c>, is held at a time and none is held once this returns. No
+    /// <c>.body.bin</c> file is read and no body is encoded or hashed, so a missing or damaged body does not stop
+    /// its record from being listed. The caller reads each case when it needs it with
+    /// <see cref="ReadEntryAsync(BaselineRecordKey, CancellationToken)"/>, which checks the record again and
+    /// verifies its body exactly once.</para>
+    /// </remarks>
+    /// <param name="cancellationToken">Cancels the reads; it is also observed before each record file.</param>
+    /// <returns>The keys sorted by <see cref="BaselineRecordKey.Order"/>, then by case id (ordinal).</returns>
+    /// <exception cref="InvalidDataException">A record file fails any check; the message names it.</exception>
+    /// <exception cref="IOException">A record file cannot be read.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public async Task<IReadOnlyList<BaselineRecordKey>> ReadRecordIndexAsync(
+        CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var keys = new KeySet(this);
+        foreach (var (file, surface) in ListRecordFiles())
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            keys.Add(file, await ReadRecordKeyAsync(file, surface, cancellationToken).ConfigureAwait(false));
+        }
+
+        return keys.Sorted();
+    }
+
+    /// <summary>
+    /// Reads the one case <paramref name="key"/> names without blocking: its record file, checked as
+    /// <see cref="ReadRecordIndexAsync"/> checked it, and its raw response body, verified, as
+    /// <see cref="ReadEntriesAsync"/> returns them.
+    /// </summary>
+    /// <remarks>
+    /// <para>The record file is the one the index read the key from: the file name the key's order, the JADE
+    /// method of its operation and its case number give, in the directory of its case id's surface. It is read
+    /// again, so a record rewritten or removed since it was indexed is refused rather than replayed: it must
+    /// pass every record check and still hold the key's order, case id and operation.</para>
+    /// <para>The body is read from the <c>.body.bin</c> file, or encoded from <c>bodyText</c> as UTF-8, exactly
+    /// once, and the bytes hashed against <c>bodySha256</c> are the bytes the entry holds. The store keeps no
+    /// reference to the entry, so dropping it releases the record and its body.</para>
+    /// </remarks>
+    /// <param name="key">A key <see cref="ReadRecordIndexAsync"/> returned.</param>
+    /// <param name="cancellationToken">Cancels the reads.</param>
+    /// <returns>The verified record and its raw body.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="key"/> or one of its names is null.</exception>
+    /// <exception cref="ArgumentException">
+    /// The key's case id, order or names do not form a record file name.
+    /// </exception>
+    /// <exception cref="InvalidDataException">
+    /// The record file is missing, fails any record check, no longer holds the key's case, or its body is
+    /// missing or does not hash to <c>bodySha256</c>; the message names the record file.
+    /// </exception>
+    /// <exception cref="IOException">The record or body file cannot be read.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public async Task<BaselineEntry> ReadEntryAsync(
+        BaselineRecordKey key, CancellationToken cancellationToken = default)
+    {
+        var (file, surface) = RecordFileOf(key);
+        cancellationToken.ThrowIfCancellationRequested();
+        var json = await TryReadAllBytesAsync(file, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidDataException($"Baseline record {Display(file)} of case {key.CaseId} is missing.");
+        var record = Deserialize<BaselineRecord>(json, file);
+        var bodyPath = CheckedBodyPath(record, file, surface);
+        if (record.Order != key.Order
+            || !string.Equals(record.CaseId, key.CaseId, StringComparison.Ordinal)
+            || !string.Equals(record.Operation, key.Operation, StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                $"Baseline record {Display(file)} is invalid: it holds case {record.CaseId} of operation "
+                + $"{record.Operation} at position {record.Order}, not the indexed case {key.CaseId} of operation "
+                + $"{key.Operation} at position {key.Order}.");
+        }
+
+        var fileBytes = bodyPath is null
+            ? null
+            : await TryReadAllBytesAsync(bodyPath, cancellationToken).ConfigureAwait(false);
+        return new BaselineEntry(record, VerifiedRecordBody(record, file, bodyPath, fileBytes));
+    }
+
+    /// <summary>
     /// The verified raw response body of <paramref name="record"/>: the bytes of its <c>.body.bin</c> file when
     /// it names one, otherwise its <c>bodyText</c> encoded as UTF-8 with no byte-order mark added (a stored
     /// U+FEFF encodes back to <c>EF BB BF</c>). The body is read or encoded once, and the bytes returned are the
@@ -970,6 +1073,32 @@ public sealed class BaselineStore
         };
         serializerOptions.MakeReadOnly(populateMissingResolver: true);
         return serializerOptions;
+    }
+
+    // Built from its own copy of the baseline format, so it does not depend on the order in which the static
+    // members are initialised.
+    private static JsonSerializerOptions CreateReadOptions()
+    {
+        var readOptions = new JsonSerializerOptions(CreateSerializerOptions());
+        readOptions.TypeInfoResolver = (readOptions.TypeInfoResolver ?? new DefaultJsonTypeInfoResolver())
+            .WithAddedModifier(static typeInfo =>
+            {
+                if (typeInfo.Type != typeof(BaselineRequest) && typeInfo.Type != typeof(BaselineResponse))
+                {
+                    return;
+                }
+
+                foreach (var property in typeInfo.Properties)
+                {
+                    if (property.PropertyType == typeof(string)
+                        && string.Equals(property.Name, BodyTextMember, StringComparison.Ordinal))
+                    {
+                        property.CustomConverter = UnpooledTextConverter.Instance;
+                    }
+                }
+            });
+        readOptions.MakeReadOnly();
+        return readOptions;
     }
 
     private static byte[] WithTrailingNewLine(byte[] json)
@@ -1144,6 +1273,36 @@ public sealed class BaselineStore
         return new BaselineEntry(record, keepBody ? body : ReadOnlyMemory<byte>.Empty);
     }
 
+    // Reads and checks one record file as every record reader does before it reads the body, and keeps only
+    // its key, so the parsed record and its bodyText are unreachable once this returns.
+    private async Task<BaselineRecordKey> ReadRecordKeyAsync(
+        string file, string surface, CancellationToken cancellationToken)
+    {
+        var json = await File.ReadAllBytesAsync(file, cancellationToken).ConfigureAwait(false);
+        var record = Deserialize<BaselineRecord>(json, file);
+        _ = CheckedBodyPath(record, file, surface);
+        return new BaselineRecordKey(record.Order, record.CaseId, record.Operation);
+    }
+
+    // The record file the index read a key from, with its surface directory, as GetRecordPath forms it for the
+    // record itself: the file name of the key's order, the JADE method after the first '.' of its operation and
+    // the case number after the last '-' of its case id, in the directory of its case id's surface. Each name
+    // is checked before it reaches the path, so no key reaches a file outside records/rest or records/soap.
+    private (string File, string Surface) RecordFileOf(BaselineRecordKey key)
+    {
+        ArgumentNullException.ThrowIfNull(key);
+        ArgumentNullException.ThrowIfNull(key.CaseId);
+        ArgumentNullException.ThrowIfNull(key.Operation);
+        var surface = SurfaceDirectoryName(key.CaseId);
+        var dot = key.Operation.IndexOf('.', StringComparison.Ordinal);
+        var dash = key.CaseId.LastIndexOf('-');
+        var name = RecordFileName(
+            key.Order,
+            dot < 0 ? "" : key.Operation[(dot + 1)..],
+            dash < 0 ? "" : key.CaseId[(dash + 1)..]);
+        return (Path.Combine(options.RecordsDirectory, surface, name), surface);
+    }
+
     // Checks a parsed record against the file it was read from, and returns the path of its body file, or
     // null when its bodyText holds the body.
     private string? CheckedBodyPath(BaselineRecord record, string file, string surface)
@@ -1277,7 +1436,7 @@ public sealed class BaselineStore
         T? value;
         try
         {
-            value = JsonSerializer.Deserialize<T>(WithoutPreamble(bytes), SerializerOptions);
+            value = JsonSerializer.Deserialize<T>(WithoutPreamble(bytes), ReadOptions);
         }
         catch (JsonException ex)
         {
@@ -1679,45 +1838,102 @@ public sealed class BaselineStore
             : Path.GetRelativePath(repositoryRoot, path).Replace(Path.DirectorySeparatorChar, '/');
     }
 
-    // Collects verified entries, refusing a repeated replay position or case id, and returns them in replay
-    // order.
-    private sealed class EntrySet(BaselineStore store)
+    // Collects what one read takes from each record file, refusing a repeated replay position or case id, and
+    // returns it in replay order: by position, then by case id (ordinal).
+    private abstract class ReplayOrderSet<T>(BaselineStore store)
     {
-        private readonly List<BaselineEntry> entries = [];
+        private readonly List<T> items = [];
         private readonly Dictionary<int, string> fileByOrder = [];
         private readonly Dictionary<string, string> fileByCaseId = new(StringComparer.Ordinal);
 
-        public void Add(string file, BaselineEntry entry)
+        public void Add(string file, T item)
         {
-            var record = entry.Record;
-            if (!fileByOrder.TryAdd(record.Order, file))
+            var order = OrderOf(item);
+            var caseId = CaseIdOf(item);
+            if (!fileByOrder.TryAdd(order, file))
             {
                 throw new InvalidDataException(
-                    $"Baseline record {store.Display(file)} repeats replay position {record.Order} of "
-                    + $"{store.Display(fileByOrder[record.Order])}.");
+                    $"Baseline record {store.Display(file)} repeats replay position {order} of "
+                    + $"{store.Display(fileByOrder[order])}.");
             }
 
-            if (!fileByCaseId.TryAdd(record.CaseId, file))
+            if (!fileByCaseId.TryAdd(caseId, file))
             {
                 throw new InvalidDataException(
-                    $"Baseline record {store.Display(file)} repeats case {record.CaseId} of "
-                    + $"{store.Display(fileByCaseId[record.CaseId])}.");
+                    $"Baseline record {store.Display(file)} repeats case {caseId} of "
+                    + $"{store.Display(fileByCaseId[caseId])}.");
             }
 
-            entries.Add(entry);
+            items.Add(item);
         }
 
-        public List<BaselineEntry> Sorted()
+        public List<T> Sorted()
         {
-            entries.Sort(static (left, right) =>
+            items.Sort((left, right) =>
             {
-                var byOrder = left.Record.Order.CompareTo(right.Record.Order);
-                return byOrder != 0 ? byOrder : string.CompareOrdinal(left.Record.CaseId, right.Record.CaseId);
+                var byOrder = OrderOf(left).CompareTo(OrderOf(right));
+                return byOrder != 0 ? byOrder : string.CompareOrdinal(CaseIdOf(left), CaseIdOf(right));
             });
-            return entries;
+            return items;
         }
 
+        protected abstract int OrderOf(T item);
+
+        protected abstract string CaseIdOf(T item);
+    }
+
+    // The verified entries of ReadRecords, ReadEntries and their asynchronous forms.
+    private sealed class EntrySet(BaselineStore store) : ReplayOrderSet<BaselineEntry>(store)
+    {
         public List<BaselineRecord> SortedRecords() => Sorted().ConvertAll(static entry => entry.Record);
+
+        protected override int OrderOf(BaselineEntry item) => item.Record.Order;
+
+        protected override string CaseIdOf(BaselineEntry item) => item.Record.CaseId;
+    }
+
+    // The keys of ReadRecordIndexAsync, refused and ordered exactly as EntrySet refuses and orders entries.
+    private sealed class KeySet(BaselineStore store) : ReplayOrderSet<BaselineRecordKey>(store)
+    {
+        protected override int OrderOf(BaselineRecordKey item) => item.Order;
+
+        protected override string CaseIdOf(BaselineRecordKey item) => item.CaseId;
+    }
+
+    // Reads a bodyText to the same string the built-in string converter returns, but unescapes an escaped value
+    // into an array of its own, which is garbage once the string is made, rather than into one rented from
+    // ArrayPool<byte>.Shared. Any other token, an unescaped value and a value that is not valid UTF-8 are left
+    // to Utf8JsonReader.GetString, so every failure is the built-in one. Write is the built-in write, although
+    // ReadOptions never writes.
+    private sealed class UnpooledTextConverter : JsonConverter<string>
+    {
+        private static readonly UTF8Encoding StrictUtf8 =
+            new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
+        public static UnpooledTextConverter Instance { get; } = new();
+
+        public override string? Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+        {
+            if (reader.TokenType != JsonTokenType.String || !reader.ValueIsEscaped || reader.HasValueSequence)
+            {
+                return reader.GetString();
+            }
+
+            // An escape is never shorter than what it stands for, so the escaped length always suffices.
+            var unescaped = new byte[reader.ValueSpan.Length];
+            var length = reader.CopyString(unescaped);
+            try
+            {
+                return StrictUtf8.GetString(unescaped, 0, length);
+            }
+            catch (DecoderFallbackException)
+            {
+                return reader.GetString();
+            }
+        }
+
+        public override void Write(Utf8JsonWriter writer, string value, JsonSerializerOptions options) =>
+            writer.WriteStringValue(value);
     }
 
     // A write or delete target inside baseline/: the baseline directory, the target's full path and the
@@ -1806,9 +2022,11 @@ public sealed class BaselineStore
 
 /// <summary>
 /// One verified case of the baseline together with its raw response body, as
-/// <see cref="BaselineStore.ReadEntries"/> returns it. The body was read from the record's <c>.body.bin</c>
-/// file, or encoded from its <c>bodyText</c> as UTF-8, exactly once, and those bytes hash to the record's
-/// <c>bodySha256</c>.
+/// <see cref="BaselineStore.ReadEntries"/> returns it for every record, or as
+/// <see cref="BaselineStore.ReadEntryAsync(BaselineRecordKey, CancellationToken)"/> returns it for the one record
+/// a key of <see cref="BaselineStore.ReadRecordIndexAsync"/> names. The body was read from the record's
+/// <c>.body.bin</c> file, or encoded from its <c>bodyText</c> as UTF-8, exactly once, and those bytes hash to the
+/// record's <c>bodySha256</c>.
 /// </summary>
 /// <remarks>
 /// The body belongs to the entry alone: the store keeps no cache, so dropping an entry releases its body.
@@ -1817,3 +2035,17 @@ public sealed class BaselineStore
 /// <param name="Record">The verified record.</param>
 /// <param name="Body">The raw response body the record describes, byte for byte.</param>
 public sealed record BaselineEntry(BaselineRecord Record, ReadOnlyMemory<byte> Body);
+
+/// <summary>
+/// The identity of one checked baseline record, as <see cref="BaselineStore.ReadRecordIndexAsync"/> lists it:
+/// enough to count the captured cases and operations, to replay them in order and to read each one with
+/// <see cref="BaselineStore.ReadEntryAsync(BaselineRecordKey, CancellationToken)"/>.
+/// </summary>
+/// <remarks>
+/// A key holds no request, response or body, so a list of keys stays small however large the recorded
+/// bodies are.
+/// </remarks>
+/// <param name="Order">The record's 1-based replay position, the <c>NNN</c> of its file name.</param>
+/// <param name="CaseId">The record's case id, for example <c>SOAP-getPhoto-02</c>.</param>
+/// <param name="Operation">The record's catalogue operation id, for example <c>Soap.getPhoto</c>.</param>
+public sealed record BaselineRecordKey(int Order, string CaseId, string Operation);

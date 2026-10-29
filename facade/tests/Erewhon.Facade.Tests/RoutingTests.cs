@@ -26,6 +26,7 @@
 // reaches a message, which is also why no Assert.Single, Assert.Empty or Assert.Equal is applied to a
 // recorded StubRequest: its dump would print the Host header and with it a port.
 
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
@@ -34,11 +35,16 @@ using System.Net.Sockets;
 using System.Text;
 using Erewhon.Contracts.Catalogue;
 using Erewhon.Facade.Admin;
+using Erewhon.Facade.Forwarding;
 using Erewhon.Facade.Routing;
+using Erewhon.Facade.Soap;
 using Erewhon.Facade.Tests.Support;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using Xunit;
+using Yarp.ReverseProxy.Forwarder;
 
 namespace Erewhon.Facade.Tests;
 
@@ -1577,5 +1583,404 @@ public sealed class BaseUrlCredentialTests
         public TOptions Get(string? name) => CurrentValue;
 
         public IDisposable? OnChange(Action<TOptions, string?> listener) => null;
+    }
+}
+
+// Invoker lifecycle (class InvokerLifecycleTests) sits here, beside the routing checks whose reloads
+// it follows, as a class of its own: the results report counts test classes whose names end in
+// "RoutingTests" as the two-case per-operation routing check, and this name matches none.
+//
+// Lifecycle of BackendForwarder's per-target invokers across routing reloads and disposal. A target in
+// service keeps one pooled invoker. A reload that supersedes the target, or Dispose, retires its invoker,
+// which is disposed once the calls still using it have ended: the cache keeps no invoker the routing
+// table no longer names, and no call loses its invoker while it runs.
+//
+// The forwarder is built directly over the real OperationRouter, PassThroughTransformer and
+// SoapFaultWriter and over a recording IHttpForwarder, so each test sees the exact invoker every call
+// was given and can hold a call in flight. A reload is an options monitor returning a new options
+// instance. Whether an invoker has been disposed is read from a request it sends to a closed loopback
+// port: a disposed invoker throws ObjectDisposedException, a live one HttpRequestException.
+//
+// Facade test failures are identified across runs by a signature over the exception type, the failing
+// line and the assertion message, so every message here is a fixed literal: no port, URL or elapsed time.
+/// <summary>
+/// Reuse, retirement and disposal of the facade's per-target <see cref="HttpMessageInvoker"/>s across
+/// routing reloads and <see cref="BackendForwarder.Dispose"/>.
+/// </summary>
+public sealed class InvokerLifecycleTests
+{
+    private const string TargetName = "backend";
+    private const string OperationId = "Rest.getCompany";
+
+    private const string UrlChange = "url";
+    private const string TargetTimeoutChange = "target-timeout";
+    private const string BackendTimeoutChange = "backend-timeout";
+
+    private const string DisposedBeforeCall = "before-call";
+    private const string DisposedDuringResolution = "during-resolution";
+
+    private const int ReloadCount = 5;
+    private const int BackendTimeoutSeconds = 30;
+
+    [Fact]
+    public async Task CallsToAnUnchangedTargetShareOneLiveInvoker()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        using ForwarderUnderTest facade = new();
+
+        await facade.CallAsync(ct);
+        await facade.CallAsync(ct);
+
+        // A reload to equal values rebuilds the routing table but leaves its target in service.
+        facade.Routing.CurrentValue = RoutingFor(urlIndex: 0, targetTimeoutSeconds: null);
+        await facade.CallAsync(ct);
+
+        IReadOnlyList<HttpMessageInvoker> used = facade.Forwarder.Invokers;
+        Assert.True(used.Count == 3, "Each call reaches the forwarder once.");
+        Assert.True(used.All(invoker => ReferenceEquals(invoker, used[0])), "Calls to an unchanged target share one invoker.");
+        Assert.False(await IsDisposedAsync(used[0], ct), "The invoker of a target in service stays alive.");
+    }
+
+    [Theory]
+    [InlineData(UrlChange)]
+    [InlineData(TargetTimeoutChange)]
+    [InlineData(BackendTimeoutChange)]
+    public async Task ReloadsThatChangeTheTargetDisposeEverySupersededInvoker(string change)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        using ForwarderUnderTest facade = new();
+
+        await facade.CallAsync(ct);
+        for (int reload = 1; reload <= ReloadCount; reload++)
+        {
+            Reload(facade, change, reload);
+            await facade.CallAsync(ct);
+        }
+
+        // Once more under the last table, which must reuse the current target's invoker.
+        await facade.CallAsync(ct);
+
+        IReadOnlyList<HttpMessageInvoker> used = facade.Forwarder.Invokers;
+        Assert.True(used.Count == ReloadCount + 2, "Each call reaches the forwarder once.");
+        Assert.True(
+            used.Take(ReloadCount + 1).Distinct().Count() == ReloadCount + 1,
+            "Every reload that changes the target gives it a new invoker.");
+        Assert.True(ReferenceEquals(used[^1], used[^2]), "The current target's invoker is reused.");
+
+        for (int superseded = 0; superseded < ReloadCount; superseded++)
+        {
+            Assert.True(await IsDisposedAsync(used[superseded], ct), "Every superseded invoker is disposed.");
+        }
+
+        Assert.False(await IsDisposedAsync(used[^1], ct), "The current target's invoker stays alive.");
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ASupersededInvokerStaysAliveUntilItsCallInFlightEnds(bool callNewTargetFirst)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        using ForwarderUnderTest facade = new();
+
+        HeldCall hold = facade.Forwarder.HoldNextCall();
+        Task inFlight = facade.CallAsync(ct);
+        HttpMessageInvoker superseded = await hold.Entered.Task.WaitAsync(ct);
+
+        facade.Routing.CurrentValue = RoutingFor(urlIndex: 1, targetTimeoutSeconds: null);
+        if (callNewTargetFirst)
+        {
+            // The first call to end under the new table sweeps the cache while the held call still
+            // holds its lease; without it, the held call retires its own superseded invoker as it ends.
+            await facade.CallAsync(ct);
+            Assert.False(ReferenceEquals(facade.Forwarder.Invokers[^1], superseded), "The new target gets its own invoker.");
+        }
+
+        Assert.False(await IsDisposedAsync(superseded, ct), "A superseded invoker stays alive while its call is in flight.");
+
+        hold.Released.TrySetResult();
+        await inFlight.WaitAsync(ct);
+
+        Assert.True(await IsDisposedAsync(superseded, ct), "A superseded invoker is disposed when its last call ends.");
+
+        await facade.CallAsync(ct);
+        HttpMessageInvoker current = facade.Forwarder.Invokers[^1];
+        Assert.False(ReferenceEquals(current, superseded), "The new target never uses the superseded invoker.");
+        Assert.False(await IsDisposedAsync(current, ct), "The current target's invoker stays alive.");
+        if (callNewTargetFirst)
+        {
+            Assert.True(ReferenceEquals(current, facade.Forwarder.Invokers[1]), "The current target's invoker is reused.");
+        }
+    }
+
+    [Fact]
+    public async Task DisposeLetsACallInFlightFinishOnItsInvokerAndThenDisposesIt()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        using ForwarderUnderTest facade = new();
+
+        HeldCall hold = facade.Forwarder.HoldNextCall();
+        Task inFlight = facade.CallAsync(ct);
+        HttpMessageInvoker leased = await hold.Entered.Task.WaitAsync(ct);
+
+        facade.Instance.Dispose();
+        Assert.False(await IsDisposedAsync(leased, ct), "Dispose leaves the invoker of a call in flight alive.");
+
+        hold.Released.TrySetResult();
+        await inFlight.WaitAsync(ct);
+        Assert.True(await IsDisposedAsync(leased, ct), "The invoker is disposed when the call in flight ends.");
+
+        // A second Dispose finds nothing left to do and must not throw.
+        facade.Instance.Dispose();
+        Assert.True(await IsDisposedAsync(leased, ct), "A second Dispose leaves the invoker disposed.");
+    }
+
+    [Fact]
+    public async Task ACallEndsNormallyWhenTheRoutingTableCannotBeReadAsItEnds()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        using ForwarderUnderTest facade = new();
+
+        HeldCall hold = facade.Forwarder.HoldNextCall();
+        Task inFlight = facade.CallAsync(ct);
+        HttpMessageInvoker leased = await hold.Entered.Task.WaitAsync(ct);
+
+        // A reload the configuration binder cannot bind makes every read of the routing options throw.
+        facade.Routing.Unreadable = true;
+        hold.Released.TrySetResult();
+        await inFlight.WaitAsync(ct);
+        Assert.False(await IsDisposedAsync(leased, ct), "An unreadable routing table retires no invoker.");
+
+        facade.Routing.Unreadable = false;
+        await facade.CallAsync(ct);
+        Assert.True(ReferenceEquals(facade.Forwarder.Invokers[^1], leased), "The target's invoker is reused once the routing table is readable.");
+    }
+
+    [Theory]
+    [InlineData(DisposedBeforeCall)]
+    [InlineData(DisposedDuringResolution)]
+    public async Task ACallThatMeetsDisposeIsRefusedWithoutForwarding(string timing)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        using ForwarderUnderTest facade = new();
+
+        await facade.CallAsync(ct);
+        HttpMessageInvoker idle = facade.Forwarder.Invokers[0];
+
+        switch (timing)
+        {
+            case DisposedBeforeCall:
+                facade.Instance.Dispose();
+                break;
+
+            case DisposedDuringResolution:
+                // Dispose runs after the call's own disposal check, while the call resolves its target,
+                // which is the window in which a call used to create an invoker nothing would dispose.
+                facade.Routing.OnNextRead(facade.Instance.Dispose);
+                break;
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(timing), timing, "Unknown disposal timing.");
+        }
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => facade.CallAsync(ct));
+
+        Assert.True(facade.Forwarder.Invokers.Count == 1, "A call that meets Dispose never reaches the forwarder.");
+        Assert.True(await IsDisposedAsync(idle, ct), "Dispose disposes an invoker no call is using at once.");
+    }
+
+    // Every target serves both surfaces, as the default target must, and no operation is listed, so
+    // every request goes to the default target.
+    private static RoutingOptions RoutingFor(int urlIndex, int? targetTimeoutSeconds) => new()
+    {
+        DefaultTarget = TargetName,
+        Targets =
+        {
+            [TargetName] = new RoutingTarget
+            {
+                RestBaseUrl = string.Create(CultureInfo.InvariantCulture, $"http://rest-{urlIndex}.invalid:65000"),
+                SoapBaseUrl = string.Create(CultureInfo.InvariantCulture, $"http://soap-{urlIndex}.invalid:21001"),
+                TimeoutSeconds = targetTimeoutSeconds,
+            },
+        },
+    };
+
+    private static void Reload(ForwarderUnderTest facade, string change, int reload)
+    {
+        switch (change)
+        {
+            case UrlChange:
+                facade.Routing.CurrentValue = RoutingFor(reload, targetTimeoutSeconds: null);
+                break;
+
+            case TargetTimeoutChange:
+                facade.Routing.CurrentValue = RoutingFor(urlIndex: 0, BackendTimeoutSeconds + reload);
+                break;
+
+            case BackendTimeoutChange:
+                facade.Backend.CurrentValue = new BackendOptions { TimeoutSeconds = BackendTimeoutSeconds + reload };
+                break;
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(change), change, "Unknown routing change.");
+        }
+    }
+
+    // A refused connection proves the invoker still sends; a disposed one refuses before it connects.
+    private static async Task<bool> IsDisposedAsync(HttpMessageInvoker invoker, CancellationToken ct)
+    {
+        Uri closed = new(string.Create(
+            CultureInfo.InvariantCulture, $"http://127.0.0.1:{StubBackend.GetClosedLoopbackPort()}/"));
+        using HttpRequestMessage probe = new(HttpMethod.Get, closed);
+        try
+        {
+            using HttpResponseMessage response = await invoker.SendAsync(probe, ct);
+        }
+        catch (ObjectDisposedException)
+        {
+            return true;
+        }
+        catch (HttpRequestException)
+        {
+            return false;
+        }
+
+        Assert.Fail("A request to a closed loopback port was answered.");
+        return false;
+    }
+
+    /// <summary>A forwarder over a recording IHttpForwarder and routing options a test can reload.</summary>
+    private sealed class ForwarderUnderTest : IDisposable
+    {
+        public ForwarderUnderTest()
+        {
+            OperationRouter router = new(Routing, Backend, OperationCatalogue.Default, NullLogger<OperationRouter>.Instance);
+            Instance = new BackendForwarder(
+                Forwarder, router, new PassThroughTransformer(), new SoapFaultWriter(), NullLogger<BackendForwarder>.Instance);
+        }
+
+        public OptionsMonitorStub<RoutingOptions> Routing { get; } = new(RoutingFor(urlIndex: 0, targetTimeoutSeconds: null));
+
+        public OptionsMonitorStub<BackendOptions> Backend { get; } = new(new BackendOptions { TimeoutSeconds = BackendTimeoutSeconds });
+
+        public RecordingForwarder Forwarder { get; } = new();
+
+        public BackendForwarder Instance { get; }
+
+        /// <summary>Forwards one REST catalogue call, as the REST endpoint does.</summary>
+        public Task CallAsync(CancellationToken ct) => Instance.ForwardAsync(
+            new DefaultHttpContext { RequestAborted = ct },
+            Surface.Rest,
+            OperationCatalogue.Default.GetById(OperationId));
+
+        public void Dispose() => Instance.Dispose();
+    }
+
+    /// <summary>
+    /// An options monitor whose value a test replaces, as a configuration reload does, which can run an
+    /// action inside the next read, and which can fail every read as a reload the binder rejects does.
+    /// </summary>
+    private sealed class OptionsMonitorStub<TOptions>(TOptions initial) : IOptionsMonitor<TOptions>
+        where TOptions : class
+    {
+        private TOptions _value = initial;
+        private Action? _onNextRead;
+        private volatile bool _unreadable;
+
+        public TOptions CurrentValue
+        {
+            get
+            {
+                Interlocked.Exchange(ref _onNextRead, null)?.Invoke();
+                return _unreadable
+                    ? throw new InvalidOperationException("The options cannot be bound.")
+                    : Volatile.Read(ref _value);
+            }
+
+            set => Volatile.Write(ref _value, value);
+        }
+
+        /// <summary>When true, every read of <see cref="CurrentValue"/> throws, as binding a malformed reload does.</summary>
+        public bool Unreadable
+        {
+            get => _unreadable;
+            set => _unreadable = value;
+        }
+
+        /// <summary>Runs <paramref name="action"/> once, inside the next read of <see cref="CurrentValue"/>.</summary>
+        public void OnNextRead(Action action) => Volatile.Write(ref _onNextRead, action);
+
+        public TOptions Get(string? name) => CurrentValue;
+
+        public IDisposable? OnChange(Action<TOptions, string?> listener) => null;
+    }
+
+    /// <summary>
+    /// Records the invoker of every call and answers it at once, or holds it in flight when a test asked
+    /// for that with <see cref="HoldNextCall"/>.
+    /// </summary>
+    private sealed class RecordingForwarder : IHttpForwarder
+    {
+        private readonly ConcurrentQueue<HeldCall> _holds = new();
+        private readonly List<HttpMessageInvoker> _invokers = [];
+        private readonly Lock _gate = new();
+
+        /// <summary>The invoker of every call so far, in call order.</summary>
+        public IReadOnlyList<HttpMessageInvoker> Invokers
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return [.. _invokers];
+                }
+            }
+        }
+
+        /// <summary>Holds the next call in flight until the returned call is released.</summary>
+        public HeldCall HoldNextCall()
+        {
+            HeldCall hold = new();
+            _holds.Enqueue(hold);
+            return hold;
+        }
+
+        public ValueTask<ForwarderError> SendAsync(
+            HttpContext context,
+            string destinationPrefix,
+            HttpMessageInvoker httpClient,
+            ForwarderRequestConfig requestConfig,
+            HttpTransformer transformer) =>
+            SendAsync(context, destinationPrefix, httpClient, requestConfig, transformer, CancellationToken.None);
+
+        public async ValueTask<ForwarderError> SendAsync(
+            HttpContext context,
+            string destinationPrefix,
+            HttpMessageInvoker httpClient,
+            ForwarderRequestConfig requestConfig,
+            HttpTransformer transformer,
+            CancellationToken cancellationToken)
+        {
+            lock (_gate)
+            {
+                _invokers.Add(httpClient);
+            }
+
+            if (_holds.TryDequeue(out HeldCall? hold))
+            {
+                hold.Entered.TrySetResult(httpClient);
+                await hold.Released.Task.WaitAsync(cancellationToken);
+            }
+
+            return ForwarderError.None;
+        }
+    }
+
+    /// <summary>A call held in flight: entered with its invoker, and ended when released.</summary>
+    private sealed class HeldCall
+    {
+        public TaskCompletionSource<HttpMessageInvoker> Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource Released { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
     }
 }

@@ -1973,7 +1973,7 @@ public sealed partial class KnownLimitationsRegisterTests : IDisposable
                     "yes",
                     InlineCode(FourResultsRun.DifferenceEntryId),
                     "3",
-                    "`artifacts/discrepancies/CASE_REST-getClient-02.json`"),
+                    "`artifacts/discrepancies/CASE:REST-getClient-02.json`"),
                 TableRow(
                     InlineCode(FourResultsRun.CompanyCaseId),
                     "`Rest.getCompany`",
@@ -1981,7 +1981,7 @@ public sealed partial class KnownLimitationsRegisterTests : IDisposable
                     "no",
                     NoValue,
                     NoValue,
-                    "`artifacts/discrepancies/CASE_REST-getCompany-01.json`"),
+                    "`artifacts/discrepancies/CASE:REST-getCompany-01.json`"),
             },
             TableBody(SectionLines(text, "### Equivalence cases")));
         Assert.Equal(
@@ -2173,12 +2173,12 @@ public sealed partial class KnownLimitationsRegisterTests : IDisposable
     [Fact]
     public void Write_CredentialedUrls_FileHoldsNoUserInformation()
     {
-        var writer = new ResultsReportWriter();
         var report = BuildReport(CredentialedUrlSource());
-        var text = writer.Render(report);
+        var text = RenderReport(report);
 
         WithTempDirectory(directory =>
         {
+            var writer = new ResultsReportWriter(directory);
             var path = Path.Combine(directory, "RESULTS.md");
 
             writer.Write(path, text);
@@ -2195,16 +2195,20 @@ public sealed partial class KnownLimitationsRegisterTests : IDisposable
     [Fact]
     public void Write_ToADirectory_FailsAndThePrintedTextHoldsNoUserInformation()
     {
-        var writer = new ResultsReportWriter();
         var report = BuildReport(CredentialedUrlSource());
-        var text = writer.Render(report);
+        var text = RenderReport(report);
 
-        // A report path that is a directory fails the write, and the replay prints the rendered text to
-        // standard output instead (AAP 0.8.4).
+        // A report path that is a directory below the repository root, as harness/ is in the exit-code
+        // verification, fails the write, and the replay prints the rendered text to standard output instead
+        // (AAP 0.8.4).
         WithTempDirectory(directory =>
         {
-            Assert.Throws<IOException>(() => writer.Write(directory, text));
-            Assert.Empty(Directory.EnumerateFileSystemEntries(directory));
+            var writer = new ResultsReportWriter(directory);
+            var target = Directory.CreateDirectory(Path.Combine(directory, "harness")).FullName;
+
+            Assert.Throws<IOException>(() => writer.Write(target, text));
+            Assert.Empty(Directory.EnumerateFileSystemEntries(target));
+            Assert.Equal([target], Directory.EnumerateFileSystemEntries(directory));
         });
 
         Assert.DoesNotContain(CredentialMark, text, StringComparison.OrdinalIgnoreCase);
@@ -2397,6 +2401,23 @@ public sealed partial class KnownLimitationsRegisterTests : IDisposable
 
         Assert.Equal(TableRow("`CHK-ORDERING`", expected, blank ? "`not-run`" : expected, "no", NoValue, NoValue, NoValue, NoValue), row);
         Assert.Equal(value, CodeSpanContent(expected));
+    }
+
+    // The artifact cell names artifacts/discrepancies/<itemId>.json with the id byte for byte; an id that cannot
+    // be one file name has no artifact, so the report renders the dash instead of failing.
+    [Theory]
+    [InlineData(FailureItemIds.OpenApiDrift, "`artifacts/discrepancies/CHK-OPENAPI-DRIFT.json`")]
+    [InlineData(FailureItemIds.WsdlContract, "`artifacts/discrepancies/CHK-WSDL-CONTRACT.json`")]
+    [InlineData("CHK-OPENAPI-DRIFT/../escape", NoValue)]
+    [InlineData("..", NoValue)]
+    public void Render_DiscrepancyArtifact_NamesTheExactItemIdOrTheDash(string itemId, string expectedArtifact)
+    {
+        const string nature = "d:0123456789abcdef";
+        var source = new ReportSourceFixture { Failures = [new FailureItem(itemId, nature)] };
+
+        var row = Assert.Single(TableBody(SectionLines(RenderReport(BuildReport(source)), "### Other failing items")));
+
+        Assert.Equal(TableRow(InlineCode(itemId), NoValue, InlineCode(nature), "no", NoValue, NoValue, expectedArtifact, NoValue), row);
     }
 
     /// <summary>The "Known limitations" lines of the report of an empty run against <paramref name="register"/>.</summary>

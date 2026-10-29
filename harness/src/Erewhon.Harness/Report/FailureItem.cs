@@ -102,6 +102,8 @@ public sealed record FailureItem(string ItemId, string Nature, string? Operation
 /// </list>
 /// Builders reject a null part. Parts that come from fixed names (case ids, components, catalogue
 /// names, signatures) must also be non-blank; observed values are kept exactly, empty included.
+/// Ordinary console lines show a nature through the lifecycle console's failure display, which hides
+/// those observed values.
 /// </remarks>
 public static class FailureItemIds
 {
@@ -186,9 +188,15 @@ public static class FailureItemIds
     private const string FailedPrefix = "failed:";
     private const string ModifiedPrefix = "modified:";
     private const string AddedPrefix = "added:";
-    private const string MismatchPrefix = "mismatch:";
-    private const string DiffersPrefix = "differs:";
-    private const string WrongTypePrefix = "wrong-type:";
+
+    /// <summary>The prefix of a conformance member's wrong wire-type nature, <c>wrong-type:</c>; the lifecycle console's failure display reads it.</summary>
+    internal const string WrongTypePrefix = "wrong-type:";
+
+    /// <summary>The prefix of a state-reset nature, <c>mismatch:</c>; the lifecycle console's failure display reads it.</summary>
+    internal const string MismatchPrefix = "mismatch:";
+
+    /// <summary>The prefix of a seed-token nature, <c>differs:</c>; the lifecycle console's failure display reads it.</summary>
+    internal const string DiffersPrefix = "differs:";
 
     private const string RestCasePrefix = "REST";
     private const string SoapCasePrefix = "SOAP";
@@ -438,6 +446,13 @@ public static class DiscrepancySignature
 {
     private const int SignatureBytes = 8;
 
+    // The extension of a discrepancy artifact, and the most bytes one Linux file name holds (NAME_MAX).
+    private const string ArtifactExtension = ".json";
+    private const int MaxFileNameBytes = 255;
+
+    // Strict, so a lone surrogate, which no UTF-8 name can hold, fails the count instead of becoming U+FFFD.
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
     private static readonly JsonWriterOptions WriterOptions = new()
     {
         Indented = false,
@@ -513,26 +528,75 @@ public static class DiscrepancySignature
     }
 
     /// <summary>
-    /// Returns <paramref name="itemId"/> with every character outside <c>[A-Za-z0-9._-]</c> replaced
-    /// by <c>_</c>, for example <c>CASE_REST-getAgent-01</c> for <c>CASE:REST-getAgent-01</c>.
+    /// Returns the file name of <paramref name="itemId"/>'s discrepancy artifact, <c>&lt;itemId&gt;.json</c>
+    /// with the id kept byte for byte, for example <c>CASE:REST-getAgent-01.json</c> for
+    /// <c>CASE:REST-getAgent-01</c>, so the artifact is <c>artifacts/discrepancies/&lt;itemId&gt;.json</c>.
     /// </summary>
     /// <remarks>
-    /// Ids that differ only in replaced characters share a name. The ids that carry discrepancy
-    /// artifacts, <c>CASE:&lt;caseId&gt;</c> and the contract checks, never do.
+    /// Nothing is replaced, so two ids never share a name. An id that cannot be one safe Linux file name is
+    /// refused instead of altered: <c>.</c> and <c>..</c>; an id holding <c>/</c>, <c>\</c>, NUL or another
+    /// control character; an id that is not valid UTF-16, which no UTF-8 name can hold; and an id whose file
+    /// name exceeds 255 UTF-8 bytes. The ids that carry discrepancy artifacts, <c>CASE:&lt;caseId&gt;</c> with
+    /// a case-matrix id such as <c>REST-getAgent-01</c>, <c>CHK-OPENAPI-DRIFT</c> and <c>CHK-WSDL-CONTRACT</c>,
+    /// are always accepted.
     /// </remarks>
     /// <param name="itemId">The item id.</param>
-    /// <exception cref="ArgumentException"><paramref name="itemId"/> is null or empty.</exception>
-    public static string SanitiseFileName(string itemId)
+    /// <returns>The file name, without a directory.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="itemId"/> is null.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="itemId"/> is empty or cannot be one safe Linux file name.
+    /// </exception>
+    public static string ArtifactFileName(string itemId)
     {
         ArgumentException.ThrowIfNullOrEmpty(itemId);
-        return string.Create(itemId.Length, itemId, static (span, source) =>
+        var problem = ArtifactFileNameProblem(itemId);
+        return problem is null
+            ? itemId + ArtifactExtension
+            : throw new ArgumentException($"The item id cannot name a discrepancy artifact: {problem}.", nameof(itemId));
+    }
+
+    /// <summary>
+    /// Returns the file name of <paramref name="itemId"/>'s discrepancy artifact as
+    /// <see cref="ArtifactFileName"/> does, without throwing for an id it refuses.
+    /// </summary>
+    /// <param name="itemId">The item id; null or empty is refused.</param>
+    /// <param name="fileName">The file name, without a directory; null when the id is refused.</param>
+    /// <returns>True when the id names its artifact.</returns>
+    public static bool TryArtifactFileName(string? itemId, [NotNullWhen(true)] out string? fileName)
+    {
+        fileName = string.IsNullOrEmpty(itemId) || ArtifactFileNameProblem(itemId) is not null
+            ? null
+            : itemId + ArtifactExtension;
+        return fileName is not null;
+    }
+
+    // Why a non-empty itemId cannot be one safe Linux file name; null when it can.
+    private static string? ArtifactFileNameProblem(string itemId)
+    {
+        if (itemId is "." or "..")
         {
-            for (var i = 0; i < source.Length; i++)
+            return "it is '.' or '..'";
+        }
+
+        foreach (var c in itemId)
+        {
+            if (c is '/' or '\\' || char.IsControl(c))
             {
-                var c = source[i];
-                span[i] = char.IsAsciiLetterOrDigit(c) || c is '.' or '_' or '-' ? c : '_';
+                return "it holds '/', '\\', NUL or another control character";
             }
-        });
+        }
+
+        int nameBytes;
+        try
+        {
+            nameBytes = StrictUtf8.GetByteCount(itemId) + ArtifactExtension.Length;
+        }
+        catch (EncoderFallbackException)
+        {
+            return "it is not valid UTF-16";
+        }
+
+        return nameBytes > MaxFileNameBytes ? "its file name would exceed the 255 UTF-8 bytes a Linux name holds" : null;
     }
 
     private static List<CanonicalEntry> Canonicalise(IEnumerable<Discrepancy>? discrepancies)
@@ -689,8 +753,8 @@ public sealed class CanonicalDiscrepancies
     /// Returns the discrepancy artifact of a failing item: <c>itemId</c>, <c>nature</c>,
     /// <c>operation</c>, <c>detail</c>, <c>signature</c> and <c>discrepancies</c>, the last being the
     /// canonical list the signature is computed over, built from <see cref="Entries"/> without preparing
-    /// or parsing the list again. The caller writes it to
-    /// <c>artifacts/discrepancies/&lt;SanitiseFileName(itemId)&gt;.json</c>.
+    /// or parsing the list again. The caller writes it to <c>artifacts/discrepancies/&lt;itemId&gt;.json</c>,
+    /// the file name <see cref="DiscrepancySignature.ArtifactFileName"/> returns.
     /// </summary>
     /// <remarks>
     /// Each entry has the members and tokens the canonical writer emits, so the list serialised with

@@ -38,7 +38,8 @@ namespace Erewhon.Harness;
 /// disposes the token source only after that wait; a callback that failed, or one still running at the
 /// bound, is reported on standard error in one line and makes the exit code 1.</para>
 /// <para>Program reads only <c>harness/config/harness.json</c> and the register, writes no file and prints
-/// only the usage line and fatal errors, to standard error. It configures no credential or header.</para>
+/// only the usage line and fatal errors, to standard error, each escaped by
+/// <see cref="LifecycleConsole.Display"/>. It configures no credential or header.</para>
 /// </remarks>
 internal static class Program
 {
@@ -399,8 +400,20 @@ internal static class Program
             body = new FailedReplayBody(ex);
         }
 
+        ResultsReportWriter writer;
+        try
+        {
+            writer = new ResultsReportWriter(options.ResolvePath("."));
+        }
+        catch (Exception ex)
+        {
+            // A writer without a root still renders the report, which the failed write then prints.
+            writer = new ResultsReportWriter();
+            AddStartupFailure(startupFailures, "the repository root is unusable, so the report cannot be written", ex);
+        }
+
         using var shutdown = new HttpComponentShutdown(options);
-        var replay = new ReplayMode(options, body, new ResultsReportWriter(), shutdown, register, stdout, startupFailures);
+        var replay = new ReplayMode(options, body, writer, shutdown, register, stdout, startupFailures);
         return await replay.RunAsync(ct).ConfigureAwait(false);
     }
 
@@ -450,8 +463,9 @@ internal static class Program
 
     private static void WriteError(string message)
     {
-        // Exception messages and paths can hold line breaks; each error stays on one line.
-        var line = message.ReplaceLineEndings(" ");
+        // Exception messages, paths and settings can hold line breaks, terminal escapes and bidirectional
+        // controls; Display escapes each of them, so every error stays one inert line.
+        var line = LifecycleConsole.Display(message);
         try
         {
             Console.Error.WriteLine(line);

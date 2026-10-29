@@ -20,6 +20,10 @@
 #
 # Usage: run-tests.sh [-h | --help]. Any other argument is reported and nothing runs.
 #
+# The test run is bounded, so a hung test host cannot stall the harness: past a 600 s suite limit the
+# run and every process it started are stopped (SIGTERM, then SIGKILL 10 s later), and exit-code then
+# holds a nonzero status. This needs setsid (util-linux).
+#
 # Environment:
 #   FACADE_TEST_RESULTS_DIR  results directory; default /repo/artifacts/facade-tests. A relative path is
 #                            taken from the caller's working directory. It must be a dedicated
@@ -40,6 +44,14 @@ DEFAULT_RESULTS_DIR="/repo/artifacts/facade-tests"
 # exit-code's content while a run is in progress. FacadeTestResults.cs reads a non-integer as an
 # unverified run, so an interrupted run can never pass for a successful one.
 RUNNING_MARKER="running"
+# The suite limit bounds the whole dotnet test run: the build check, the test host and the TRX write.
+# No test or request timeout reaches a test host that blocks outside a request (in a host start-up or
+# disposal, or in the runner itself), and the harness waits for this script to end. A healthy run
+# takes well under a minute; the limit also leaves room for a first build of a fresh checkout.
+readonly SUITE_LIMIT_SECONDS=600
+# Past the limit the run gets SIGTERM and this long to end on it before SIGKILL ends whatever is left of
+# it. A run stopped either way writes no TRX or xunit XML, so exit-code alone records its outcome.
+readonly KILL_GRACE_SECONDS=10
 
 usage() {
     cat <<EOF
@@ -206,6 +218,50 @@ if [ ! -f tests/Erewhon.Facade.Tests/obj/project.assets.json ]; then
     fi
 fi
 
+if ! command -v setsid >/dev/null 2>&1; then
+    record 127
+    echo "facade-tests: setsid (util-linux) is not on PATH, so the test run cannot be bounded; tests not run" >&2
+    exit 0
+fi
+
+# run_bounded <command> [<argument>...]: runs the command in a session and process group of its own and
+# sets rc to its exit status. Past SUITE_LIMIT_SECONDS the whole group gets SIGTERM, then SIGKILL from
+# KILL_GRACE_SECONDS later for as long as any of it is left, so neither the dotnet CLI nor the test host
+# it starts outlives the run, even when stopped or ignoring SIGTERM; STOPPED_BY is then "limit". The
+# group is signalled from here rather than through timeout(1), because the uutils timeout's
+# `--kill-after` never sends SIGKILL to a command that ignores SIGTERM. The run does not receive this
+# script's terminal signals, so a TERM, INT or HUP sent to the script stops it the same way, and
+# STOPPED_BY is then "signal".
+run_bounded() {
+    local pid term_at kill_at="" stop_requested=0
+    STOPPED_BY=""
+    trap 'stop_requested=1' TERM INT HUP
+    setsid "$@" &
+    pid=$!
+    term_at=$((SECONDS + SUITE_LIMIT_SECONDS))
+    # The run is over once the command has ended and no process is left in its group. The job table says
+    # whether the command still runs, so a reused pid is never taken for it.
+    while [ -n "$(jobs -rp)" ] || kill -0 -- "-$pid" 2>/dev/null; do
+        if [ -z "$kill_at" ]; then
+            if [ "$stop_requested" -eq 1 ]; then
+                STOPPED_BY="signal"
+            elif [ "$SECONDS" -ge "$term_at" ]; then
+                STOPPED_BY="limit"
+            fi
+            if [ -n "$STOPPED_BY" ]; then
+                kill -TERM -- "-$pid" 2>/dev/null
+                kill_at=$((SECONDS + KILL_GRACE_SECONDS))
+            fi
+        elif [ "$SECONDS" -ge "$kill_at" ]; then
+            kill -KILL -- "-$pid" 2>/dev/null
+        fi
+        sleep 1
+    done
+    wait "$pid"
+    rc=$?
+    trap - TERM INT HUP
+}
+
 # The xunit.v3 options are given without a `--` separator. On SDK 10.0.403, `dotnet test` in
 # Microsoft.Testing.Platform mode rejects `-- ... --results-directory <dir>` when <dir> exists (it
 # exits 1 with "Specifying a directory for 'dotnet test' should be via '--project' or '--solution'."
@@ -213,11 +269,22 @@ fi
 # the test application.
 #
 # On the .NET 8 fallback (KL-SUB-DOTNET, VSTest runner) the run line becomes:
-#   dotnet test tests/Erewhon.Facade.Tests/Erewhon.Facade.Tests.csproj -c Release --no-restore --logger "trx;LogFileName=facade-tests.trx" --results-directory "$RESULTS_DIR"
-dotnet test --project "$TEST_PROJECT" -c Release --no-restore \
+#   run_bounded dotnet test tests/Erewhon.Facade.Tests/Erewhon.Facade.Tests.csproj -c Release --no-restore --logger "trx;LogFileName=facade-tests.trx" --results-directory "$RESULTS_DIR"
+run_bounded dotnet test --project "$TEST_PROJECT" -c Release --no-restore \
     --report-xunit-trx --report-xunit-trx-filename "$TRX_NAME" \
     --report-xunit-xml --report-xunit-xml-filename "$XML_NAME" --results-directory "$RESULTS_DIR"
-rc=$?
+case "$STOPPED_BY" in
+    limit)
+        echo "facade-tests: dotnet test exceeded the ${SUITE_LIMIT_SECONDS} s suite limit and was stopped" >&2
+        ;;
+    signal)
+        echo "facade-tests: dotnet test was stopped on a signal to this script" >&2
+        ;;
+esac
+# A stopped run never counts as passed, whatever status it ended with.
+if [ -n "$STOPPED_BY" ] && [ "$rc" -eq 0 ]; then
+    rc=124
+fi
 
 record "$rc"
 # The stale TRX and xunit XML were removed before the run, so each one here, or its absence, is this run's.

@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using Erewhon.Harness.Lifecycle;
 using Microsoft.Win32.SafeHandles;
 
 namespace Erewhon.Harness.Modes;
@@ -19,7 +20,9 @@ namespace Erewhon.Harness.Modes;
 /// <para>Exit code 0 means the line was printed. Every other outcome (no report, a directory at the
 /// report path, a read failure, a report with no non-blank line, an unwritable standard output or
 /// cancellation) is one line naming the path and the reason on standard error, never on
-/// <c>stdout</c>, and exit code 1. <see cref="RunAsync"/> never throws.</para>
+/// <c>stdout</c>, and exit code 1. That line is printed through
+/// <see cref="LifecycleConsole.Display"/>, so a path or message cannot break it or drive the
+/// terminal. <see cref="RunAsync"/> never throws.</para>
 /// <para>When the mode is given <see cref="Console.Out"/> itself on a system other than Windows, and
 /// descriptor 1 is not seekable (a pipe, a socket or a terminal), the line goes straight to descriptor 1 as
 /// the bytes <see cref="Console.Out"/> would write: the line in its encoding, followed by its line
@@ -388,11 +391,10 @@ public sealed class SummaryMode
 
     private static void ReportFailure(string reason)
     {
-        // Exception messages and paths can hold line breaks; the reason must stay on one line.
-        var line = (LinePrefix + reason)
-            .Replace("\r\n", " ", StringComparison.Ordinal)
-            .Replace('\r', ' ')
-            .Replace('\n', ' ');
+        // Exception messages and paths can hold line breaks, terminal escapes and bidirectional controls;
+        // Display escapes each of them, so the reason stays one inert line. Only failure reasons are escaped:
+        // the final line on stdout is the report's own and is printed verbatim.
+        var line = LifecycleConsole.Display(LinePrefix + reason);
         try
         {
             Console.Error.WriteLine(line);

@@ -10,6 +10,7 @@ using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
 using Microsoft.Net.Http.Headers;
 using Yarp.ReverseProxy.Forwarder;
+using Yarp.ReverseProxy.Transforms;
 
 namespace Erewhon.Facade.Forwarding;
 
@@ -26,7 +27,8 @@ namespace Erewhon.Facade.Forwarding;
 /// <c>Host</c> is the target authority, which the HTTP stack derives from the destination URI.
 /// No <c>X-Forwarded-*</c>, <c>Forwarded</c>, <c>Via</c>, credential or token header is added,
 /// because no layer of the facade authenticates or derives an identity and the backend is plain
-/// HTTP without authentication.
+/// HTTP without authentication. A body-less write carries the <c>Content-Length: 0</c> the HTTP
+/// stack would write for it anyway, as an empty content, so the stack sends it to the backend once.
 /// </para>
 /// <para>
 /// The request target is taken from the raw target the caller sent, never from the decoded
@@ -152,7 +154,9 @@ public sealed class PassThroughTransformer : HttpTransformer
     /// Copies every end-to-end request header unchanged, drops the fields the caller's
     /// <c>Connection</c> header nominates, replaces the caller's <c>Host</c> with the target
     /// authority and points the request at <paramref name="destinationPrefix"/> followed by the
-    /// origin form of the caller's raw request target.
+    /// origin form of the caller's raw request target. A body-less request whose method the HTTP stack
+    /// sends with <c>Content-Length: 0</c> gets an empty content carrying that same header, so the
+    /// handler sends it to the backend once.
     /// </summary>
     /// <param name="httpContext">The incoming request.</param>
     /// <param name="proxyRequest">The outgoing request to the backend.</param>
@@ -208,6 +212,29 @@ public sealed class PassThroughTransformer : HttpTransformer
         else if (IsAsteriskForm(rawTarget) && Uri.TryCreate(destinationPrefix, in RawTargetOptions, out var root))
         {
             proxyRequest.RequestUri = root;
+        }
+
+        // A request that arrived without a body (no Content-Length, not chunked) and without content
+        // headers reaches this point with no content. SocketsHttpHandler resends such a request on a new
+        // connection, up to three more times, when the backend closes the connection before answering,
+        // because no body has started to go out, while the forwarder still sees and logs one call. For a
+        // path-only write such as POST /createTender/... each resend is another backend transaction. A
+        // request with content is sent at most once by the invoker (SingleDeliveryHandler), so a write
+        // gets content here. YARP rejects any content a transform sets except its own empty content, which
+        // it creates when a content header is added through RequestTransform.AddHeader. That header is
+        // "Content-Length: 0", the value the handler writes at the same place for a content-less request
+        // of these methods, so the bytes on the wire do not change. A caller's "Expect: 100-continue" is
+        // still forwarded unchanged, and such a write, with an empty or a real body, is sent once as well.
+        if (proxyRequest.Content is null && SendsContentLengthWhenBodyless(httpContext, proxyRequest.Method))
+        {
+            var context = new RequestTransformContext
+            {
+                HttpContext = httpContext,
+                ProxyRequest = proxyRequest,
+                DestinationPrefix = destinationPrefix,
+                CancellationToken = cancellationToken,
+            };
+            RequestTransform.AddHeader(context, HeaderNames.ContentLength, "0");
         }
     }
 
@@ -328,6 +355,37 @@ public sealed class PassThroughTransformer : HttpTransformer
             headers.Remove(name);
         }
     }
+
+    // GET, HEAD, OPTIONS, DELETE and CONNECT are the methods SocketsHttpHandler sends without any framing
+    // header when they carry no content. Any content would make the handler write Content-Length, or
+    // Transfer-Encoding: chunked when the content has no length, a header the caller never sent, so these
+    // requests keep no content and their headers pass unchanged. The cost is that, without content, the
+    // handler may still resend such a request when the backend closes the connection unanswered; these
+    // methods are idempotent, so a resend repeats no write. The methods are compared with HttpMethod
+    // equality (ordinal, case-insensitive), as the handler compares them. A request the forwarder tunnels
+    // as an upgrade is left to its own upgrade handling.
+    private static bool SendsContentLengthWhenBodyless(HttpContext httpContext, HttpMethod method) =>
+        method != HttpMethod.Get
+        && method != HttpMethod.Head
+        && method != HttpMethod.Options
+        && method != HttpMethod.Delete
+        && method != HttpMethod.Connect
+        && !IsTunnelledUpgrade(httpContext);
+
+    // YARP tunnels an upgradable request whose Upgrade value is "websocket" or starts with "SPDY/",
+    // compared ordinal case-insensitively. It drops any other Upgrade value as a hop-by-hop header and
+    // forwards an ordinary request, which then needs the same single delivery as any other.
+    private static bool IsTunnelledUpgrade(HttpContext httpContext)
+    {
+        if (httpContext.Features.Get<IHttpUpgradeFeature>()?.IsUpgradableRequest != true)
+        {
+            return false;
+        }
+
+        var upgrade = httpContext.Request.Headers.Upgrade.ToString();
+        return string.Equals(upgrade, "websocket", StringComparison.OrdinalIgnoreCase)
+            || upgrade.StartsWith("SPDY/", StringComparison.OrdinalIgnoreCase);
+    }
 }
 
 // The connection-level capture of each request's Connection lines, and the listener extension that
@@ -354,8 +412,16 @@ public static class RawConnectionHeaderCaptureExtensions
         // collection falls back to the connection features, where the capture is found.
         listen.Use(next => async connection =>
         {
+            // Kestrel's limits are final once connections arrive. It admits a request line of up to
+            // MaxRequestLineSize bytes with its CRLF and a header block of up to
+            // MaxRequestHeadersTotalSize bytes plus its closing CRLF, and counts a chunked body's
+            // trailer section against what the header block left of that allowance.
+            var limits = listen.KestrelServerOptions.Limits;
+            var headerBlockBytes = (long)limits.MaxRequestHeadersTotalSize + 2;
             var transport = connection.Transport;
-            var capture = new RawConnectionHeaderCapture();
+            var capture = new RawConnectionHeaderCapture(
+                (int)Math.Min(limits.MaxRequestLineSize + headerBlockBytes, int.MaxValue),
+                (int)Math.Min(headerBlockBytes, int.MaxValue));
             connection.Transport = capture.Observe(transport);
             connection.Features.Set(capture);
             try
@@ -384,17 +450,18 @@ public static class RawConnectionHeaderCaptureExtensions
 /// </para>
 /// <para>
 /// The capture follows the connection's HTTP/1.1 request framing forward over the bytes Kestrel reads:
-/// each request head (bounded to 64 KiB) is parsed once for its method, raw target and
-/// <c>Connection</c> line values, and each body, framed by <c>Content-Length</c> or chunked, is skipped
+/// each request head (bounded by the listener's Kestrel request-line and header limits, so every head
+/// Kestrel admits is framed) is parsed once for its method, raw target and <c>Connection</c> line
+/// values, and each body, framed by <c>Content-Length</c> or chunked, is skipped
 /// by count, never copied. A head's values become current when Kestrel consumes the head, which it does
 /// before it dispatches the request; Kestrel dispatches the requests of one HTTP/1.1 connection one at
 /// a time, so the head consumed last is that of the request in progress. At most 32 framed heads wait
 /// for Kestrel: a pipelining caller's further heads are framed on later reads, as Kestrel catches up.
 /// </para>
 /// <para>
-/// Framing the capture cannot follow (a head over the bound, an invalid or conflicting
-/// <c>Content-Length</c>, a final transfer coding other than chunked, a malformed chunk) or a reader
-/// call it cannot account for stops the capture for the rest of the connection:
+/// Framing the capture cannot follow (a head or trailer section over its bound, an invalid or
+/// conflicting <c>Content-Length</c>, a final transfer coding other than chunked, a malformed chunk)
+/// or a reader call it cannot account for stops the capture for the rest of the connection:
 /// <see cref="TryGetConnectionValues"/> then answers false, and the request headers Kestrel parsed
 /// are all there is. Observation never throws into Kestrel and never changes what Kestrel reads. The
 /// state belongs to one connection, so it only ever describes requests of the caller that sent them.
@@ -406,10 +473,6 @@ public static class RawConnectionHeaderCaptureExtensions
 /// </remarks>
 public sealed class RawConnectionHeaderCapture
 {
-    // Kestrel's default limits allow an 8 KiB request line and 32 KiB of header fields; the bound also
-    // applies to a chunked body's trailer section.
-    private const int MaxHeadBytes = 64 * 1024;
-
     // A chunk-size line with its chunk extensions.
     private const int MaxChunkLineBytes = 8 * 1024;
 
@@ -420,6 +483,11 @@ public sealed class RawConnectionHeaderCapture
 
     private const byte CarriageReturn = (byte)'\r';
     private const byte LineFeed = (byte)'\n';
+
+    // The request head and trailer section bounds follow the listener's Kestrel request-line and header
+    // limits, so they frame every head and trailer section Kestrel admits.
+    private readonly int _maxHeadBytes;
+    private readonly int _maxTrailerBytes;
 
     private readonly Lock _gate = new();
     private readonly Queue<CapturedHead> _pending = new();
@@ -447,8 +515,14 @@ public sealed class RawConnectionHeaderCapture
     private bool _hasTransferEncoding;
     private bool _chunked;
 
-    internal RawConnectionHeaderCapture()
+    // maxHeadBytes bounds a request line, its header fields and the blank line that ends them;
+    // maxTrailerBytes bounds the trailer fields and blank line after a chunked body's last chunk.
+    internal RawConnectionHeaderCapture(int maxHeadBytes, int maxTrailerBytes)
     {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxHeadBytes);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxTrailerBytes);
+        _maxHeadBytes = maxHeadBytes;
+        _maxTrailerBytes = maxTrailerBytes;
     }
 
     private enum Framing
@@ -597,12 +671,12 @@ public sealed class RawConnectionHeaderCapture
             var used = _framing switch
             {
                 Framing.BeforeRequestLine => SkipLineBreaks(bytes),
-                Framing.RequestLine or Framing.HeaderLine => TakeLine(bytes, MaxHeadBytes),
+                Framing.RequestLine or Framing.HeaderLine => TakeLine(bytes, _maxHeadBytes),
                 Framing.ContentLengthBody or Framing.ChunkData => SkipCounted(bytes),
                 Framing.ChunkSizeLine => TakeLine(bytes, MaxChunkLineBytes),
                 Framing.ChunkDataCarriageReturn => Expect(bytes[0], CarriageReturn, Framing.ChunkDataLineFeed),
                 Framing.ChunkDataLineFeed => Expect(bytes[0], LineFeed, Framing.ChunkSizeLine),
-                Framing.TrailerLine => TakeLine(bytes, MaxHeadBytes),
+                Framing.TrailerLine => TakeLine(bytes, _maxTrailerBytes),
                 _ => throw new UnreachableException(),
             };
 
@@ -671,7 +745,8 @@ public sealed class RawConnectionHeaderCapture
     }
 
     // Collects a line up to its LF, within the byte limit of its section, and handles it once complete.
-    // A line ends at LF with an optional CR before it, as Kestrel reads request and header lines.
+    // A line ends at LF with an optional CR before it, as Kestrel reads request and header lines. The
+    // line buffer grows only as far as the section limit, the most one line of the section can hold.
     private int TakeLine(ReadOnlySpan<byte> bytes, int sectionLimit)
     {
         var lineFeed = bytes.IndexOf(LineFeed);
@@ -686,7 +761,7 @@ public sealed class RawConnectionHeaderCapture
         var content = bytes[..(lineFeed < 0 ? used : lineFeed)];
         if (_lineLength + content.Length > _line.Length)
         {
-            Array.Resize(ref _line, Math.Min(Math.Max(_line.Length * 2, _lineLength + content.Length), MaxHeadBytes));
+            Array.Resize(ref _line, Math.Min(Math.Max(_line.Length * 2, _lineLength + content.Length), sectionLimit));
         }
 
         content.CopyTo(_line.AsSpan(_lineLength));

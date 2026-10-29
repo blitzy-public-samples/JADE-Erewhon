@@ -98,19 +98,51 @@ try
         // The facade never answers 413: any body-size limit stays the backend's own.
         kestrel.Limits.MaxRequestBodySize = null;
 
+        // Nor 414 or 431 for a request line or header block the request buffer can hold: it is
+        // forwarded, and the backend's own limits decide. The buffer is the bound because Kestrel
+        // refuses to start with either head limit above MaxRequestBufferSize, which stays bounded
+        // (Kestrel's 1 MiB default) since it is also the back-pressure threshold for a body streamed
+        // to a slow backend. Kestrel refuses a header block only once it holds more than the limit
+        // plus the block's closing CRLF, and stops reading when the buffer is full, so the header
+        // limit stays three bytes below the buffer: at the full size, a block just over it would wait
+        // for the request-headers timeout (408) instead of being refused with 431. The header total
+        // already bounds how many headers fit. Only a larger head is answered by the facade itself, with
+        // 414 or 431 rather than forwarded, and that bound is the accepted limit recorded as
+        // KL-FACADE-REQUEST-HEAD in harness/config/known-limitations.json.
+        const int RequestBufferSize = 1024 * 1024;
+        kestrel.Limits.MaxRequestBufferSize = RequestBufferSize;
+        kestrel.Limits.MaxRequestLineSize = RequestBufferSize;
+        kestrel.Limits.MaxRequestHeadersTotalSize = RequestBufferSize - 3;
+        kestrel.Limits.MaxRequestHeaderCount = int.MaxValue;
+
+        // Header values are read and written as Latin-1, one char per byte, as BackendForwarder's handler
+        // writes and reads them, so non-ASCII header bytes pass through in both directions unchanged;
+        // ASCII values decode and encode exactly as before.
+        kestrel.RequestHeaderEncodingSelector = static _ => System.Text.Encoding.Latin1;
+        kestrel.ResponseHeaderEncodingSelector = static _ => System.Text.Encoding.Latin1;
+
+        // Every port is checked on its own and against the others before any listener is added.
+        var restPort = ListenerPort(facade.RestPort, nameof(FacadeOptions.RestPort));
+        var soapPort = ListenerPort(facade.SoapPort, nameof(FacadeOptions.SoapPort));
+        var adminPort = ListenerPort(facade.AdminPort, nameof(FacadeOptions.AdminPort));
+        RequireDistinctPorts(
+            (nameof(FacadeOptions.RestPort), restPort),
+            (nameof(FacadeOptions.SoapPort), soapPort),
+            (nameof(FacadeOptions.AdminPort), adminPort));
+
         // Plain HTTP/1.1 on every listener, as the JADE applications serve (_webIsSecure false).
         // The forwarding REST and SOAP listeners also capture each request's Connection lines as sent.
-        kestrel.Listen(address, ListenerPort(facade.RestPort, nameof(FacadeOptions.RestPort)), listen =>
+        kestrel.Listen(address, restPort, listen =>
         {
             listen.Protocols = HttpProtocols.Http1;
             listen.UseRawConnectionHeaderCapture();
         });
-        kestrel.Listen(address, ListenerPort(facade.SoapPort, nameof(FacadeOptions.SoapPort)), listen =>
+        kestrel.Listen(address, soapPort, listen =>
         {
             listen.Protocols = HttpProtocols.Http1;
             listen.UseRawConnectionHeaderCapture();
         });
-        kestrel.Listen(address, ListenerPort(facade.AdminPort, nameof(FacadeOptions.AdminPort)), listen => listen.Protocols = HttpProtocols.Http1);
+        kestrel.Listen(address, adminPort, listen => listen.Protocols = HttpProtocols.Http1);
     });
 
     builder.Services.AddOptions<FacadeOptions>().Bind(builder.Configuration.GetSection(FacadeOptions.SectionName));
@@ -164,6 +196,15 @@ try
 
     var app = builder.Build();
 
+    // When the facade is its own process, the host is disposed on every path out of this block, so a
+    // failure before it runs, such as a WSDL path that cannot be resolved, still flushes the console log
+    // and releases the host's services and configuration sources; after RunAsync, which disposes the
+    // host itself, this second disposal does nothing. In-process, the host is left to the caller that
+    // captured it while it was built (WebApplicationFactory<Program>), which goes on reading the host's
+    // services on its own thread: disposing them here could make that caller report an
+    // ObjectDisposedException in place of the start-up failure.
+    await using var ownedApp = Assembly.GetEntryAssembly() == typeof(Program).Assembly ? app : null;
+
     // Loads the published WSDL now, so its presence or absence is logged at start-up. An absent WSDL
     // never stops the facade: WSDL requests are then forwarded to the default target unchanged.
     app.Services.GetRequiredService<WsdlDocument>();
@@ -174,8 +215,8 @@ try
     app.MapSoapEndpoints();
     app.MapAdminEndpoints();
 
-    // POST /admin/shutdown on the admin listener stops the host, and Run returns.
-    app.Run();
+    // POST /admin/shutdown on the admin listener stops the host, and RunAsync returns.
+    await app.RunAsync();
 }
 catch (Exception exception) when (Assembly.GetEntryAssembly() == typeof(Program).Assembly)
 {
@@ -188,13 +229,36 @@ catch (Exception exception) when (Assembly.GetEntryAssembly() == typeof(Program)
 return 0;
 
 // Kestrel options are built while the app is built, before the ListenerPorts start-up validation runs,
-// so an out-of-range port is reported here under its own key. Port 0 is rejected too: the matcher
-// policy needs the exact port each listener is bound to.
+// so an out-of-range or shared port is reported here under its own key. Port 0 is rejected too: the
+// matcher policy needs the exact port each listener is bound to.
 static int ListenerPort(int port, string key) =>
     port is >= 1 and <= IPEndPoint.MaxPort
         ? port
         : throw new InvalidOperationException(
             $"{FacadeOptions.SectionName}:{key} must be between 1 and {IPEndPoint.MaxPort}; the value is {port}.");
+
+// The matcher policy tells the listeners apart only by port, so each needs its own. Every pair that
+// shares one is named in a single message, in the order the listeners are given.
+static void RequireDistinctPorts(params (string Key, int Port)[] listeners)
+{
+    var conflicts = new List<string>();
+    for (var first = 0; first < listeners.Length; first++)
+    {
+        for (var second = first + 1; second < listeners.Length; second++)
+        {
+            if (listeners[first].Port == listeners[second].Port)
+            {
+                conflicts.Add(
+                    $"{FacadeOptions.SectionName}:{listeners[first].Key} and {FacadeOptions.SectionName}:{listeners[second].Key} are both {listeners[first].Port}; each listener needs its own port.");
+            }
+        }
+    }
+
+    if (conflicts.Count > 0)
+    {
+        throw new InvalidOperationException(string.Join(" ", conflicts));
+    }
+}
 
 /// <summary>
 /// The facade's entry point, declared public so that <c>WebApplicationFactory&lt;Program&gt;</c> in

@@ -288,8 +288,7 @@ public sealed class OpenApiDriftCheck(HarnessOptions options, JsonSemanticCompar
         try
         {
             path = LiveDocumentPath();
-            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            await File.WriteAllBytesAsync(path, body, ct).ConfigureAwait(false);
+            await ArtifactTree().WriteFileAsync(path, body, ct).ConfigureAwait(false);
             return null;
         }
         catch (Exception ex) when (IsFileSystemFailure(ex))
@@ -307,12 +306,8 @@ public sealed class OpenApiDriftCheck(HarnessOptions options, JsonSemanticCompar
         {
             path = LiveDocumentPath();
 
-            // File.Delete throws when the directory is absent, which here just means there is nothing to remove.
-            if (File.Exists(path))
-            {
-                File.Delete(path);
-            }
-
+            // An absent directory or file is nothing to remove, and a directory in the file's place is kept.
+            ArtifactTree().DeleteFile(path);
             return null;
         }
         catch (Exception ex) when (IsFileSystemFailure(ex))
@@ -323,6 +318,11 @@ public sealed class OpenApiDriftCheck(HarnessOptions options, JsonSemanticCompar
 
     private string LiveDocumentPath() =>
         Path.Combine(_options.ArtifactsDirectory, ArtifactSubdirectory, LiveDocumentFileName);
+
+    // The live document is saved and removed through directory handles anchored at the repository root, so a
+    // link at artifacts/ or artifacts/openapi refuses the call and a link at live.json is never written through:
+    // nothing outside artifacts/openapi is written or deleted.
+    private ConfinedTree ArtifactTree() => new(_options.ResolvePath("."));
 
     // Repository-relative, so the report reads the same under Compose (/repo) and in local-process mode.
     private string DisplayPath(string path) =>

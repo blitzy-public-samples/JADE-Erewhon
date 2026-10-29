@@ -1967,6 +1967,9 @@ public sealed partial class JsonSemanticComparerTests
     // limit is RequestLimitSeconds, which the drift check tests above declare with the same value.
     private const int ReadinessLimitSeconds = 30;
 
+    // Printed once the root is accepted, before the readiness wait of ReadinessLimitSeconds; a refusal never prints it.
+    private const string WaitLine = "export-openapi: waiting up to 30 s for the facade admin listener";
+
     // Well inside the readiness limit, and generous for a loaded host.
     private static readonly TimeSpan RefusalLimit = TimeSpan.FromSeconds(10);
 
@@ -2042,7 +2045,9 @@ public sealed partial class JsonSemanticComparerTests
 
         Assert.Equal(0, exitCode);
         Assert.Equal(
-            string.Create(CultureInfo.InvariantCulture, $"{LinePrefix}wrote {Document.Length} bytes to {target}{Environment.NewLine}"),
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{WaitLine}{Environment.NewLine}{LinePrefix}wrote {Document.Length} bytes to {target}{Environment.NewLine}"),
             ExportConsole.ToString());
         string[] created = [repoRoot, Path.Combine(repoRoot, "contracts"), Path.GetDirectoryName(target)!, target];
         Assert.Equal(created, Entries());
@@ -2067,7 +2072,7 @@ public sealed partial class JsonSemanticComparerTests
 
         Assert.Equal(1, exitCode);
         Assert.Equal(
-            $"{LinePrefix}failed: {typeof(IOException).FullName}: The contract directory '{openApiDirectory}' cannot be created: "
+            $"{WaitLine}{Environment.NewLine}{LinePrefix}failed: {typeof(IOException).FullName}: The contract directory '{openApiDirectory}' cannot be created: "
                 + $"its parent '{contracts}' is not a directory.{Environment.NewLine}",
             ExportConsole.ToString());
         Assert.Equal(new[] { repoRoot }, Entries());

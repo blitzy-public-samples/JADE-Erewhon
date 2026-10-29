@@ -1022,14 +1022,20 @@ public sealed class ResultsReport
 }
 
 
-/// <summary>Renders and writes <c>RESULTS.md</c>; <c>ReplayLifecycleTests</c> substitutes a throwing writer.</summary>
+/// <summary>
+/// Renders and writes <c>RESULTS.md</c>; <c>ReplayLifecycleTests</c> substitutes writers that throw or block.
+/// </summary>
 public interface IResultsReportWriter
 {
     /// <summary>Returns the report's Markdown text.</summary>
     /// <param name="report">The built report.</param>
     string Render(ResultsReport report);
 
-    /// <summary>Writes <paramref name="content"/> to <paramref name="path"/>, replacing the whole file.</summary>
+    /// <summary>
+    /// Writes <paramref name="content"/> to <paramref name="path"/> as the whole file, which must lie strictly
+    /// below the repository root. Any failure throws; the replay then records <c>CHK-REPORT</c> and prints the
+    /// text instead, and it abandons a write that does not finish within its report-write limit the same way.
+    /// </summary>
     /// <param name="path">The report path, normally <c>HarnessOptions.EffectiveReportPath</c>.</param>
     /// <param name="content">The rendered report.</param>
     void Write(string path, string content);
@@ -1039,8 +1045,15 @@ public interface IResultsReportWriter
 /// Renders the results report in the section order of AAP 0.8.2 and writes it as UTF-8 without a BOM
 /// and with <c>\n</c> line endings. Rendering is deterministic: invariant culture, UTC dates, fixed
 /// section and row order. The last line is the final line, so <c>tail -n 1 RESULTS.md</c> and
-/// <c>Modes/SummaryMode.cs</c> return it exactly. The instance holds no state.
+/// <c>Modes/SummaryMode.cs</c> return it exactly.
 /// </summary>
+/// <remarks>
+/// A writer created with a repository root publishes the report only strictly below that root, through
+/// <see cref="ConfinedTree.PublishFile(string, ReadOnlySpan{byte})"/>: the root is the tree Compose mounts from
+/// the host (<c>.:/repo</c>) and the working tree of a local run, so a report anywhere else would never reach
+/// the checkout. A writer created without one renders only and refuses every write. The instance holds only
+/// that root and may be shared.
+/// </remarks>
 public sealed class ResultsReportWriter : IResultsReportWriter
 {
     private const string Title = "# Erewhon strangler facade — results";
@@ -1092,9 +1105,25 @@ public sealed class ResultsReportWriter : IResultsReportWriter
             "The backend is not the stand-in, so no state reset or seed confirmation took place; equivalence was still compared.",
     };
 
-    /// <summary>Creates a writer.</summary>
+    // Null for a writer that renders only.
+    private readonly ConfinedTree? _repository;
+
+    /// <summary>Creates a writer that renders only; it has no repository root, so it refuses every write.</summary>
     public ResultsReportWriter()
     {
+    }
+
+    /// <summary>Creates a writer that renders and publishes the report strictly below <paramref name="repositoryRoot"/>.</summary>
+    /// <param name="repositoryRoot">
+    /// The repository root, normally <c>HarnessOptions.ResolvePath(".")</c>; it need not exist yet.
+    /// </param>
+    /// <exception cref="ArgumentNullException"><paramref name="repositoryRoot"/> is null.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="repositoryRoot"/> is empty, white space or not a usable path.
+    /// </exception>
+    public ResultsReportWriter(string repositoryRoot)
+    {
+        _repository = new ConfinedTree(repositoryRoot);
     }
 
     /// <inheritdoc/>
@@ -1120,13 +1149,36 @@ public sealed class ResultsReportWriter : IResultsReportWriter
     }
 
     /// <inheritdoc/>
-    /// <exception cref="ArgumentException"><paramref name="path"/> is null or blank.</exception>
+    /// <remarks>
+    /// The file is published whole, creating the missing directories above it: the text goes to a temporary
+    /// file beside it, which then replaces the previous report, so a reader sees the old report or the new
+    /// one. The entry at <paramref name="path"/> is never opened, so a FIFO, a device or a symbolic link there is
+    /// refused at once instead of blocking or redirecting the write, and is left in place.
+    /// </remarks>
+    /// <exception cref="ArgumentException"><paramref name="path"/> is null, blank or not a usable path.</exception>
     /// <exception cref="ArgumentNullException"><paramref name="content"/> is null.</exception>
-    /// <exception cref="IOException"><paramref name="path"/> is a directory, or the write fails.</exception>
+    /// <exception cref="InvalidOperationException">The writer was created without a repository root.</exception>
+    /// <exception cref="IOException">
+    /// <paramref name="path"/> is not strictly below the repository root, is a directory or another entry that is
+    /// not a regular file, a directory on the way is a symbolic link or not a directory, or the write fails.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">The operating system denies access on the way.</exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown.
+    /// </exception>
     public void Write(string path, string content)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);
         ArgumentNullException.ThrowIfNull(content);
+        var repository = _repository ?? throw new InvalidOperationException(
+            "This ResultsReportWriter renders only: it was created without a repository root, so it writes no report.");
+
+        // Compose mounts only the repository from the host (.:/repo), so a report anywhere else would be lost
+        // with the container while the run reported success.
+        if (!repository.Contains(path))
+        {
+            throw new IOException($"Report path '{path}' is outside the repository root '{repository.Root}'");
+        }
 
         // The exit-code verification points the report at a directory (AAP 0.8.4); this must fail even
         // for a root process, which could otherwise not be stopped by permissions.
@@ -1135,14 +1187,8 @@ public sealed class ResultsReportWriter : IResultsReportWriter
             throw new IOException($"Report path '{path}' is a directory");
         }
 
-        var directory = Path.GetDirectoryName(path);
-        if (!string.IsNullOrEmpty(directory) && !Directory.Exists(directory))
-        {
-            Directory.CreateDirectory(directory);
-        }
-
         var normalised = content.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
-        File.WriteAllText(path, normalised, Utf8NoBom);
+        repository.PublishFile(path, Utf8NoBom.GetBytes(normalised));
     }
 
     private static void RenderBanner(MarkdownBuilder md, ResultsReport report)
@@ -1529,9 +1575,12 @@ public sealed class ResultsReportWriter : IResultsReportWriter
     private static string AttemptsText(ReportedFailure failure) =>
         failure.Documented && failure.Entry is { } entry ? Number(entry.Attempts) : Dash;
 
+    // The artifact replay writes for a d:<signature> item, named by its exact item id; an id that cannot be a
+    // file name has no artifact, so it renders the dash rather than failing the report.
     private static string ArtifactText(FailureItem item) =>
         item.Nature.StartsWith(DiffNaturePrefix, StringComparison.Ordinal)
-            ? Code($"{DiscrepancyArtifactDirectory}{DiscrepancySignature.SanitiseFileName(item.ItemId)}.json")
+            && DiscrepancySignature.TryArtifactFileName(item.ItemId, out var fileName)
+            ? Code(DiscrepancyArtifactDirectory + fileName)
             : Dash;
 
     private static string CheckText(CheckResult? check)

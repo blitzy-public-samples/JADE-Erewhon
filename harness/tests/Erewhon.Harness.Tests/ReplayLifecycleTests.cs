@@ -15,6 +15,7 @@ using Erewhon.Contracts.Seed;
 using Erewhon.Harness;
 using Erewhon.Harness.Baseline;
 using Erewhon.Harness.Cases;
+using Erewhon.Harness.Compare;
 using Erewhon.Harness.Lifecycle;
 using Erewhon.Harness.Modes;
 using Erewhon.Harness.Report;
@@ -33,23 +34,29 @@ namespace Erewhon.Harness.Tests;
 
 /// <summary>
 /// The replay exit path (AAP 0.8.4) and exit code (AAP 0.7.7), driven in-process through the seams of
-/// <see cref="ReplayMode"/>: a fake body, a report writer that renders with the real
-/// <see cref="ResultsReportWriter"/> but never touches the disk, and a shutdown client that records its
-/// calls. Whatever the body, the report write or a shutdown does, every component is shut down, the final
-/// line is the last line printed and the exit code is 0 or 1. The admin URLs name reserved
-/// <c>.invalid</c> hosts that nothing contacts, because every request goes through the fakes. The
+/// <see cref="ReplayMode"/>: a fake body, report writers that render with the real
+/// <see cref="ResultsReportWriter"/> and record, fail or block their writes without touching the disk, the
+/// real writer anchored at a temporary repository root, and a shutdown client that records its calls.
+/// Whatever the body, the report write or a shutdown does, every component is shut down, the final line is
+/// the last line printed and the exit code is 0 or 1. The admin URLs name reserved <c>.invalid</c> hosts
+/// that nothing contacts, because every request goes through the fakes. The
 /// conformance-evidence tests run the real <see cref="ReplayBody"/> instead, against a temporary
-/// repository root and a closed loopback port, so every network step fails at once. It also
+/// repository root and a closed loopback port, so every network step fails at once. The test of a blank
+/// facade admin URL runs it too, and contacts nothing: its backend is external and its facade listeners
+/// are a loopback socket that is only checked for connections. It also
 /// covers the lifecycle clients behind that path: shutdown confirmation against scripted and loopback
 /// admin replies, state-reset confirmation against scripted admin responses, and the lifecycle console
 /// sink, which escapes every printed line and never lets a writer that throws replace a computed result;
-/// and the capture mode against a loopback stand-in stub, which refuses or stops with exit code 1 whenever
-/// the seed facts cannot be confirmed, and otherwise publishes them in the manifest it writes last. It also
-/// covers the start-up and exit of the harness process itself: the entry point, which refuses an argument
-/// that is not a setting before any mode runs and loads its settings strictly or leniently, so a replay
-/// whose settings are partly unusable still writes its report to the configured path; and the cancellation
-/// Main hands SIGTERM and SIGINT to, whose completion passes the mode's exit code through or gives exit
-/// code 1 within its bound.
+/// the capture mode against a loopback stand-in stub, which refuses or stops with exit code 1 whenever
+/// the seed facts cannot be confirmed, and otherwise publishes them in the manifest it writes last;
+/// the modes' console diagnostics, which classify an unreadable SOAP <c>statusCode</c> without quoting the
+/// response and keep each <c>export-openapi</c>, <c>summary</c> and entry-point line one inert line; and
+/// the empty-state reset bracket of replay and capture, whose seed restore still runs and is confirmed
+/// when the run is cancelled inside it. It also covers the start-up and exit of the harness process
+/// itself: the entry point, which refuses an argument that is not a setting before any mode runs and loads
+/// its settings strictly or leniently, so a replay whose settings are partly unusable still writes its
+/// report to the configured path; and the cancellation Main hands SIGTERM and SIGINT to, whose completion
+/// passes the mode's exit code through or gives exit code 1 within its bound.
 /// </summary>
 /// <remarks>
 /// Assertions on the console and the report text use fixed messages, because both hold the per-test
@@ -60,9 +67,19 @@ public sealed partial class ReplayLifecycleTests : IDisposable
     private const string FacadeAdminUrl = "http://facade.invalid:9090";
     private const string StandInAdminUrl = "http://standin.invalid:9090";
     private const string RepoRootToken = "<repo-root>";
+    private const string ReportTitle = "# Erewhon strangler facade — results";
     private const string CaseMatrixPath = "harness/config/case-matrix.json";
 
     private static readonly TimeSpan RunLimit = TimeSpan.FromSeconds(30);
+
+    // The report-write limit of the stalled-write test, and the time within which that run must end: the limit
+    // plus cleanup, far inside the run limit.
+    private static readonly TimeSpan ShortReportWriteLimit = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan AbandonedWriteRunBound = TimeSpan.FromSeconds(10);
+
+    // The report-write limit of the refused-destination tests: below the run limit, so a write that blocked
+    // instead of being refused would be abandoned and fail the refusal assertion rather than hang the run.
+    private static readonly TimeSpan RefusalReportWriteLimit = TimeSpan.FromSeconds(10);
 
     private static readonly Regex FinalLinePattern = new(
         @"^\d+ of 22 operations equivalent, \d+ documented differences$",
@@ -100,6 +117,19 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         Cancelled,
     }
 
+    /// <summary>A report destination the real, rooted writer must refuse.</summary>
+    public enum RefusedReportPath
+    {
+        /// <summary>A directory below the repository root, as <c>harness/</c> is in the exit-code verification.</summary>
+        DirectoryBelowRoot,
+
+        /// <summary>A FIFO below the repository root that nothing reads, at the report's own name.</summary>
+        UnreadFifoBelowRoot,
+
+        /// <summary>A file in a new directory under a temporary directory beside the repository root.</summary>
+        OutsideRoot,
+    }
+
     /// <inheritdoc />
     public void Dispose()
     {
@@ -108,6 +138,11 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         _captureConsole.Dispose();
         _repoRoot?.Dispose();
         _cancellationSource?.Dispose();
+        _bracketRoot?.Dispose();
+        if (_confinedTemp is not null)
+        {
+            Directory.Delete(_confinedTemp, recursive: true);
+        }
         if (_seedDirectory is not null)
         {
             Directory.Delete(_seedDirectory, recursive: true);
@@ -117,6 +152,12 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         if (_captureRoot is not null && Directory.Exists(_captureRoot))
         {
             Directory.Delete(_captureRoot, recursive: true);
+        }
+
+        // The mode diagnostics root's path is recorded before its directory is created, so it may not exist.
+        if (_modeDiagnosticsRoot is not null && Directory.Exists(_modeDiagnosticsRoot))
+        {
+            Directory.Delete(_modeDiagnosticsRoot, recursive: true);
         }
     }
 
@@ -154,6 +195,123 @@ public sealed partial class ReplayLifecycleTests : IDisposable
 
         // The harness's last line is the final line of the report it printed.
         Assert.Equal(ResultsReport.FormatFinalLine(0, 0), Redacted(LastNonEmptyLine(StdoutText)));
+    }
+
+    // A write that never ends, as one to a stalled destination does, is abandoned at the report-write limit and
+    // handled exactly like a write that throws, so cleanup, the final line and the exit code still follow.
+    [Fact]
+    public async Task ReportWriteThatNeverEnds_IsAbandonedAtTheLimit_PrintsReport_ShutsDownAll_Exits1()
+    {
+        using var writer = new BlockingReportWriter();
+        var shutdown = new RecordingShutdown();
+        Assert.Equal(TimeSpan.FromSeconds(30), NewMode(FakeBody.NoOp(), writer, shutdown, KnownLimitationsRegister.Empty).ReportWriteLimit);
+        var mode = new ReplayMode(Options(), FakeBody.NoOp(), writer, shutdown, KnownLimitationsRegister.Empty, _stdout)
+        {
+            ReportWriteLimit = ShortReportWriteLimit,
+        };
+
+        var elapsed = Stopwatch.StartNew();
+        var exitCode = await RunAsync(mode);
+        elapsed.Stop();
+
+        AssertExitCode(1, exitCode);
+        Assert.Equal(1, writer.WriteAttempts);
+        var item = Assert.Single(mode.State.Failures);
+        Assert.Equal((FailureItemIds.Report, FailureItemIds.WriteFailed), (item.ItemId, item.Nature));
+        Assert.True(
+            item.Detail is not null && item.Detail.Contains("did not finish within 1 s and was abandoned", StringComparison.Ordinal),
+            "the CHK-REPORT item names the abandoned write");
+        Assert.True(
+            StdoutText.Contains("report could not be written (System.TimeoutException: ", StringComparison.Ordinal),
+            "the console states that the write was abandoned");
+
+        var printed = writer.Rendered[^1];
+        Assert.True(StdoutText.Contains(printed, StringComparison.Ordinal), "stdout holds the full report text");
+        Assert.True(printed.Contains(FailureItemIds.Report, StringComparison.Ordinal), "the printed report lists the CHK-REPORT item");
+
+        Assert.Equal(BothComponents, shutdown.Components);
+        Assert.True(elapsed.Elapsed < AbandonedWriteRunBound, "an abandoned report write holds the exit path no longer than its limit");
+        Assert.Equal(ResultsReport.FormatFinalLine(0, 0), Redacted(LastNonEmptyLine(StdoutText)));
+    }
+
+    [Theory]
+    [InlineData(0L)]
+    [InlineData(-1L)]
+    [InlineData(int.MaxValue + 1L)]
+    public void ReportWriteLimit_NotPositiveOrNotFinite_IsRefused(long milliseconds)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ReplayMode(
+            Options(), FakeBody.NoOp(), new RecordingReportWriter(), new RecordingShutdown(), KnownLimitationsRegister.Empty, _stdout)
+        {
+            ReportWriteLimit = TimeSpan.FromMilliseconds(milliseconds),
+        });
+    }
+
+    // With the real writer anchored at the repository root, a destination it must not write is refused at once:
+    // CHK-REPORT, the report text on the console, nothing created at the destination or outside the root, every
+    // component shut down and exit 1. An unread FIFO would block a write that opened it.
+    [Theory]
+    [InlineData(RefusedReportPath.DirectoryBelowRoot, "is a directory")]
+    [InlineData(RefusedReportPath.UnreadFifoBelowRoot, "is not a regular file")]
+    [InlineData(RefusedReportPath.OutsideRoot, "is outside the repository root")]
+    public async Task RootedWriter_RefusedReportPath_RecordsItem_PrintsReport_CreatesNothing_ShutsDownAll_Exits1(
+        RefusedReportPath destination, string refusal)
+    {
+        using var outside = new TempDirectory();
+        var reportPath = destination switch
+        {
+            RefusedReportPath.DirectoryBelowRoot => Directory.CreateDirectory(RepoRootDirectory.PathOf("harness")).FullName,
+            RefusedReportPath.UnreadFifoBelowRoot => RepoRootDirectory.PathOf("RESULTS.md"),
+            _ => Path.Combine(outside.Root, "reports", "RESULTS.md"),
+        };
+        if (destination == RefusedReportPath.UnreadFifoBelowRoot)
+        {
+            SpecialFileSupport.CreateFifo(reportPath);
+        }
+
+        var options = Options();
+        options.ReportPath = reportPath;
+        var shutdown = new RecordingShutdown();
+        var mode = new ReplayMode(
+            options, FakeBody.NoOp(), new ResultsReportWriter(RepoRootDirectory.Root), shutdown, KnownLimitationsRegister.Empty, _stdout)
+        {
+            ReportWriteLimit = RefusalReportWriteLimit,
+        };
+
+        var exitCode = await RunAsync(mode);
+
+        AssertExitCode(1, exitCode);
+        var item = Assert.Single(mode.State.Failures);
+        Assert.Equal((FailureItemIds.Report, FailureItemIds.WriteFailed), (item.ItemId, item.Nature));
+        Assert.True(
+            item.Detail is not null && item.Detail.Contains(refusal, StringComparison.Ordinal),
+            "the CHK-REPORT item names why the destination was refused");
+
+        // The printed report, from its title to its final line, is the one rebuilt with the CHK-REPORT item.
+        var text = StdoutText;
+        var start = text.IndexOf(ReportTitle, StringComparison.Ordinal);
+        Assert.True(start >= 0, "stdout holds the report text");
+        var end = text.IndexOf(ResultsReport.FormatFinalLine(0, 0), start, StringComparison.Ordinal);
+        Assert.True(end > start, "the printed report ends with its final line");
+        Assert.True(text[start..end].Contains(FailureItemIds.Report, StringComparison.Ordinal), "the printed report lists the CHK-REPORT item");
+
+        // Nothing was written: the entry the report was pointed at is as it was, no temporary file is left
+        // beside it, and nothing appeared outside the root.
+        Assert.Equal(
+            destination == RefusedReportPath.OutsideRoot ? [] : [Path.GetFileName(reportPath)],
+            SpecialFileSupport.Names(RepoRootDirectory.Root));
+        Assert.Empty(SpecialFileSupport.Names(outside.Root));
+        if (destination == RefusedReportPath.DirectoryBelowRoot)
+        {
+            Assert.Empty(SpecialFileSupport.Names(reportPath));
+        }
+        else if (destination == RefusedReportPath.UnreadFifoBelowRoot)
+        {
+            Assert.True(SpecialFileSupport.IsFifo(reportPath), "a refused FIFO is left in place");
+        }
+
+        Assert.Equal(BothComponents, shutdown.Components);
+        AssertFinalLineLast();
     }
 
     [Theory]
@@ -311,6 +469,138 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         Assert.Equal(1, writer.WriteCount);
         Assert.Equal(BothComponents, shutdown.Components);
         AssertFinalLineLast();
+    }
+
+    // A documented seed-token item holding an email, a documented ordering item, an undocumented reset
+    // item holding a hostile source and a documented SOAP conformance gap whose wrong-type nature names an
+    // XML element a response chose. The conclusion names all four with their console natures, the
+    // documented ones with the entry that documents each. Whether the report is written or, after a failed
+    // write, printed for recovery, the exact natures survive in the report text, no observed value reaches
+    // standard output outside it, and the final line stays last.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Conclusion_NamesDocumentedItemsWithTheirEntries_AndPrintsNoObservedValue(bool reportWriteFails)
+    {
+        const string email = "brian.private@example.org";
+        const string hostileSource = "Hank " + email + "\u001B[31m\u202ERED";
+        const string privateName = "Jane_Doe_private";
+        var seed = new FailureItem(FailureItemIds.Seed("brian-olsen-email"), FailureItemIds.Differs($"\"{email}\""));
+        var ordering = new FailureItem(FailureItemIds.Ordering, FailureItemIds.NotAncestor);
+        var reset = new FailureItem(FailureItemIds.Reset(ResetPoints.ReplayStart), FailureItemIds.Mismatch("source", hostileSource));
+        var wrongType = new FailureItem(
+            FailureItemIds.Conformance(Surface.Soap, "DTOResult", "allErrors"),
+            FailureItemIds.WrongType("item-name:" + privateName));
+        var register = new KnownLimitationsRegister(
+        [
+            new RegisterEntry("KL-SEED-EMAIL", RegisterCategories.ConformanceGap, null, [new(seed.ItemId, seed.Nature)], "seed differs", 3, "registered"),
+            new RegisterEntry("KL-CHK-ORDERING", RegisterCategories.Check, null, [new(ordering.ItemId, ordering.Nature)], "history", 0, "registered"),
+            new RegisterEntry("KL-CONF-ALLERRORS", RegisterCategories.ConformanceGap, null, [new(wrongType.ItemId, wrongType.Nature)], "item element misnamed", 3, "registered"),
+        ]);
+        var throwing = new ThrowingReportWriter();
+        var recording = new RecordingReportWriter();
+        var mode = NewMode(
+            FakeBody.Adding(seed, ordering, reset, wrongType),
+            reportWriteFails ? throwing : recording,
+            new RecordingShutdown(),
+            register);
+
+        var exitCode = await RunAsync(mode);
+
+        AssertExitCode(1, exitCode);
+        Assert.Equal(
+            [(seed.ItemId, seed.Nature), (ordering.ItemId, ordering.Nature), (reset.ItemId, reset.Nature), (wrongType.ItemId, wrongType.Nature)],
+            mode.State.Failures.Take(4).Select(item => (item.ItemId, item.Nature)));
+
+        var reportText = reportWriteFails ? throwing.Rendered[^1] : recording.Written[^1];
+        Assert.True(reportText.Contains(seed.Nature, StringComparison.Ordinal), "the report keeps the exact seed-token nature");
+        Assert.True(reportText.Contains(reset.Nature, StringComparison.Ordinal), "the report keeps the exact reset nature");
+        Assert.True(reportText.Contains(wrongType.Nature, StringComparison.Ordinal), "the report keeps the exact wrong-type nature");
+        Assert.Equal(reportWriteFails, StdoutText.Contains(reportText, StringComparison.Ordinal));
+
+        var outside = StdoutText.Replace(reportText, string.Empty, StringComparison.Ordinal);
+        foreach (var raw in new[] { email, "Hank", privateName, "\u001B", "\u202E", "\\u001B", "\\u202E" })
+        {
+            Assert.DoesNotContain(raw, outside, StringComparison.Ordinal);
+        }
+
+        var lines = outside.Split('\n').Select(line => line.TrimEnd('\r')).ToList();
+        var undocumentedCount = reportWriteFails ? 2 : 1;
+        var countLine = lines.FindIndex(line => line.StartsWith(
+            string.Create(CultureInfo.InvariantCulture, $"replay: {undocumentedCount} undocumented failing item(s); "),
+            StringComparison.Ordinal));
+        var resetLine = lines.IndexOf("replay:   CHK-RESET:replay-start mismatch:source:<redacted: 39 chars>");
+        var documentedLine = lines.IndexOf("replay: 3 documented failing item(s)");
+        var seedLine = lines.IndexOf("replay:   CONF:SEED:brian-olsen-email differs:<redacted: 27 chars> (documented: KL-SEED-EMAIL)");
+        var orderingLine = lines.IndexOf("replay:   CHK-ORDERING not-ancestor (documented: KL-CHK-ORDERING)");
+        var wrongTypeLine = lines.IndexOf(
+            "replay:   CONF:Soap:DTOResult.allErrors wrong-type:item-name:<redacted: 16 chars> (documented: KL-CONF-ALLERRORS)");
+        Assert.True(countLine >= 0, "the conclusion counts the undocumented items");
+        Assert.True(resetLine > countLine, "the undocumented reset item follows its count, redacted");
+        Assert.True(documentedLine > resetLine, "the documented count follows the undocumented list");
+        Assert.True(seedLine > documentedLine, "the documented seed-token item names its entry, redacted");
+        Assert.True(orderingLine > seedLine, "the documented ordering item names its entry, in report order");
+        Assert.True(wrongTypeLine > orderingLine, "the documented wrong-type item names its entry with its local name redacted");
+        AssertFinalLineLast();
+    }
+
+    // The real body with one baseline record. The backend is external, so no stand-in is waited for or reset,
+    // and both facade listeners are one loopback socket the test never accepts from, so any connection the
+    // run made would still wait in its backlog. A 1 s request limit keeps a regression from hanging the run.
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    public async Task BlankFacadeAdminUrl_RecordsFacadeNotReady_SendsNoCase(string facadeAdminUrl)
+    {
+        const string caseId = "REST-getAgent-01";
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var facadeUrl = string.Create(
+            CultureInfo.InvariantCulture,
+            $"http://127.0.0.1:{((IPEndPoint)listener.LocalEndpoint).Port}");
+        var options = Options(backendAdminUrl: "");
+        options.Target = new HarnessEndpoints { RestBaseUrl = facadeUrl, SoapBaseUrl = facadeUrl, AdminUrl = facadeAdminUrl };
+        options.RequestTimeoutSeconds = 1;
+        var body = """{"name":"Hank Williams"}"""u8.ToArray();
+        new BaselineStore(options).WriteRecord(
+            new BaselineRecord(
+                1,
+                caseId,
+                "Rest.getAgent",
+                CaseKinds.Success,
+                StateChanging: false,
+                CasePreStates.Seed,
+                SourceLabels.StandIn,
+                new BaselineRequest("GET", "/agent/Hank%20Williams", new Dictionary<string, string> { ["Accept"] = "application/json" }, null),
+                BaselineResponse.FromRawBody(200, "application/json; charset=utf-8", body, bodyFile: null)),
+            body);
+        var state = new ReplayRunState();
+
+        using (var limit = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken))
+        {
+            limit.CancelAfter(RunLimit);
+            await new ReplayBody(options, OperationCatalogue.Default, KnownLimitationsRegister.Empty, _stdout)
+                .ExecuteAsync(state, limit.Token)
+                .WaitAsync(limit.Token);
+        }
+
+        var ready = Assert.Single(state.Failures, item => item.ItemId == FailureItemIds.Ready(ShutdownTarget.FacadeComponent));
+        Assert.Equal(FailureItemIds.Timeout, ready.Nature);
+        Assert.True(ready.Detail?.Contains("Harness:Target:AdminUrl", StringComparison.Ordinal) == true, "the item names the blank setting");
+        Assert.DoesNotContain(state.Failures, item => item.ItemId == FailureItemIds.Ready(ShutdownTarget.StandInComponent));
+        Assert.True(
+            StdoutText.Contains($"not ready: {ShutdownTarget.FacadeComponent} (", StringComparison.Ordinal),
+            "the console reports the facade as not ready");
+
+        // The case is compared as unanswered, and no connection reached the facade listeners.
+        var result = Assert.Single(state.Cases);
+        Assert.Equal(caseId, result.CaseId);
+        Assert.True(result.Compared, "the case is compared");
+        Assert.False(result.Equivalent, "an unanswered case is not equivalent");
+        Assert.Null(result.ObservedStatus);
+        Assert.Contains(result.Discrepancies, discrepancy => discrepancy.Kind == DiscrepancyKinds.NoResponse(NoResponseReasons.Connect));
+        Assert.Contains(state.Failures, item => item.ItemId == FailureItemIds.Case(caseId) && item.Nature == result.ItemNature);
+        Assert.False(listener.Pending(), "no request reached the facade listeners");
     }
 
     // The SDK pin is baked into the harness assembly at build time, so the run facts state it although the
@@ -546,6 +836,38 @@ public sealed partial class ReplayLifecycleTests : IDisposable
             _paths.Add(path);
             throw new IOException("report path is a directory");
         }
+    }
+
+    /// <summary>
+    /// Renders with the real writer and blocks every write until disposed, as a write to a destination that
+    /// stalls does; a released write then fails, as one abandoned to a stalled destination eventually may.
+    /// </summary>
+    private sealed class BlockingReportWriter : IResultsReportWriter, IDisposable
+    {
+        private readonly ResultsReportWriter _renderer = new();
+        private readonly TaskCompletionSource _released = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly List<string> _rendered = [];
+        private int _writeAttempts;
+
+        public IReadOnlyList<string> Rendered => _rendered;
+
+        public int WriteAttempts => Volatile.Read(ref _writeAttempts);
+
+        public string Render(ResultsReport report)
+        {
+            var text = _renderer.Render(report);
+            _rendered.Add(text);
+            return text;
+        }
+
+        public void Write(string path, string content)
+        {
+            Interlocked.Increment(ref _writeAttempts);
+            _released.Task.Wait();
+            throw new IOException("the stalled report write was released");
+        }
+
+        public void Dispose() => _released.TrySetResult();
     }
 
     /// <summary>Renders with the real writer and keeps every written text in memory instead of on disk.</summary>
@@ -2236,6 +2558,405 @@ public sealed partial class ReplayLifecycleTests
     ];
 }
 
+// ---- Empty-state bracket under cancellation -----------------------------------------------------
+// The empty-state bracket under cancellation, for the real ReplayBody and the real CaptureMode: once
+// POST /admin/reset?state=empty has been sent for the getCompany empty-state case, a run cancelled while
+// that reset's confirmation read or the case's own request is outstanding still sends
+// POST /admin/reset?state=seed and has it confirmed, and the cancellation still ends the run: replay's
+// body throws it, capture exits 1. Each run works in a temporary repository root of its own holding
+// copies of the committed case matrix and harness settings (and, for replay, the committed empty-state
+// record), against one in-process loopback stub that serves the stand-in's admin endpoints and answers
+// every other request at once with 404.
+// These members live in this class because the harness test project keeps its fixed set of test
+// classes, and the bracket is the reset that replay and capture run around their one empty-state case.
+// The admin requests come from the shutdown and state-reset members, ReferenceDate from the console-sink
+// members and FindRepoRoot from the exit-path members.
+public sealed partial class ReplayLifecycleTests
+{
+    private const string EmptyStateCaseId = "REST-getCompany-03";
+    private const string EmptyStateRecordFile = "baseline/records/rest/056-getCompany-03.json";
+    private const string HarnessConfigFile = "harness/config/harness.json";
+    private const string BracketSeedDirectoryName = "seed";
+    private const string EmptyStateRequest = "GET /company";
+    private const string SeedRestorationLabel = "seed restoration after " + EmptyStateCaseId;
+
+    // A passing test cancels the run as soon as the stub holds the hung request, so neither the request
+    // limit nor the hang limit is reached; both only bound a failing run.
+    private const int BracketRequestLimitSeconds = 20;
+    private const int BracketTestTimeoutMilliseconds = 120_000;
+    private static readonly TimeSpan HangLimit = TimeSpan.FromSeconds(90);
+
+    // Created on first use, so only the bracket tests touch the file system; removed in Dispose.
+    private TempDirectory? _bracketRoot;
+    private string? _bracketSeedSha256;
+
+    /// <summary>The request the stub holds unanswered, inside the empty-state bracket, until the run is cancelled.</summary>
+    public enum HangPoint
+    {
+        /// <summary>The <c>GET /admin/info</c> that confirms the empty reset, sent after the reset itself.</summary>
+        EmptyResetConfirmation,
+
+        /// <summary>The case's own <c>GET /company</c> against the empty state.</summary>
+        CaseRequest,
+    }
+
+    /// <summary>
+    /// The bracket tests' temporary repository root, created on first use with copies of the committed case
+    /// matrix and harness settings and a one-file seed directory, whose fingerprint
+    /// <see cref="BracketSeedSha256"/> holds and the stub reports, so a first capture confirms every reset.
+    /// </summary>
+    private TempDirectory BracketRoot
+    {
+        get
+        {
+            if (_bracketRoot is null)
+            {
+                _bracketRoot = new TempDirectory();
+                CopyCommitted(_bracketRoot, CaseMatrixPath);
+                CopyCommitted(_bracketRoot, HarnessConfigFile);
+                _bracketRoot.Write($"{BracketSeedDirectoryName}/Company.txt", "Erewhon Investments Inc\tErewhon House\n");
+                _bracketSeedSha256 = SeedFingerprint.ComputeSha256Hex(_bracketRoot.PathOf(BracketSeedDirectoryName));
+            }
+
+            return _bracketRoot;
+        }
+    }
+
+    /// <summary>The fingerprint of the seed directory below <see cref="BracketRoot"/>, which it creates on first use.</summary>
+    private string BracketSeedSha256
+    {
+        get
+        {
+            // Reading the root runs its setup, which fingerprints the seed directory.
+            _ = BracketRoot;
+            return _bracketSeedSha256
+                ?? throw new InvalidOperationException("The bracket root was left without a seed fingerprint by a failed setup.");
+        }
+    }
+
+    [Theory(Timeout = BracketTestTimeoutMilliseconds)]
+    [InlineData(HangPoint.EmptyResetConfirmation)]
+    [InlineData(HangPoint.CaseRequest)]
+    public async Task Replay_CancelledInsideTheEmptyStateBracket_RestoresTheSeedStateAndPropagatesTheCancellation(HangPoint hang)
+    {
+        CopyCommitted(BracketRoot, EmptyStateRecordFile);
+        await using var stub = await BracketStandInStub.StartAsync(hang, BracketSeedSha256, TestContext.Current.CancellationToken);
+        var state = new ReplayRunState();
+        using var console = new StringWriter(CultureInfo.InvariantCulture);
+
+        // Readiness writes from two probes at once.
+        using var output = TextWriter.Synchronized(console);
+        using var run = new CancellationTokenSource();
+
+        var execution = new ReplayBody(BracketOptions(stub.BaseUrl), OperationCatalogue.Default, KnownLimitationsRegister.Empty, output)
+            .ExecuteAsync(state, run.Token);
+        var held = await HoldsHungRequestAsync(stub, execution);
+        await run.CancelAsync();
+        var outcome = await Record.ExceptionAsync(() => execution);
+
+        Assert.True(held, "the run ended before the stub held the request inside the empty-state bracket");
+        Assert.IsAssignableFrom<OperationCanceledException>(outcome);
+        AssertSeedRestoredAfterEmptyReset(stub.Requests);
+        var restoreItem = FailureItemIds.Reset(ResetPoints.After(EmptyStateCaseId));
+        Assert.False(
+            state.Failures.Any(item => string.Equals(item.ItemId, restoreItem, StringComparison.Ordinal)),
+            "the seed restoration after the empty-state case was not confirmed");
+        Assert.False(
+            state.Failures.Any(item => item.Detail?.StartsWith(SeedRestorationLabel, StringComparison.Ordinal) == true),
+            "the seed restoration after the empty-state case threw");
+    }
+
+    [Theory(Timeout = BracketTestTimeoutMilliseconds)]
+    [InlineData(HangPoint.EmptyResetConfirmation)]
+    [InlineData(HangPoint.CaseRequest)]
+    public async Task Capture_CancelledInsideTheEmptyStateBracket_RestoresTheSeedStateAndExitsOne(HangPoint hang)
+    {
+        await using var stub = await BracketStandInStub.StartAsync(hang, BracketSeedSha256, TestContext.Current.CancellationToken);
+        using var console = new StringWriter(CultureInfo.InvariantCulture);
+
+        // Readiness writes from two probes at once.
+        using var output = TextWriter.Synchronized(console);
+        using var run = new CancellationTokenSource();
+
+        var capture = new CaptureMode(BracketOptions(stub.BaseUrl), OperationCatalogue.Default, output).RunAsync(run.Token);
+        var held = await HoldsHungRequestAsync(stub, capture);
+        await run.CancelAsync();
+        var exitCode = await capture;
+
+        Assert.True(held, "the capture ended before the stub held the request inside the empty-state bracket");
+        Assert.Equal(1, exitCode);
+        AssertSeedRestoredAfterEmptyReset(stub.Requests);
+        var lines = console.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        Assert.True(
+            lines.Any(line => line.StartsWith($"{SourceLabels.ConsolePrefix} capture failed: ", StringComparison.Ordinal)
+                              && line.Contains("CanceledException", StringComparison.Ordinal)),
+            "the capture did not end with the cancellation");
+        var restoreItem = FailureItemIds.Reset(ResetPoints.After(EmptyStateCaseId));
+        Assert.False(
+            lines.Any(line => line.Contains(restoreItem, StringComparison.Ordinal)),
+            "the seed restoration after the empty-state case was not confirmed");
+        Assert.False(
+            lines.Any(line => line.Contains(SeedRestorationLabel, StringComparison.Ordinal)),
+            "the seed restoration after the empty-state case threw");
+    }
+
+    // The bracket's order as the stub saw it: one empty reset, then a seed reset, then the read that
+    // confirms it.
+    private static void AssertSeedRestoredAfterEmptyReset(IReadOnlyList<string> requests)
+    {
+        var empty = IndexOf(requests, EmptyResetRequest, start: 0);
+        Assert.True(empty >= 0, "the stub received no empty reset");
+        Assert.True(IndexOf(requests, EmptyResetRequest, empty + 1) < 0, "the stub received more than one empty reset");
+
+        var seed = IndexOf(requests, SeedResetRequest, empty + 1);
+        Assert.True(seed > empty, "the stub received no seed reset after the empty reset");
+        Assert.True(
+            IndexOf(requests, InfoRequest, seed + 1) > seed,
+            "the seed reset after the empty reset was not followed by its confirmation read");
+    }
+
+    private static int IndexOf(IReadOnlyList<string> requests, string request, int start)
+    {
+        for (var index = start; index < requests.Count; index++)
+        {
+            if (string.Equals(requests[index], request, StringComparison.Ordinal))
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
+
+    // True once the stub holds the hung request; false when the run ended first or the hang never came
+    // within the limit, so the caller cancels the run before it fails the test.
+    private static async Task<bool> HoldsHungRequestAsync(BracketStandInStub stub, Task run)
+    {
+        try
+        {
+            var first = await Task.WhenAny(stub.HangReached, run).WaitAsync(HangLimit, TestContext.Current.CancellationToken);
+            return first == stub.HangReached;
+        }
+        catch (TimeoutException)
+        {
+            return false;
+        }
+    }
+
+    // The committed settings, with the stub as every listener of both the facade and the backend, the
+    // temporary root as the repository and a request limit far below the test's own.
+    private HarnessOptions BracketOptions(string baseUrl)
+    {
+        var configuration = new ConfigurationBuilder()
+            .AddJsonFile(BracketRoot.PathOf(HarnessConfigFile), optional: false, reloadOnChange: false)
+            .Build();
+        HarnessOptions options;
+        try
+        {
+            options = configuration.GetSection(HarnessOptions.SectionName).Get<HarnessOptions>()
+                ?? throw new InvalidDataException($"{HarnessConfigFile} has no {HarnessOptions.SectionName} section");
+        }
+        finally
+        {
+            (configuration as IDisposable)?.Dispose();
+        }
+
+        options.RepoRoot = BracketRoot.Root;
+        options.SeedDirectory = BracketSeedDirectoryName;
+        options.RequestTimeoutSeconds = BracketRequestLimitSeconds;
+        foreach (var endpoints in new[] { options.Target, options.Backend })
+        {
+            endpoints.RestBaseUrl = baseUrl;
+            endpoints.SoapBaseUrl = baseUrl;
+            endpoints.AdminUrl = baseUrl;
+        }
+
+        return options;
+    }
+
+    private static void CopyCommitted(TempDirectory root, string relativePath)
+    {
+        var source = Path.Combine(FindRepoRoot(), relativePath.Replace('/', Path.DirectorySeparatorChar));
+        var target = root.PathOf(relativePath);
+        Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+        File.Copy(source, target);
+    }
+
+    /// <summary>
+    /// An in-process HTTP/1.1 stand-in on 127.0.0.1 and an ephemeral port. <c>GET /health</c> answers 200;
+    /// <c>POST /admin/reset?state=seed|empty</c> raises the generation and switches the state;
+    /// <c>GET /admin/info</c> reports the stand-in source, the seed fingerprint, the reference date, the
+    /// generation and no mutations. Inside the empty state it holds the one request its
+    /// <see cref="HangPoint"/> names unanswered until the client gives up or the stub stops; every other
+    /// request target gets 404 and no body. Every request is recorded as <c>&lt;method&gt; &lt;raw target&gt;</c>
+    /// on arrival.
+    /// </summary>
+    private sealed class BracketStandInStub : IAsyncDisposable
+    {
+        // Bounds the graceful stop; a held request is released by the stopping token at once.
+        private static readonly TimeSpan ShutdownLimit = TimeSpan.FromSeconds(5);
+
+        private readonly ConcurrentQueue<string> _requests = new();
+        private readonly TaskCompletionSource _hangReached = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly Lock _gate = new();
+        private readonly HangPoint _hang;
+        private readonly string _seedSha256;
+        private WebApplication? _app;
+        private long _generation;
+        private bool _empty;
+        private bool _held;
+
+        private BracketStandInStub(HangPoint hang, string seedSha256)
+        {
+            _hang = hang;
+            _seedSha256 = seedSha256;
+        }
+
+        /// <summary>The stub's base URL, <c>http://127.0.0.1:&lt;port&gt;</c>.</summary>
+        public string BaseUrl { get; private set; } = "";
+
+        /// <summary>Every request received so far, in arrival order.</summary>
+        public IReadOnlyList<string> Requests => [.. _requests];
+
+        /// <summary>Completes when the stub starts holding the hung request.</summary>
+        public Task HangReached => _hangReached.Task;
+
+        /// <summary>Starts a stub that holds the request <paramref name="hang"/> names.</summary>
+        public static async Task<BracketStandInStub> StartAsync(HangPoint hang, string seedSha256, CancellationToken ct)
+        {
+            var stub = new BracketStandInStub(hang, seedSha256);
+            var builder = WebApplication.CreateSlimBuilder();
+            builder.Logging.ClearProviders();
+            builder.Services.Configure<HostOptions>(options => options.ShutdownTimeout = ShutdownLimit);
+            builder.WebHost.ConfigureKestrel(kestrel => kestrel.Listen(IPAddress.Loopback, 0));
+
+            var app = builder.Build();
+            app.Run(stub.HandleAsync);
+            try
+            {
+                await app.StartAsync(ct);
+                var address = app.Services.GetRequiredService<IServer>().Features.GetRequiredFeature<IServerAddressesFeature>().Addresses.Single();
+                stub.BaseUrl = new Uri(address).GetLeftPart(UriPartial.Authority);
+                stub._app = app;
+                return stub;
+            }
+            catch
+            {
+                await app.DisposeAsync();
+                throw;
+            }
+        }
+
+        /// <summary>Stops the server, releasing any held request, and frees its port.</summary>
+        public async ValueTask DisposeAsync()
+        {
+            if (_app is { } app)
+            {
+                await app.StopAsync(CancellationToken.None);
+                await app.DisposeAsync();
+            }
+        }
+
+        private async Task HandleAsync(HttpContext context)
+        {
+            var target = context.Features.GetRequiredFeature<IHttpRequestFeature>().RawTarget;
+            var request = $"{context.Request.Method} {target}";
+            _requests.Enqueue(request);
+
+            switch (request)
+            {
+                case HealthRequest:
+                    context.Response.StatusCode = StatusCodes.Status200OK;
+                    return;
+
+                case EmptyResetRequest or SeedResetRequest:
+                    lock (_gate)
+                    {
+                        _generation++;
+                        _empty = string.Equals(request, EmptyResetRequest, StringComparison.Ordinal);
+                    }
+
+                    await WriteJsonAsync(context, "{}");
+                    return;
+
+                case InfoRequest:
+                    if (TakeHang(HangPoint.EmptyResetConfirmation))
+                    {
+                        await HoldAsync(context);
+                        return;
+                    }
+
+                    await WriteJsonAsync(context, Info());
+                    return;
+
+                case EmptyStateRequest when TakeHang(HangPoint.CaseRequest):
+                    await HoldAsync(context);
+                    return;
+
+                default:
+                    context.Response.StatusCode = StatusCodes.Status404NotFound;
+                    return;
+            }
+        }
+
+        // The named request is held once, and only inside the empty state.
+        private bool TakeHang(HangPoint point)
+        {
+            lock (_gate)
+            {
+                if (_hang != point || !_empty || _held)
+                {
+                    return false;
+                }
+
+                _held = true;
+                return true;
+            }
+        }
+
+        private string Info()
+        {
+            long generation;
+            lock (_gate)
+            {
+                generation = _generation;
+            }
+
+            return new JsonObject
+            {
+                ["source"] = SourceLabels.StandIn,
+                ["seedSha256"] = _seedSha256,
+                ["referenceDate"] = ReferenceDate,
+                ["generation"] = generation,
+                ["mutations"] = 0,
+            }.ToJsonString();
+        }
+
+        // Nothing is answered: the client's cancellation aborts the request, or the stub's stop releases it.
+        private async Task HoldAsync(HttpContext context)
+        {
+            _hangReached.TrySetResult();
+            var stopping = context.RequestServices.GetRequiredService<IHostApplicationLifetime>().ApplicationStopping;
+            using var release = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, stopping);
+            try
+            {
+                await Task.Delay(Timeout.Infinite, release.Token);
+            }
+            catch (OperationCanceledException) when (release.IsCancellationRequested)
+            {
+                // Released: the held request ends without an answer.
+            }
+        }
+
+        private static async Task WriteJsonAsync(HttpContext context, string json)
+        {
+            context.Response.StatusCode = StatusCodes.Status200OK;
+            context.Response.ContentType = "application/json; charset=utf-8";
+            await context.Response.WriteAsync(json, context.RequestAborted);
+        }
+    }
+}
+
 
 // ---- Lifecycle console sink ---------------------------------------------------------------------
 // The lifecycle clients' console sink: every printed line is escaped so that an admin value or a
@@ -2249,6 +2970,14 @@ public sealed partial class ReplayLifecycleTests
 public sealed partial class ReplayLifecycleTests
 {
     private const string ReferenceDate = "2026-01-01";
+
+    // A 64-digit fingerprint and an email address, placed where /admin/info and the seed-token assertions
+    // put observed values.
+    private const string ConsoleSha = "0123456789abcdef0123456789ABCDEF0123456789abcdef0123456789abcdef";
+    private const string ConsoleEmail = "brian.private@example.org";
+
+    // An XML local name a SOAP response can put in a collection, where a wrong-type nature names it.
+    private const string ConsolePrivateName = "Jane_Doe_private";
 
     private static readonly string SeedSha256 = new('a', 64);
 
@@ -2264,8 +2993,8 @@ public sealed partial class ReplayLifecycleTests
 
     // ---- Display --------------------------------------------------------------------------------
 
-    // CR, LF, NUL, ESC, DEL, NEL, the line and paragraph separators, bidirectional marks, an
-    // embedding, an override and isolates, and lone surrogates of both halves.
+    // CR, LF, NUL, ESC, DEL, NEL, the line and paragraph separators, the Arabic letter mark and the other
+    // bidirectional marks, an embedding, an override and isolates, and lone surrogates of both halves.
     [Theory]
     [InlineData(0x000D)]
     [InlineData(0x000A)]
@@ -2275,6 +3004,7 @@ public sealed partial class ReplayLifecycleTests
     [InlineData(0x0085)]
     [InlineData(0x2028)]
     [InlineData(0x2029)]
+    [InlineData(0x061C)]
     [InlineData(0x200E)]
     [InlineData(0x200F)]
     [InlineData(0x202A)]
@@ -2307,7 +3037,7 @@ public sealed partial class ReplayLifecycleTests
     // ---- Log injection --------------------------------------------------------------------------
 
     [Fact]
-    public async Task InjectedSource_PrintsOneEscapedLine_AndTheFailureItemKeepsTheRawValue()
+    public async Task InjectedSource_PrintsOneRedactedLine_AndTheFailureItemKeepsTheRawValue()
     {
         var forged = $"{SourceLabels.ConsolePrefix} reset seed at {ResetPoints.ReplayStart}: generation 99";
         var raw = "bad\n" + forged;
@@ -2325,9 +3055,99 @@ public sealed partial class ReplayLifecycleTests
             new[]
             {
                 $"{SourceLabels.ConsolePrefix} reset {AdminRoutes.ResetStateSeed} at {ResetPoints.ReplayStart}: "
-                + $"mismatch source observed bad\\u000A{forged}",
+                + string.Create(CultureInfo.InvariantCulture, $"mismatch source observed <redacted: {raw.Length} chars>"),
             },
             PrintedLines());
+    }
+
+    // ---- Failure display ------------------------------------------------------------------------
+
+    [Theory]
+    // differs: every observed value but the empty one and the absent token is redacted, ESC included.
+    [InlineData("differs:\"" + ConsoleEmail + "\"", "differs:<redacted: 27 chars>")]
+    [InlineData("differs:\"\u001B[31mX\"", "differs:<redacted: 8 chars>")]
+    [InlineData("differs:\"\"", "differs:<redacted: 2 chars>")]
+    [InlineData("differs:7", "differs:<redacted: 1 char>")]
+    [InlineData("differs:absent", "differs:absent")]
+    [InlineData("differs:", "differs:")]
+    // mismatch: the reset's own tokens and the strict form of each field are shown.
+    [InlineData("mismatch:http:connect", "mismatch:http:connect")]
+    [InlineData("mismatch:http:503", "mismatch:http:503")]
+    [InlineData("mismatch:http:invalid-url", "mismatch:http:invalid-url")]
+    [InlineData("mismatch:http:info-invalid", "mismatch:http:info-invalid")]
+    [InlineData("mismatch:http:info-404", "mismatch:http:info-404")]
+    [InlineData("mismatch:generation:before-null", "mismatch:generation:before-null")]
+    [InlineData("mismatch:generation:before-timeout", "mismatch:generation:before-timeout")]
+    [InlineData("mismatch:generation:5", "mismatch:generation:5")]
+    [InlineData("mismatch:mutations:-3", "mismatch:mutations:-3")]
+    [InlineData("mismatch:source:null", "mismatch:source:null")]
+    [InlineData("mismatch:source:", "mismatch:source:")]
+    [InlineData("mismatch:seedSha256:" + ConsoleSha, "mismatch:seedSha256:" + ConsoleSha)]
+    [InlineData("mismatch:referenceDate:2026-01-01", "mismatch:referenceDate:2026-01-01")]
+    // mismatch: anything else is redacted, including a value of another field's form.
+    [InlineData("mismatch:source:jade-standin-2", "mismatch:source:<redacted: 14 chars>")]
+    [InlineData("mismatch:source:Hank " + ConsoleEmail + "\u001B[31m\u202ERED", "mismatch:source:<redacted: 39 chars>")]
+    [InlineData("mismatch:seedSha256:" + ConsoleEmail, "mismatch:seedSha256:<redacted: 25 chars>")]
+    [InlineData("mismatch:seedSha256: " + ConsoleSha, "mismatch:seedSha256:<redacted: 65 chars>")]
+    [InlineData("mismatch:seedSha256:2026-01-01", "mismatch:seedSha256:<redacted: 10 chars>")]
+    [InlineData("mismatch:referenceDate:2026-01-01\u001B]0;x\u0007", "mismatch:referenceDate:<redacted: 16 chars>")]
+    [InlineData("mismatch:referenceDate:2026-1-01", "mismatch:referenceDate:<redacted: 9 chars>")]
+    [InlineData("mismatch:generation:12a", "mismatch:generation:<redacted: 3 chars>")]
+    [InlineData("mismatch:mutations:\u0663", "mismatch:mutations:<redacted: 1 char>")]
+    [InlineData("mismatch:http:info-" + ConsoleEmail, "mismatch:http:<redacted: 30 chars>")]
+    [InlineData("mismatch:http:before-5031", "mismatch:http:<redacted: 11 chars>")]
+    [InlineData("mismatch:" + ConsoleEmail + ":connect", "mismatch:<redacted: 33 chars>")]
+    [InlineData("mismatch:nofield", "mismatch:<redacted: 7 chars>")]
+    // wrong-type: every wire-type token the conformance check writes is shown, behind any item: prefixes.
+    [InlineData("wrong-type:object", "wrong-type:object")]
+    [InlineData("wrong-type:array", "wrong-type:array")]
+    [InlineData("wrong-type:string", "wrong-type:string")]
+    [InlineData("wrong-type:number", "wrong-type:number")]
+    [InlineData("wrong-type:boolean", "wrong-type:boolean")]
+    [InlineData("wrong-type:element", "wrong-type:element")]
+    [InlineData("wrong-type:text", "wrong-type:text")]
+    [InlineData("wrong-type:item:element", "wrong-type:item:element")]
+    [InlineData("wrong-type:item:item:text", "wrong-type:item:item:text")]
+    [InlineData("wrong-type:xsi-type:unresolved", "wrong-type:xsi-type:unresolved")]
+    [InlineData("wrong-type:item:xsi-type:unresolved", "wrong-type:item:xsi-type:unresolved")]
+    // wrong-type: an XML item element's name and an xsi:type name are redacted and their prefixes kept;
+    // any other token is redacted as a whole, spellings that differ only in case, empty tokens and control
+    // characters included.
+    [InlineData("wrong-type:xsi-type:{urn:other}" + ConsolePrivateName, "wrong-type:xsi-type:<redacted: 27 chars>")]
+    [InlineData("wrong-type:item:xsi-type:{urn:other}" + ConsolePrivateName, "wrong-type:item:xsi-type:<redacted: 27 chars>")]
+    [InlineData("wrong-type:item-name:{urn:other}" + ConsolePrivateName, "wrong-type:item-name:<redacted: 27 chars>")]
+    [InlineData("wrong-type:item-name:" + ConsolePrivateName, "wrong-type:item-name:<redacted: 16 chars>")]
+    [InlineData("wrong-type:item:item-name:" + ConsolePrivateName, "wrong-type:item:item-name:<redacted: 16 chars>")]
+    [InlineData("wrong-type:item:item:item-name:x", "wrong-type:item:item:item-name:<redacted: 1 char>")]
+    [InlineData("wrong-type:item-name:" + ConsoleEmail, "wrong-type:item-name:<redacted: 25 chars>")]
+    [InlineData("wrong-type:" + ConsolePrivateName, "wrong-type:<redacted: 16 chars>")]
+    [InlineData("wrong-type:item:" + ConsolePrivateName, "wrong-type:<redacted: 21 chars>")]
+    [InlineData("wrong-type:item:textual", "wrong-type:<redacted: 12 chars>")]
+    [InlineData("wrong-type:String", "wrong-type:<redacted: 6 chars>")]
+    [InlineData("wrong-type:item:\u001B[31m", "wrong-type:<redacted: 10 chars>")]
+    [InlineData("wrong-type:item:", "wrong-type:<redacted: 5 chars>")]
+    [InlineData("wrong-type:", "wrong-type:<redacted: 0 chars>")]
+    // Every other nature holds no response value and is shown unchanged.
+    [InlineData("d:0123456789abcdef", "d:0123456789abcdef")]
+    [InlineData("failed:fedcba9876543210", "failed:fedcba9876543210")]
+    [InlineData("modified:3b18e512dba79e4c8300dd08aeb37f8e728b8dad", "modified:3b18e512dba79e4c8300dd08aeb37f8e728b8dad")]
+    [InlineData("unreachable-in-source", "unreachable-in-source")]
+    [InlineData("not-ancestor", "not-ancestor")]
+    [InlineData("System.InvalidOperationException", "System.InvalidOperationException")]
+    public void FailureItemDisplay_HidesObservedValues_AndKeepsEveryOtherNature(string nature, string expected)
+    {
+        var item = new FailureItem("CHK-RESET:replay-start", nature);
+
+        var display = FailureItemDisplay.Nature(nature);
+
+        Assert.Equal(expected, display);
+        Assert.Equal($"CHK-RESET:replay-start {expected}", FailureItemDisplay.Describe(item));
+
+        // The item itself keeps the exact nature, and no redacted value reaches the display.
+        Assert.Equal(nature, item.Nature);
+        Assert.DoesNotContain(ConsoleEmail, display, StringComparison.Ordinal);
+        Assert.DoesNotContain(ConsolePrivateName, display, StringComparison.Ordinal);
+        Assert.DoesNotContain("\u001B", display, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -2481,6 +3301,42 @@ public sealed partial class ReplayLifecycleTests
         Assert.Equal(FailureItemIds.Ready(ShutdownTarget.StandInComponent), item.ItemId);
         Assert.Equal(FailureItemIds.Timeout, item.Nature);
         Assert.Equal(1, writer.Attempts);
+    }
+
+    // Capture passes its stand-in prefix, so its ready and not-ready lines carry it; replay and
+    // export-openapi pass none, and their lines start with the outcome as before.
+    [Theory]
+    [InlineData(SourceLabels.ConsolePrefix + " ", true)]
+    [InlineData(SourceLabels.ConsolePrefix + " ", false)]
+    [InlineData(null, true)]
+    [InlineData(null, false)]
+    public async Task Readiness_StartsItsLineWithTheGivenPrefix(string? linePrefix, bool listening)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var answering = listening ? AnswerHealthOnceAsync(listener, ct) : null;
+        using var readiness = new Readiness(
+            new HarnessOptions { ReadinessTimeoutSeconds = 10, ReadinessPollIntervalSeconds = 1 },
+            _console,
+            linePrefix);
+
+        // A URL that is not http or https is rejected at once, without a probe.
+        var item = await readiness.WaitAsync(
+            ShutdownTarget.StandInComponent,
+            listening ? string.Create(CultureInfo.InvariantCulture, $"http://127.0.0.1:{port}") : "ftp://standin.invalid:9090",
+            ct);
+
+        Assert.Equal(listening, item is null);
+        if (answering is not null)
+        {
+            await answering;
+        }
+
+        var expectedStart = (linePrefix ?? "")
+            + (listening ? $"ready: {ShutdownTarget.StandInComponent} (" : $"not ready: {ShutdownTarget.StandInComponent} (invalid admin URL: ");
+        Assert.StartsWith(expectedStart, Assert.Single(PrintedLines()), StringComparison.Ordinal);
     }
 
     [Theory]
@@ -3202,6 +4058,246 @@ public sealed partial class ReplayLifecycleTests
     private Program.SignalCancellation NewCancellation() => new(CancellationSource, CancellationErrors.Enqueue);
 }
 
+// ---- Mode diagnostics ---------------------------------------------------------------------------
+// The modes' ordinary console diagnostics: capture classifies an unreadable SOAP statusCode without
+// quoting the response body or the parser's message; export-openapi announces its readiness wait; and
+// the lines of export-openapi, summary and the entry point stay single inert lines whatever control or
+// bidirectional characters a path or message holds. The fake facade listens on loopback only.
+// These members live in this class because the harness test project keeps its fixed set of test
+// classes, and these lines are escaped by the console sink covered above. The standard-error test
+// replaces Console.Error, which is process-wide, so it keeps only the terminated lines that start with
+// its mode's prefix: what a test of another class writes there meanwhile can neither fail it nor pass it.
+public sealed partial class ReplayLifecycleTests
+{
+    // ESC starting a colour sequence, BEL ending an OSC title sequence, a right-to-left override and an
+    // Arabic letter mark: each is legal in a Linux file name and would drive or disguise a terminal line
+    // if printed as it is.
+    private const string HostileName = "x\u001B[31my\u001B]0;t\u0007\u202Ez\u061Cw";
+
+    // Bounds the fake facade's wait for the mode's requests, so a mode that stops before readiness fails
+    // the test instead of leaving it waiting.
+    private static readonly TimeSpan AnswerLimit = TimeSpan.FromSeconds(30);
+
+    // Created on first use, so only the mode diagnostics tests touch the file system; removed in Dispose.
+    private string? _modeDiagnosticsRoot;
+
+    /// <summary>The <c>export-openapi</c> outcome a test drives.</summary>
+    public enum ExportOutcome
+    {
+        /// <summary>The contract is written under the repository root.</summary>
+        Written,
+
+        /// <summary><c>contracts/openapi</c> under the repository root is a file, so creating the contract directory throws.</summary>
+        WriteFailed,
+    }
+
+    /// <summary>The standard-error diagnostic a test drives.</summary>
+    public enum ErrorLine
+    {
+        /// <summary><c>summary</c> with no report under the repository root.</summary>
+        SummaryMissingReport,
+
+        /// <summary>The entry point with a <c>harness.json</c> that is not JSON.</summary>
+        InvalidConfiguration,
+    }
+
+    /// <summary>The mode diagnostics tests' temporary directory, created empty on first use.</summary>
+    private string ModeDiagnosticsRoot
+    {
+        get
+        {
+            if (_modeDiagnosticsRoot is null)
+            {
+                // The path is recorded before the directory is created, so Dispose removes whatever exists.
+                // The run sets TMPDIR to a per-clone directory, so parallel checkouts never share a root.
+                _modeDiagnosticsRoot = Path.Combine(Path.GetTempPath(), $"erewhon-mode-diagnostics-{Guid.NewGuid():N}");
+                Directory.CreateDirectory(_modeDiagnosticsRoot);
+            }
+
+            return _modeDiagnosticsRoot;
+        }
+    }
+
+    // ---- Capture: SOAP statusCode --------------------------------------------------------------
+
+    // Non-XML text holding an email; a statusCode holding an email and ESC, which XML forbids; a statusCode
+    // holding an email and a right-to-left override, which XML allows; no statusCode element at all; and a
+    // readable code, whose surrounding white space xsd:int collapses.
+    [Theory]
+    [InlineData("<<not xml jane.parser@example.org \u001B[2J", null, "the body is not XML (XmlException)")]
+    [InlineData("<r><statusCode>jane.secret@example.org \u001B[2J</statusCode></r>", null, "the body is not XML (XmlException)")]
+    [InlineData("<r><statusCode>jane.secret@example.org \u202Edrow</statusCode></r>", null, "statusCode is not an integer")]
+    [InlineData("<r><name>jane.secret@example.org</name></r>", null, "the body has no statusCode element")]
+    [InlineData("<r><statusCode> 404 </statusCode></r>", 404, "")]
+    public void ReadResultStatusCode_ReportsAFixedClassification(string body, int? expectedCode, string expectedProblem)
+    {
+        var code = CaptureMode.ReadResultStatusCode(Encoding.UTF8.GetBytes(body), out var problem);
+
+        Assert.Equal(expectedCode, code);
+        Assert.Equal(expectedProblem, problem);
+    }
+
+    // ---- export-openapi ------------------------------------------------------------------------
+
+    // The readiness wait is announced with the configured limit, then the outcome follows as one line. The
+    // root holds contracts/, so the mode reaches readiness; a regular file where contracts/openapi belongs
+    // makes the write fail.
+    [Theory]
+    [InlineData(ExportOutcome.Written, "export-openapi: wrote 2 bytes to ")]
+    [InlineData(ExportOutcome.WriteFailed, "export-openapi: failed: System.IO.")]
+    public async Task ExportOpenApi_AnnouncesTheWait_AndPrintsOneEscapedLinePerOutcome(ExportOutcome outcome, string expectedStart)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = Path.Combine(ModeDiagnosticsRoot, HostileName);
+        var contracts = Directory.CreateDirectory(Path.Combine(root, "contracts")).FullName;
+        if (outcome == ExportOutcome.WriteFailed)
+        {
+            await File.WriteAllTextAsync(Path.Combine(contracts, "openapi"), "not a directory", ct);
+        }
+
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        var answering = AnswerFacadeAsync(listener, connections: 2, ct);
+        var options = new HarnessOptions
+        {
+            RepoRoot = root,
+            ReadinessTimeoutSeconds = 10,
+            ReadinessPollIntervalSeconds = 1,
+            RequestTimeoutSeconds = 5,
+        };
+        options.Target.AdminUrl = string.Create(CultureInfo.InvariantCulture, $"http://127.0.0.1:{port}");
+        using var stdout = new StringWriter(CultureInfo.InvariantCulture);
+
+        var exitCode = await new ExportOpenApiMode(options, stdout).RunAsync(ct);
+
+        Assert.Equal(outcome == ExportOutcome.Written ? 0 : 1, exitCode);
+        Assert.Equal(
+            new[] { $"GET {AdminRoutes.Health}", $"GET {AdminRoutes.OpenApiDocument}" },
+            await answering.WaitAsync(AnswerLimit, ct));
+        var lines = ModeDiagnosticLines(stdout.ToString());
+        Assert.Equal(2, lines.Count);
+        Assert.Equal("export-openapi: waiting up to 10 s for the facade admin listener", lines[0]);
+        var line = lines[1];
+        AssertEscaped(line, expectedStart, LifecycleConsole.Display(root));
+        if (outcome == ExportOutcome.Written)
+        {
+            Assert.Equal($"{expectedStart}{LifecycleConsole.Display(options.ContractsOpenApiPath)}", line);
+            Assert.Equal("{}", await File.ReadAllTextAsync(options.ContractsOpenApiPath, ct));
+        }
+    }
+
+    // ---- Standard error ------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(ErrorLine.SummaryMissingReport, "summary", "summary: '")]
+    [InlineData(ErrorLine.InvalidConfiguration, "capture", "capture: failed: System.IO.InvalidDataException: ")]
+    public async Task StandardErrorLines_AreOneEscapedLine(ErrorLine errorLine, string mode, string expectedStart)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var root = Path.Combine(ModeDiagnosticsRoot, HostileName);
+        var configDirectory = Path.Combine(root, "harness", "config");
+        Directory.CreateDirectory(configDirectory);
+        if (errorLine == ErrorLine.InvalidConfiguration)
+        {
+            await File.WriteAllTextAsync(Path.Combine(configDirectory, "harness.json"), "{", ct);
+        }
+
+        using var stdout = new StringWriter(CultureInfo.InvariantCulture);
+        using var stderr = new StringWriter(CultureInfo.InvariantCulture);
+        var original = Console.Error;
+        int exitCode;
+        Console.SetError(stderr);
+        try
+        {
+            exitCode = await Program.RunAsync([mode, $"--Harness:RepoRoot={root}"], stdout, ct);
+        }
+        finally
+        {
+            Console.SetError(original);
+        }
+
+        Assert.Equal(1, exitCode);
+        Assert.Equal("", stdout.ToString());
+
+        // Other test classes run the modes concurrently and may write to the swapped standard error, but
+        // only this run's line names this test's own repository root; the mode prints exactly one.
+        var modePrefix = mode + ": ";
+        var escapedRoot = LifecycleConsole.Display(root);
+        var line = Assert.Single(
+            TerminatedLines(stderr.ToString()),
+            printed => printed.StartsWith(modePrefix, StringComparison.Ordinal)
+                && printed.Contains(escapedRoot, StringComparison.Ordinal));
+        AssertEscaped(line, expectedStart, LifecycleConsole.Display(root));
+        if (errorLine == ErrorLine.SummaryMissingReport)
+        {
+            Assert.Equal(
+                $"{expectedStart}{LifecycleConsole.Display(new HarnessOptions { RepoRoot = root }.EffectiveReportPath)}' does not exist",
+                line);
+        }
+    }
+
+    // ---- Helpers --------------------------------------------------------------------------------
+
+    // The line starts as expected, quotes the escaped hostile text, holds none of HostileName's controls
+    // as they are, and holds no character that Display escapes, so it can neither split nor drive the
+    // console.
+    private static void AssertEscaped(string line, string expectedStart, string escapedText)
+    {
+        Assert.StartsWith(expectedStart, line, StringComparison.Ordinal);
+        Assert.Contains(escapedText, line, StringComparison.Ordinal);
+        Assert.DoesNotContain(line, c => c is '\u001B' or '\u0007' or '\u202E' or '\u061C');
+        Assert.Equal(line, LifecycleConsole.Display(line));
+    }
+
+    // The printed text as lines, each with its terminator removed.
+    private static List<string> ModeDiagnosticLines(string text)
+    {
+        Assert.EndsWith(Environment.NewLine, text, StringComparison.Ordinal);
+        return [.. text[..^Environment.NewLine.Length].Split(Environment.NewLine)];
+    }
+
+    // The lines of text that end with a terminator, each with it removed; text after the last terminator,
+    // which another writer of the same stream may still be completing, is left out.
+    private static string[] TerminatedLines(string text) => text.Split(Environment.NewLine)[..^1];
+
+    // Answers each of the next connections with 200 and closes it: a JSON object for the OpenAPI document
+    // and an empty body for anything else. Returns each request's method and target, in arrival order.
+    private static async Task<List<string>> AnswerFacadeAsync(TcpListener listener, int connections, CancellationToken ct)
+    {
+        var requests = new List<string>();
+        for (var i = 0; i < connections; i++)
+        {
+            using var client = await listener.AcceptTcpClientAsync(ct);
+            var stream = client.GetStream();
+            var head = new StringBuilder();
+            var buffer = new byte[1024];
+            while (!head.ToString().Contains("\r\n\r\n", StringComparison.Ordinal))
+            {
+                var read = await stream.ReadAsync(buffer, ct);
+                if (read == 0)
+                {
+                    break;
+                }
+
+                head.Append(Encoding.ASCII.GetString(buffer, 0, read));
+            }
+
+            var requestLine = head.ToString().Split("\r\n", 2)[0].Split(' ');
+            var request = requestLine.Length >= 2 ? $"{requestLine[0]} {requestLine[1]}" : head.ToString();
+            requests.Add(request);
+            var body = request == $"GET {AdminRoutes.OpenApiDocument}" ? "{}" : "";
+            var response = string.Create(
+                CultureInfo.InvariantCulture,
+                $"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {body.Length}\r\nConnection: close\r\n\r\n{body}");
+            await stream.WriteAsync(Encoding.ASCII.GetBytes(response), ct);
+            await stream.FlushAsync(ct);
+        }
+
+        return requests;
+    }
+}
+
 // ---- Support types of the capture mode tests ----------------------------------------------------
 // The capture stand-in stub serves the capture mode tests of ReplayLifecycleTests; it is an internal
 // support type, not a test class.
@@ -3330,5 +4426,851 @@ internal sealed class CaptureStandInStub : IAsyncDisposable
         }
 
         return (StatusCodes.Status200OK, "{}");
+    }
+}
+
+/// <summary>
+/// Physical confinement of the replay's artifact and report writers against real files: every test owns a
+/// fresh temporary directory holding a repository root and a protected directory outside it, and checks that
+/// no recreate, write or delete through <see cref="ConfinedTree"/> reaches the protected directory through a
+/// symbolic link, whether the link sits on <c>artifacts/</c>, on a directory below it, at the target, inside a
+/// cleared directory, dangles, is a hard link or is swapped in mid-way; that a published file replaces only a
+/// regular file and never opens or follows the entry at its name, a FIFO included; that paths not strictly
+/// below the root are refused; and that <see cref="DiscrepancySignature.ArtifactFileName"/> keeps an item id
+/// byte for byte. The repository's own tree is never touched.
+/// </summary>
+public sealed partial class ReplayLifecycleTests
+{
+    // The confinement tests' sandbox: a fresh temporary directory per test, created on first use, holding a
+    // repository root and a protected directory outside it. The run sets TMPDIR to a per-clone directory, so
+    // parallel checkouts never share one; Dispose removes it.
+    private string? _confinedTemp;
+    private ConfinedTree? _confinedTree;
+
+    private const string LinkRefusal = "ConfinedTree never writes or deletes through a link";
+    private const string OutsideRefusal = "ConfinedTree writes and deletes only below its root";
+    private const string DirectoryRefusal = "it is a directory.";
+    private const string NotRegularFileRefusal = "it is not a regular file, so it is left in place.";
+    private const string PublishedName = "RESULTS.md";
+    private const string SentinelName = "SENTINEL";
+
+    // Rounds of every recreate, write and delete the swap test runs while its directories are swapped.
+    private const int SwapIterations = 300;
+
+    // The publish race runs at least this many publications, and keeps publishing until the swapper has put at
+    // least this many FIFOs and links on the name.
+    private const int MinimumRacePublications = 100;
+    private const int MinimumRaceSwaps = 60;
+
+    // A publication that has not ended by then is blocked, which fails the test instead of hanging it.
+    private static readonly TimeSpan PromptLimit = TimeSpan.FromSeconds(10);
+
+    // The directories the swap test replaces with links: one a cleared directory's subdirectory and a written
+    // file's parent, the other a recreated directory itself.
+    private static readonly string[] SwappedDirectories = ["artifacts/replay/rest", "artifacts/discrepancies"];
+
+    private static readonly byte[] SentinelBytes = "protected content outside the repository\n"u8.ToArray();
+    private static readonly byte[] FirstBytes = "{\"first\":\"a longer document than the second\"}"u8.ToArray();
+    private static readonly byte[] SecondBytes = "{\"second\":2}"u8.ToArray();
+
+    // FIFOs and links the publish race's swapper has put on the published name.
+    private int _confinedRaceSwaps;
+
+    /// <summary>Each linked directory above a recreated target, with the target.</summary>
+    public static TheoryData<string, string> LinkedAncestors { get; } = new()
+    {
+        { "artifacts", "artifacts/discrepancies" },
+        { "artifacts", "artifacts/replay" },
+        { "artifacts/replay", "artifacts/replay/rest" },
+    };
+
+    /// <summary>Each linked directory above a written file, written synchronously and asynchronously.</summary>
+    public static TheoryData<string, bool> LinkedWriteAncestors { get; } = new()
+    {
+        { "artifacts", false },
+        { "artifacts", true },
+        { "artifacts/replay", false },
+        { "artifacts/replay", true },
+    };
+
+    /// <summary>A dangling or a live link at a written file, written synchronously and asynchronously.</summary>
+    public static TheoryData<bool, bool> LinkAtFileName { get; } = new()
+    {
+        { false, false },
+        { false, true },
+        { true, false },
+        { true, true },
+    };
+
+    /// <summary>Item ids that name their discrepancy artifact exactly, the longest allowed name included.</summary>
+    public static TheoryData<string> ArtifactItemIds { get; } =
+    [
+        "CASE:REST-getAgent-01",
+        "CASE:SOAP-getPhoto-02",
+        "CHK-OPENAPI-DRIFT",
+        "CHK-WSDL-CONTRACT",
+        new string('a', 250),
+    ];
+
+    /// <summary>
+    /// The forms of item id that cannot be one safe Linux file name, by name, so that test names stay printable;
+    /// <see cref="UnusableItemId"/> builds each id.
+    /// </summary>
+    public static TheoryData<string> UnusableItemIdForms { get; } =
+    [
+        "null",
+        "empty",
+        "dot",
+        "dot-dot",
+        "slash",
+        "backslash",
+        "nul",
+        "line-feed",
+        "delete",
+        "c1-control",
+        "lone-surrogate",
+        "ascii-name-over-255-bytes",
+        "utf8-name-over-255-bytes",
+    ];
+
+    /// <summary>Each entry at a published file's name that is refused and kept, with the refusal it gives.</summary>
+    public static TheoryData<string, string> RefusedPublishTargets { get; } = new()
+    {
+        { "fifo", NotRegularFileRefusal },
+        { "file-link", NotRegularFileRefusal },
+        { "dangling-link", NotRegularFileRefusal },
+        { "directory-link", NotRegularFileRefusal },
+        { "directory", DirectoryRefusal },
+    };
+
+    // ---- Recreating a directory ---------------------------------------------------------------------
+
+    [Theory]
+    [MemberData(nameof(LinkedAncestors))]
+    public void RecreateDirectory_LinkedAncestor_IsRefusedAndTheOutsideIsIntact(string linkedDirectory, string target)
+    {
+        ProtectedTree();
+        LinkToOutside(linkedDirectory);
+        var before = ConfinedSnapshot(ConfinedOutside);
+
+        AssertLinkRefusal(Assert.Throws<IOException>(() => ConfinedTreeUnderTest.RecreateDirectory(ConfinedFull(target))), linkedDirectory);
+
+        Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
+        Assert.True(IsLink(linkedDirectory), "A refused recreate must leave the linked directory in place.");
+    }
+
+    [Fact]
+    public void RecreateDirectory_FileAboveTheTarget_IsRefusedAndKept()
+    {
+        File.WriteAllBytes(ConfinedFull("artifacts"), SentinelBytes);
+
+        var refusal = Assert.Throws<IOException>(() => ConfinedTreeUnderTest.RecreateDirectory(ConfinedFull("artifacts/discrepancies")));
+
+        Assert.Contains("'artifacts': it is not a directory", refusal.Message, StringComparison.Ordinal);
+        Assert.Equal(SentinelBytes, File.ReadAllBytes(ConfinedFull("artifacts")));
+    }
+
+    [Theory]
+    [InlineData("directory-link")]
+    [InlineData("file-link")]
+    [InlineData("dangling-link")]
+    [InlineData("file")]
+    [InlineData("absent")]
+    public void RecreateDirectory_EntryAtTheTarget_IsRemovedItselfAndAnEmptyDirectoryCreated(string entry)
+    {
+        ProtectedTree();
+        Directory.CreateDirectory(ConfinedFull("artifacts"));
+        var target = ConfinedFull("artifacts/discrepancies");
+        switch (entry)
+        {
+            case "directory-link":
+                Directory.CreateSymbolicLink(target, Path.Combine(ConfinedOutside, "discrepancies"));
+                break;
+            case "file-link":
+                File.CreateSymbolicLink(target, Path.Combine(ConfinedOutside, SentinelName));
+                break;
+            case "dangling-link":
+                File.CreateSymbolicLink(target, Path.Combine(ConfinedOutside, "created-through-link"));
+                break;
+            case "file":
+                File.WriteAllBytes(target, SentinelBytes);
+                break;
+        }
+
+        var before = ConfinedSnapshot(ConfinedOutside);
+
+        ConfinedTreeUnderTest.RecreateDirectory(target);
+
+        Assert.False(IsLink("artifacts/discrepancies"), "The recreated entry must be a real directory, not a link.");
+        Assert.True(Directory.Exists(target), "The recreated entry must be a directory.");
+        Assert.Empty(Directory.EnumerateFileSystemEntries(target));
+        Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
+    }
+
+    [Fact]
+    public void RecreateDirectory_ClearsNestedEntries_WithoutFollowingLinks()
+    {
+        ProtectedTree();
+        var outsideFile = Path.Combine(ConfinedOutside, SentinelName);
+        Directory.CreateDirectory(ConfinedFull("artifacts/replay/rest/deeper"));
+        Directory.CreateDirectory(ConfinedFull("artifacts/replay/soap"));
+        File.WriteAllBytes(ConfinedFull("artifacts/replay/rest/001-getAgent-01.body"), FirstBytes);
+        File.WriteAllBytes(ConfinedFull("artifacts/replay/rest/deeper/.hidden"), FirstBytes);
+        Directory.CreateSymbolicLink(ConfinedFull("artifacts/replay/soap/directory-link"), ConfinedOutside);
+        File.CreateSymbolicLink(ConfinedFull("artifacts/replay/soap/file-link"), outsideFile);
+        File.CreateSymbolicLink(ConfinedFull("artifacts/replay/rest/deeper/dangling-link"), Path.Combine(ConfinedOutside, "missing"));
+        CreateHardLink(ConfinedFull("artifacts/replay/soap/hard-link"), outsideFile);
+        var before = ConfinedSnapshot(ConfinedOutside);
+
+        ConfinedTreeUnderTest.RecreateDirectory(ConfinedFull("artifacts/replay"));
+
+        Assert.True(Directory.Exists(ConfinedFull("artifacts/replay")), "The cleared directory must exist again.");
+        Assert.Empty(Directory.EnumerateFileSystemEntries(ConfinedFull("artifacts/replay")));
+        Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
+    }
+
+    // ---- Writing a file -----------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task WriteFile_CreatesMissingDirectories_AndReplacesTheFileExactly(bool useAsync)
+    {
+        const string file = "artifacts/replay/rest/001-getAgent-01.body";
+
+        await ConfinedWrite(file, FirstBytes, useAsync);
+        await ConfinedWrite(file, SecondBytes, useAsync);
+
+        Assert.Equal(SecondBytes, await File.ReadAllBytesAsync(ConfinedFull(file), TestCancellation));
+        Assert.Equal([file], Directory.EnumerateFiles(ConfinedRoot, "*", SearchOption.AllDirectories).Select(ConfinedRelative));
+    }
+
+    [Theory]
+    [MemberData(nameof(LinkedWriteAncestors))]
+    public async Task WriteFile_ThroughLinkedAncestor_IsRefusedAndWritesNothingOutside(string linkedDirectory, bool useAsync)
+    {
+        ProtectedTree();
+        LinkToOutside(linkedDirectory);
+        var before = ConfinedSnapshot(ConfinedOutside);
+
+        foreach (var file in new[] { "artifacts/replay/rest/001-getAgent-01.body", "artifacts/replay/new/002-getAgent-02.body" })
+        {
+            AssertLinkRefusal(await Assert.ThrowsAsync<IOException>(() => ConfinedWrite(file, FirstBytes, useAsync)), linkedDirectory);
+        }
+
+        Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
+    }
+
+    [Theory]
+    [MemberData(nameof(LinkAtFileName))]
+    public async Task WriteFile_LinkAtTheFileName_IsRefusedAndItsTargetUnchanged(bool dangling, bool useAsync)
+    {
+        ProtectedTree();
+        const string file = "artifacts/discrepancies/CASE:REST-getAgent-01.json";
+        var target = Path.Combine(ConfinedOutside, dangling ? "created-through-link" : SentinelName);
+        Directory.CreateDirectory(ConfinedFull("artifacts/discrepancies"));
+        File.CreateSymbolicLink(ConfinedFull(file), target);
+        var before = ConfinedSnapshot(ConfinedOutside);
+
+        AssertLinkRefusal(await Assert.ThrowsAsync<IOException>(() => ConfinedWrite(file, FirstBytes, useAsync)), file);
+
+        Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
+        Assert.True(IsLink(file), "A refused write must leave the link in place.");
+    }
+
+    // A hard link is no symbolic link, so the write is allowed; it must replace the entry, never write through it.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task WriteFile_HardLinkAtTheFileName_IsReplacedWithoutChangingTheOutsideFile(bool useAsync)
+    {
+        ProtectedTree();
+        const string file = "artifacts/openapi/live.json";
+        var outsideFile = Path.Combine(ConfinedOutside, SentinelName);
+        Directory.CreateDirectory(ConfinedFull("artifacts/openapi"));
+        CreateHardLink(ConfinedFull(file), outsideFile);
+
+        await ConfinedWrite(file, SecondBytes, useAsync);
+
+        Assert.Equal(SecondBytes, await File.ReadAllBytesAsync(ConfinedFull(file), TestCancellation));
+        Assert.Equal(SentinelBytes, await File.ReadAllBytesAsync(outsideFile, TestCancellation));
+    }
+
+    [Fact]
+    public async Task WriteFileAsync_CancelledBeforeTheWrite_LeavesTheTreeUntouched()
+    {
+        using var cancelled = new CancellationTokenSource();
+        await cancelled.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => ConfinedTreeUnderTest.WriteFileAsync(ConfinedFull("artifacts/wsdl/facade.wsdl"), FirstBytes, cancelled.Token));
+
+        Assert.Empty(Directory.EnumerateFileSystemEntries(ConfinedRoot));
+    }
+
+    // ---- Publishing a file --------------------------------------------------------------------------
+
+    [Fact]
+    public void PublishFile_CreatesMissingDirectories_AndReplacesARegularFileWhole()
+    {
+        const string file = "artifacts/report/" + PublishedName;
+        Assert.True(ConfinedTreeUnderTest.Contains(ConfinedFull(file)), "A path below the root must be contained.");
+
+        ConfinedTreeUnderTest.PublishFile(ConfinedFull(file), FirstBytes);
+        ConfinedTreeUnderTest.PublishFile(ConfinedFull(file), SecondBytes);
+
+        Assert.Equal(SecondBytes, File.ReadAllBytes(ConfinedFull(file)));
+        Assert.Equal([PublishedName], SpecialFileSupport.Names(ConfinedFull("artifacts/report")));
+    }
+
+    // A hard link is a regular file, so it is replaced; the outside file it shares an inode with keeps its content.
+    [Fact]
+    public void PublishFile_HardLinkAtTheName_IsReplacedWithoutChangingTheOutsideFile()
+    {
+        ProtectedTree();
+        var outsideFile = Path.Combine(ConfinedOutside, SentinelName);
+        CreateHardLink(ConfinedFull(PublishedName), outsideFile);
+
+        ConfinedTreeUnderTest.PublishFile(ConfinedFull(PublishedName), SecondBytes);
+
+        Assert.Equal(SecondBytes, File.ReadAllBytes(ConfinedFull(PublishedName)));
+        Assert.Equal(SentinelBytes, File.ReadAllBytes(outsideFile));
+        Assert.Equal([PublishedName], SpecialFileSupport.Names(ConfinedRoot));
+    }
+
+    // The entry is examined, never opened: an unread FIFO would otherwise block the call for good, so the call
+    // runs off the test's thread and must end within the prompt limit.
+    [Theory]
+    [MemberData(nameof(RefusedPublishTargets))]
+    public async Task PublishFile_EntryThatIsNotARegularFile_IsRefusedPromptlyAndKept(string entry, string refusal)
+    {
+        ProtectedTree();
+        const string name = "harness";
+        var target = ConfinedFull(name);
+        switch (entry)
+        {
+            case "fifo":
+                SpecialFileSupport.CreateFifo(target);
+                break;
+            case "file-link":
+                File.CreateSymbolicLink(target, Path.Combine(ConfinedOutside, SentinelName));
+                break;
+            case "dangling-link":
+                File.CreateSymbolicLink(target, Path.Combine(ConfinedOutside, "created-through-link"));
+                break;
+            case "directory-link":
+                Directory.CreateSymbolicLink(target, ConfinedOutside);
+                break;
+            case "directory":
+                Directory.CreateDirectory(target);
+                break;
+        }
+
+        var before = ConfinedSnapshot(ConfinedOutside);
+
+        var publish = Task.Run(() => ConfinedTreeUnderTest.PublishFile(target, FirstBytes), TestCancellation);
+        var failure = await Assert.ThrowsAsync<IOException>(() => publish.WaitAsync(PromptLimit, TestCancellation));
+
+        Assert.Contains($"ConfinedTree could not publish '{name}': {refusal}", failure.Message, StringComparison.Ordinal);
+        Assert.Equal([name], SpecialFileSupport.Names(ConfinedRoot));
+        Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
+        var kept = entry switch
+        {
+            "fifo" => SpecialFileSupport.IsFifo(target),
+            "directory" => !IsLink(name) && Directory.Exists(target) && SpecialFileSupport.Names(target).Count == 0,
+            _ => IsLink(name),
+        };
+        Assert.True(kept, "A refused publication must leave the entry at the name as it was.");
+    }
+
+    [Theory]
+    [InlineData("artifacts")]
+    [InlineData("artifacts/report")]
+    public void PublishFile_ThroughLinkedAncestor_IsRefusedAndWritesNothingOutside(string linkedDirectory)
+    {
+        ProtectedTree();
+        LinkToOutside(linkedDirectory);
+        var before = ConfinedSnapshot(ConfinedOutside);
+
+        AssertLinkRefusal(
+            Assert.Throws<IOException>(() => ConfinedTreeUnderTest.PublishFile(ConfinedFull("artifacts/report/" + PublishedName), FirstBytes)),
+            linkedDirectory);
+
+        Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
+        Assert.True(IsLink(linkedDirectory), "A refused publication must leave the linked directory in place.");
+    }
+
+    // An entry swapped in at the name between the check and the rename is replaced as the entry it is: a FIFO is
+    // never opened, so no publication blocks, and a link is never followed. A background thread keeps moving a
+    // fresh FIFO and a link to the protected sentinel onto the name while the publications run. Which of them
+    // succeed depends on timing, so only that each ends promptly, succeeding or refused with an I/O error, that
+    // nothing outside changes and that no temporary file is left is asserted.
+    [Fact]
+    public async Task PublishFile_RacingAFifoOrLinkSwappedInAtTheName_NeverBlocksOrFollows()
+    {
+        ProtectedTree();
+        var target = ConfinedFull(PublishedName);
+        var before = ConfinedSnapshot(ConfinedOutside);
+
+        Exception? swapFailure = null;
+        using var stop = new CancellationTokenSource();
+        var swapper = new Thread(() => swapFailure = SwapSpecialEntriesOnto(target, stop.Token)) { IsBackground = true };
+        swapper.Start();
+        try
+        {
+            for (var publications = 0;
+                publications < MinimumRacePublications || (Volatile.Read(ref _confinedRaceSwaps) < MinimumRaceSwaps && swapper.IsAlive);
+                publications++)
+            {
+                var outcome = await Outcome(
+                    () => Task.Run(() => ConfinedTreeUnderTest.PublishFile(target, FirstBytes), TestCancellation).WaitAsync(PromptLimit, TestCancellation));
+                Assert.True(
+                    outcome is null or IOException,
+                    "A publication racing a swap must end promptly, succeeding or refused with an I/O error.");
+            }
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            swapper.Join();
+        }
+
+        Assert.Null(swapFailure);
+        Assert.True(Volatile.Read(ref _confinedRaceSwaps) >= MinimumRaceSwaps, "The swapper must have raced the publications.");
+        Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
+        Assert.DoesNotContain(SpecialFileSupport.Names(ConfinedRoot), name => name.EndsWith(".publishing", StringComparison.Ordinal));
+    }
+
+    // ---- Deleting a file ----------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void DeleteFile_LinkAtTheTarget_IsRemovedItself(bool dangling)
+    {
+        ProtectedTree();
+        const string file = "artifacts/wsdl/backend.wsdl";
+        Directory.CreateDirectory(ConfinedFull("artifacts/wsdl"));
+        File.CreateSymbolicLink(ConfinedFull(file), Path.Combine(ConfinedOutside, dangling ? "missing" : SentinelName));
+        var before = ConfinedSnapshot(ConfinedOutside);
+
+        ConfinedTreeUnderTest.DeleteFile(ConfinedFull(file));
+
+        Assert.False(File.Exists(ConfinedFull(file)) || IsLink(file), "The link itself must be removed.");
+        Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
+    }
+
+    [Fact]
+    public void DeleteFile_ThroughLinkedAncestor_IsRefusedAndDeletesNothingOutside()
+    {
+        ProtectedTree();
+        LinkToOutside("artifacts");
+        var before = ConfinedSnapshot(ConfinedOutside);
+
+        AssertLinkRefusal(
+            Assert.Throws<IOException>(() => ConfinedTreeUnderTest.DeleteFile(ConfinedFull($"artifacts/discrepancies/{SentinelName}"))),
+            "artifacts");
+
+        Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
+    }
+
+    [Fact]
+    public void DeleteFile_MissingDirectoryOrDirectoryAtTheTarget_CreatesAndRemovesNothing()
+    {
+        ConfinedTreeUnderTest.DeleteFile(ConfinedFull("artifacts/openapi/live.json"));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(ConfinedRoot));
+
+        Directory.CreateDirectory(ConfinedFull("artifacts/openapi/live.json"));
+        ConfinedTreeUnderTest.DeleteFile(ConfinedFull("artifacts/openapi/live.json"));
+        Assert.True(Directory.Exists(ConfinedFull("artifacts/openapi/live.json")), "A directory at the target must be kept.");
+    }
+
+    // ---- Replacement races --------------------------------------------------------------------------
+
+    // A directory swapped for a link while the tree works must never redirect it. A background thread keeps
+    // moving artifacts/replay/rest and artifacts/discrepancies aside, putting a link to the protected directory
+    // in each place and moving the directory back, while every recreate, write and delete runs against the
+    // moving tree. Which operations succeed depends on timing, so only that each one succeeds or fails with an
+    // I/O error, and that the protected directory is unchanged, is asserted.
+    [Fact]
+    public async Task ConcurrentSwap_NeverClearsWritesOrDeletesThroughTheSwappedInLink()
+    {
+        ProtectedTree();
+        File.WriteAllBytes(Path.Combine(ConfinedOutside, "001-getAgent-01.body"), SentinelBytes);
+        File.WriteAllBytes(Path.Combine(ConfinedOutside, "CASE-REST-getAgent-01.json"), SentinelBytes);
+        ConfinedTreeUnderTest.WriteFile(ConfinedFull("artifacts/replay/rest/001-getAgent-01.body"), FirstBytes);
+        ConfinedTreeUnderTest.WriteFile(ConfinedFull("artifacts/discrepancies/CASE-REST-getAgent-01.json"), FirstBytes);
+        var before = ConfinedSnapshot(ConfinedOutside);
+        Func<Task>[] operations =
+        [
+            () => ConfinedWrite("artifacts/replay/rest/001-getAgent-01.body", FirstBytes, useAsync: false),
+            () => ConfinedWrite("artifacts/discrepancies/CASE-REST-getAgent-01.json", FirstBytes, useAsync: true),
+            () => Synchronously(() => ConfinedTreeUnderTest.DeleteFile(ConfinedFull("artifacts/replay/rest/001-getAgent-01.body"))),
+            () => Synchronously(() => ConfinedTreeUnderTest.RecreateDirectory(ConfinedFull("artifacts/replay"))),
+            () => Synchronously(() => ConfinedTreeUnderTest.RecreateDirectory(ConfinedFull("artifacts/discrepancies"))),
+        ];
+
+        Exception? swapFailure = null;
+        using var stop = new CancellationTokenSource();
+        var swapper = new Thread(() => swapFailure = SwapForLinks(stop.Token)) { IsBackground = true };
+        swapper.Start();
+        try
+        {
+            for (var iteration = 0; iteration < SwapIterations; iteration++)
+            {
+                foreach (var operation in operations)
+                {
+                    var outcome = await Outcome(operation);
+                    Assert.True(
+                        outcome is null or IOException,
+                        "An operation racing a swap must succeed or fail with an I/O error.");
+                }
+            }
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            swapper.Join();
+            RemoveSwappedInLinks();
+        }
+
+        Assert.Null(swapFailure);
+        Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
+        ConfinedTreeUnderTest.RecreateDirectory(ConfinedFull("artifacts/replay"));
+        ConfinedTreeUnderTest.WriteFile(ConfinedFull("artifacts/replay/rest/001-getAgent-01.body"), SecondBytes);
+        Assert.Equal(SecondBytes, await File.ReadAllBytesAsync(ConfinedFull("artifacts/replay/rest/001-getAgent-01.body"), TestCancellation));
+    }
+
+    // ---- Lexical containment ------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(".")]
+    [InlineData("artifacts/..")]
+    [InlineData("..")]
+    [InlineData("../outside/SENTINEL")]
+    [InlineData("artifacts/../../outside/discrepancies")]
+    [InlineData("../repo-sibling/artifacts")]
+    [InlineData("/")]
+    public async Task PathNotStrictlyBelowTheRoot_IsRefusedByEveryOperation(string relative)
+    {
+        ProtectedTree();
+        var path = Path.Combine(ConfinedRoot, relative);
+        var before = ConfinedSnapshot(ConfinedTemp);
+
+        Assert.Contains(OutsideRefusal, Assert.Throws<IOException>(() => ConfinedTreeUnderTest.RecreateDirectory(path)).Message, StringComparison.Ordinal);
+        Assert.Contains(OutsideRefusal, Assert.Throws<IOException>(() => ConfinedTreeUnderTest.WriteFile(path, FirstBytes)).Message, StringComparison.Ordinal);
+        Assert.Contains(
+            OutsideRefusal,
+            (await Assert.ThrowsAsync<IOException>(() => ConfinedTreeUnderTest.WriteFileAsync(path, FirstBytes, TestCancellation))).Message,
+            StringComparison.Ordinal);
+        Assert.Contains(OutsideRefusal, Assert.Throws<IOException>(() => ConfinedTreeUnderTest.DeleteFile(path)).Message, StringComparison.Ordinal);
+        Assert.Contains(OutsideRefusal, Assert.Throws<IOException>(() => ConfinedTreeUnderTest.PublishFile(path, FirstBytes)).Message, StringComparison.Ordinal);
+        Assert.False(ConfinedTreeUnderTest.Contains(path), "A path not strictly below the root must not be contained.");
+
+        Assert.Equal(before, ConfinedSnapshot(ConfinedTemp));
+    }
+
+    // ---- Discrepancy artifact names -----------------------------------------------------------------
+
+    [Theory]
+    [MemberData(nameof(ArtifactItemIds))]
+    public void ArtifactFileName_KeepsTheItemIdByteForByte(string itemId)
+    {
+        var expected = itemId + ".json";
+
+        Assert.Equal(expected, DiscrepancySignature.ArtifactFileName(itemId));
+        Assert.True(DiscrepancySignature.TryArtifactFileName(itemId, out var fileName), "A usable item id must name its artifact.");
+        Assert.Equal(expected, fileName);
+
+        ConfinedTreeUnderTest.WriteFile(ConfinedFull($"artifacts/discrepancies/{fileName}"), FirstBytes);
+        Assert.Equal(
+            Encoding.UTF8.GetBytes(expected),
+            Encoding.UTF8.GetBytes(Path.GetFileName(Assert.Single(Directory.EnumerateFiles(ConfinedFull("artifacts/discrepancies"))))));
+    }
+
+    [Theory]
+    [MemberData(nameof(UnusableItemIdForms))]
+    public void ArtifactFileName_RefusesAnIdThatIsNotOneSafeFileName(string form)
+    {
+        var itemId = UnusableItemId(form);
+
+        Assert.ThrowsAny<ArgumentException>(() => DiscrepancySignature.ArtifactFileName(itemId!));
+        Assert.False(DiscrepancySignature.TryArtifactFileName(itemId, out var fileName), "An unusable item id must name no artifact.");
+        Assert.Null(fileName);
+    }
+
+    // ---- Helpers ------------------------------------------------------------------------------------
+
+    // 251 ASCII characters, or 126 two-byte characters, give a name of 256 or 257 UTF-8 bytes with ".json".
+    private static string? UnusableItemId(string form) => form switch
+    {
+        "null" => null,
+        "empty" => "",
+        "dot" => ".",
+        "dot-dot" => "..",
+        "slash" => "CASE:REST/getAgent-01",
+        "backslash" => "CASE:REST\\getAgent-01",
+        "nul" => "CASE:REST-getAgent-01\0",
+        "line-feed" => "CASE:REST-getAgent-01\n",
+        "delete" => "CASE:REST-getAgent-01\u007F",
+        "c1-control" => "CASE:REST-getAgent-01\u0085",
+        "lone-surrogate" => "CASE:REST-getAgent-\uD800",
+        "ascii-name-over-255-bytes" => new string('a', 251),
+        "utf8-name-over-255-bytes" => new string('\u00E9', 126),
+        _ => throw new ArgumentOutOfRangeException(nameof(form), form, "Unknown item id form."),
+    };
+
+    private static void AssertLinkRefusal(IOException refusal, string linkedComponent)
+    {
+        Assert.Contains(LinkRefusal, refusal.Message, StringComparison.Ordinal);
+        Assert.Contains($"because '{linkedComponent}' is a symbolic link", refusal.Message, StringComparison.Ordinal);
+    }
+
+    // The protected directory holds the entries replay clears, so a clear that followed a link would delete them.
+    private void ProtectedTree()
+    {
+        File.WriteAllBytes(Path.Combine(ConfinedOutside, SentinelName), SentinelBytes);
+        foreach (var directory in new[] { "discrepancies", "replay/rest", "rest" })
+        {
+            Directory.CreateDirectory(Path.Combine(ConfinedOutside, directory));
+            File.WriteAllBytes(Path.Combine(ConfinedOutside, directory, SentinelName), SentinelBytes);
+        }
+
+        File.WriteAllBytes(Path.Combine(ConfinedOutside, "rest", "001-getAgent-01.body"), SentinelBytes);
+    }
+
+    // Links relative (a directory below the root) to the protected directory; the setup is a real escape
+    // route, because the protected sentinel is visible through the link.
+    private void LinkToOutside(string relative)
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(ConfinedFull(relative))!);
+        Directory.CreateSymbolicLink(ConfinedFull(relative), ConfinedOutside);
+        Assert.True(File.Exists(Path.Combine(ConfinedFull(relative), SentinelName)), "The link must reach the protected directory.");
+    }
+
+    // Until stop, moves each swapped directory aside, links its path to the protected directory, removes that
+    // link and moves the directory back. A step the tree's own work rules out, such as linking a path where the
+    // tree has just recreated the directory, is skipped. Every step renames or removes an entry below the root,
+    // never one in the protected directory. Returns the first other failure, or null.
+    private Exception? SwapForLinks(CancellationToken stop)
+    {
+        try
+        {
+            for (var cycle = 0; !stop.IsCancellationRequested; cycle++)
+            {
+                foreach (var directory in SwappedDirectories)
+                {
+                    var path = ConfinedFull(directory);
+                    var aside = $"{path}.aside-{cycle}";
+                    if (!Attempt(() => Directory.Move(path, aside)))
+                    {
+                        continue;
+                    }
+
+                    if (Attempt(() => Directory.CreateSymbolicLink(path, ConfinedOutside)))
+                    {
+                        Attempt(() => File.Delete(path));
+                    }
+
+                    Attempt(() => Directory.Move(aside, path));
+                }
+            }
+
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
+    }
+
+    // Whether a swap step succeeded; it fails only with the error of a path the tree changed first, such as a
+    // link the tree already replaced with a directory.
+    private static bool Attempt(Action step)
+    {
+        try
+        {
+            step();
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
+    }
+
+    // Until stop, stages a fresh FIFO or a link to the protected sentinel beside target, in turn, and renames it
+    // onto target, replacing whatever a publication left there. Every step works below the root, never in the
+    // protected directory. Returns the first failure, or null.
+    private Exception? SwapSpecialEntriesOnto(string target, CancellationToken stop)
+    {
+        try
+        {
+            var staged = target + ".staged";
+            for (var cycle = 0; !stop.IsCancellationRequested; cycle++)
+            {
+                if (cycle % 2 == 0)
+                {
+                    SpecialFileSupport.CreateFifo(staged);
+                }
+                else
+                {
+                    File.CreateSymbolicLink(staged, Path.Combine(ConfinedOutside, SentinelName));
+                }
+
+                File.Move(staged, target, overwrite: true);
+                Interlocked.Increment(ref _confinedRaceSwaps);
+            }
+
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
+    }
+
+    // A link the swapper left behind is removed, so the final write and the cleanup see directories.
+    private void RemoveSwappedInLinks()
+    {
+        foreach (var directory in SwappedDirectories)
+        {
+            if (IsLink(directory))
+            {
+                File.Delete(ConfinedFull(directory));
+            }
+        }
+    }
+
+    private static Task Synchronously(Action operation)
+    {
+        operation();
+        return Task.CompletedTask;
+    }
+
+    // The exception an operation ends with, or null when it succeeds.
+    private static async Task<Exception?> Outcome(Func<Task> operation)
+    {
+        try
+        {
+            await operation();
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
+    }
+
+    private Task ConfinedWrite(string relative, byte[] bytes, bool useAsync)
+    {
+        if (useAsync)
+        {
+            return ConfinedTreeUnderTest.WriteFileAsync(ConfinedFull(relative), bytes, TestCancellation);
+        }
+
+        ConfinedTreeUnderTest.WriteFile(ConfinedFull(relative), bytes);
+        return Task.CompletedTask;
+    }
+
+    // Every entry below a directory, in ordinal order: files as "relative/path=hex", directories as
+    // "relative/path/" and links as "relative/path->relative/target", so a created, changed or removed entry
+    // changes the snapshot. Paths are relative, so a failure reads the same in every run.
+    private static List<string> ConfinedSnapshot(string directory) =>
+    [
+        .. Directory.EnumerateFileSystemEntries(directory, "*", SearchOption.AllDirectories)
+            .Select(entry =>
+            {
+                var relative = Path.GetRelativePath(directory, entry).Replace(Path.DirectorySeparatorChar, '/');
+                var linkTarget = new FileInfo(entry).LinkTarget;
+                return linkTarget is not null
+                    ? relative + "->" + Path.GetRelativePath(directory, linkTarget).Replace(Path.DirectorySeparatorChar, '/')
+                    : Directory.Exists(entry)
+                        ? relative + "/"
+                        : relative + "=" + Convert.ToHexStringLower(File.ReadAllBytes(entry));
+            })
+            .Order(StringComparer.Ordinal),
+    ];
+
+    // .NET has no hard-link API, so ln(1) creates it.
+    private static void CreateHardLink(string link, string existingFile)
+    {
+        var startInfo = new ProcessStartInfo("ln") { UseShellExecute = false };
+        startInfo.ArgumentList.Add(existingFile);
+        startInfo.ArgumentList.Add(link);
+        using var process = Process.Start(startInfo);
+        Assert.NotNull(process);
+        process.WaitForExit();
+        Assert.True(process.ExitCode == 0, "ln must create the hard link.");
+    }
+
+    private bool IsLink(string relative) => new FileInfo(ConfinedFull(relative)).LinkTarget is not null;
+
+    private string ConfinedFull(string relative) => Path.Combine(ConfinedRoot, relative.Replace('/', Path.DirectorySeparatorChar));
+
+    // Paths are asserted relative to the root, so a failure reads the same in every run.
+    private string ConfinedRelative(string path) => Path.GetRelativePath(ConfinedRoot, path).Replace(Path.DirectorySeparatorChar, '/');
+
+    private string ConfinedTemp => _confinedTemp ??= CreateConfinedSandbox();
+
+    private string ConfinedRoot => Path.Combine(ConfinedTemp, "repo");
+
+    private string ConfinedOutside => Path.Combine(ConfinedTemp, "outside");
+
+    private ConfinedTree ConfinedTreeUnderTest => _confinedTree ??= new ConfinedTree(ConfinedRoot);
+
+    private static string CreateConfinedSandbox()
+    {
+        var temp = Path.Combine(Path.GetTempPath(), "erewhon-confined-tree-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(temp, "repo"));
+        Directory.CreateDirectory(Path.Combine(temp, "outside"));
+        return temp;
+    }
+}
+
+/// <summary>
+/// Named pipes (FIFOs) for the tests that point a write at one, and a directory listing that is safe beside
+/// one. .NET has no API that creates or recognises a FIFO, so mkfifo(1) creates it and the shell's
+/// <c>test -p</c> recognises it. Nothing here opens an entry, so nothing can block on a FIFO that nobody reads.
+/// </summary>
+internal static class SpecialFileSupport
+{
+    private static readonly TimeSpan ToolLimit = TimeSpan.FromSeconds(30);
+
+    /// <summary>Creates a FIFO at <paramref name="path"/>, which must not exist.</summary>
+    public static void CreateFifo(string path) =>
+        Assert.True(Run("mkfifo", path) == 0, "mkfifo must create the FIFO.");
+
+    /// <summary>Whether the entry at <paramref name="path"/> is a FIFO; a link to one is not.</summary>
+    public static bool IsFifo(string path) =>
+        new FileInfo(path).LinkTarget is null && Run("sh", "-c", "test -p \"$1\"", "sh", path) == 0;
+
+    /// <summary>The names in <paramref name="directory"/>, dot names included, in ordinal order.</summary>
+    public static List<string> Names(string directory) =>
+    [
+        .. Directory.EnumerateFileSystemEntries(directory, "*", new EnumerationOptions { AttributesToSkip = 0 })
+            .Select(entry => Path.GetRelativePath(directory, entry))
+            .Order(StringComparer.Ordinal),
+    ];
+
+    // Runs a tool with its arguments passed as they are and returns its exit code; a tool that does not end
+    // within the limit fails the test instead of hanging it.
+    private static int Run(string tool, params string[] arguments)
+    {
+        var startInfo = new ProcessStartInfo(tool) { UseShellExecute = false };
+        foreach (var argument in arguments)
+        {
+            startInfo.ArgumentList.Add(argument);
+        }
+
+        using var process = Process.Start(startInfo);
+        Assert.NotNull(process);
+        if (!process.WaitForExit(ToolLimit))
+        {
+            process.Kill();
+            Assert.Fail($"{tool} did not finish within the tool limit.");
+        }
+
+        return process.ExitCode;
     }
 }

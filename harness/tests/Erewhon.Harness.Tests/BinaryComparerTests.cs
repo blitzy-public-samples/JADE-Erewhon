@@ -747,10 +747,20 @@ public sealed partial class BinaryComparerTests
     // Manifest publications the cancellation-race test cancels while they run.
     private const int CancellationIterations = 200;
 
+    // The reader that applies the record checks alone, keeps only each record's key and leaves every record and
+    // its body to ReadEntryAsync.
+    private const string RecordIndexReader = "ReadRecordIndexAsync";
+
+    // The size of each large inline body the index regression writes.
+    private const int LargeBodySize = 3 * 1024 * 1024;
+
     private static readonly string[] DocumentNames =
         ["record", "body-file", "manifest", "normalisation-rules", "conformance", "wsdl"];
 
     private static readonly string[] ReaderNames = ["ReadRecords", "ReadRecordsAsync", "ReadEntries", "ReadEntriesAsync"];
+
+    // The damages that only a body read can detect, so the record index lists their records.
+    private static readonly string[] BodyDamages = ["tampered-body-file", "tampered-body-text", "missing-body-file"];
 
     // The directories the parent-swap test replaces with links, and the protected files an escape through
     // them would replace or delete.
@@ -763,12 +773,14 @@ public sealed partial class BinaryComparerTests
     private HarnessOptions? _storeOptions;
     private BaselineStore? _store;
 
-    /// <summary>The four record readers, which share every check.</summary>
-    public static TheoryData<string> Readers { get; } = [.. ReaderNames];
+    /// <summary>
+    /// The four record readers, which share every check, and the record index, which shares every record check.
+    /// </summary>
+    public static TheoryData<string> Readers { get; } = [.. ReaderNames, RecordIndexReader];
 
     /// <summary>
     /// Each damage to a written baseline, the file the error must name and the reason it must give, for every
-    /// record reader.
+    /// record reader, and for the record index when the damage is to the record rather than its body.
     /// </summary>
     public static TheoryData<string, string, string, string> DamagedRecords()
     {
@@ -778,6 +790,12 @@ public sealed partial class BinaryComparerTests
             ("tampered-body-text", RestRecordPath, "is invalid: its body hashes to"),
             ("missing-body-file", PhotoRecordPath, $"is invalid: its body file {PhotoBodyPath} is missing."),
             ("malformed-json", RestRecordPath, "is not a valid BaselineRecord document"),
+            ("invalid-utf8-body-text", RestRecordPath,
+                "is not a valid BaselineRecord document: The JSON value could not be converted to "
+                + "Erewhon.Harness.Baseline.BaselineResponse. Path: $.response.bodyText"),
+            ("lone-surrogate-body-text", RestRecordPath,
+                "is not a valid BaselineRecord document: The JSON value could not be converted to "
+                + "Erewhon.Harness.Baseline.BaselineResponse. Path: $.response.bodyText"),
             ("json-null", RestRecordPath, "holds a JSON null instead of a BaselineRecord"),
             ("missing-case-id", RestRecordPath, "is invalid: member caseId is missing."),
             ("missing-request-headers", RestRecordPath, "is invalid: member request.headers is missing."),
@@ -800,6 +818,11 @@ public sealed partial class BinaryComparerTests
             foreach (var reader in ReaderNames)
             {
                 data.Add(damage, reader, file, reason);
+            }
+
+            if (!BodyDamages.Contains(damage))
+            {
+                data.Add(damage, RecordIndexReader, file, reason);
             }
         }
 
@@ -1047,18 +1070,74 @@ public sealed partial class BinaryComparerTests
     [MemberData(nameof(Readers))]
     public async Task Readers_ReturnReplayOrderAcrossSurfaces(string reader)
     {
-        Store.WriteRecord(NewRecord(3, "REST-getClient-01", "Rest.getClient", AgentBody), AgentBody);
-        Store.WriteRecord(
-            NewRecord(1, "SOAP-getPhoto-01", "Soap.getPhoto", PhotoBody, "001-getPhoto-01.body.bin"), PhotoBody);
-        Store.WriteRecord(NewRecord(2, "REST-getAgent-02", "Rest.getAgent", AgentBody), AgentBody);
-        Store.WriteRecord(NewRecord(4, "SOAP-getAgentNames-01", "Soap.getAgentNames", SoapBody), SoapBody);
+        WriteCasesAcrossSurfaces();
 
-        var records = await ReadWith(reader);
+        var keys = await ReadWith(reader);
 
-        Assert.Equal([1, 2, 3, 4], records.Select(static record => record.Order));
+        Assert.Equal([1, 2, 3, 4], keys.Select(static key => key.Order));
         Assert.Equal(
             ["SOAP-getPhoto-01", "REST-getAgent-02", "REST-getClient-01", "SOAP-getAgentNames-01"],
-            records.Select(static record => record.CaseId));
+            keys.Select(static key => key.CaseId));
+        Assert.Equal(
+            ["Soap.getPhoto", "Rest.getAgent", "Rest.getClient", "Soap.getAgentNames"],
+            keys.Select(static key => key.Operation));
+    }
+
+    // For each key of the index, the per-case reader returns exactly the record and the body bytes the
+    // whole-baseline reader returns for that case: JSON text, a body file, and SOAP text.
+    [Theory]
+    [InlineData("SOAP-getPhoto-01")]
+    [InlineData("REST-getAgent-02")]
+    [InlineData("REST-getClient-01")]
+    [InlineData("SOAP-getAgentNames-01")]
+    public async Task ReadEntry_ReturnsTheRecordAndBodyReadEntriesReturns(string caseId)
+    {
+        WriteCasesAcrossSurfaces();
+
+        var keys = await Store.ReadRecordIndexAsync(TestCancellation);
+        var entries = await Store.ReadEntriesAsync(TestCancellation);
+
+        Assert.Equal(Keys(entries.Select(static entry => entry.Record)), keys);
+        var expected = Assert.Single(
+            entries, candidate => string.Equals(candidate.Record.CaseId, caseId, StringComparison.Ordinal));
+        var key = Assert.Single(keys, candidate => string.Equals(candidate.CaseId, caseId, StringComparison.Ordinal));
+        var entry = await Store.ReadEntryAsync(key, TestCancellation);
+        Assert.Equal(Text(expected.Record), Text(entry.Record));
+        Assert.Equal(expected.Body.ToArray(), entry.Body.ToArray());
+    }
+
+    // Several multi-MiB inline bodies: the index lists only keys, whose type carries no request, response or
+    // body, and each case read returns its whole body, byte for byte.
+    [Fact]
+    public async Task RecordIndex_LargeInlineBodies_AreListedAsKeysAndEachReadsWhole()
+    {
+        BaselineRecordKey[] written =
+        [
+            .. Enumerable.Range(1, 4).Select(order =>
+            {
+                var body = LargeJsonBody(order);
+                var record = NewRecord(order, $"REST-getAgent-{order:D2}", "Rest.getAgent", body);
+                Store.WriteRecord(record, body);
+                return KeyOf(record);
+            }),
+        ];
+
+        var keys = await Store.ReadRecordIndexAsync(TestCancellation);
+
+        Assert.Equal(
+            [("CaseId", typeof(string)), ("Operation", typeof(string)), ("Order", typeof(int))],
+            typeof(BaselineRecordKey).GetProperties()
+                .Select(static property => (property.Name, property.PropertyType))
+                .OrderBy(static property => property.Name, StringComparer.Ordinal));
+        Assert.Equal(written, keys);
+        foreach (var key in keys)
+        {
+            var expected = LargeJsonBody(key.Order);
+            var entry = await Store.ReadEntryAsync(key, TestCancellation);
+            Assert.Equal(expected.Length, entry.Body.Length);
+            Assert.True(expected.AsSpan().SequenceEqual(entry.Body.Span), $"{key.CaseId} read back other bytes");
+            Assert.Equal(Encoding.UTF8.GetString(expected), entry.Record.Response.BodyText);
+        }
     }
 
     [Theory]
@@ -1102,6 +1181,8 @@ public sealed partial class BinaryComparerTests
         Assert.Empty(await Store.ReadRecordsAsync(TestCancellation));
         Assert.Empty(Store.ReadEntries());
         Assert.Empty(await Store.ReadEntriesAsync(TestCancellation));
+        Assert.Empty(await Store.ReadRecordIndexAsync(TestCancellation));
+        await Assert.ThrowsAsync<InvalidDataException>(() => Store.ReadEntryAsync(KeyOf(AgentRecord), TestCancellation));
         Assert.Empty(Directory.EnumerateFileSystemEntries(StoreRoot));
     }
 
@@ -1190,6 +1271,88 @@ public sealed partial class BinaryComparerTests
             : Assert.Throws<InvalidDataException>(() => Store.ReadBodyBytes(record));
 
         Assert.StartsWith(message, ex.Message, StringComparison.Ordinal);
+    }
+
+    // The index reads no body, so a damaged body leaves its record listed; the one verified read of that case
+    // refuses it, naming its record file, and the other case still reads as written, byte for byte.
+    [Theory]
+    [InlineData("tampered-body-file", PhotoRecordPath, "is invalid: its body hashes to")]
+    [InlineData("missing-body-file", PhotoRecordPath, $"is invalid: its body file {PhotoBodyPath} is missing.")]
+    [InlineData("tampered-body-text", RestRecordPath, "is invalid: its body hashes to")]
+    public async Task RecordIndex_DamagedBody_IsListedAndRefusedWhenItsCaseIsRead(
+        string damage, string damagedFile, string reason)
+    {
+        await WriteFixture(Store, useAsync: false);
+        await Damage(damage);
+
+        var keys = await Store.ReadRecordIndexAsync(TestCancellation);
+
+        Assert.Equal([KeyOf(AgentRecord), KeyOf(PhotoRecord)], keys);
+        foreach (var key in keys)
+        {
+            var (file, record, body) = string.Equals(key.CaseId, AgentRecord.CaseId, StringComparison.Ordinal)
+                ? (RestRecordPath, AgentRecord, AgentBody)
+                : (PhotoRecordPath, PhotoRecord, PhotoBody);
+            if (string.Equals(file, damagedFile, StringComparison.Ordinal))
+            {
+                var ex = await Assert.ThrowsAsync<InvalidDataException>(
+                    () => Store.ReadEntryAsync(key, TestCancellation));
+                Assert.StartsWith($"Baseline record {file} {reason}", ex.Message, StringComparison.Ordinal);
+            }
+            else
+            {
+                var entry = await Store.ReadEntryAsync(key, TestCancellation);
+                Assert.Equal(Text(record), Text(entry.Record));
+                Assert.Equal(body, entry.Body.ToArray());
+            }
+        }
+    }
+
+    // The per-case reader reads the record file again, so a record changed or removed after it was indexed is
+    // refused, naming the file, rather than replayed as the indexed case; the other case still reads.
+    [Theory]
+    [InlineData("deleted", $"Baseline record {RestRecordPath} of case REST-getAgent-01 is missing.")]
+    [InlineData(
+        "other-position",
+        $"Baseline record {RestRecordPath} is invalid: case REST-getAgent-01 at position 3 must be stored as "
+        + "003-getAgent-01.json.")]
+    [InlineData(
+        "other-case",
+        $"Baseline record {RestRecordPath} is invalid: case REST-getAgent-02 at position 1 must be stored as "
+        + "001-getAgent-02.json.")]
+    [InlineData(
+        "other-operation",
+        $"Baseline record {RestRecordPath} is invalid: it holds case REST-getAgent-01 of operation REST.getAgent at "
+        + "position 1, not the indexed case REST-getAgent-01 of operation Rest.getAgent at position 1.")]
+    public async Task ReadEntry_RecordChangedAfterIndexing_IsInvalidDataNamingTheFile(string change, string message)
+    {
+        await WriteFixture(Store, useAsync: false);
+        var keys = await Store.ReadRecordIndexAsync(TestCancellation);
+        await ChangeAgentRecord(change);
+
+        var ex = await Assert.ThrowsAsync<InvalidDataException>(() => Store.ReadEntryAsync(keys[0], TestCancellation));
+
+        Assert.Equal(message, ex.Message);
+        Assert.Equal(PhotoBody, (await Store.ReadEntryAsync(keys[1], TestCancellation)).Body.ToArray());
+    }
+
+    // A key becomes a path only through the checked file-name parts, so one that names no record file, a
+    // climb out of records/ included, is an argument error.
+    [Theory]
+    [InlineData(1, "Rest-getAgent-01", "Rest.getAgent", "caseId")]
+    [InlineData(0, "REST-getAgent-01", "Rest.getAgent", "position")]
+    [InlineData(1, "REST-getAgent-01", "RestgetAgent", "jadeMethod")]
+    [InlineData(1, "REST-/../../../../escaped-01", "Rest./../../../../escaped", "jadeMethod")]
+    [InlineData(1, "REST-getAgent-0a", "Rest.getAgent", "caseNumber")]
+    public async Task ReadEntry_KeyNamingNoRecordFile_IsArgumentError(
+        int order, string caseId, string operation, string parameter)
+    {
+        await WriteFixture(Store, useAsync: false);
+
+        var ex = await Assert.ThrowsAnyAsync<ArgumentException>(
+            () => Store.ReadEntryAsync(new BaselineRecordKey(order, caseId, operation), TestCancellation));
+
+        Assert.Equal(parameter, ex.ParamName);
     }
 
     [Fact]
@@ -1707,6 +1870,8 @@ public sealed partial class BinaryComparerTests
     [InlineData("TryReadManifestAsync")]
     [InlineData("ReadRecordsAsync")]
     [InlineData("ReadEntriesAsync")]
+    [InlineData(RecordIndexReader)]
+    [InlineData("ReadEntryAsync")]
     [InlineData("ReadBodyBytesAsync:file")]
     [InlineData("ReadBodyBytesAsync:text")]
     [InlineData("ReadNormalisationRulesAsync")]
@@ -2004,14 +2169,65 @@ public sealed partial class BinaryComparerTests
 
     private BaselineManifest? ReadManifest() => Store.TryReadManifest(out var manifest) ? manifest : null;
 
-    private async Task<IReadOnlyList<BaselineRecord>> ReadWith(string reader) => reader switch
+    // What a reader returns, as record keys, so the record readers and the record index are held to one order
+    // and one set of refusals.
+    private async Task<IReadOnlyList<BaselineRecordKey>> ReadWith(string reader) => reader switch
     {
-        "ReadRecords" => Store.ReadRecords(),
-        "ReadRecordsAsync" => await Store.ReadRecordsAsync(TestCancellation),
-        "ReadEntries" => [.. Store.ReadEntries().Select(static entry => entry.Record)],
-        "ReadEntriesAsync" => [.. (await Store.ReadEntriesAsync(TestCancellation)).Select(static entry => entry.Record)],
+        "ReadRecords" => Keys(Store.ReadRecords()),
+        "ReadRecordsAsync" => Keys(await Store.ReadRecordsAsync(TestCancellation)),
+        "ReadEntries" => Keys(Store.ReadEntries().Select(static entry => entry.Record)),
+        "ReadEntriesAsync" => Keys((await Store.ReadEntriesAsync(TestCancellation)).Select(static entry => entry.Record)),
+        RecordIndexReader => await Store.ReadRecordIndexAsync(TestCancellation),
         _ => throw new ArgumentOutOfRangeException(nameof(reader), reader, null),
     };
+
+    private static BaselineRecordKey KeyOf(BaselineRecord record) => new(record.Order, record.CaseId, record.Operation);
+
+    private static List<BaselineRecordKey> Keys(IEnumerable<BaselineRecord> records) => [.. records.Select(KeyOf)];
+
+    // Four records out of replay order across both surfaces: JSON text, a body file, JSON text and SOAP text.
+    private void WriteCasesAcrossSurfaces()
+    {
+        Store.WriteRecord(NewRecord(3, "REST-getClient-01", "Rest.getClient", AgentBody), AgentBody);
+        Store.WriteRecord(
+            NewRecord(1, "SOAP-getPhoto-01", "Soap.getPhoto", PhotoBody, "001-getPhoto-01.body.bin"), PhotoBody);
+        Store.WriteRecord(NewRecord(2, "REST-getAgent-02", "Rest.getAgent", AgentBody), AgentBody);
+        Store.WriteRecord(NewRecord(4, "SOAP-getAgentNames-01", "Soap.getAgentNames", SoapBody), SoapBody);
+    }
+
+    // A JSON body of exactly LargeBodySize bytes whose content differs for every order.
+    private static byte[] LargeJsonBody(int order)
+    {
+        var prefix = Encoding.UTF8.GetBytes($"{{\"order\":{order},\"fill\":\"");
+        var suffix = "\"}"u8;
+        var body = new byte[LargeBodySize];
+        prefix.CopyTo(body, 0);
+        body.AsSpan(prefix.Length, LargeBodySize - prefix.Length - suffix.Length).Fill((byte)('a' + order));
+        suffix.CopyTo(body.AsSpan(LargeBodySize - suffix.Length));
+        return body;
+    }
+
+    // Changes or removes the REST record of the fixture after it was indexed, keeping its file name.
+    private async Task ChangeAgentRecord(string change)
+    {
+        switch (change)
+        {
+            case "deleted":
+                File.Delete(Full(RestRecordPath));
+                break;
+            case "other-position":
+                await EditRecord(RestRecordPath, static json => json["order"] = 3);
+                break;
+            case "other-case":
+                await EditRecord(RestRecordPath, static json => json["caseId"] = "REST-getAgent-02");
+                break;
+            case "other-operation":
+                await EditRecord(RestRecordPath, static json => json["operation"] = "REST.getAgent");
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(change), change, null);
+        }
+    }
 
     private async Task Damage(string damage)
     {
@@ -2031,6 +2247,12 @@ public sealed partial class BinaryComparerTests
                 break;
             case "malformed-json":
                 await WriteRaw(RestRecordPath, "{\"order\":1,"u8.ToArray());
+                break;
+            case "invalid-utf8-body-text":
+                await WriteEscapedBodyTextTail(RestRecordPath, [0xFF, 0xFE]);
+                break;
+            case "lone-surrogate-body-text":
+                await WriteEscapedBodyTextTail(RestRecordPath, "\\uD800"u8.ToArray());
                 break;
             case "json-null":
                 await WriteRaw(RestRecordPath, "null"u8.ToArray());
@@ -2092,6 +2314,18 @@ public sealed partial class BinaryComparerTests
         }
     }
 
+    // Gives a record a response bodyText that starts with an escaped quote, so it is read through the unescaping
+    // path, and ends in tail, raw bytes no JSON writer produces: invalid UTF-8 or a lone surrogate escape.
+    private async Task WriteEscapedBodyTextTail(string relative, byte[] tail)
+    {
+        const string marker = "TAIL";
+        await EditRecord(relative, static json => json["response"]!["bodyText"] = "\"" + marker);
+        var bytes = await ReadBytes(relative);
+        var at = bytes.AsSpan().IndexOf(Encoding.ASCII.GetBytes(marker));
+        Assert.True(at > 0, "the marker is in the record");
+        await WriteRaw(relative, [.. bytes.AsSpan(0, at), .. tail, .. bytes.AsSpan(at + marker.Length)]);
+    }
+
     private async Task EditRecord(string relative, Action<JsonObject> edit)
     {
         var json = JsonNode.Parse(await ReadBytes(relative))!.AsObject();
@@ -2119,6 +2353,10 @@ public sealed partial class BinaryComparerTests
                 return Store.ReadRecordsAsync(cancellationToken);
             case "ReadEntriesAsync":
                 return Store.ReadEntriesAsync(cancellationToken);
+            case RecordIndexReader:
+                return Store.ReadRecordIndexAsync(cancellationToken);
+            case "ReadEntryAsync":
+                return Store.ReadEntryAsync(KeyOf(PhotoRecord), cancellationToken);
             case "ReadBodyBytesAsync:file":
                 return Store.ReadBodyBytesAsync(PhotoRecord, cancellationToken);
             case "ReadBodyBytesAsync:text":

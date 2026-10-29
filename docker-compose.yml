@@ -110,6 +110,8 @@ services:
     command: ["replay"]
     environment:
       Harness__RepoRoot: /repo
+      # HARNESS_REPORT_PATH must name a path under /repo, the bind mount of the checkout: replay refuses any
+      # other path with CHK-REPORT and exit 1, because a report written there would never reach the host.
       Harness__ReportPath: ${HARNESS_REPORT_PATH:-/repo/RESULTS.md}
       Harness__ExecutionMode: docker
       Harness__Target__RestBaseUrl: http://facade:65000

@@ -26,7 +26,9 @@ namespace Erewhon.Harness.Modes;
 /// <para>The request carries no header of its own: the admin listener is unauthenticated and contained by
 /// network placement. <c>Harness:Target:AdminUrl</c> must therefore be an absolute <c>http</c> or
 /// <c>https</c> URL without user information; it is checked before readiness, and no line quotes the
-/// setting. Every outcome is one console line and exit code 0 (written) or 1 (anything else);
+/// setting. The readiness wait is announced with its limit before it starts. Every outcome is one console
+/// line, and every line is printed through <see cref="LifecycleConsole.Display"/> so that no path or
+/// message can break it or drive the terminal; the exit code is 0 (written) or 1 (anything else).
 /// <see cref="RunAsync"/> never throws.</para>
 /// </remarks>
 /// <param name="options">The harness settings: the repository root, the facade admin URL, the request limit and the contract path.</param>
@@ -51,7 +53,8 @@ public sealed class ExportOpenApiMode(HarnessOptions options, TextWriter stdout)
         }
         catch (Exception ex)
         {
-            var line = $"{LinePrefix}failed: {ex.GetType().FullName}: {ex.Message}";
+            // Escaped once, for whichever sink takes it: the message can quote paths and parser input.
+            var line = LifecycleConsole.Display($"{LinePrefix}failed: {ex.GetType().FullName}: {ex.Message}");
             try
             {
                 _stdout.WriteLine(line);
@@ -104,6 +107,10 @@ public sealed class ExportOpenApiMode(HarnessOptions options, TextWriter stdout)
             return 1;
         }
 
+        // The wait can last the whole readiness limit, so it is announced; the URL is not quoted.
+        Print(string.Create(
+            CultureInfo.InvariantCulture,
+            $"waiting up to {_options.ReadinessTimeout.TotalSeconds:0} s for the {Component} admin listener"));
         using (var readiness = new Readiness(_options))
         {
             var notReady = await readiness.WaitAsync(Component, adminUrl, ct).ConfigureAwait(false);
@@ -223,5 +230,7 @@ public sealed class ExportOpenApiMode(HarnessOptions options, TextWriter stdout)
         }
     }
 
-    private void Print(string message) => _stdout.WriteLine(LinePrefix + message);
+    // Paths, URLs and parser messages are escaped by Display, so each message stays one inert line. A
+    // writer that throws reaches RunAsync's handler, which falls back to standard error.
+    private void Print(string message) => _stdout.WriteLine(LifecycleConsole.Display(LinePrefix + message));
 }

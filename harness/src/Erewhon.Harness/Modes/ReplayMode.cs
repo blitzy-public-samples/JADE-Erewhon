@@ -374,7 +374,11 @@ public sealed class ReplayRunState : IReportSource
 /// exception, cancellation included, as <c>CHK-EXCEPTION</c>. The <c>finally</c> runs the report attempt,
 /// the cleanup and the report rewrite, each inside its own <c>try</c>/<c>catch</c>, so a failure in one never
 /// skips the next. Cleanup uses <see cref="CancellationToken.None"/>, so a cancelled run (SIGTERM) still shuts
-/// its components down; every wait is bounded by the shutdown client's own limits.</para>
+/// its components down; every wait is bounded by the shutdown client's own limits. Each report write runs off
+/// the calling thread and is abandoned as failed, like a write that throws, when it has not finished within
+/// <see cref="ReportWriteLimit"/>, so a destination that stalls never keeps the run from its cleanup, its final
+/// line and its exit code. A blocked file-system call cannot be cancelled, so an abandoned write may still
+/// finish later; the printed report and the exit code 1 then remain the run's verdict.</para>
 /// <para>The exit code is 0 only when the last report write succeeded, the register documents every
 /// failing item, both those recorded here and those the report derives, and the report holds no captured
 /// case the replay left uncompared (<see cref="ResultsReport.UnaccountedCases"/>). <c>CHK-REPORT</c>,
@@ -390,6 +394,15 @@ public sealed class ReplayMode
     // Never quoted: a configured URL may carry a password, and the outcome does not depend on its text.
     private const string UnusableAdminUrl =
         "admin URL is blank or not an absolute http(s) URL without user information, so the stop cannot be requested or confirmed";
+
+    // How long one report write may take before it is abandoned as failed (AAP 0.8.4: no exit path waits
+    // indefinitely). Publishing RESULTS.md takes milliseconds, so only a destination that stalls reaches it.
+    private const int DefaultReportWriteLimitSeconds = 30;
+
+    // The longest wait Task.Delay accepts as a finite delay.
+    private static readonly TimeSpan MaximumReportWriteLimit = TimeSpan.FromMilliseconds(int.MaxValue);
+
+    private readonly TimeSpan _reportWriteLimit = TimeSpan.FromSeconds(DefaultReportWriteLimitSeconds);
 
     private readonly HarnessOptions _options;
     private readonly IReplayBody _body;
@@ -442,6 +455,19 @@ public sealed class ReplayMode
     /// <summary>The run state the report is built from; tests read the recorded items from it.</summary>
     public ReplayRunState State { get; }
 
+    /// <summary>
+    /// How long one report write may take before the mode abandons it and records <c>CHK-REPORT</c>
+    /// (<c>write-failed</c>); 30 s unless a test shortens it.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is not positive or is longer than a finite delay allows.</exception>
+    internal TimeSpan ReportWriteLimit
+    {
+        get => _reportWriteLimit;
+        init => _reportWriteLimit = value > TimeSpan.Zero && value <= MaximumReportWriteLimit
+            ? value
+            : throw new ArgumentOutOfRangeException(nameof(value), value, "The report-write limit must be positive and finite.");
+    }
+
     /// <summary>Runs the replay and its exit path. Call once per instance.</summary>
     /// <param name="ct">Cancels the body only; the report and cleanup always run.</param>
     /// <returns>
@@ -471,7 +497,7 @@ public sealed class ReplayMode
     {
         try
         {
-            AttemptReport();
+            await AttemptReportAsync().ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -496,7 +522,7 @@ public sealed class ReplayMode
             if (State.Failures.Count > countBefore)
             {
                 Print("cleanup added failing items; rewriting the report");
-                AttemptReport();
+                await AttemptReportAsync().ConfigureAwait(false);
             }
         }
         catch (Exception ex)
@@ -520,10 +546,10 @@ public sealed class ReplayMode
         }
     }
 
-    // Builds, renders and writes the report. A write failure records CHK-REPORT and prints the full
-    // report text, rebuilt so it shows that item; a build or render failure records CHK-REPORT and prints
-    // the plain failure list. Neither throws.
-    private void AttemptReport()
+    // Builds, renders and writes the report. A write failure, a write abandoned at the report-write limit
+    // included, records CHK-REPORT and prints the full report text, rebuilt so it shows that item; a build or
+    // render failure records CHK-REPORT and prints the plain failure list. Neither throws.
+    private async Task AttemptReportAsync()
     {
         ResultsReport report;
         string text;
@@ -544,7 +570,7 @@ public sealed class ReplayMode
         try
         {
             var path = _options.EffectiveReportPath;
-            _writer.Write(path, text);
+            await WriteWithinLimitAsync(path, text).ConfigureAwait(false);
             _lastWriteSucceeded = true;
             Print($"report written to {path}");
             return;
@@ -568,6 +594,34 @@ public sealed class ReplayMode
         }
 
         WriteRaw(text);
+    }
+
+    // Runs the write off the calling thread and waits at most the report-write limit for it; the write's own
+    // exception is rethrown. A write still running at the limit is abandoned with a TimeoutException: a
+    // blocked file-system call cannot be cancelled, so it is left to end on its own, and the exception it may
+    // end with is observed, so it never surfaces as an unobserved task exception.
+    private async Task WriteWithinLimitAsync(string path, string text)
+    {
+        var write = Task.Run(() => _writer.Write(path, text));
+        using (var expiry = new CancellationTokenSource())
+        {
+            var limit = Task.Delay(_reportWriteLimit, expiry.Token);
+            if (await Task.WhenAny(write, limit).ConfigureAwait(false) == write)
+            {
+                await expiry.CancelAsync().ConfigureAwait(false);
+                await write.ConfigureAwait(false);
+                return;
+            }
+        }
+
+        _ = write.ContinueWith(
+            static abandoned => { _ = abandoned.Exception; },
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+        throw new TimeoutException(string.Create(
+            CultureInfo.InvariantCulture,
+            $"the report write did not finish within {_reportWriteLimit.TotalSeconds:0.###} s and was abandoned"));
     }
 
     private void RecordReportFailure(string detail)
@@ -621,7 +675,8 @@ public sealed class ReplayMode
         }
     }
 
-    // Exit code first, then the undocumented items, then the final line, which nothing may follow.
+    // Exit code first, then the undocumented items, then the documented ones with the register entry that
+    // documents each, then the final line, which nothing may follow.
     private int Conclude()
     {
         var exitCode = 1;
@@ -653,7 +708,14 @@ public sealed class ReplayMode
                 $"{undocumented.Count} undocumented failing item(s); report {(_lastWriteSucceeded ? "written" : "not written")}; exit {exitCode}"));
             foreach (var item in undocumented)
             {
-                Print($"  {item.ItemId} {item.Nature}");
+                Print($"  {FailureItemDisplay.Describe(item)}");
+            }
+
+            var documented = DocumentedFailures();
+            Print(string.Create(CultureInfo.InvariantCulture, $"{documented.Count} documented failing item(s)"));
+            foreach (var (item, entry) in documented)
+            {
+                Print($"  {FailureItemDisplay.Describe(item)} (documented: {entry.Id})");
             }
 
             if (unaccounted.Count > 0)
@@ -684,11 +746,37 @@ public sealed class ReplayMode
         return exitCode;
     }
 
+    // The documented counterpart of Conclude's undocumented list, over the same items: the last report's
+    // documented failures in report order, then any recorded item the register documents that the report
+    // does not hold, each with the first entry, in file order, that documents it.
+    private List<(FailureItem Item, RegisterEntry Entry)> DocumentedFailures()
+    {
+        var documented = new List<(FailureItem Item, RegisterEntry Entry)>();
+        var listed = new HashSet<(string ItemId, string Nature)>();
+        foreach (var failure in _lastReport?.Failures ?? [])
+        {
+            if (failure is { Documented: true, Entry: { } entry } && listed.Add((failure.Item.ItemId, failure.Item.Nature)))
+            {
+                documented.Add((failure.Item, entry));
+            }
+        }
+
+        foreach (var item in State.Failures)
+        {
+            if (_register.FindEntry(item) is { } entry && listed.Add((item.ItemId, item.Nature)))
+            {
+                documented.Add((item, entry));
+            }
+        }
+
+        return documented;
+    }
+
     private void PrintFailureList()
     {
         foreach (var item in State.Failures)
         {
-            Print($"  {item.ItemId} {item.Nature}");
+            Print($"  {FailureItemDisplay.Describe(item)}");
         }
     }
 
@@ -770,7 +858,11 @@ public sealed class ReplayMode
 /// <para>Cases go to the facade (<c>Harness:Target:*</c>), exactly as recorded: method, raw path and
 /// query, the recorded headers and body, nothing added. The backend (<c>Harness:Backend:*</c>) is reached
 /// only for readiness, the reset and seed confirmation through its admin endpoints, and the WSDL contract
-/// check. An external backend (no admin URL) is never reset; the report records KL-SUB-NORESET.</para>
+/// check. An external backend (no admin URL) is never waited for or reset; the report records KL-SUB-NORESET.</para>
+/// <para>Readiness polls each admin <c>/health</c> up to the readiness limit, and a component that does not
+/// become ready is a <c>CHK-READY:&lt;component&gt;</c> item with nature <c>timeout</c>. The facade has no
+/// blank-URL exception: a blank <c>Harness:Target:AdminUrl</c> makes it not ready without a probe. No case
+/// is sent to a facade that is not ready; each is compared as <c>no-response:connect</c>.</para>
 /// <para>Every step runs inside a guard that records an exception as <c>CHK-EXCEPTION</c> and carries on,
 /// so one failing case or check never prevents the others. Only the caller's cancellation ends the body
 /// early, and <see cref="ReplayMode"/> still writes the report and shuts the components down.</para>
@@ -866,7 +958,6 @@ public sealed class ReplayBody(
         private const string LinePrefix = "replay: ";
         private const string DiscrepanciesDirectoryName = "discrepancies";
         private const string ReplayDirectoryName = "replay";
-        private const string ArtifactExtension = ".json";
         private const string ObservedBodyExtension = ".body";
         private const string ManifestName = "baseline/manifest.json";
         private const string ConformanceName = "baseline/conformance.json";
@@ -879,7 +970,9 @@ public sealed class ReplayBody(
 
         private BaselineManifest? _manifest;
         private CaseMatrix? _matrix;
-        private IReadOnlyList<BaselineEntry> _entries = [];
+        // Keys only, with no request, response or body: each record and its body are read and verified when
+        // its case is replayed, and dropped when that case ends.
+        private IReadOnlyList<BaselineRecordKey> _keys = [];
         private bool _recordsRead;
         private ResetExpectations _expectations = ResetExpectations.None;
         private Normaliser? _normaliser;
@@ -935,30 +1028,40 @@ public sealed class ReplayBody(
         // replay started, and openapi/ and wsdl/ belong to their checks.
         private void PrepareArtifacts()
         {
-            RecreateDirectory(Path.Combine(options.ArtifactsDirectory, DiscrepanciesDirectoryName));
-            RecreateDirectory(Path.Combine(options.ArtifactsDirectory, ReplayDirectoryName));
+            var artifacts = ArtifactTree();
+            artifacts.RecreateDirectory(Path.Combine(options.ArtifactsDirectory, DiscrepanciesDirectoryName));
+            artifacts.RecreateDirectory(Path.Combine(options.ArtifactsDirectory, ReplayDirectoryName));
         }
 
-        // A link is removed itself and never followed, so clearing can never delete anything outside
-        // artifacts/; a recursive delete removes nested links without following them either.
-        private static void RecreateDirectory(string path)
-        {
-            if (new FileInfo(path).LinkTarget is not null || File.Exists(path))
-            {
-                File.Delete(path);
-            }
-            else if (Directory.Exists(path))
-            {
-                Directory.Delete(path, recursive: true);
-            }
+        // Every artifact is cleared and written through directory handles anchored at the repository root, so
+        // nothing outside artifacts/ is ever deleted or written: a link at artifacts/ or at another directory on
+        // the way refuses the call before anything is deleted or written; a link at a directory being recreated,
+        // or anywhere inside it, is removed itself and never followed; a link at a file being written refuses the
+        // write; and a directory swapped for a link mid-way cannot redirect the handles already open.
+        private ConfinedTree ArtifactTree() => new(options.ResolvePath("."));
 
-            Directory.CreateDirectory(path);
-        }
-
+        // Readiness probes nothing for a blank admin URL, because only an external backend has none. The
+        // facade always has an admin listener, so a blank Harness:Target:AdminUrl means its readiness can
+        // never be established: the facade is not ready, with the item a wait that ran out records.
         private async Task WaitForComponentsAsync()
         {
+            const string blankFacadeAdminUrl = "Harness:Target:AdminUrl is blank, so the facade's /health cannot be polled";
+
             using var readiness = new Readiness(options, stdout);
-            var facade = readiness.WaitAsync(ShutdownTarget.FacadeComponent, options.Target.AdminUrl, ct);
+            Task<FailureItem?> facade;
+            if (string.IsNullOrWhiteSpace(options.Target.AdminUrl))
+            {
+                Print($"not ready: {ShutdownTarget.FacadeComponent} ({blankFacadeAdminUrl})");
+                facade = Task.FromResult<FailureItem?>(new FailureItem(
+                    FailureItemIds.Ready(ShutdownTarget.FacadeComponent),
+                    FailureItemIds.Timeout,
+                    Detail: blankFacadeAdminUrl));
+            }
+            else
+            {
+                facade = readiness.WaitAsync(ShutdownTarget.FacadeComponent, options.Target.AdminUrl, ct);
+            }
+
             var standIn = options.IsExternalBackend
                 ? Task.FromResult<FailureItem?>(null)
                 : readiness.WaitAsync(ShutdownTarget.StandInComponent, options.Backend.AdminUrl, ct);
@@ -987,7 +1090,7 @@ public sealed class ReplayBody(
             PrintBaseline(string.Create(
                 CultureInfo.InvariantCulture,
                 $"{ManifestName}: source {_manifest.Source}, capture execution {_manifest.CaptureExecution ?? "not recorded"}, "
-                + $"{_manifest.NotCaptured.Count} case(s) not captured, seed facts {(_manifest.HasSeedFacts ? "confirmed at every reset" : "absent")}"));
+                + $"{_manifest.NotCaptured.Count} case(s) not captured, seed facts {(_manifest.HasSeedFacts ? "recorded; to be confirmed at every reset" : "absent")}"));
         }
 
         private async Task ResetAtStartAsync()
@@ -1032,19 +1135,21 @@ public sealed class ReplayBody(
 
         private async Task ReadRecordsAsync()
         {
-            _entries = await _store.ReadEntriesAsync(ct).ConfigureAwait(false);
+            _keys = await _store.ReadRecordIndexAsync(ct).ConfigureAwait(false);
             _recordsRead = true;
 
             // The capture evidence, recorded before any case is replayed, so a case that is never compared
             // (no comparer, cancellation, a failed case step) is still reported as captured.
-            state.SetCaptured(_entries
-                .Where(entry => !string.IsNullOrWhiteSpace(entry.Record.Operation))
-                .GroupBy(entry => entry.Record.Operation, StringComparer.Ordinal)
+            state.SetCaptured(_keys
+                .Where(key => !string.IsNullOrWhiteSpace(key.Operation))
+                .GroupBy(key => key.Operation, StringComparer.Ordinal)
                 .ToDictionary(
                     group => group.Key,
-                    group => (IReadOnlyList<string>)group.Select(entry => entry.Record.CaseId).ToArray(),
+                    group => (IReadOnlyList<string>)group.Select(key => key.CaseId).ToArray(),
                     StringComparer.Ordinal));
-            PrintBaseline(string.Create(CultureInfo.InvariantCulture, $"{_entries.Count} baseline record(s) read and verified"));
+            PrintBaseline(string.Create(
+                CultureInfo.InvariantCulture,
+                $"{_keys.Count} baseline record(s) read; each body is verified when its case is replayed"));
         }
 
         private BaselineFacts DescribeBaseline()
@@ -1053,8 +1158,8 @@ public sealed class ReplayBody(
             return new BaselineFacts(
                 _matrix?.PlannedOperationCount ?? manifest?.Counts.PlannedOperations ?? 0,
                 _matrix?.PlannedCaseCount ?? manifest?.Counts.PlannedCases ?? 0,
-                _entries.Select(entry => entry.Record.Operation).Distinct(StringComparer.Ordinal).Count(),
-                _entries.Count,
+                _keys.Select(key => key.Operation).Distinct(StringComparer.Ordinal).Count(),
+                _keys.Count,
                 manifest?.NotCaptured ?? [],
                 _store.WsdlExists && (manifest is null || manifest.WsdlCaptured),
                 manifest is not null,
@@ -1064,8 +1169,10 @@ public sealed class ReplayBody(
         // Beyond the manifest's notCaptured list, a planned case without a baseline record is also reported
         // as not-captured: left unreported, its operation would read as a difference with no failing item
         // behind it, and the exit code, which judges failing items only, would pass an undocumented gap.
-        // Unlisted gaps are derived only from records that were read, so a damaged baseline is reported once,
-        // as the exception, rather than as every planned case.
+        // Unlisted gaps are derived only from the record keys that were read, so a damaged record file is
+        // reported once, as the exception, rather than as every planned case. A damaged body does not stop its
+        // record from being indexed: its case is listed as recorded and reports the exception when it is
+        // replayed.
         private void RecordNotCaptured()
         {
             var reasons = new List<(string CaseId, string Reason)>();
@@ -1080,7 +1187,7 @@ public sealed class ReplayBody(
 
             if (_recordsRead && _matrix is not null)
             {
-                var recorded = _entries.Select(entry => entry.Record.CaseId).ToHashSet(StringComparer.Ordinal);
+                var recorded = _keys.Select(key => key.CaseId).ToHashSet(StringComparer.Ordinal);
                 foreach (var definition in _matrix.Cases)
                 {
                     if (!recorded.Contains(definition.Id) && seen.Add(definition.Id))
@@ -1142,19 +1249,28 @@ public sealed class ReplayBody(
             {
                 Print(string.Create(
                     CultureInfo.InvariantCulture,
-                    $"no comparer could be built, so none of the {_entries.Count} record(s) is compared"));
+                    $"no comparer could be built, so none of the {_keys.Count} record(s) is compared"));
                 return;
             }
 
-            foreach (var entry in _entries)
+            // Each record and its body are read and verified once, inside the case's guard, and are unreachable
+            // once the iteration ends, so replay holds one baseline record and one body at a time. A record file
+            // changed or removed since it was indexed, or a body that is missing or does not hash to its
+            // bodySha256, becomes that case's CHK-EXCEPTION, and the other cases still run.
+            foreach (var key in _keys)
             {
                 ct.ThrowIfCancellationRequested();
-                await Guard($"replay case {entry.Record.CaseId}", () => ReplayCaseAsync(entry, _comparer)).ConfigureAwait(false);
+                await Guard($"replay case {key.CaseId}", async () =>
+                {
+                    var entry = await _store.ReadEntryAsync(key, ct).ConfigureAwait(false);
+                    await ReplayCaseAsync(entry, _comparer).ConfigureAwait(false);
+                }).ConfigureAwait(false);
             }
         }
 
-        // The empty-state case is bracketed by an empty reset before it and a seed reset after it, which
-        // runs even when the case itself fails, so no later state depends on it (AAP 0.7.3).
+        // The empty-state case is bracketed by an empty reset before it and a seed reset after it, so no later
+        // state depends on it (AAP 0.7.3). The empty reset runs inside the protected block, so once it has
+        // started the seed reset runs whatever happens (the case failing, the run being cancelled included).
         private async Task ReplayCaseAsync(BaselineEntry entry, ResponseComparer comparer)
         {
             var record = entry.Record;
@@ -1162,21 +1278,41 @@ public sealed class ReplayBody(
             var bracketed = string.Equals(record.PreState, CasePreStates.Empty, StringComparison.Ordinal)
                 && !options.IsExternalBackend;
 
-            if (bracketed)
-            {
-                await ResetAsync(ResetPoints.Before(record.CaseId), AdminRoutes.ResetStateEmpty).ConfigureAwait(false);
-            }
-
             try
             {
+                if (bracketed)
+                {
+                    await ResetAsync(ResetPoints.Before(record.CaseId), AdminRoutes.ResetStateEmpty).ConfigureAwait(false);
+                }
+
                 await CompareCaseAsync(entry, operation, comparer).ConfigureAwait(false);
             }
             finally
             {
                 if (bracketed)
                 {
-                    await ResetAsync(ResetPoints.After(record.CaseId), AdminRoutes.ResetStateSeed).ConfigureAwait(false);
+                    await RestoreSeedAsync(record.CaseId).ConfigureAwait(false);
                 }
+            }
+        }
+
+        // The seed reset closing the empty-state bracket. It takes CancellationToken.None rather than the run
+        // token, so it still runs after the run was cancelled; it stays bounded because StateReset bounds each
+        // of its at most three admin requests by HarnessOptions.RequestTimeout. It never throws, so the case's
+        // own failure or the run's cancellation propagates unchanged: a mismatch is a CHK-RESET item like every
+        // other reset's, and any other failure of the restore a CHK-EXCEPTION item of its own.
+        private async Task RestoreSeedAsync(string caseId)
+        {
+            try
+            {
+                var result = await reset
+                    .ResetAsync(ResetPoints.After(caseId), AdminRoutes.ResetStateSeed, _expectations, CancellationToken.None)
+                    .ConfigureAwait(false);
+                state.AddFailures(result.Failures);
+            }
+            catch (Exception ex)
+            {
+                RecordStepFailure($"seed restoration after {caseId}", ex);
             }
         }
 
@@ -1249,8 +1385,7 @@ public sealed class ReplayBody(
             {
                 var directory = Path.Combine(options.ArtifactsDirectory, ReplayDirectoryName, BaselineStore.SurfaceDirectoryName(record.CaseId));
                 var stem = Path.GetFileNameWithoutExtension(BaselineStore.RecordFileName(record));
-                Directory.CreateDirectory(directory);
-                await File.WriteAllBytesAsync(Path.Combine(directory, stem + ObservedBodyExtension), body, ct).ConfigureAwait(false);
+                await ArtifactTree().WriteFileAsync(Path.Combine(directory, stem + ObservedBodyExtension), body, ct).ConfigureAwait(false);
             }
             catch (Exception ex) when (IsArtifactFailure(ex))
             {
@@ -1265,9 +1400,8 @@ public sealed class ReplayBody(
             try
             {
                 var directory = Path.Combine(options.ArtifactsDirectory, DiscrepanciesDirectoryName);
-                Directory.CreateDirectory(directory);
-                var path = Path.Combine(directory, DiscrepancySignature.SanitiseFileName(item.ItemId) + ArtifactExtension);
-                await File.WriteAllBytesAsync(path, BaselineStore.SerializeDocument(canonical.ToArtifact(item)), ct).ConfigureAwait(false);
+                var path = Path.Combine(directory, DiscrepancySignature.ArtifactFileName(item.ItemId));
+                await ArtifactTree().WriteFileAsync(path, BaselineStore.SerializeDocument(canonical.ToArtifact(item)), ct).ConfigureAwait(false);
                 return null;
             }
             catch (Exception ex) when (IsArtifactFailure(ex))
@@ -1296,7 +1430,7 @@ public sealed class ReplayBody(
             var node = await _store.TryReadConformanceAsync(ct).ConfigureAwait(false);
             if (node is null)
             {
-                if (_manifest is { IsNotRun: false } || _entries.Count > 0)
+                if (_manifest is { IsNotRun: false } || _keys.Count > 0)
                 {
                     const string detail = $"{ConformanceName} absent although the baseline was captured";
                     state.SetCheck(NotRun(CheckNames.Conformance, detail));

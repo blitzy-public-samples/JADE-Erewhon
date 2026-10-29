@@ -337,21 +337,23 @@ public static class ResetPoints
 /// </remarks>
 public sealed class StateReset : IDisposable
 {
-    private const string HttpField = "http";
-    private const string GenerationField = "generation";
-    private const string MutationsField = "mutations";
-    private const string SourceField = "source";
-    private const string SeedSha256Field = "seedSha256";
-    private const string ReferenceDateField = "referenceDate";
+    // The mismatch fields and observed tokens are internal so FailureItemDisplay decides from the same
+    // spellings which observed values a console line may show.
+    internal const string HttpField = "http";
+    internal const string GenerationField = "generation";
+    internal const string MutationsField = "mutations";
+    internal const string SourceField = "source";
+    internal const string SeedSha256Field = "seedSha256";
+    internal const string ReferenceDateField = "referenceDate";
 
-    private const string ConnectFailure = "connect";
-    private const string TimeoutFailure = "timeout";
-    private const string ResetFailure = "reset";
-    private const string InvalidBodyFailure = "invalid";
-    private const string InvalidUrlFailure = "invalid-url";
-    private const string InfoFailurePrefix = "info-";
-    private const string BeforeFailurePrefix = "before-";
-    private const string NullObserved = "null";
+    internal const string ConnectFailure = "connect";
+    internal const string TimeoutFailure = "timeout";
+    internal const string ResetFailure = "reset";
+    internal const string InvalidBodyFailure = "invalid";
+    internal const string InvalidUrlFailure = "invalid-url";
+    internal const string InfoFailurePrefix = "info-";
+    internal const string BeforeFailurePrefix = "before-";
+    internal const string NullObserved = "null";
 
     private const string DateFormat = "yyyy-MM-dd";
 
@@ -592,8 +594,12 @@ public sealed class StateReset : IDisposable
         string observed,
         string detail)
     {
+        // The item keeps the exact value; the console line shows only what FailureItemDisplay allows, because
+        // a wrong backend can put personal data into any field it reports.
         failures.Add(new FailureItem(FailureItemIds.Reset(point), FailureItemIds.Mismatch(field, observed), Detail: detail));
-        LifecycleConsole.WriteLine(_output, $"{SourceLabels.ConsolePrefix} reset {state} at {point}: mismatch {field} observed {observed}");
+        LifecycleConsole.WriteLine(
+            _output,
+            $"{SourceLabels.ConsolePrefix} reset {state} at {point}: mismatch {field} observed {FailureItemDisplay.Observed(field, observed)}");
     }
 
     private async Task<InfoRead> ReadInfoCoreAsync(Uri infoUri, CancellationToken ct)

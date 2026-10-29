@@ -103,33 +103,39 @@ public sealed class ConformanceCheck
     // body types carry a result status code, but not the property name.
     private const string ResultStatusCodeProperty = "statusCode";
 
-    private const string AbsentObservation = "absent";
+    /// <summary>
+    /// The observed value of a seed-token assertion whose client or property is missing. No compact JSON
+    /// value has this text, so the lifecycle console's failure display shows it on the console as it is.
+    /// </summary>
+    internal const string AbsentObservation = "absent";
 
     // The SOAP 1.1 envelope's local names; they are evidence only in the catalogue's envelope namespace.
     private const string SoapEnvelopeElement = "Envelope";
     private const string SoapBodyElement = "Body";
 
-    // Wrong wire-type tokens (AAP 0.7.7 nature wrong-type:<observed type>).
-    private const string JsonObjectToken = "object";
-    private const string JsonArrayToken = "array";
-    private const string JsonStringToken = "string";
-    private const string JsonNumberToken = "number";
-    private const string JsonBooleanToken = "boolean";
-    private const string XmlElementToken = "element";
-    private const string XmlTextToken = "text";
+    // Wrong wire-type tokens (AAP 0.7.7 nature wrong-type:<observed type>). They, the two collection
+    // prefixes and the two xsi:type tokens below are internal so FailureItemDisplay decides from the same
+    // spellings which part of a wrong-type nature a console line may show.
+    internal const string JsonObjectToken = "object";
+    internal const string JsonArrayToken = "array";
+    internal const string JsonStringToken = "string";
+    internal const string JsonNumberToken = "number";
+    internal const string JsonBooleanToken = "boolean";
+    internal const string XmlElementToken = "element";
+    internal const string XmlTextToken = "text";
 
     // Wrong wire-type tokens of a collection's contents: the offending item's own token after the item
     // prefix, or the name of an XML item element the array does not name after the item-name prefix (its
     // local name in the target namespace, its Clark name {namespace}local in any other).
-    private const string CollectionItemPrefix = "item:";
-    private const string CollectionItemNamePrefix = "item-name:";
+    internal const string CollectionItemPrefix = "item:";
+    internal const string CollectionItemNamePrefix = "item-name:";
 
     // Wrong wire-type tokens of a DTO element whose xsi:type names no catalogue DTO of the declared kind
     // in the target namespace: the Clark name {namespace}local its QName resolves to after the prefix, or
     // the unresolved token when it is no QName or its prefix is unbound. A Clark name always starts with
     // '{', so the two forms never collide.
-    private const string XsiTypeTokenPrefix = "xsi-type:";
-    private const string UnresolvedXsiTypeToken = XsiTypeTokenPrefix + "unresolved";
+    internal const string XsiTypeTokenPrefix = "xsi-type:";
+    internal const string UnresolvedXsiTypeToken = XsiTypeTokenPrefix + "unresolved";
 
     // The JSON wire token each JADE primitive must carry in OperationCatalogue.WireTypes.
     private const string StringJsonToken = "string";

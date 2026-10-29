@@ -17,6 +17,13 @@
 // assertion message, so every message and Assert.Equal operand here is run-invariant: no port, URL,
 // elapsed time or GUID. Timing bounds are Assert.True calls with fixed messages.
 
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Xml.Linq;
 using Erewhon.Contracts.Catalogue;
@@ -491,5 +498,468 @@ public sealed class LogLevelFloorsTests
                 .AddLogLevelFloor("Yarp", LogLevel.Error);
         });
         return services.BuildServiceProvider();
+    }
+}
+
+// Forwarding transport (class ForwardingTransportTests) sits here, because its single-delivery cases
+// end in the facade's unreachable-backend 502 or SOAP Fault, as a class of its own: the results
+// report counts test classes whose names end in "FailureBehaviourTests" as the six-case
+// unreachable and timeout check, and this name matches none.
+//
+// Transport fidelity of forwarding, observed as raw bytes on both sides of the facade: a body-less write,
+// and a write sent with Expect: 100-continue with or without a body, reaches a backend that closes the
+// connection without answering exactly once, a body-less request keeps the wire form the HTTP stack gives
+// it, and header values outside ASCII pass byte for byte in both directions. The backends are raw TcpListener sockets and the caller is a raw socket, because HttpClient
+// adds Content-Length: 0 to a body-less write and refuses non-ASCII header values on the test's own side,
+// and a Kestrel stub would decode the bytes it is meant to record.
+//
+// Failures are identified across runs by a signature over the exception type, the failing line and the
+// assertion message, so every message and Assert.Equal operand here is run-invariant: the backend's
+// authority is replaced by a fixed token before request heads are compared, and no port, URL or elapsed
+// time appears in a message.
+/// <summary>
+/// Raw-byte checks of what the facade sends to a backend and returns to a caller: single delivery of
+/// body-less writes and of writes sent with <c>Expect: 100-continue</c>, the unchanged wire form of
+/// body-less requests, and Latin-1 header bytes in both directions.
+/// </summary>
+public sealed class ForwardingTransportTests
+{
+    private const string PostCreateTenderId = "Rest.postCreateTender";
+    private const string PostCreateAgentId = "Rest.postCreateAgent";
+    private const string GetCompanyId = "Rest.getCompany";
+
+    // A REST target that is no catalogue operation, which the REST catch-all forwards to the default target.
+    private const string UnmatchedTarget = "/x";
+
+    // Stands for the backend's authority (127.0.0.1:<port>) in every compared request head.
+    private const string BackendAuthorityToken = "{backend}";
+
+    private const string ProbeHeader = "X-Probe: one\r\n";
+
+    // Makes Kestrel report the request as upgradable; YARP tunnels only WebSocket and SPDY/* upgrades and
+    // drops these hop-by-hop headers from any other request.
+    private const string UntunnelledUpgradeHeaders = "Connection: Upgrade\r\nUpgrade: foo\r\n";
+    private const string ContentLengthZero = "Content-Length: 0\r\n";
+    private const string ExpectContinueHeader = "Expect: 100-continue\r\n";
+    private const string ProblemContentTypeLine = "\r\nContent-Type: application/problem+json\r\n";
+
+    // UTF-8 "Zoë" and Latin-1 "café" as raw header lines; Latin-1 maps each byte to one char, so these
+    // strings and their Encoding.Latin1 bytes are the same octets.
+    private const string Utf8NameHeader = "X-Name: Zo\u00c3\u00ab\r\n";
+    private const string Latin1ResponseHeader = "X-Latin: caf\u00e9\r\n";
+    private const string Utf8ResponseHeader = "X-Utf8: Zo\u00c3\u00ab\r\n";
+    private const string BackendBody = "{\"stub\":\"hdr\"}";
+
+    private static readonly TimeSpan RawCallerTimeout = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Body-less writes and the headers they carry: the path-only catalogue write <c>postCreateTender</c>,
+    /// alone, with <c>Expect: 100-continue</c>, and with an explicit <c>Content-Length: 0</c> as well; a
+    /// <c>PUT</c> and a custom method sent to the REST catch-all; and a <c>POST</c> asking for an upgrade
+    /// the forwarder does not tunnel, which it forwards as an ordinary request.
+    /// </summary>
+    public static TheoryData<string, string, string> BodylessWrites() => new()
+    {
+        { "POST", CatalogueTarget(PostCreateTenderId), ProbeHeader },
+        { "POST", CatalogueTarget(PostCreateTenderId), ExpectContinueHeader },
+        { "POST", CatalogueTarget(PostCreateTenderId), ContentLengthZero + ExpectContinueHeader },
+        { "PUT", UnmatchedTarget, ProbeHeader },
+        { "FOO", UnmatchedTarget, ProbeHeader },
+        { "POST", UnmatchedTarget, UntunnelledUpgradeHeaders },
+    };
+
+    /// <summary>
+    /// Whether the body of a write sent with <c>Expect: 100-continue</c> is chunked rather than framed by
+    /// <c>Content-Length</c>.
+    /// </summary>
+    public static TheoryData<bool> ExpectContinueBodyFramings() => new() { false, true };
+
+    /// <summary>
+    /// Body-less requests, whether the HTTP stack writes <c>Content-Length: 0</c> for their method, and
+    /// whether the facade sends them to a backend that closes unanswered exactly once. Both hold for
+    /// <c>POST</c>. <c>GET</c> and <c>DELETE</c> get no <c>Content-Length</c>; they are forwarded without
+    /// content so that no framing header is added, which leaves the HTTP stack free to resend them.
+    /// </summary>
+    public static TheoryData<string, string, bool, bool> BodylessHeads() => new()
+    {
+        { "POST", CatalogueTarget(PostCreateTenderId), true, true },
+        { "GET", CatalogueTarget(GetCompanyId), false, false },
+        { "DELETE", UnmatchedTarget, false, false },
+    };
+
+    [Theory]
+    [MemberData(nameof(BodylessWrites))]
+    public async Task BodylessWriteToBackendThatClosesUnansweredIsSentOnce(string method, string target, string headers)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await using RawBackend backend = RawBackend.Start(reply: null);
+        await using FacadeFactory facade = await StartFacadeAsync(backend, ct);
+
+        RawExchange response = await SendRawAsync(facade.RestPort, CallerHead(method, target, headers), ct);
+
+        Assert.Equal(502, response.Status);
+        Assert.True(
+            response.Head.Contains(ProblemContentTypeLine, StringComparison.Ordinal),
+            "unanswered body-less write did not get the facade's problem+json response");
+        Assert.True(backend.Heads.Count == 1, "body-less write did not reach the closing backend exactly once");
+    }
+
+    [Theory]
+    [MemberData(nameof(ExpectContinueBodyFramings))]
+    public async Task WriteWithBodyAndExpectContinueToBackendThatClosesUnansweredIsSentOnce(bool chunked)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await using RawBackend backend = RawBackend.Start(reply: null);
+        await using FacadeFactory facade = await StartFacadeAsync(backend, ct);
+        PreparedRequest write = OperationRequests.ForRest(OperationCatalogue.Default.GetById(PostCreateAgentId));
+        string body = Encoding.Latin1.GetString(write.Body!);
+        string length = body.Length.ToString(chunked ? "x" : "D", CultureInfo.InvariantCulture);
+        string headers = "Content-Type: " + write.ContentType + "\r\n"
+            + (chunked ? "Transfer-Encoding: chunked\r\n" : "Content-Length: " + length + "\r\n")
+            + ExpectContinueHeader;
+        string framedBody = chunked ? length + "\r\n" + body + "\r\n0\r\n\r\n" : body;
+
+        RawExchange response = await SendRawAsync(
+            facade.RestPort, CallerHead(write.Method.Method, write.PathAndQuery, headers, framedBody), ct);
+
+        Assert.Equal(502, response.Status);
+        Assert.True(
+            response.Head.Contains(ProblemContentTypeLine, StringComparison.Ordinal),
+            "unanswered write with a body did not get the facade's problem+json response");
+        IReadOnlyList<byte[]> heads = backend.Heads;
+        Assert.True(heads.Count == 1, "write with a body and Expect: 100-continue did not reach the closing backend exactly once");
+        Assert.True(
+            backend.Normalise(heads[0]).Contains("\r\n" + ExpectContinueHeader, StringComparison.Ordinal),
+            "Expect: 100-continue did not reach the backend unchanged");
+    }
+
+    // The backend answers the first request on a connection and keeps it open, then closes it on the
+    // next request without answering, as a backend that fails after receiving a write on a pooled
+    // connection does. A resend would go out on a new connection, where the backend answers again.
+    [Fact]
+    public async Task ExpectContinueWriteOnReusedConnectionToBackendThatClosesUnansweredIsSentOnce()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        byte[] reply = Encoding.Latin1.GetBytes(
+            "HTTP/1.1 200 OK\r\n"
+            + "Content-Type: application/json\r\n"
+            + "Content-Length: " + BackendBody.Length.ToString(CultureInfo.InvariantCulture) + "\r\n"
+            + "\r\n"
+            + BackendBody);
+        await using RawBackend backend = RawBackend.Start(reply, closeNextUnanswered: true);
+        await using FacadeFactory facade = await StartFacadeAsync(backend, ct);
+
+        RawExchange first = await SendRawAsync(
+            facade.RestPort, CallerHead("GET", CatalogueTarget(GetCompanyId), ProbeHeader), ct);
+        RawExchange write = await SendRawAsync(
+            facade.RestPort, CallerHead("POST", CatalogueTarget(PostCreateTenderId), ExpectContinueHeader), ct);
+
+        Assert.Equal(200, first.Status);
+        Assert.Equal(502, write.Status);
+        Assert.True(
+            write.Head.Contains(ProblemContentTypeLine, StringComparison.Ordinal),
+            "unanswered write on a reused connection did not get the facade's problem+json response");
+        Assert.True(
+            backend.Heads.Count == 2,
+            "write on a reused connection did not reach the closing backend exactly once");
+    }
+
+    [Theory]
+    [MemberData(nameof(BodylessHeads))]
+    public async Task BodylessRequestKeepsItsWireForm(string method, string target, bool contentLengthZero, bool sentOnce)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await using RawBackend backend = RawBackend.Start(reply: null);
+        await using FacadeFactory facade = await StartFacadeAsync(backend, ct);
+
+        RawExchange response = await SendRawAsync(facade.RestPort, CallerHead(method, target, ProbeHeader), ct);
+
+        Assert.Equal(502, response.Status);
+        IReadOnlyList<byte[]> heads = backend.Heads;
+        if (sentOnce)
+        {
+            Assert.True(heads.Count == 1, "body-less write did not reach the closing backend exactly once");
+        }
+        else
+        {
+            Assert.True(heads.Count >= 1, "body-less request did not reach the backend");
+        }
+
+        string expected = method + " " + target + " HTTP/1.1\r\n"
+            + "Host: " + BackendAuthorityToken + "\r\n"
+            + ProbeHeader
+            + (contentLengthZero ? ContentLengthZero : string.Empty)
+            + "\r\n";
+        foreach (byte[] head in heads)
+        {
+            Assert.Equal(expected, backend.Normalise(head));
+        }
+    }
+
+    [Fact]
+    public async Task NonAsciiHeaderBytesPassThroughBothWays()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        byte[] reply = Encoding.Latin1.GetBytes(
+            "HTTP/1.1 200 OK\r\n"
+            + "Content-Type: application/json\r\n"
+            + Latin1ResponseHeader
+            + Utf8ResponseHeader
+            + "Content-Length: " + BackendBody.Length.ToString(CultureInfo.InvariantCulture) + "\r\n"
+            + "Connection: close\r\n"
+            + "\r\n"
+            + BackendBody);
+        await using RawBackend backend = RawBackend.Start(reply);
+        await using FacadeFactory facade = await StartFacadeAsync(backend, ct);
+        string target = CatalogueTarget(GetCompanyId);
+
+        RawExchange response = await SendRawAsync(facade.RestPort, CallerHead("GET", target, Utf8NameHeader), ct);
+
+        IReadOnlyList<byte[]> heads = backend.Heads;
+        Assert.True(heads.Count == 1, "request with a non-ASCII header did not reach the backend exactly once");
+        Assert.Equal(
+            "GET " + target + " HTTP/1.1\r\nHost: " + BackendAuthorityToken + "\r\n" + Utf8NameHeader + "\r\n",
+            backend.Normalise(heads[0]));
+
+        Assert.Equal(200, response.Status);
+        Assert.True(
+            response.Head.Contains("\r\n" + Latin1ResponseHeader, StringComparison.Ordinal),
+            "Latin-1 response header bytes did not reach the caller unchanged");
+        Assert.True(
+            response.Head.Contains("\r\n" + Utf8ResponseHeader, StringComparison.Ordinal),
+            "UTF-8 response header bytes did not reach the caller unchanged");
+        Assert.Equal(BackendBody, Encoding.Latin1.GetString(response.Body));
+    }
+
+    // The raw target of a catalogue REST operation at its normal address, with the catalogue's verb.
+    private static string CatalogueTarget(string operationId) =>
+        OperationRequests.ForRest(OperationCatalogue.Default.GetById(operationId)).PathAndQuery;
+
+    private static Task<FacadeFactory> StartFacadeAsync(RawBackend backend, CancellationToken ct) =>
+        FacadeFactory.StartAsync(
+            new FacadeTestSettings { BackendRestBaseUrl = backend.BaseUrl, BackendSoapBaseUrl = backend.BaseUrl },
+            ct);
+
+    // An HTTP/1.1 request head that frames no body unless extraHeaders carries a Content-Length or
+    // Transfer-Encoding, followed by the already framed body bytes. Connection: close is hop-by-hop, so it
+    // never reaches the backend; it makes the facade close the connection after answering, which ends the
+    // caller's read. The Host value is not forwarded either.
+    private static byte[] CallerHead(string method, string target, string extraHeaders, string framedBody = "") =>
+        Encoding.Latin1.GetBytes(
+            method + " " + target + " HTTP/1.1\r\nHost: facade\r\n" + extraHeaders + "Connection: close\r\n\r\n"
+            + framedBody);
+
+    // Sends the raw request to the facade's REST socket and reads until the facade closes the connection.
+    private static async Task<RawExchange> SendRawAsync(int port, byte[] request, CancellationToken ct)
+    {
+        using var limit = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        limit.CancelAfter(RawCallerTimeout);
+        byte[] received;
+        try
+        {
+            using var client = new TcpClient(AddressFamily.InterNetwork);
+            await client.ConnectAsync(IPAddress.Loopback, port, limit.Token);
+            NetworkStream stream = client.GetStream();
+            await stream.WriteAsync(request, limit.Token);
+
+            using var buffer = new MemoryStream();
+            await stream.CopyToAsync(buffer, limit.Token);
+            received = buffer.ToArray();
+        }
+        catch (Exception exception) when (
+            exception is SocketException or IOException
+            || (exception is OperationCanceledException && !ct.IsCancellationRequested))
+        {
+            Assert.Fail("raw facade request failed at the transport level (" + exception.GetType().Name + ")");
+            throw new UnreachableException();
+        }
+
+        return RawExchange.Parse(received);
+    }
+
+    /// <summary>The final response as the raw caller received it.</summary>
+    /// <param name="Status">The status code from the status line.</param>
+    /// <param name="Head">The status line and header section, terminator included, one char per byte.</param>
+    /// <param name="Body">The bytes after the header section.</param>
+    private sealed record RawExchange(int Status, string Head, byte[] Body)
+    {
+        // Skips interim 1xx responses, such as the 100 Continue the facade's server writes once the body
+        // of a request sent with Expect: 100-continue is first read.
+        public static RawExchange Parse(byte[] received)
+        {
+            int start = 0;
+            while (true)
+            {
+                int end = received.AsSpan(start).IndexOf("\r\n\r\n"u8);
+                Assert.True(end >= 0, "facade response has no complete header section");
+
+                string head = Encoding.Latin1.GetString(received, start, end + 4);
+                string[] statusLine = head[..head.IndexOf('\r', StringComparison.Ordinal)].Split(' ');
+                Assert.True(
+                    statusLine.Length >= 2 && int.TryParse(statusLine[1], NumberStyles.None, CultureInfo.InvariantCulture, out _),
+                    "facade response has no status code");
+
+                int status = int.Parse(statusLine[1], NumberStyles.None, CultureInfo.InvariantCulture);
+                start += end + 4;
+                if (status >= 200)
+                {
+                    return new RawExchange(status, head, received[start..]);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// A backend on a raw loopback socket that records the bytes of every request head it receives and
+    /// then either closes the connection without answering or writes a fixed reply and closes, or, after
+    /// the reply, keeps the connection open for one more request head and closes without answering it.
+    /// </summary>
+    private sealed class RawBackend : IAsyncDisposable
+    {
+        private const int MaxHeadBytes = 64 * 1024;
+
+        private static readonly TimeSpan ConnectionLimit = TimeSpan.FromSeconds(15);
+
+        private readonly TcpListener _listener;
+        private readonly byte[]? _reply;
+        private readonly bool _closeNextUnanswered;
+        private readonly ConcurrentQueue<byte[]> _heads = new();
+        private readonly ConcurrentQueue<Task> _connections = new();
+        private readonly CancellationTokenSource _stop = new();
+        private readonly Task _acceptLoop;
+        private int _disposed;
+
+        private RawBackend(byte[]? reply, bool closeNextUnanswered)
+        {
+            _reply = reply;
+            _closeNextUnanswered = closeNextUnanswered;
+            _listener = new TcpListener(IPAddress.Loopback, 0);
+            _listener.Start();
+            int port = ((IPEndPoint)_listener.LocalEndpoint).Port;
+            Authority = "127.0.0.1:" + port.ToString(CultureInfo.InvariantCulture);
+            _acceptLoop = AcceptLoopAsync();
+        }
+
+        /// <summary>The <c>host:port</c> the backend listens on, as the facade's <c>Host</c> header names it.</summary>
+        public string Authority { get; }
+
+        /// <summary>The base URL to route a target to.</summary>
+        public string BaseUrl => "http://" + Authority;
+
+        /// <summary>The request heads received so far, in arrival order, terminator included.</summary>
+        public IReadOnlyList<byte[]> Heads => [.. _heads];
+
+        /// <summary>Starts listening on a free loopback port.</summary>
+        /// <param name="reply">
+        /// The bytes written after the first request head on each connection; null to close without answering.
+        /// </param>
+        /// <param name="closeNextUnanswered">
+        /// True to keep each connection open after <paramref name="reply"/>, record the next request head on
+        /// it and close without answering; <paramref name="reply"/> must then keep the connection alive.
+        /// </param>
+        /// <returns>The listening backend; the caller disposes it.</returns>
+        public static RawBackend Start(byte[]? reply, bool closeNextUnanswered = false) => new(reply, closeNextUnanswered);
+
+        /// <summary>Returns a head as one char per byte, with this backend's authority replaced by a fixed token.</summary>
+        /// <param name="head">A head from <see cref="Heads"/>.</param>
+        /// <returns>The run-invariant head text.</returns>
+        public string Normalise(byte[] head) =>
+            Encoding.Latin1.GetString(head).Replace(Authority, BackendAuthorityToken, StringComparison.Ordinal);
+
+        /// <summary>Stops listening and waits for every connection to end. Safe to call more than once; never throws.</summary>
+        public async ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            await _stop.CancelAsync();
+            _listener.Stop();
+            await _acceptLoop;
+            await Task.WhenAll(_connections);
+            _stop.Dispose();
+        }
+
+        private async Task AcceptLoopAsync()
+        {
+            while (true)
+            {
+                Socket socket;
+                try
+                {
+                    socket = await _listener.AcceptSocketAsync(_stop.Token);
+                }
+                catch (Exception exception) when (exception is OperationCanceledException or SocketException or ObjectDisposedException)
+                {
+                    return;
+                }
+
+                _connections.Enqueue(ServeAsync(socket));
+            }
+        }
+
+        // The head is recorded before the connection closes, so by the time the facade sees the close, and
+        // so before it answers its caller, the head is counted.
+        private async Task ServeAsync(Socket socket)
+        {
+            using (socket)
+            {
+                using var limit = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+                limit.CancelAfter(ConnectionLimit);
+                try
+                {
+                    using var stream = new NetworkStream(socket, ownsSocket: false);
+                    byte[] head = await ReadHeadAsync(stream, limit.Token);
+                    if (head.Length > 0)
+                    {
+                        _heads.Enqueue(head);
+                        if (_reply is not null)
+                        {
+                            await stream.WriteAsync(_reply, limit.Token);
+                            if (_closeNextUnanswered)
+                            {
+                                byte[] next = await ReadHeadAsync(stream, limit.Token);
+                                if (next.Length > 0)
+                                {
+                                    _heads.Enqueue(next);
+                                }
+                            }
+                        }
+                    }
+
+                    socket.Shutdown(SocketShutdown.Both);
+                }
+                catch (Exception exception) when (exception is OperationCanceledException or SocketException or IOException or ObjectDisposedException)
+                {
+                    // The facade or the test ended the connection first; the head, if any, is already recorded.
+                }
+            }
+        }
+
+        // Reads up to and including the blank line that ends the header section, or whatever arrived before
+        // the peer closed or the bound was reached.
+        private static async Task<byte[]> ReadHeadAsync(NetworkStream stream, CancellationToken ct)
+        {
+            var head = new List<byte>();
+            byte[] buffer = new byte[4096];
+            while (head.Count < MaxHeadBytes)
+            {
+                int read = await stream.ReadAsync(buffer, ct);
+                if (read == 0)
+                {
+                    break;
+                }
+
+                head.AddRange(buffer.AsSpan(0, read));
+                int end = CollectionsMarshal.AsSpan(head).IndexOf("\r\n\r\n"u8);
+                if (end >= 0)
+                {
+                    return [.. head.GetRange(0, end + 4)];
+                }
+            }
+
+            return [.. head];
+        }
     }
 }

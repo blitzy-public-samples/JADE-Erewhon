@@ -13,7 +13,7 @@ namespace Erewhon.Facade.Routing;
 /// <remarks>
 /// Equal configuration gives equal records, so <c>BackendForwarder</c> keys one
 /// <c>HttpMessageInvoker</c> per distinct target on this record, and a changed URL or deadline becomes
-/// a new key.
+/// a new key. The superseded key's invoker is disposed once the calls still using it have finished.
 /// </remarks>
 /// <param name="Name">The target's key under <c>Routing:Targets</c>, spelled as configured.</param>
 /// <param name="BaseUrl">
@@ -212,6 +212,20 @@ public sealed partial class OperationRouter
     /// <exception cref="InvalidOperationException">The configuration cannot be bound and no table has been published yet.</exception>
     public RoutingSnapshot Describe() => CurrentTable().Snapshot;
 
+    /// <summary>Returns every target a request can be resolved to under the current configuration.</summary>
+    /// <remarks>
+    /// The set is taken from the same table <see cref="Resolve"/> uses, so a rejected reload leaves the
+    /// last valid table's set in service. It is built once per table and the same instance is returned
+    /// until the table is rebuilt after a reload, so a caller can tell a rebuilt table from an unchanged
+    /// one by reference. <c>BackendForwarder</c> retires the invoker of every target outside it.
+    /// </remarks>
+    /// <returns>
+    /// The resolved target of each surface's <c>Routing:DefaultTarget</c> route and of every catalogue
+    /// operation's route; an entry that cannot be resolved contributes nothing.
+    /// </returns>
+    /// <exception cref="OptionsValidationException">The configuration is invalid and no valid table was ever built.</exception>
+    public IReadOnlySet<ResolvedTarget> TargetsInService() => CurrentTable().Targets;
+
     private static SurfaceRoute SurfaceRouteFor(Surface surface) => surface switch
     {
         Surface.Rest => RestRoute,
@@ -335,7 +349,13 @@ public sealed partial class OperationRouter
             DescribeTargets(routing, backend),
             operations.AsReadOnly());
 
-        return new CompiledTable(routing, backend, rest, soap, snapshot);
+        var targets = new[] { rest, soap }
+            .SelectMany(static routes => routes.ByRoutingKey.Values.Prepend(routes.Default))
+            .Select(static route => route.Target)
+            .OfType<ResolvedTarget>()
+            .ToFrozenSet();
+
+        return new CompiledTable(routing, backend, rest, soap, snapshot, targets);
     }
 
     private SurfaceRoutes CompileSurface(
@@ -491,12 +511,14 @@ public sealed partial class OperationRouter
     /// <param name="Rest">The REST routes.</param>
     /// <param name="Soap">The SOAP routes.</param>
     /// <param name="Snapshot">The effective table <see cref="Describe"/> returns.</param>
+    /// <param name="Targets">Every target the routes resolve to, which <see cref="TargetsInService"/> returns.</param>
     private sealed record CompiledTable(
         RoutingOptions Routing,
         BackendOptions Backend,
         SurfaceRoutes Rest,
         SurfaceRoutes Soap,
-        RoutingSnapshot Snapshot)
+        RoutingSnapshot Snapshot,
+        FrozenSet<ResolvedTarget> Targets)
     {
         public SurfaceRoutes For(Surface surface) => surface == Surface.Rest ? Rest : Soap;
 

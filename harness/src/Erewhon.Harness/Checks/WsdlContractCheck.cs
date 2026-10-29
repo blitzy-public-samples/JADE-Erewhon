@@ -317,8 +317,7 @@ public sealed class WsdlContractCheck(
         try
         {
             path = ArtifactPath(side);
-            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-            await File.WriteAllBytesAsync(path, body, ct).ConfigureAwait(false);
+            await ArtifactTree().WriteFileAsync(path, body, ct).ConfigureAwait(false);
             return null;
         }
         catch (Exception ex) when (IsFileSystemFailure(ex))
@@ -343,12 +342,8 @@ public sealed class WsdlContractCheck(
         {
             path = ArtifactPath(side);
 
-            // File.Delete throws when the directory is absent, which here just means there is nothing to remove.
-            if (File.Exists(path))
-            {
-                File.Delete(path);
-            }
-
+            // An absent directory or file is nothing to remove, and a directory in the file's place is kept.
+            ArtifactTree().DeleteFile(path);
             return null;
         }
         catch (Exception ex) when (IsFileSystemFailure(ex))
@@ -359,6 +354,11 @@ public sealed class WsdlContractCheck(
 
     private string ArtifactPath(WsdlSide side) =>
         Path.Combine(_options.ArtifactsDirectory, ArtifactSubdirectory, side.FileName);
+
+    // Both artifacts are saved and removed through directory handles anchored at the repository root, so a
+    // link at artifacts/ or artifacts/wsdl refuses the call and a link at an artifact is never written through:
+    // nothing outside artifacts/wsdl is written or deleted.
+    private ConfinedTree ArtifactTree() => new(_options.ResolvePath("."));
 
     private static bool IsFileSystemFailure(Exception ex) =>
         ex is IOException or UnauthorizedAccessException or NotSupportedException or SecurityException
