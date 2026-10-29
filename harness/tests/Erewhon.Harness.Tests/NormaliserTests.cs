@@ -1,15 +1,20 @@
+using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Erewhon.Contracts.Catalogue;
+using Erewhon.Contracts.Wire;
 using Erewhon.Harness.Compare;
 
 namespace Erewhon.Harness.Tests;
 
 /// <summary>
 /// The two normalisation rules (N1 generated identifiers, N2 timestamps) as derived from the contracts
-/// catalogue, their validity forms in each wire syntax, and the pairwise rule that decides equality at a
-/// targeted position. Every expected class and property name below is checked against the catalogue-derived
-/// rules, never used to build them.
+/// catalogue, their validity forms in each wire syntax, the pairwise rule that decides equality at a
+/// targeted position, and the strict parse and load of the rules document
+/// (<c>baseline/normalisation-rules.json</c>). Every expected class and property name below is checked
+/// against the catalogue-derived rules, never used to build them.
 /// </summary>
-public sealed class NormaliserTests
+public sealed class NormaliserTests : IDisposable
 {
     private const string N1 = NormalisationRuleIds.N1;
     private const string N2 = NormalisationRuleIds.N2;
@@ -47,13 +52,184 @@ public sealed class NormaliserTests
 
     private const int ValidSampleCount = 3;
 
+    // The fixed parts of every Parse diagnostic.
+    private const string InvalidPrefix = "Invalid normalisation rules: ";
+    private const string NotJsonPrefix = "The normalisation rules are not valid JSON: ";
+
+    private const string RulesFileName = "normalisation-rules.json";
+
+    /// <summary>
+    /// Edits of a valid rules document that Parse must reject, keyed by the name each theory invocation
+    /// shows, with the diagnostic the message must start with. Rule 0 is N1 and rule 1 is N2.
+    /// </summary>
+    private static readonly IReadOnlyDictionary<string, RejectedDocument> RejectedDocuments =
+        new Dictionary<string, RejectedDocument>(StringComparer.Ordinal)
+        {
+            // Syntax: the same strictness as the catalogue loader.
+            ["empty text"] = Rewritten(_ => "", NotJsonPrefix + "The input does not contain any JSON tokens."),
+            ["truncated JSON"] = Rewritten(text => text[..^1], NotJsonPrefix + "Expected depth to be zero at the end of the JSON payload."),
+            ["trailing comma"] = Rewritten(text => text[..^1] + ",}", NotJsonPrefix + "The JSON object contains a trailing comma"),
+            ["comment"] = Rewritten(
+                text => text.Replace(",\"rules\":", ",/* comment */\"rules\":", StringComparison.Ordinal),
+                NotJsonPrefix + "'/' is an invalid start of a property name."),
+            ["duplicate root key (version twice)"] = Rewritten(
+                text => "{\"version\":1," + text[1..],
+                NotJsonPrefix + "Duplicate property 'version'"),
+            ["duplicate rule key (id twice)"] = Rewritten(
+                text => text.Replace("\"id\":\"N1\"", "\"id\":\"N1\",\"id\":\"N1\"", StringComparison.Ordinal),
+                NotJsonPrefix + "Duplicate property 'id'"),
+            ["root not an object"] = Rewritten(text => "[" + text + "]", InvalidPrefix + "$ must be an object, but is Array."),
+
+            // Root members.
+            ["unknown root member"] = Edited(
+                document => document["comment"] = "added",
+                InvalidPrefix + "$ has unknown member 'comment'."),
+            ["version 2"] = Edited(
+                document => document["version"] = 2,
+                InvalidPrefix + "$.version must be the integer 1, but is 2."),
+            ["version as string \"1\""] = Edited(
+                document => document["version"] = "1",
+                InvalidPrefix + "$.version must be the integer 1, but is \"1\"."),
+            ["version 1.5"] = Edited(
+                document => document["version"] = 1.5,
+                InvalidPrefix + "$.version must be the integer 1, but is 1.5."),
+            ["version missing"] = Edited(
+                document => document.Remove("version"),
+                InvalidPrefix + "$ has no member 'version'."),
+            ["rules missing"] = Edited(
+                document => document.Remove("rules"),
+                InvalidPrefix + "$ has no member 'rules'."),
+            ["rules not an array"] = Edited(
+                document => document["rules"] = new JsonObject(),
+                InvalidPrefix + "$.rules must be an array of exactly 2 rules, 'N1' then 'N2'."),
+
+            // Rule count, ids and order: exactly N1 then N2.
+            ["one rule (N2 removed)"] = Edited(
+                document => RulesOf(document).RemoveAt(1),
+                InvalidPrefix + "$.rules must be an array of exactly 2 rules, 'N1' then 'N2'."),
+            ["three rules (additional id N3)"] = Edited(
+                document =>
+                {
+                    var extra = RuleOf(document, 1).DeepClone().AsObject();
+                    extra["id"] = "N3";
+                    RulesOf(document).Add(extra);
+                },
+                InvalidPrefix + "$.rules must be an array of exactly 2 rules, 'N1' then 'N2'."),
+            ["ids misordered (N2 then N1)"] = Edited(
+                document =>
+                {
+                    var rules = RulesOf(document);
+                    var first = rules[0];
+                    rules.RemoveAt(0);
+                    rules.Add(first);
+                },
+                InvalidPrefix + "$.rules[0].id must be 'N1', but is 'N2'."),
+            ["id changed (N2 to N3)"] = Edited(
+                document => RuleOf(document, 1)["id"] = "N3",
+                InvalidPrefix + "$.rules[1].id must be 'N2', but is 'N3'."),
+            ["id changed case (N1 to n1)"] = Edited(
+                document => RuleOf(document, 0)["id"] = "n1",
+                InvalidPrefix + "$.rules[0].id must be 'N1', but is 'n1'."),
+            ["id not a string"] = Edited(
+                document => RuleOf(document, 0)["id"] = 1,
+                InvalidPrefix + "$.rules[0].id must be a string, but is Number."),
+            ["rule not an object"] = Edited(
+                document => RulesOf(document)[1] = N2,
+                InvalidPrefix + "$.rules[1] must be an object, but is String."),
+
+            // Rule members.
+            ["unknown rule member"] = Edited(
+                document => RuleOf(document, 1)["enabled"] = true,
+                InvalidPrefix + "$.rules[1] has unknown member 'enabled'."),
+            ["rule id missing"] = Edited(
+                document => RuleOf(document, 0).Remove("id"),
+                InvalidPrefix + "$.rules[0] has no member 'id'."),
+            ["description missing"] = Edited(
+                document => RuleOf(document, 0).Remove("description"),
+                InvalidPrefix + "$.rules[0] has no member 'description'."),
+            ["description not a string"] = Edited(
+                document => RuleOf(document, 1)["description"] = null,
+                InvalidPrefix + "$.rules[1].description must be a string, but is Null."),
+            ["N1 name changed"] = Edited(
+                document => RuleOf(document, 0)["name"] = "{guid}",
+                InvalidPrefix + "$.rules[0].name must be '{generated-guid}', but is '{guid}'."),
+            ["names swapped"] = Edited(
+                document =>
+                {
+                    RuleOf(document, 0)["name"] = TimestampLookalike;
+                    RuleOf(document, 1)["name"] = GuidLookalike;
+                },
+                InvalidPrefix + "$.rules[0].name must be '{generated-guid}', but is '{timestamp}'."),
+
+            // Valid forms: fixed per rule and syntax.
+            ["validForm json changed"] = Edited(
+                document => ValidFormOf(document, 0)["json"] = "guid",
+                InvalidPrefix + "$.rules[0].validForm.json must be 'jade-guid', but is 'guid'."),
+            ["validForm xml changed"] = Edited(
+                document => ValidFormOf(document, 1)["xml"] = "xsd:date",
+                InvalidPrefix + "$.rules[1].validForm.xml must be 'xsd:dateTime', but is 'xsd:date'."),
+            ["validForm unknown member"] = Edited(
+                document => ValidFormOf(document, 0)["yaml"] = "jade-guid",
+                InvalidPrefix + "$.rules[0].validForm has unknown member 'yaml'."),
+            ["validForm missing member"] = Edited(
+                document => ValidFormOf(document, 1).Remove("json"),
+                InvalidPrefix + "$.rules[1].validForm has no member 'json'."),
+            ["validForm not an object"] = Edited(
+                document => RuleOf(document, 0)["validForm"] = "jade-guid",
+                InvalidPrefix + "$.rules[0].validForm must be an object, but is String."),
+
+            // Targets.
+            ["targets not an array"] = Edited(
+                document => RuleOf(document, 0)["targets"] = new JsonObject(),
+                InvalidPrefix + "$.rules[0].targets must be an array, but is Object."),
+            ["target not an object"] = Edited(
+                document => TargetsOf(document, 0)[0] = "DTOAgent.guid",
+                InvalidPrefix + "$.rules[0].targets[0] must be an object, but is String."),
+            ["target class empty"] = Edited(
+                document => TargetOf(document, 0, 0)["class"] = "",
+                InvalidPrefix + "$.rules[0].targets[0].class must not be empty."),
+            ["target property empty"] = Edited(
+                document => TargetOf(document, 1, 0)["property"] = "",
+                InvalidPrefix + "$.rules[1].targets[0].property must not be empty."),
+            ["target class not a string"] = Edited(
+                document => TargetOf(document, 0, 2)["class"] = 42,
+                InvalidPrefix + "$.rules[0].targets[2].class must be a string, but is Number."),
+            ["target property missing"] = Edited(
+                document => TargetOf(document, 0, 0).Remove("property"),
+                InvalidPrefix + "$.rules[0].targets[0] has no member 'property'."),
+            ["target unknown member"] = Edited(
+                document => TargetOf(document, 1, 1)["rule"] = N2,
+                InvalidPrefix + "$.rules[1].targets[1] has unknown member 'rule'."),
+            ["target repeated within a rule"] = Edited(
+                document => TargetsOf(document, 0).Insert(1, TargetOf(document, 0, 0).DeepClone()),
+                InvalidPrefix + "$.rules[0].targets[1] repeats target "),
+            ["same position under N1 and N2"] = Edited(
+                document => TargetsOf(document, 1).Add(new JsonObject { ["class"] = "DTOResult", ["property"] = "guid" }),
+                InvalidPrefix + "DTOResult.guid is targeted by both 'N1' and 'N2'."),
+        };
+
     private readonly NormalisationRules _rules;
     private readonly Normaliser _normaliser;
+
+    // Created on first use, so only the file tests touch the file system; removed in Dispose.
+    private string? _temporaryDirectory;
 
     public NormaliserTests()
     {
         _rules = NormalisationRules.FromCatalogue(OperationCatalogue.Default);
         _normaliser = new Normaliser(_rules);
+    }
+
+    /// <summary>An isolated directory for this test instance's files.</summary>
+    private string TemporaryDirectory => _temporaryDirectory ??=
+        Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), Path.GetRandomFileName())).FullName;
+
+    public void Dispose()
+    {
+        if (_temporaryDirectory is not null && Directory.Exists(_temporaryDirectory))
+        {
+            Directory.Delete(_temporaryDirectory, recursive: true);
+        }
     }
 
     /// <summary>Every rule paired with every wire syntax.</summary>
@@ -226,6 +402,150 @@ public sealed class NormaliserTests
         Assert.Equal(document, parsed.ToJsonNode().ToJsonString());
     }
 
+    // ---- Rules document -------------------------------------------------------------------------
+
+    /// <summary>The name of every rejected document, so each edit is its own theory invocation.</summary>
+    public static TheoryData<string> RejectedDocumentNames()
+    {
+        var data = new TheoryData<string>();
+        foreach (var name in RejectedDocuments.Keys)
+        {
+            data.Add(name);
+        }
+
+        return data;
+    }
+
+    // Equal rules must always give the same bytes, since capture writes the document that replay compares.
+    [Fact]
+    public void Generation_IsDeterministic()
+    {
+        var first = NormalisationRules.FromCatalogue(OperationCatalogue.Default);
+        var second = NormalisationRules.FromCatalogue(OperationCatalogue.Default);
+
+        Assert.Equal(first.ToJsonNode().ToJsonString(), second.ToJsonNode().ToJsonString());
+        Assert.Equal(_rules.ToJsonNode().ToJsonString(), _rules.ToJsonNode().ToJsonString());
+        Assert.NotSame(_rules.ToJsonNode(), _rules.ToJsonNode());
+    }
+
+    [Fact]
+    public void Generation_SortsTargetsOrdinally()
+    {
+        foreach (var rule in _rules.Rules)
+        {
+            var sorted = rule.Targets
+                .OrderBy(target => target.Class, StringComparer.Ordinal)
+                .ThenBy(target => target.Property, StringComparer.Ordinal);
+            Assert.Equal(sorted, rule.Targets);
+        }
+    }
+
+    // The ids must be exactly N1 then N2, so a changed, misordered or additional id is rejected, as is
+    // every other departure from the fixed two-rule shape, with the offending path in the message.
+    [Theory]
+    [MemberData(nameof(RejectedDocumentNames))]
+    public void Parse_RejectsDocument(string name)
+    {
+        var rejected = RejectedDocuments[name];
+        var document = rejected.Write(_rules.ToJsonNode().AsObject());
+
+        var exception = Assert.Throws<InvalidDataException>(() => NormalisationRules.Parse(document));
+        Assert.StartsWith(rejected.ExpectedMessage, exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ParseAndLoad_RejectNullOrEmptyArguments()
+    {
+        Assert.Throws<ArgumentNullException>(() => NormalisationRules.Parse(null!));
+        Assert.Throws<ArgumentNullException>(() => NormalisationRules.Load(null!));
+        Assert.Throws<ArgumentException>(() => NormalisationRules.Load(""));
+    }
+
+    [Fact]
+    public void Parse_KeepsDescriptionsAsStored()
+    {
+        var document = _rules.ToJsonNode().AsObject();
+        RuleOf(document, 0)["description"] = "Edited N1 description.";
+        RuleOf(document, 1)["description"] = "";
+
+        var parsed = NormalisationRules.Parse(document.ToJsonString());
+
+        Assert.Equal("Edited N1 description.", parsed.Rules[0].Description);
+        Assert.Equal("", parsed.Rules[1].Description);
+        Assert.Equal(document.ToJsonString(), parsed.ToJsonNode().ToJsonString());
+    }
+
+    [Fact]
+    public void Parse_ResortsTargets()
+    {
+        var document = _rules.ToJsonNode().AsObject();
+        for (var rule = 0; rule < _rules.Rules.Count; rule++)
+        {
+            var targets = TargetsOf(document, rule);
+            var reversed = targets.Select(target => target!.DeepClone()).Reverse().ToList();
+            targets.Clear();
+            foreach (var target in reversed)
+            {
+                targets.Add(target);
+            }
+        }
+
+        var parsed = NormalisationRules.Parse(document.ToJsonString());
+
+        for (var rule = 0; rule < _rules.Rules.Count; rule++)
+        {
+            Assert.Equal(_rules.Rules[rule].Targets, parsed.Rules[rule].Targets);
+        }
+
+        Assert.Equal(_rules.ToJsonNode().ToJsonString(), parsed.ToJsonNode().ToJsonString());
+    }
+
+    // Encoding.UTF8 strips a leading byte order mark, so a file saved by an editor that adds one still loads.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Load_ReadsAValidFile(bool byteOrderMark)
+    {
+        var path = Path.Combine(TemporaryDirectory, RulesFileName);
+        File.WriteAllText(path, _rules.ToJsonNode().ToJsonString(), new UTF8Encoding(byteOrderMark));
+        Assert.Equal(byteOrderMark, File.ReadAllBytes(path).AsSpan().StartsWith(Encoding.UTF8.Preamble));
+
+        var loaded = NormalisationRules.Load(path);
+
+        Assert.Equal(_rules.ToJsonNode().ToJsonString(), loaded.ToJsonNode().ToJsonString());
+    }
+
+    [Fact]
+    public void Load_RejectsAnInvalidDocument()
+    {
+        var path = Path.Combine(TemporaryDirectory, RulesFileName);
+        var document = _rules.ToJsonNode().AsObject();
+        RuleOf(document, 1)["id"] = "N3";
+        File.WriteAllText(path, document.ToJsonString());
+
+        var exception = Assert.Throws<InvalidDataException>(() => NormalisationRules.Load(path));
+        Assert.Equal(InvalidPrefix + "$.rules[1].id must be 'N2', but is 'N3'.", exception.Message);
+    }
+
+    // A directory at the path is the portable unreadable case: tests may run as root, which file modes do
+    // not stop. .NET reports it as UnauthorizedAccessException, which is not an IOException.
+    [Theory]
+    [InlineData("missing file", typeof(FileNotFoundException))]
+    [InlineData("file under a missing directory", typeof(DirectoryNotFoundException))]
+    [InlineData("directory at the path", typeof(UnauthorizedAccessException))]
+    public void Load_RejectsAnUnreadablePath(string pathCase, Type expected)
+    {
+        var path = pathCase switch
+        {
+            "missing file" => Path.Combine(TemporaryDirectory, RulesFileName),
+            "file under a missing directory" => Path.Combine(TemporaryDirectory, "missing", RulesFileName),
+            "directory at the path" => Directory.CreateDirectory(Path.Combine(TemporaryDirectory, RulesFileName)).FullName,
+            _ => throw new ArgumentOutOfRangeException(nameof(pathCase), pathCase, "No path for this case."),
+        };
+
+        Assert.Throws(expected, () => NormalisationRules.Load(path));
+    }
+
     // ---- Validity forms -------------------------------------------------------------------------
 
     [Theory]
@@ -249,6 +569,31 @@ public sealed class NormaliserTests
     public void N2_ValidJson(string? text, bool expected)
     {
         Assert.Equal(expected, _normaliser.IsValid(N2, text, WireSyntax.Json));
+    }
+
+    // Where a JSON value is classified as an element (the conformance check's Date and TimeStamp wire types),
+    // a string token holding an unpaired surrogate escape parses but cannot be decoded, so it is invalid
+    // rather than an exception, and every kind other than a string is invalid.
+    [Theory]
+    [InlineData(@"""\uD800""", false)]
+    [InlineData(@"""\uDC00""", false)]
+    [InlineData(@"""\uDC00\uD800""", false)]
+    [InlineData(@"""\/Date(1\uD800)\/""", false)]
+    [InlineData(@"""\/Date(1767268800000)\/""", true)]
+    [InlineData(@"""/Date(1767268800000)/""", true)]
+    [InlineData(@"""\/Date(1767268800000+1300)\/""", true)]
+    [InlineData(@"""not a date""", false)]
+    [InlineData(@"""""", false)]
+    [InlineData("1767268800000", false)]
+    [InlineData("null", false)]
+    [InlineData("true", false)]
+    [InlineData("{}", false)]
+    [InlineData("[]", false)]
+    public void N2_ValidJsonElement(string json, bool expected)
+    {
+        using var document = JsonDocument.Parse(json);
+
+        Assert.Equal(expected, JadeWireFormats.IsMicrosoftJsonDate(document.RootElement));
     }
 
     [Theory]
@@ -504,4 +849,33 @@ public sealed class NormaliserTests
     // A distinct string instance, so equality cannot pass on reference identity alone.
     private static NormalisedSlot CopyOf(NormalisedSlot slot) =>
         new(slot.Present, slot.IsNull, slot.Text is null ? null : new string(slot.Text.AsSpan()));
+
+    /// <summary>A rejected document made by editing the valid document's nodes.</summary>
+    private static RejectedDocument Edited(Action<JsonObject> edit, string expectedMessage) =>
+        new(
+            document =>
+            {
+                edit(document);
+                return document.ToJsonString();
+            },
+            expectedMessage);
+
+    /// <summary>A rejected document made by rewriting the valid document's compact text.</summary>
+    private static RejectedDocument Rewritten(Func<string, string> rewrite, string expectedMessage) =>
+        new(document => rewrite(document.ToJsonString()), expectedMessage);
+
+    private static JsonArray RulesOf(JsonObject document) => document["rules"]!.AsArray();
+
+    private static JsonObject RuleOf(JsonObject document, int rule) => RulesOf(document)[rule]!.AsObject();
+
+    private static JsonObject ValidFormOf(JsonObject document, int rule) => RuleOf(document, rule)["validForm"]!.AsObject();
+
+    private static JsonArray TargetsOf(JsonObject document, int rule) => RuleOf(document, rule)["targets"]!.AsArray();
+
+    private static JsonObject TargetOf(JsonObject document, int rule, int target) => TargetsOf(document, rule)[target]!.AsObject();
+
+    /// <summary>A rules document Parse must reject, and the start of the message it must give.</summary>
+    /// <param name="Write">Turns a fresh valid document into the rejected text.</param>
+    /// <param name="ExpectedMessage">The diagnostic the exception message starts with, naming the offending path.</param>
+    private sealed record RejectedDocument(Func<JsonObject, string> Write, string ExpectedMessage);
 }

@@ -188,12 +188,32 @@ public static partial class JadeWireFormats
 
     /// <summary>
     /// Whether a JSON element is a string whose decoded value is a valid Microsoft JSON date. Numbers,
-    /// <c>null</c> and every other kind are invalid.
+    /// <c>null</c> and every other kind are invalid, and so is a string that cannot be decoded, such as one
+    /// holding an unpaired surrogate escape like <c>"\uD800"</c>.
     /// </summary>
     /// <param name="element">The element to test.</param>
     /// <returns><see langword="true"/> when the element is a valid Microsoft JSON date string.</returns>
-    public static bool IsMicrosoftJsonDate(JsonElement element) =>
-        element.ValueKind == JsonValueKind.String && IsMicrosoftJsonDate(element.GetString());
+    public static bool IsMicrosoftJsonDate(JsonElement element)
+    {
+        if (element.ValueKind != JsonValueKind.String)
+        {
+            return false;
+        }
+
+        string? value;
+        try
+        {
+            value = element.GetString();
+        }
+        catch (InvalidOperationException exception) when (exception is not ObjectDisposedException)
+        {
+            // A string token holding an unpaired surrogate escape such as \uD800 parses, but its value cannot
+            // be decoded, so it is not a valid date. A disposed document is a caller error and still throws.
+            return false;
+        }
+
+        return IsMicrosoftJsonDate(value);
+    }
 
     /// <summary>Formats a JADE <c>Date</c> as an <c>xsd:date</c> with no timezone: <c>yyyy-MM-dd</c>.</summary>
     /// <param name="value">The date to format.</param>
@@ -447,14 +467,41 @@ public static partial class JadeWireFormats
             return false;
         }
 
-        // Length / 4 * 3 bounds the decoded size without the int overflow Length * 3 would risk.
-        byte[] buffer = new byte[(value.Length / 4 * 3) + 3];
-        if (!Convert.TryFromBase64String(value, buffer, out int written))
+        // Convert skips ' ', '\t', '\r' and '\n' and decodes whole four-character groups ending in at most two
+        // '=', so counting the other characters gives the exact decoded length and one array receives the
+        // bytes. Base64.IsValid would not do: it rejects nonzero unused bits, as in "AB==", that Convert accepts.
+        ReadOnlySpan<char> text = value.AsSpan();
+        int significant = text.Length;
+        if (text.ContainsAny(" \t\r\n"))
+        {
+            significant -= text.Count(' ') + text.Count('\t') + text.Count('\r') + text.Count('\n');
+        }
+
+        int padding = 0;
+        for (int index = text.Length - 1; index >= 0 && padding <= 2; index--)
+        {
+            if (text[index] == '=')
+            {
+                padding++;
+            }
+            else if (text[index] is not (' ' or '\t' or '\r' or '\n'))
+            {
+                break;
+            }
+        }
+
+        if (significant % 4 != 0 || padding > 2)
         {
             return false;
         }
 
-        bytes = buffer.AsSpan(0, written).ToArray();
+        byte[] decoded = new byte[(significant / 4 * 3) - padding];
+        if (!Convert.TryFromBase64String(value, decoded, out int written) || written != decoded.Length)
+        {
+            return false;
+        }
+
+        bytes = decoded;
         return true;
     }
 

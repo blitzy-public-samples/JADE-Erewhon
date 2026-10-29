@@ -95,14 +95,18 @@ public sealed class RestOperationMatcher(OperationCatalogue catalogue)
     /// </para>
     /// <para>
     /// The path after its leading <c>/</c> splits on <c>/</c> with empty segments kept, so a trailing
-    /// slash or <c>//</c> leaves an empty segment that no template accepts. When the last segment ends
-    /// with a catalogue format suffix (<c>.jsonn</c> tried before <c>.json</c>), that one suffix is removed
-    /// from the last segment only and reported in <see cref="RestMatch.FormatSuffix"/>. A last segment
-    /// that is nothing but a suffix names neither a resource nor a parameter value, so it does not match.
+    /// slash or <c>//</c> leaves an empty segment. An empty segment binds an empty placeholder value (an
+    /// empty String parameter, which the stand-in reads as the JADE null string) but never equals a
+    /// literal segment, so a trailing slash on a literal-only path still does not match. When the last
+    /// segment ends with a catalogue format suffix (<c>.jsonn</c> tried before <c>.json</c>), that one
+    /// suffix is removed from the last segment only and reported in <see cref="RestMatch.FormatSuffix"/>.
+    /// A last segment that is nothing but a suffix names neither a resource nor a parameter value, so it
+    /// does not match.
     /// </para>
     /// <para>
     /// A template matches when the method equals its verb ignoring case, the segment count is the
-    /// template's, each literal segment is equal ordinally, and each placeholder segment is non-empty.
+    /// template's, and each literal segment is equal ordinally; a placeholder segment matches any value,
+    /// the empty one included.
     /// </para>
     /// </remarks>
     /// <param name="method">The HTTP method, for example <c>GET</c>; compared case-insensitively.</param>
@@ -284,12 +288,10 @@ public sealed class RestOperationMatcher(OperationCatalogue catalogue)
                 return false;
             }
 
+            // A placeholder segment matches any value, the empty one included, so only literals compare.
             for (var index = 0; index < segments.Length; index++)
             {
-                var matched = _literals[index] is { } literal
-                    ? string.Equals(segments[index], literal, StringComparison.Ordinal)
-                    : segments[index].Length > 0;
-                if (!matched)
+                if (_literals[index] is { } literal && !string.Equals(segments[index], literal, StringComparison.Ordinal))
                 {
                     return false;
                 }

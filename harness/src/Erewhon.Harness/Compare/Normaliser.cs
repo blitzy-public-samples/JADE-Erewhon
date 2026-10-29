@@ -221,8 +221,14 @@ public sealed class NormalisationRules
     /// <summary>Reads and parses a normalisation rules file, as <see cref="Parse"/> does.</summary>
     /// <param name="path">The file path, normally <c>baseline/normalisation-rules.json</c>.</param>
     /// <returns>The rules.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="path"/> is null.</exception>
+    /// <exception cref="ArgumentException"><paramref name="path"/> is empty.</exception>
     /// <exception cref="InvalidDataException">The file content is not a valid rules document.</exception>
-    /// <exception cref="IOException">The file cannot be read.</exception>
+    /// <exception cref="IOException">
+    /// The file cannot be read, including <see cref="FileNotFoundException"/> for a missing file and
+    /// <see cref="DirectoryNotFoundException"/> for a missing directory.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">The path names a directory, or reading the file is denied.</exception>
     public static NormalisationRules Load(string path)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
@@ -619,4 +625,3 @@ public sealed class Normaliser(NormalisationRules rules)
         }
     }
 }
-

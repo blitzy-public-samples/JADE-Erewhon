@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using Erewhon.Harness.Compare;
 
 namespace Erewhon.Harness.Tests;
@@ -12,6 +13,73 @@ public sealed class BinaryComparerTests
     private const int JpegLength = 22;
 
     private const int JfifMarkerOffset = 6;
+
+    // The envelope fixtures are ASCII, so each character is one UTF-8 byte and every offset can be
+    // counted on the literals. The declaration is 38 bytes, and the soap:Envelope start tag is 169:
+    // 14 for "<soap:Envelope", 55, 54 and 45 for its xmlns:soap, xmlns:xsi and xmlns:xsd attributes,
+    // and 1 for ">". soap:Body therefore starts at offset 38 + 169 = 207.
+    private const string XmlDeclaration = "<?xml version=\"1.0\" encoding=\"utf-8\"?>";
+
+    private const string EnvelopeStartTag =
+        "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\""
+        + " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\""
+        + " xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\">";
+
+    // The start tag above with its xmlns:xsi and xmlns:xsd attributes swapped: the same 169 bytes,
+    // first differing after the common "<soap:Envelope", xmlns:soap attribute and " xmlns:xs", at
+    // offset 38 + 14 + 55 + 9 = 116, where "i" (0x69) meets "d" (0x64).
+    private const string SwappedAttributesEnvelopeStartTag =
+        "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\""
+        + " xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\""
+        + " xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\">";
+
+    // Everything after the start tag in an unindented getPhoto response; the photo is the Jpeg()
+    // body in base64.
+    private const string CompactPhotoEnvelopeContent =
+        "<soap:Body><getPhotoResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getPhotoResult>"
+        + "<photo>/9j/4AAQSkZJRgABAgAAZABkAAD/2Q==</photo>"
+        + "</getPhotoResult></getPhotoResponse></soap:Body></soap:Envelope>";
+
+    // A SOAP 1.1 getPhoto response written as the stand-in writes it, with no indentation: 407 bytes.
+    private const string CompactPhotoEnvelope = XmlDeclaration + EnvelopeStartTag + CompactPhotoEnvelopeContent;
+
+    // The compact envelope with its two namespace attributes in swapped order: 407 bytes.
+    private const string SwappedAttributesPhotoEnvelope =
+        XmlDeclaration + SwappedAttributesEnvelopeStartTag + CompactPhotoEnvelopeContent;
+
+    // The compact envelope indented by two spaces per level, with whitespace only between elements:
+    // 8 line feeds and 2 + 4 + 6 + 8 + 6 + 4 + 2 = 32 spaces make it 447 bytes, and the first line
+    // feed (0x0a) stands where the compact body has the "<" (0x3c) of soap:Body, at offset 207.
+    private const string IndentedPhotoEnvelope =
+        XmlDeclaration
+        + EnvelopeStartTag + "\n"
+        + "  <soap:Body>\n"
+        + "    <getPhotoResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\">\n"
+        + "      <getPhotoResult>\n"
+        + "        <photo>/9j/4AAQSkZJRgABAgAAZABkAAD/2Q==</photo>\n"
+        + "      </getPhotoResult>\n"
+        + "    </getPhotoResponse>\n"
+        + "  </soap:Body>\n"
+        + "</soap:Envelope>";
+
+    // The compact envelope with two ordinary attributes on its photo element, xsi:type="xsd:base64Binary"
+    // (28 bytes with its leading space) before xsi:nil="false" (16): 407 + 44 = 451 bytes. The photo
+    // element starts after the 11 bytes of "<soap:Body>", the 62 of the getPhotoResponse start tag and
+    // the 16 of "<getPhotoResult>", at offset 207 + 89 = 296.
+    private const string TypedPhotoEnvelope =
+        XmlDeclaration + EnvelopeStartTag
+        + "<soap:Body><getPhotoResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getPhotoResult>"
+        + "<photo xsi:type=\"xsd:base64Binary\" xsi:nil=\"false\">/9j/4AAQSkZJRgABAgAAZABkAAD/2Q==</photo>"
+        + "</getPhotoResult></getPhotoResponse></soap:Body></soap:Envelope>";
+
+    // The typed envelope with the photo's xsi:type and xsi:nil attributes swapped: the same 451 bytes,
+    // first differing after the common "<photo xsi:", at offset 296 + 11 = 307, where "t" (0x74) meets
+    // "n" (0x6e).
+    private const string ReorderedTypedPhotoEnvelope =
+        XmlDeclaration + EnvelopeStartTag
+        + "<soap:Body><getPhotoResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getPhotoResult>"
+        + "<photo xsi:nil=\"false\" xsi:type=\"xsd:base64Binary\">/9j/4AAQSkZJRgABAgAAZABkAAD/2Q==</photo>"
+        + "</getPhotoResult></getPhotoResponse></soap:Body></soap:Envelope>";
 
     [Fact]
     public void IdenticalBytes_GiveNoDiscrepancy()
@@ -117,6 +185,43 @@ public sealed class BinaryComparerTests
         Assert.Equal(
             new Discrepancy("$body[6]", DiscrepancyKinds.Value, DiscrepancyValue.Literal("4a"), DiscrepancyValue.Literal("4b")),
             discrepancy);
+    }
+
+    // Indentation between elements, namespace-declaration order and ordinary attribute order are what
+    // XML canonicalisation ignores, yet they change the bytes, so envelopes differing only in them must
+    // still be reported different.
+    [Theory]
+    [InlineData("indentation")]
+    [InlineData("namespace-declaration-order")]
+    [InlineData("ordinary-attribute-order")]
+    public void XmlFormattingDifference_IsNotCanonicalised(string variant)
+    {
+        var (baseline, observed, expected) = variant switch
+        {
+            "indentation" => (CompactPhotoEnvelope, IndentedPhotoEnvelope, new[]
+            {
+                new Discrepancy("$body", DiscrepancyKinds.Length, DiscrepancyValue.Literal("407"), DiscrepancyValue.Literal("447")),
+                new Discrepancy("$body[207]", DiscrepancyKinds.Value, DiscrepancyValue.Literal("3c"), DiscrepancyValue.Literal("0a")),
+            }),
+            "namespace-declaration-order" => (CompactPhotoEnvelope, SwappedAttributesPhotoEnvelope, new[]
+            {
+                new Discrepancy("$body[116]", DiscrepancyKinds.Value, DiscrepancyValue.Literal("69"), DiscrepancyValue.Literal("64")),
+            }),
+            "ordinary-attribute-order" => (TypedPhotoEnvelope, ReorderedTypedPhotoEnvelope, new[]
+            {
+                new Discrepancy("$body[307]", DiscrepancyKinds.Value, DiscrepancyValue.Literal("74"), DiscrepancyValue.Literal("6e")),
+            }),
+            _ => throw new ArgumentOutOfRangeException(nameof(variant), variant, "Unknown XML formatting variant."),
+        };
+
+        var discrepancies = BinaryComparer.Compare(
+            Encoding.UTF8.GetBytes(baseline), Encoding.UTF8.GetBytes(observed));
+
+        Assert.Equal(expected.Length, discrepancies.Count);
+        foreach (var discrepancy in expected)
+        {
+            Assert.Contains(discrepancy, discrepancies);
+        }
     }
 
     /// <summary>
