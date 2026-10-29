@@ -1,4 +1,5 @@
 using System.Collections.Frozen;
+using System.Text;
 using System.Xml;
 using Erewhon.Contracts.Catalogue;
 using Microsoft.AspNetCore.Http;
@@ -272,7 +273,7 @@ public sealed class SoapOperationResolver
 
     /// <summary>Tells whether a request asks for the WSDL; see <see cref="IsWsdlRequest(string, string?)"/>.</summary>
     /// <param name="request">The request; only its method and raw query string are read.</param>
-    /// <returns>True for a <c>GET</c> whose query has a <c>wsdl</c> key.</returns>
+    /// <returns>True for a <c>GET</c> whose query has a key that percent-decodes to <c>wsdl</c>, in any ASCII case.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="request"/> is null.</exception>
     public static bool IsWsdlRequest(HttpRequest request)
     {
@@ -282,14 +283,22 @@ public sealed class SoapOperationResolver
 
     /// <summary>
     /// Tells whether a method and raw query string ask for the WSDL: the method is <c>GET</c> and some
-    /// <c>&amp;</c>-separated part of the query has the key <c>wsdl</c>, compared case-insensitively. A
-    /// part's key is the text before its first <c>=</c>, or the whole part when it has none. The key is not
-    /// URL-decoded and the path is not inspected.
+    /// <c>&amp;</c>-separated part of the query has the key <c>wsdl</c>. A part's key is the text before
+    /// its first <c>=</c>, or the whole part when it has none; both separators are found in the raw text,
+    /// so an escaped <c>&amp;</c> or <c>=</c> stays part of the key. The key is percent-decoded once and
+    /// then compared with <c>wsdl</c> case-insensitively in ASCII letters only. The path is not inspected.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// <c>?WebServiceHTTP&amp;serviceName=ErewhonWebService&amp;listName=WebServiceHTTP&amp;wsdl</c>,
-    /// <c>?wsdl</c> and <c>?WSDL=1</c> ask for it; <c>?x=wsdl</c>, <c>?wsdlx</c>, an empty query and any
-    /// <c>POST</c> do not.
+    /// <c>?wsdl</c>, <c>?WSDL=1</c>, <c>?%77sdl</c> and <c>?%57SDL=1</c> ask for it; <c>?x=wsdl</c>,
+    /// <c>?x=%77sdl</c>, <c>?wsdlx</c>, <c>?%2577sdl</c> (decoded once, to <c>%77sdl</c>), <c>?wsdl%3D1</c>,
+    /// <c>?w%C5%BFdl</c> (U+017F is not an ASCII letter), an empty query and any <c>POST</c> do not.
+    /// </para>
+    /// <para>
+    /// The query itself is only read: the caller forwards or serves the request with its query unchanged.
+    /// A <c>+</c> is not translated to a space, because neither can form the key.
+    /// </para>
     /// </remarks>
     /// <param name="method">The HTTP method.</param>
     /// <param name="rawQuery">The raw query string, with or without its leading <c>?</c>; null or empty for none.</param>
@@ -314,13 +323,37 @@ public sealed class SoapOperationResolver
             var part = query[range];
             var separator = part.IndexOf('=');
             var key = separator < 0 ? part : part[..separator];
-            if (key.Equals(WsdlQueryKey, StringComparison.OrdinalIgnoreCase))
+            if (IsWsdlQueryKey(key))
             {
                 return true;
             }
         }
 
         return false;
+    }
+
+    // The key arrives split on the raw '&' and '=', so an escaped separator is still part of it. It is
+    // percent-decoded once, as ASP.NET Core decodes query keys: an invalid escape stays literal, and a '%'
+    // produced by decoding is not decoded again. The comparison folds ASCII letters only, so a decoded
+    // non-ASCII character such as U+017F (long s) never stands in for an 's'.
+    private static bool IsWsdlQueryKey(ReadOnlySpan<char> key)
+    {
+        if (!key.Contains('%'))
+        {
+            return Ascii.EqualsIgnoreCase(key, WsdlQueryKey);
+        }
+
+        // Each letter of the key is spelled by at most one three-character escape, so a longer key never
+        // decodes to it.
+        if (key.Length > WsdlQueryKey.Length * 3)
+        {
+            return false;
+        }
+
+        // Unescaping never lengthens its input, so a buffer of the key's own length always suffices.
+        Span<char> decoded = stackalloc char[key.Length];
+        return Uri.TryUnescapeDataString(key, decoded, out var written)
+            && Ascii.EqualsIgnoreCase(decoded[..written], WsdlQueryKey);
     }
 
     private static void RequireCatalogueValue(string member, string actual, string expected)
