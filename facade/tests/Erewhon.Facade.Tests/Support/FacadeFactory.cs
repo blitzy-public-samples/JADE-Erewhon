@@ -26,6 +26,7 @@ using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Configuration.EnvironmentVariables;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -62,7 +63,10 @@ public sealed class FacadeTestSettings
     /// <summary>
     /// Further configuration keys, applied after every other setting so that they win, for example
     /// <c>Settings = { ["Routing:Operations:Rest:getCompany"] = "stub" }</c>. Keys are matched
-    /// case-insensitively, as configuration keys are.
+    /// case-insensitively, as configuration keys are, so an entry replaces the value a typed property or
+    /// the factory gives the same key however it is spelled, for example <c>backend:timeoutseconds</c>
+    /// over <see cref="BackendTimeoutSeconds"/>. An entry that moves a listener off its allocated loopback
+    /// port (<c>Facade:BindAddress</c> or a <c>Facade:*Port</c>) fails the start.
     /// </summary>
     public Dictionary<string, string?> Settings { get; init; } = new(StringComparer.OrdinalIgnoreCase);
 
@@ -367,13 +371,26 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
 
     /// <inheritdoc />
     /// <remarks>
+    /// <para>
     /// Runs the facade as in production, never in the factory's default Development environment, whose
     /// developer exception page would answer in place of a forwarded response. Each setting is applied
-    /// twice: as a host setting, which reaches the facade's builder through its arguments, and as an
-    /// in-memory application configuration source, added last, so it also wins over the facade's
-    /// <c>appsettings.json</c> and any <c>Facade__*</c>, <c>Backend__*</c> or <c>Routing__*</c> environment
-    /// variable. A <see cref="FacadeTestSettings.LoggerProvider"/> is registered here, after the facade's
-    /// entry point has replaced the default logging providers.
+    /// twice, with the same deduplicated pairs: as a host setting, which reaches the facade's builder
+    /// through its arguments, and as an in-memory application configuration source, added last, so it
+    /// also wins over the facade's <c>appsettings.json</c>.
+    /// </para>
+    /// <para>
+    /// The facade reads no environment variable: every environment-variable source, plain or with the
+    /// <c>ASPNETCORE_</c> or <c>DOTNET_</c> prefix, is removed from its application configuration here and
+    /// from the host settings in <see cref="CreateHost"/>. Each test owns the configuration it asserts on,
+    /// so a <c>Routing__*</c>, <c>Backend__*</c> or <c>Facade__*</c> variable exported in the shell that runs
+    /// the tests, such as a rerouting of one operation, cannot change the routing table, deadline or
+    /// listeners of the facade under test. The facade then reads its shipped <c>appsettings.json</c> and
+    /// this factory's settings alone.
+    /// </para>
+    /// <para>
+    /// A <see cref="FacadeTestSettings.LoggerProvider"/> is registered here, after the facade's entry point
+    /// has replaced the default logging providers.
+    /// </para>
     /// </remarks>
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
@@ -383,7 +400,11 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
             builder.UseSetting(key, value);
         }
 
-        builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(_settings));
+        builder.ConfigureAppConfiguration((_, configuration) =>
+        {
+            RemoveEnvironmentVariables(configuration);
+            configuration.AddInMemoryCollection(_settings);
+        });
 
         if (_loggerProvider is { } loggerProvider)
         {
@@ -393,15 +414,24 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
 
     /// <inheritdoc />
     /// <remarks>
+    /// <para>
+    /// The web host builder of <c>WebApplicationFactory</c> reads the <c>ASPNETCORE_</c>-prefixed
+    /// environment variables into the host settings, which become the facade's command-line arguments
+    /// when the host is built and would outrank its <c>appsettings.json</c>. They are removed from those
+    /// settings before the build, as <see cref="ConfigureWebHost"/> explains.
+    /// </para>
+    /// <para>
     /// The base factory keeps a host only once it has started, so a host whose start fails, for example on
     /// a <c>Facade:WsdlPath</c> that cannot be resolved, is disposed here and the failure rethrown
     /// unchanged. The facade's entry point is finished with the host by then: its failure reaches the start
     /// only once it has completed, and a host its <c>RunAsync</c> already disposed, as after a port found in
     /// use, is disposed again harmlessly.
+    /// </para>
     /// </remarks>
     protected override IHost CreateHost(IHostBuilder builder)
     {
         ArgumentNullException.ThrowIfNull(builder);
+        builder.ConfigureHostConfiguration(RemoveEnvironmentVariables);
         var recorder = new BuiltHostRecorder(builder);
         try
         {
@@ -432,6 +462,35 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
         }
     }
 
+    // Removes every environment-variable source from a configuration and keeps every other source in its
+    // place. The facade's application configuration holds them as sources of their own. The host
+    // settings hold the ASPNETCORE_-prefixed variables as one provider of a chained configuration, whose
+    // other providers, the host settings this factory and WebApplicationFactory supply, are chained again
+    // without it; they stay owned by the configuration they came from.
+    private static void RemoveEnvironmentVariables(IConfigurationBuilder configuration)
+    {
+        IList<IConfigurationSource> sources = configuration.Sources;
+        for (int index = sources.Count - 1; index >= 0; index--)
+        {
+            switch (sources[index])
+            {
+                case EnvironmentVariablesConfigurationSource:
+                    sources.RemoveAt(index);
+                    break;
+
+                case ChainedConfigurationSource { Configuration: IConfigurationRoot chained }
+                    when chained.Providers.Any(provider => provider is EnvironmentVariablesConfigurationProvider):
+                    sources[index] = new ChainedConfigurationSource
+                    {
+                        Configuration = new ConfigurationRoot(
+                            [.. chained.Providers.Where(provider => provider is not EnvironmentVariablesConfigurationProvider)]),
+                        ShouldDisposeConfiguration = false,
+                    };
+                    break;
+            }
+        }
+    }
+
     private void VerifyBinding()
     {
         ICollection<string>? addresses = Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()?.Addresses;
@@ -457,37 +516,45 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
         }
     }
 
-    // The ordered settings the facade starts with; a later pair overrides an earlier one with the same key.
+    // The settings the facade starts with, one value per key, with keys matched case-insensitively as
+    // configuration keys are: the allocated ports, the loopback bind address and the WSDL path, then the
+    // typed properties, then every extra setting, each replacing the value an earlier step gave its key
+    // however the key is spelled. ConfigureWebHost applies exactly these pairs through both of its
+    // channels, and its in-memory source rejects a key given twice.
     private static KeyValuePair<string, string?>[] BuildSettings(FacadeTestSettings settings, int restPort, int soapPort, int adminPort)
     {
-        var pairs = new List<KeyValuePair<string, string?>>
+        var values = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
         {
-            new("Facade:RestPort", restPort.ToString(CultureInfo.InvariantCulture)),
-            new("Facade:SoapPort", soapPort.ToString(CultureInfo.InvariantCulture)),
-            new("Facade:AdminPort", adminPort.ToString(CultureInfo.InvariantCulture)),
-            new("Facade:BindAddress", LoopbackHost),
-            new("Facade:WsdlPath", settings.WsdlPath ?? Path.Combine(AppContext.BaseDirectory, "no-wsdl", "ErewhonWebService.wsdl")),
-            new("Routing:Targets:backend:RestBaseUrl", settings.BackendRestBaseUrl),
-            new("Routing:Targets:backend:SoapBaseUrl", settings.BackendSoapBaseUrl),
+            ["Facade:RestPort"] = restPort.ToString(CultureInfo.InvariantCulture),
+            ["Facade:SoapPort"] = soapPort.ToString(CultureInfo.InvariantCulture),
+            ["Facade:AdminPort"] = adminPort.ToString(CultureInfo.InvariantCulture),
+            ["Facade:BindAddress"] = LoopbackHost,
+            ["Facade:WsdlPath"] = settings.WsdlPath ?? Path.Combine(AppContext.BaseDirectory, "no-wsdl", "ErewhonWebService.wsdl"),
+            ["Routing:Targets:backend:RestBaseUrl"] = settings.BackendRestBaseUrl,
+            ["Routing:Targets:backend:SoapBaseUrl"] = settings.BackendSoapBaseUrl,
         };
 
         if (settings.StubRestBaseUrl is not null)
         {
-            pairs.Add(new("Routing:Targets:stub:RestBaseUrl", settings.StubRestBaseUrl));
+            values["Routing:Targets:stub:RestBaseUrl"] = settings.StubRestBaseUrl;
         }
 
         if (settings.StubSoapBaseUrl is not null)
         {
-            pairs.Add(new("Routing:Targets:stub:SoapBaseUrl", settings.StubSoapBaseUrl));
+            values["Routing:Targets:stub:SoapBaseUrl"] = settings.StubSoapBaseUrl;
         }
 
         if (settings.BackendTimeoutSeconds is int timeoutSeconds)
         {
-            pairs.Add(new("Backend:TimeoutSeconds", timeoutSeconds.ToString(CultureInfo.InvariantCulture)));
+            values["Backend:TimeoutSeconds"] = timeoutSeconds.ToString(CultureInfo.InvariantCulture);
         }
 
-        pairs.AddRange(settings.Settings);
-        return [.. pairs];
+        foreach ((string key, string? value) in settings.Settings)
+        {
+            values[key] = value;
+        }
+
+        return [.. values];
     }
 
     private static (int RestPort, int SoapPort, int AdminPort) DrawDistinctPorts()

@@ -2,9 +2,11 @@
 // moves exactly one operation to a second target by changing one
 // Routing:Operations:<Rest|Soap>:<jadeMethod> key, calls all 22 catalogue operations at their normal
 // addresses, and asserts that the moved operation alone reaches stub B, through the same URL and with
-// B's response unchanged, while the other 21 still reach stub A, the default "backend" target. REST and
-// SOAP each get a case because the facade matches them differently: REST by verb and path, SOAP by the
-// SOAPAction header and then by the request body.
+// B's response (status, Content-Type and body) unchanged, while the other 21 still reach stub A, the
+// default "backend" target, and return A's. The two stubs send Content-Types that differ in media type
+// and charset, so a dropped, rewritten or swapped Content-Type fails. REST and SOAP each get a case
+// because the facade matches them differently: REST by verb and path, SOAP by the SOAPAction header and
+// then by the request body.
 //
 // Request-line pass-through (class RequestLinePassThroughTests) adds a third stub C as
 // Routing:DefaultTarget, distinct from the backend A, and sends each request over a raw socket so that
@@ -22,9 +24,9 @@
 //
 // Facade test failures are identified across runs by a signature over the exception type, the failing
 // line and the assertion message, so every message here is built only from fixed values: operation ids,
-// stub ids, listener names, request targets and status codes. No port, URL, elapsed time or GUID ever
-// reaches a message, which is also why no Assert.Single, Assert.Empty or Assert.Equal is applied to a
-// recorded StubRequest: its dump would print the Host header and with it a port.
+// stub ids, listener names, request targets, content types and status codes. No port, URL, elapsed time
+// or GUID ever reaches a message, which is also why no Assert.Single, Assert.Empty or Assert.Equal is
+// applied to a recorded StubRequest: its dump would print the Host header and with it a port.
 
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -32,6 +34,7 @@ using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
+using System.Runtime.ExceptionServices;
 using System.Text;
 using Erewhon.Contracts.Catalogue;
 using Erewhon.Facade.Admin;
@@ -40,6 +43,8 @@ using Erewhon.Facade.Routing;
 using Erewhon.Facade.Soap;
 using Erewhon.Facade.Tests.Support;
 using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
@@ -50,7 +55,8 @@ namespace Erewhon.Facade.Tests;
 
 /// <summary>
 /// Proves that one routing key moves one operation and nothing else (the per-operation routing check of
-/// the results report), on the facade hosted on real loopback Kestrel listeners.
+/// the results report), on the facade hosted on real loopback Kestrel listeners. Every call must return
+/// the status, Content-Type and body bytes of the stub it reached, unchanged.
 /// </summary>
 public sealed class RoutingTests
 {
@@ -73,6 +79,14 @@ public sealed class RoutingTests
     // Distinct from the backend stub's 200, so a response that came from the wrong stub cannot pass.
     internal const int RerouteStatus = 203;
 
+    // Each stub sends its own Content-Type, and the two differ in both media type and charset, so a
+    // response whose Content-Type the facade dropped, rewrote or took from the other stub cannot pass.
+    private static readonly StubContentType BackendContentType =
+        new("text/plain; charset=utf-8", "text/plain", "utf-8");
+
+    private static readonly StubContentType RerouteContentType =
+        new("application/x-erewhon-stub-b; charset=iso-8859-1", "application/x-erewhon-stub-b", "iso-8859-1");
+
     /// <summary>
     /// Routes <paramref name="operation"/> of <paramref name="surface"/> to target <c>stub</c> (stub B)
     /// while target <c>backend</c> is stub A, then calls every catalogue operation once.
@@ -94,9 +108,12 @@ public sealed class RoutingTests
         Assert.Equal(SoapOperationCount, soapOperations.Count);
 
         // Both stubs start before the facade: the factory must not run while another host is built.
-        await using StubBackend backend = await StubBackend.StartAsync(BackendStubId, null, ct);
+        await using StubBackend backend = await StubBackend.StartAsync(
+            BackendStubId, new StubBackendOptions { ExtraHeaders = BackendContentType.AsResponseHeaders() }, ct);
         await using StubBackend stub = await StubBackend.StartAsync(
-            RerouteStubId, new StubBackendOptions { Status = RerouteStatus }, ct);
+            RerouteStubId,
+            new StubBackendOptions { Status = RerouteStatus, ExtraHeaders = RerouteContentType.AsResponseHeaders() },
+            ct);
 
         // Exactly one routing key differs from the shipped table, in the documented key form.
         await using FacadeFactory facade = await FacadeFactory.StartAsync(
@@ -126,11 +143,13 @@ public sealed class RoutingTests
             if (isRerouted)
             {
                 reroutedCalls++;
-                AssertForwardedUnchanged(op.Id, prepared, response, reached: stub, bypassed: backend, RerouteStatus);
+                AssertForwardedUnchanged(
+                    op.Id, prepared, response, reached: stub, bypassed: backend, RerouteStatus, RerouteContentType);
             }
             else
             {
-                AssertForwardedUnchanged(op.Id, prepared, response, reached: backend, bypassed: stub, BackendStatus);
+                AssertForwardedUnchanged(
+                    op.Id, prepared, response, reached: backend, bypassed: stub, BackendStatus, BackendContentType);
             }
         }
 
@@ -146,7 +165,13 @@ public sealed class RoutingTests
             PreparedRequest bodyOnly = OperationRequests.ForSoap(rerouted, includeSoapAction: false);
             RawResponse response = await FacadeFactory.SendAsync(client, bodyOnly.ToMessage(facade.SoapBaseAddress), ct);
             AssertForwardedUnchanged(
-                rerouted.Id + " without SOAPAction", bodyOnly, response, reached: stub, bypassed: backend, RerouteStatus);
+                rerouted.Id + " without SOAPAction",
+                bodyOnly,
+                response,
+                reached: stub,
+                bypassed: backend,
+                RerouteStatus,
+                RerouteContentType);
         }
     }
 
@@ -159,14 +184,16 @@ public sealed class RoutingTests
     // Asserts that the call reached 'reached' once and 'bypassed' never, on the listener of the
     // operation's surface, with the caller's method, raw target, body, Content-Type and SOAPAction
     // unchanged and no X-Forwarded-* header added, and that the facade returned the stub's own status,
-    // X-Stub-Id and body bytes.
+    // X-Stub-Id, Content-Type (one value, byte for byte, and the media type and charset a client parses
+    // from it) and body bytes.
     private static void AssertForwardedUnchanged(
         string label,
         PreparedRequest prepared,
         RawResponse response,
         StubBackend reached,
         StubBackend bypassed,
-        int expectedStatus)
+        int expectedStatus,
+        StubContentType expectedContentType)
     {
         IReadOnlyList<StubRequest> received = reached.Received;
         int bypassedCount = bypassed.Received.Count;
@@ -223,16 +250,40 @@ public sealed class RoutingTests
         Assert.True(
             string.Equals(stubId, reached.Id, StringComparison.Ordinal),
             $"{label}: facade response carried X-Stub-Id {stubId ?? "(absent)"}, expected {reached.Id}");
+
+        // Only fixed values reach these messages: the observed header is whatever the facade produced,
+        // so it is compared but never printed.
+        string[] contentTypes = response.Headers.TryGetValue(ContentTypeHeader, out string[]? values) ? values : [];
+        Assert.True(
+            contentTypes.Length == 1 && string.Equals(contentTypes[0], expectedContentType.Value, StringComparison.Ordinal),
+            $"{label}: facade response did not carry stub {reached.Id}'s Content-Type {expectedContentType.Value} unchanged as its only Content-Type");
+        Assert.True(
+            string.Equals(response.MediaType, expectedContentType.MediaType, StringComparison.Ordinal),
+            $"{label}: facade response media type is not stub {reached.Id}'s {expectedContentType.MediaType}");
+        Assert.True(
+            string.Equals(response.CharSet, expectedContentType.CharSet, StringComparison.Ordinal),
+            $"{label}: facade response charset is not stub {reached.Id}'s {expectedContentType.CharSet}");
+
         Assert.True(
             response.Body.AsSpan().SequenceEqual(request.ResponseBody),
             $"{label}: facade response body differs from the bytes stub {reached.Id} sent");
+    }
+
+    // A Content-Type a stub sends: the exact header value, and the media type and charset a client
+    // parses from it.
+    private sealed record StubContentType(string Value, string MediaType, string CharSet)
+    {
+        // The stub's response headers: this Content-Type in place of the stub's default one.
+        public IReadOnlyDictionary<string, string> AsResponseHeaders() =>
+            new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { [ContentTypeHeader] = Value };
     }
 }
 
 /// <summary>
 /// Proves, on the facade hosted on real loopback Kestrel listeners, that the operation a REST request
 /// is, and the method token and request target its target receives, follow from the caller's raw request
-/// line alone: raw-target dispatch, the method token as sent, and the asterisk-form <c>OPTIONS *</c>.
+/// line alone: raw-target dispatch, the method token as sent, and the asterisk-form <c>OPTIONS *</c>. Also
+/// proves that the setup's teardown releases every stub listener when an earlier part fails to stop.
 /// </summary>
 public sealed class RequestLinePassThroughTests
 {
@@ -251,6 +302,10 @@ public sealed class RequestLinePassThroughTests
 
     private const string HostHeader = "Host";
     private const string AbsoluteForm = "absolute";
+
+    // The parts of the raw-target setup in the order its teardown disposes them: the facade, then C, B and A.
+    private const string FacadePartName = "facade";
+    private const string TeardownOrder = FacadePartName + "," + DefaultStubId + "," + RerouteStubId + "," + BackendStubId;
 
     /// <summary>
     /// With <c>getCompany</c> routed to stub B and a default target C distinct from the backend A, sends
@@ -346,6 +401,41 @@ public sealed class RequestLinePassThroughTests
         AssertReachedOnly($"OPTIONS * on the {socket} socket", setup, DefaultStubId, listener, "OPTIONS", "*", response);
     }
 
+    /// <summary>
+    /// Drives the teardown of the raw-target setup with four recording parts standing for the facade and
+    /// stubs C, B and A, in its disposal order, the named ones failing to stop. Asserts that every part is
+    /// disposed exactly once and in that order whatever failed before it, so a facade whose host throws
+    /// while stopping leaves no stub listener behind, and that the first failure in disposal order is the
+    /// one that propagates once all have been disposed.
+    /// </summary>
+    /// <param name="failing">The comma-separated names of the parts whose disposal throws.</param>
+    /// <param name="expectedMessage">The message of the failure that must propagate.</param>
+    [Theory]
+    [InlineData(FacadePartName, "facade failed to stop")]
+    [InlineData(RerouteStubId, "B failed to stop")]
+    [InlineData(FacadePartName + "," + RerouteStubId, "facade failed to stop")]
+    public async Task TeardownDisposesEveryPartInOrderAndRethrowsTheFirstFailure(string failing, string expectedMessage)
+    {
+        string[] failingNames = failing.Split(',');
+        var disposed = new ConcurrentQueue<string>();
+        IAsyncDisposable[] parts =
+        [
+            .. TeardownOrder.Split(',').Select(
+                name => new RecordingPart(name, failingNames.Contains(name, StringComparer.Ordinal), disposed)),
+        ];
+
+        InvalidOperationException failure = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => DisposeInOrderAsync(parts).AsTask());
+
+        Assert.True(
+            string.Equals(failure.Message, expectedMessage, StringComparison.Ordinal),
+            $"teardown with {failing} failing propagated '{failure.Message}', expected '{expectedMessage}'");
+        string order = string.Join(",", disposed);
+        Assert.True(
+            string.Equals(order, TeardownOrder, StringComparison.Ordinal),
+            $"teardown with {failing} failing disposed {order}, expected {TeardownOrder}, each part once");
+    }
+
     // Asserts that the stub named 'expectedStubId' received the call once on 'listener' and the other two
     // stubs none, with the method token and raw target exactly as expected, its own listener's authority
     // as Host and no X-Forwarded-* header, and that the facade returned that stub's status, X-Stub-Id and
@@ -398,6 +488,29 @@ public sealed class RequestLinePassThroughTests
         Assert.True(
             response.Body.AsSpan().SequenceEqual(request.ResponseBody),
             $"{label}: facade response body differs from the bytes stub {reached.Id} sent");
+    }
+
+    // Disposes each part in the order given, each one whatever the ones before it did, so that a part
+    // that throws while stopping, such as a facade host, cannot leave the parts after it listening. Once
+    // all have been disposed, the first failure is rethrown with its original stack trace; any later one
+    // is dropped, because the first is the one that explains the teardown.
+    private static async ValueTask DisposeInOrderAsync(params IAsyncDisposable[] parts)
+    {
+        ArgumentNullException.ThrowIfNull(parts);
+        ExceptionDispatchInfo? firstFailure = null;
+        foreach (IAsyncDisposable part in parts)
+        {
+            try
+            {
+                await part.DisposeAsync();
+            }
+            catch (Exception exception)
+            {
+                firstFailure ??= ExceptionDispatchInfo.Capture(exception);
+            }
+        }
+
+        firstFailure?.Throw();
     }
 
     // Stub A as target "backend", stub B as target "stub" serving getCompany, and stub C as target "dflt",
@@ -457,9 +570,16 @@ public sealed class RequestLinePassThroughTests
             }
             catch
             {
-                for (int index = started.Count - 1; index >= 0; index--)
+                // What started stops in reverse order of start, each part whatever the ones before it did.
+                // The start failure is the outcome the test reports, so a failure to stop a part is
+                // dropped here rather than allowed to replace it, and the start failure is rethrown below.
+                try
                 {
-                    await started[index].DisposeAsync();
+                    await DisposeInOrderAsync([.. Enumerable.Reverse(started)]);
+                }
+                catch (Exception)
+                {
+                    // Dropped, as explained above: every part has already been disposed by now.
                 }
 
                 throw;
@@ -474,13 +594,24 @@ public sealed class RequestLinePassThroughTests
             _ => throw new ArgumentOutOfRangeException(nameof(id), "stub id is not A, B or C"),
         };
 
-        // The facade stops first, so no forwarded call is in flight when the stubs stop.
+        // The facade stops first, so no forwarded call is in flight when the stubs stop. Each stub stops
+        // even when the facade's host throws while stopping, so no stub listener outlives the test, and
+        // that failure is rethrown once all four have been disposed.
+        public ValueTask DisposeAsync() => DisposeInOrderAsync(Facade, Fallback, Rerouted, Backend);
+    }
+
+    // One part of the raw-target setup in the teardown test: records its name when disposed and, when told
+    // to, then fails asynchronously, as a host that throws while stopping does.
+    private sealed class RecordingPart(string name, bool fails, ConcurrentQueue<string> disposed) : IAsyncDisposable
+    {
         public async ValueTask DisposeAsync()
         {
-            await Facade.DisposeAsync();
-            await Fallback.DisposeAsync();
-            await Rerouted.DisposeAsync();
-            await Backend.DisposeAsync();
+            await Task.Yield();
+            disposed.Enqueue(name);
+            if (fails)
+            {
+                throw new InvalidOperationException(name + " failed to stop");
+            }
         }
     }
 
@@ -972,6 +1103,9 @@ public sealed class PassThroughTransformerTests
     // Backend:TimeoutSeconds for the call whose body never follows its head.
     private const int MidBodyDeadlineSeconds = 2;
 
+    // The fixed message of an HttpClient exchange, head and body, that outlived RawExchangeTimeout.
+    private const string ExchangeBoundExpiredMessage = "facade response did not end within the 15 s exchange bound";
+
     // The blank line that ends a message head.
     private static readonly byte[] HeadTerminator = "\r\n\r\n"u8.ToArray();
 
@@ -1013,6 +1147,17 @@ public sealed class PassThroughTransformerTests
 
     // How long a raw exchange with the facade may take before it fails the test, as the raw client's.
     private static readonly TimeSpan RawExchangeTimeout = TimeSpan.FromSeconds(15);
+
+    // The window, from just before the request is sent, in which the facade must abort a body that never
+    // follows its head: not before the deadline, and within the failure tests' 5 s timeout bound.
+    private static readonly TimeSpan MidBodyAbortLowerBound = TimeSpan.FromSeconds(MidBodyDeadlineSeconds);
+    private static readonly TimeSpan MidBodyAbortUpperBound = TimeSpan.FromSeconds(5);
+
+    // True when the exchange bound, or the raw client's own timeout of the same length, ended an
+    // HttpClient exchange rather than the test run did: a cancellation the test did not request, or any
+    // failure once the bound has passed.
+    private static bool ExchangeBoundEnded(Exception exception, CancellationTokenSource exchange, CancellationToken ct) =>
+        !ct.IsCancellationRequested && (exception is OperationCanceledException || exchange.IsCancellationRequested);
 
     /// <summary>
     /// Sends a request with a body whose two <c>Connection</c> lines nominate custom, request and content
@@ -1252,7 +1397,8 @@ public sealed class PassThroughTransformerTests
     /// <summary>
     /// Has the backend send its status line and headers and then withhold the body until the test has
     /// received the facade's response head, and asserts that the head arrived first and the full body
-    /// after it.
+    /// after it. The head and the body are read under one 15 s exchange bound, so a facade that never
+    /// ends the response fails the test instead of hanging it.
     /// </summary>
     /// <param name="operationId">The catalogue operation called at its normal address.</param>
     [Theory]
@@ -1287,6 +1433,10 @@ public sealed class PassThroughTransformerTests
         using HttpClient client = facade.CreateRawClient();
         using HttpRequestMessage request = OperationRequests.For(operation).ToMessage(SocketFor(facade, operation));
 
+        // HttpClient's own timeout ends once the head is read, so one bound covers the head and the body.
+        using var exchange = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        exchange.CancelAfter(RawExchangeTimeout);
+
         byte[] body;
         bool headBeforeBody;
         string? endToEnd;
@@ -1294,7 +1444,8 @@ public sealed class PassThroughTransformerTests
         int status;
         try
         {
-            using HttpResponseMessage response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+            using HttpResponseMessage response = await client.SendAsync(
+                request, HttpCompletionOption.ResponseHeadersRead, exchange.Token);
             headBeforeBody = !bodySent.Task.IsCompleted;
             release.TrySetResult();
 
@@ -1303,7 +1454,12 @@ public sealed class PassThroughTransformerTests
                 ? values.ToString()
                 : null;
             contentLength = response.Content.Headers.ContentLength;
-            body = await response.Content.ReadAsByteArrayAsync(ct);
+            body = await response.Content.ReadAsByteArrayAsync(exchange.Token);
+        }
+        catch (Exception exception) when (ExchangeBoundEnded(exception, exchange, ct))
+        {
+            Assert.Fail(ExchangeBoundExpiredMessage);
+            throw new UnreachableException();
         }
         catch (Exception exception) when (IsTransportFailure(exception, ct))
         {
@@ -1322,7 +1478,9 @@ public sealed class PassThroughTransformerTests
     /// <summary>
     /// Has the backend send its status line and headers and then never send the body, with a 2 s
     /// deadline, and asserts that the caller receives the backend's head and then an aborted body:
-    /// the response the backend started is never re-headed with the facade's timeout response.
+    /// the response the backend started is never re-headed with the facade's timeout response. The
+    /// abort must come between 2 and 5 s after the request is sent, and the head and the body are read
+    /// under one 15 s exchange bound, so a facade that never aborts fails the test instead of hanging it.
     /// </summary>
     /// <param name="operationId">The catalogue operation called at its normal address.</param>
     [Theory]
@@ -1352,21 +1510,37 @@ public sealed class PassThroughTransformerTests
         using HttpClient client = facade.CreateRawClient();
         using HttpRequestMessage request = OperationRequests.For(operation).ToMessage(SocketFor(facade, operation));
 
+        // HttpClient's own timeout ends once the head is read, so one bound covers the head and the body.
+        using var exchange = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        exchange.CancelAfter(RawExchangeTimeout);
+
         int status;
         bool bodyAborted;
+        TimeSpan bodyEndedAfter;
+        long sendStart = Stopwatch.GetTimestamp();
         try
         {
-            using HttpResponseMessage response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+            using HttpResponseMessage response = await client.SendAsync(
+                request, HttpCompletionOption.ResponseHeadersRead, exchange.Token);
             status = (int)response.StatusCode;
             try
             {
-                await response.Content.ReadAsByteArrayAsync(ct);
+                await response.Content.ReadAsByteArrayAsync(exchange.Token);
                 bodyAborted = false;
             }
-            catch (Exception exception) when (exception is HttpRequestException or IOException)
+            catch (Exception exception)
+                when ((exception is HttpRequestException or IOException) && !exchange.IsCancellationRequested)
             {
+                // The facade broke off the response; a read the exchange bound cancelled is no abort.
                 bodyAborted = true;
             }
+
+            bodyEndedAfter = Stopwatch.GetElapsedTime(sendStart);
+        }
+        catch (Exception exception) when (ExchangeBoundEnded(exception, exchange, ct))
+        {
+            Assert.Fail(ExchangeBoundExpiredMessage);
+            throw new UnreachableException();
         }
         catch (Exception exception) when (IsTransportFailure(exception, ct))
         {
@@ -1376,6 +1550,8 @@ public sealed class PassThroughTransformerTests
 
         Assert.Equal(200, status);
         Assert.True(bodyAborted, "response body was not aborted after the deadline passed");
+        Assert.True(bodyEndedAfter >= MidBodyAbortLowerBound, "response body was aborted before the 2 s deadline passed");
+        Assert.True(bodyEndedAfter <= MidBodyAbortUpperBound, "response body was not aborted within 5 s of the request");
         Assert.True(backend.RequestCount == 1, "backend did not receive exactly one request");
     }
 
@@ -1694,6 +1870,253 @@ public sealed class PassThroughTransformerTests
                     // backend is stopping; the connection is closed without an answer.
                 }
             }
+        }
+    }
+}
+
+// Configuration of the facade under test (class FacadeTestHostSettingsTests). FacadeFactory starts the
+// facade with its shipped appsettings.json and the settings the test supplies, and with nothing taken
+// from the environment of the process that runs the tests. An extra setting replaces the value a typed
+// FacadeTestSettings property or the factory gives the same key, however the key is spelled, and a
+// Routing__*, Backend__* or Facade__* variable exported in the shell, plain or with the ASPNETCORE_ or
+// DOTNET_ prefix the host also reads, never reaches the facade. The class name ends in none of the
+// suffixes "RoutingTests", "FailureBehaviourTests" and "ListenerIsolationTests" by which the results
+// report counts its checks.
+//
+// The shell cases set process environment variables for the length of one test and restore them
+// afterwards, which is safe because the assembly runs no two tests at once (FacadeFactory.cs). Every
+// assertion message is a fixed literal: no port, URL or elapsed time.
+/// <summary>
+/// Proves that an extra setting overrides the typed or factory value of the same key whatever its letter
+/// case, and that environment variables of the test process neither reroute an operation of the facade
+/// under test nor stop its start-up.
+/// </summary>
+public sealed class FacadeTestHostSettingsTests
+{
+    private const string BackendStubId = "A";
+    private const string OverrideStubId = "B";
+    private const string StubIdHeader = "X-Stub-Id";
+    private const int BackendStatus = 200;
+
+    // Distinct from stub A's 200, so a response that came from the wrong stub cannot pass.
+    private const int OverrideStatus = 203;
+
+    // Backend:TimeoutSeconds in the shipped appsettings.json.
+    private const int ShippedTimeoutSeconds = 30;
+
+    // Given through the typed properties. The timeout differs from the shipped one, so a typed value the
+    // facade did not apply cannot pass either.
+    private const int TypedTimeoutSeconds = 7;
+    private const string TypedWsdlPath = "no-wsdl-typed/ErewhonWebService.wsdl";
+
+    // Given through Settings. Both WSDL paths are relative to the test's base directory and name no file,
+    // so the facade starts with wsdl: absent either way.
+    private const int ExtraTimeoutSeconds = 2;
+    private const string ExtraTimeoutSecondsText = "2";
+    private const string ExtraWsdlPath = "no-wsdl-extra/ErewhonWebService.wsdl";
+
+    // Base URLs of a backend the facade never calls: it starts without connecting to its targets.
+    private const string UnusedRestBaseUrl = "http://127.0.0.1:2";
+    private const string UnusedSoapBaseUrl = "http://127.0.0.1:3";
+
+    // The rerouting example of the routing design, as exported in QA's shell: one operation moved to a new
+    // target whose base URL is a closed port.
+    private const string ShellTargetName = "orders";
+    private const string ShellTargetBaseUrl = "http://127.0.0.1:2";
+
+    /// <summary>
+    /// Gives <paramref name="key"/> a value through <see cref="FacadeTestSettings.Settings"/> that its
+    /// typed property also sets, and checks the timeout and WSDL path the facade applies.
+    /// </summary>
+    /// <param name="key">The extra setting's key, in the letter case of the row.</param>
+    /// <param name="value">The extra setting's value.</param>
+    /// <param name="expectedTimeoutSeconds">The <c>Backend:TimeoutSeconds</c> the facade must apply.</param>
+    /// <param name="expectedWsdlPath">The <c>Facade:WsdlPath</c> the facade must apply.</param>
+    [Theory]
+    [InlineData("Backend:TimeoutSeconds", ExtraTimeoutSecondsText, ExtraTimeoutSeconds, TypedWsdlPath)]
+    [InlineData("backend:TIMEOUTSECONDS", ExtraTimeoutSecondsText, ExtraTimeoutSeconds, TypedWsdlPath)]
+    [InlineData("Facade:WsdlPath", ExtraWsdlPath, TypedTimeoutSeconds, ExtraWsdlPath)]
+    [InlineData("FACADE:wsdlpath", ExtraWsdlPath, TypedTimeoutSeconds, ExtraWsdlPath)]
+    public async Task ExtraSettingOverridesTypedValueOfTheSameKey(
+        string key, string value, int expectedTimeoutSeconds, string expectedWsdlPath)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(
+            new FacadeTestSettings
+            {
+                BackendRestBaseUrl = UnusedRestBaseUrl,
+                BackendSoapBaseUrl = UnusedSoapBaseUrl,
+                BackendTimeoutSeconds = TypedTimeoutSeconds,
+                WsdlPath = TypedWsdlPath,
+                Settings = { [key] = value },
+            },
+            ct);
+
+        int timeoutSeconds = facade.Services.GetRequiredService<OperationRouter>().Describe().BackendTimeoutSeconds;
+        string wsdlPath = facade.Services.GetRequiredService<IOptions<FacadeOptions>>().Value.WsdlPath;
+        Assert.True(
+            timeoutSeconds == expectedTimeoutSeconds,
+            "Backend:TimeoutSeconds: facade applied another value than the extra or typed setting gave it");
+        Assert.True(
+            string.Equals(wsdlPath, expectedWsdlPath, StringComparison.Ordinal),
+            "Facade:WsdlPath: facade applied another value than the extra or typed setting gave it");
+    }
+
+    /// <summary>
+    /// Gives <c>Routing:Targets:backend:RestBaseUrl</c> stub B's REST base URL through
+    /// <see cref="FacadeTestSettings.Settings"/> while the typed backend URLs are stub A's, and checks that
+    /// a REST operation reaches stub B alone while a SOAP operation still reaches stub A.
+    /// </summary>
+    /// <param name="key">The extra setting's key, in the letter case of the row.</param>
+    [Theory]
+    [InlineData("Routing:Targets:backend:RestBaseUrl")]
+    [InlineData("routing:TARGETS:Backend:restbaseurl")]
+    public async Task ExtraBaseUrlOverridesTypedBackendBaseUrl(string key)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        OperationDescriptor restOperation = OperationCatalogue.Default.Find(Surface.Rest, "getCompany");
+        OperationDescriptor soapOperation = OperationCatalogue.Default.Find(Surface.Soap, "getAgentNames");
+
+        // Both stubs start before the facade: the factory must not run while another host is built.
+        await using StubBackend typed = await StubBackend.StartAsync(BackendStubId, ct: ct);
+        await using StubBackend extra = await StubBackend.StartAsync(
+            OverrideStubId, new StubBackendOptions { Status = OverrideStatus }, ct);
+
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(
+            new FacadeTestSettings
+            {
+                BackendRestBaseUrl = typed.RestBaseUrl,
+                BackendSoapBaseUrl = typed.SoapBaseUrl,
+                Settings = { [key] = extra.RestBaseUrl },
+            },
+            ct);
+        using HttpClient client = facade.CreateRawClient();
+
+        RawResponse rest = await FacadeFactory.SendAsync(
+            client, OperationRequests.For(restOperation).ToMessage(facade.RestBaseAddress), ct);
+        Assert.True(
+            extra.ReceivedOn(StubListener.Rest).Count == 1 && extra.Received.Count == 1,
+            "Rest.getCompany did not reach the REST base URL of the extra setting exactly once");
+        Assert.True(typed.Received.Count == 0, "Rest.getCompany reached the typed REST base URL the extra setting replaced");
+        Assert.True(
+            rest.Status == OverrideStatus && string.Equals(rest.Header(StubIdHeader), OverrideStubId, StringComparison.Ordinal),
+            "Rest.getCompany: facade did not return the response of the extra setting's REST base URL");
+
+        typed.ClearLog();
+        extra.ClearLog();
+
+        RawResponse soap = await FacadeFactory.SendAsync(
+            client, OperationRequests.For(soapOperation).ToMessage(facade.SoapBaseAddress), ct);
+        Assert.True(
+            typed.ReceivedOn(StubListener.Soap).Count == 1 && typed.Received.Count == 1,
+            "Soap.getAgentNames did not reach the typed SOAP base URL exactly once");
+        Assert.True(extra.Received.Count == 0, "Soap.getAgentNames reached the stub that only the extra REST base URL names");
+        Assert.True(
+            soap.Status == BackendStatus && string.Equals(soap.Header(StubIdHeader), BackendStubId, StringComparison.Ordinal),
+            "Soap.getAgentNames: facade did not return the response of the typed SOAP base URL");
+    }
+
+    /// <summary>
+    /// Exports a rerouting of <paramref name="operation"/> to a new target, with <paramref name="prefix"/>,
+    /// in the test process's environment, and checks that the facade defines no such target and still
+    /// forwards the operation to its backend, stub A.
+    /// </summary>
+    /// <param name="prefix">The environment variable prefix: none, <c>ASPNETCORE_</c> or <c>DOTNET_</c>.</param>
+    /// <param name="surface">The rerouted operation's surface, <c>Rest</c> or <c>Soap</c>.</param>
+    /// <param name="operation">The rerouted operation's JADE method name, its routing key.</param>
+    [Theory]
+    [InlineData("", "Rest", "getCompany")]
+    [InlineData("ASPNETCORE_", "Soap", "getAgentNames")]
+    [InlineData("DOTNET_", "Rest", "getCompany")]
+    public async Task ShellRoutingVariablesDoNotReachTheFacade(string prefix, string surface, string operation)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        OperationDescriptor rerouted = OperationCatalogue.Default.Find(Enum.Parse<Surface>(surface), operation);
+
+        using var shell = new ProcessEnvironment();
+        shell.Set($"{prefix}Routing__Operations__{surface}__{operation}", ShellTargetName);
+        shell.Set($"{prefix}Routing__Targets__{ShellTargetName}__{surface}BaseUrl", ShellTargetBaseUrl);
+
+        await using StubBackend backend = await StubBackend.StartAsync(BackendStubId, ct: ct);
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(
+            new FacadeTestSettings
+            {
+                BackendRestBaseUrl = backend.RestBaseUrl,
+                BackendSoapBaseUrl = backend.SoapBaseUrl,
+            },
+            ct);
+
+        using HttpClient client = facade.CreateRawClient();
+        Uri socket = rerouted.Surface == Surface.Rest ? facade.RestBaseAddress : facade.SoapBaseAddress;
+        RawResponse response = await FacadeFactory.SendAsync(client, OperationRequests.For(rerouted).ToMessage(socket), ct);
+        Assert.True(
+            backend.Received.Count == 1,
+            "the operation the shell environment reroutes did not reach stub A exactly once");
+        Assert.True(
+            response.Status == BackendStatus && string.Equals(response.Header(StubIdHeader), BackendStubId, StringComparison.Ordinal),
+            "facade did not return stub A's response for the operation the shell environment reroutes");
+
+        // A variable for a key appsettings.json does not hold, such as a new target, would otherwise reach
+        // the facade even from a source that appsettings.json overrides.
+        RoutingSnapshot table = facade.Services.GetRequiredService<OperationRouter>().Describe();
+        Assert.False(
+            table.Targets.Any(target => string.Equals(target.Name, ShellTargetName, StringComparison.OrdinalIgnoreCase)),
+            "facade defined a routing target exported in the shell environment");
+    }
+
+    /// <summary>
+    /// Exports, with <paramref name="prefix"/>, a routing key that names no catalogue operation and a
+    /// <c>Backend:TimeoutSeconds</c> of 0, either of which fails the facade's start-up validation, and
+    /// checks that the facade starts with the shipped timeout.
+    /// </summary>
+    /// <param name="prefix">The environment variable prefix: none, <c>ASPNETCORE_</c> or <c>DOTNET_</c>.</param>
+    [Theory]
+    [InlineData("")]
+    [InlineData("ASPNETCORE_")]
+    [InlineData("DOTNET_")]
+    public async Task ShellVariablesThatFailValidationDoNotStopStartUp(string prefix)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        using var shell = new ProcessEnvironment();
+        shell.Set($"{prefix}Routing__Operations__Rest__notAnOperation", "backend");
+        shell.Set($"{prefix}Backend__TimeoutSeconds", "0");
+
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(
+            new FacadeTestSettings
+            {
+                BackendRestBaseUrl = UnusedRestBaseUrl,
+                BackendSoapBaseUrl = UnusedSoapBaseUrl,
+            },
+            ct);
+
+        int timeoutSeconds = facade.Services.GetRequiredService<OperationRouter>().Describe().BackendTimeoutSeconds;
+        Assert.True(
+            timeoutSeconds == ShippedTimeoutSeconds,
+            "Backend:TimeoutSeconds: facade applied another value than the shipped appsettings.json gives it");
+    }
+
+    // Sets process environment variables for one test and, on disposal, restores each one's previous value,
+    // or its absence, in the reverse order of setting.
+    private sealed class ProcessEnvironment : IDisposable
+    {
+        private readonly List<(string Name, string? Previous)> _saved = [];
+
+        public void Set(string name, string value)
+        {
+            _saved.Add((name, Environment.GetEnvironmentVariable(name)));
+            Environment.SetEnvironmentVariable(name, value);
+        }
+
+        public void Dispose()
+        {
+            for (int index = _saved.Count - 1; index >= 0; index--)
+            {
+                Environment.SetEnvironmentVariable(_saved[index].Name, _saved[index].Previous);
+            }
+
+            _saved.Clear();
         }
     }
 }
@@ -2484,6 +2907,631 @@ public sealed class BaseUrlCredentialTests
         }
 
         public TOptions CurrentValue => _rejection is { } rejection ? throw rejection : value;
+
+        public TOptions Get(string? name) => CurrentValue;
+
+        public IDisposable? OnChange(Action<TOptions, string?> listener) => null;
+    }
+}
+
+// Routing configuration lifecycle (class RoutingConfigurationLifecycleTests) sits here, beside the
+// routing checks whose table it starts and reloads, as a class of its own: the results report counts
+// test classes whose names end in "RoutingTests" as the two-case per-operation routing check, and this
+// name matches none.
+//
+// The routing table from start-up through reloads. On the facade hosted on real loopback Kestrel
+// listeners: a table with a key that names no catalogue operation, an entry that names an undefined
+// target or a target without its surface's base URL, a timeout that is not an integer greater than 0,
+// or a key outside the section's shape stops start-up with exactly one failure naming that entry;
+// changing one operation's key in the running facade's configuration moves that operation alone; and a
+// reload rejected before the first request leaves the table published while the facade started serving
+// every request, logged once, until a valid reload replaces it. In-process, over OperationRouter and
+// options monitors the test drives: an initialised router moves one operation on reload and its routing
+// snapshot shows the move; a reload rejected before the first resolution, by the validator or by the
+// configuration binder, keeps the start-up table until a valid reload, while before any table is
+// published the same rejection propagates unchanged; and a resolution that read older options before a
+// newer table was published never replaces that table.
+//
+// A reload of the hosted facade sets each key on every provider of its configuration root and then
+// reloads the root, as a changed settings file or environment does. The test's in-memory source is the
+// last provider and keeps its values when reloaded, so the keys win over appsettings.json.
+//
+// Facade test failures are identified across runs by a signature over the exception type, the failing
+// line and the assertion message, so every message here is a fixed literal or built from operation ids,
+// target names, stub ids, configuration paths and status codes: no port, URL, elapsed time or GUID. The
+// base URLs of the start-up cases, which never start, and of the in-process cases are synthetic and
+// never contacted.
+/// <summary>
+/// Proves that an invalid routing table stops the facade's start-up with a failure naming the entry, that
+/// one changed key moves one operation in the running facade, that a rejected reload keeps the last valid
+/// table, the start-up table included, in service until a valid reload, and that a table compiled from
+/// older options never replaces a newer one.
+/// </summary>
+public sealed class RoutingConfigurationLifecycleTests
+{
+    private const string BackendTarget = "backend";
+    private const string StubTarget = "stub";
+    private const string OrdersTarget = "orders";
+
+    private const string BackendStubId = "A";
+    private const string StubStubId = "B";
+    private const string StubIdHeader = "X-Stub-Id";
+
+    // Distinct from the backend stub's 200, so a response that came from the wrong stub cannot pass.
+    private const int StubStatus = 203;
+
+    // The 13 REST and 9 SOAP operations carried over from ErewhonRestService and ErewhonWebService.
+    private const int CatalogueOperationCount = 22;
+
+    private const string GetCompanyKey = "Routing:Operations:Rest:getCompany";
+    private const string BackendTimeoutKey = "Routing:Targets:backend:TimeoutSeconds";
+
+    // OperationRouter's rejected-reload and reload-accepted log entries.
+    private const int ReloadRejectedEventId = 1101;
+    private const int ReloadAcceptedEventId = 1102;
+
+    // How an in-process case rejects a reload: through RoutingOptionsValidator, or through the
+    // configuration binder for a value that does not convert to its option's type.
+    private const string ValidatorRejection = "validator";
+    private const string BinderRejection = "binder";
+
+    // The start-up cases never bind a listener or send a request, so these URLs are never contacted.
+    private const string SyntheticRestBaseUrl = "http://127.0.0.1:1";
+    private const string SyntheticSoapBaseUrl = "http://127.0.0.1:2";
+
+    // Ends every wait of the ordered-publication case, so a regression fails it instead of hanging it.
+    private static readonly TimeSpan WaitBound = TimeSpan.FromSeconds(10);
+
+    private static readonly string RouterCategory = typeof(OperationRouter).FullName!;
+
+    /// <summary>
+    /// A routing table that breaks one rule stops the facade's start-up, through the validator the facade
+    /// registers or the shape check it runs before binding, with exactly one failure naming the entry.
+    /// </summary>
+    /// <param name="key">The one routing key added to the shipped table.</param>
+    /// <param name="value">The key's value.</param>
+    /// <param name="failure">The one failure start-up must report, as RoutingOptionsValidator words it.</param>
+    [Theory]
+    [InlineData("Routing:Operations:Rest:nope", BackendTarget, "Routing:Operations:Rest:nope is not a catalogue REST operation")]
+    [InlineData(GetCompanyKey, "nowhere", "Routing:Operations:Rest:getCompany names undefined target 'nowhere'")]
+    [InlineData(
+        "Routing:Operations:Soap:getAgentNames",
+        StubTarget,
+        "Routing:Targets:stub has no SoapBaseUrl but serves Routing:Operations:Soap:getAgentNames")]
+    [InlineData(BackendTimeoutKey, "0", "Routing:Targets:backend:TimeoutSeconds must be greater than 0 (was 0)")]
+    [InlineData(BackendTimeoutKey, "abc", "Routing:Targets:backend:TimeoutSeconds must be an integer greater than 0 (was 'abc')")]
+    [InlineData("Routing:Unknown", "x", "Routing:Unknown is not a routing setting (expected DefaultTarget, Targets or Operations)")]
+    public async Task InvalidStartUpRoutingStopsTheFacadeNamingTheEntry(string key, string value, string failure)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        // Target stub has a REST base URL only, which is valid while no SOAP operation is routed to it.
+        var settings = new FacadeTestSettings
+        {
+            BackendRestBaseUrl = SyntheticRestBaseUrl,
+            BackendSoapBaseUrl = SyntheticSoapBaseUrl,
+            StubRestBaseUrl = SyntheticRestBaseUrl,
+            Settings = { [key] = value },
+        };
+
+        // The host's start-up validation throws, and the facade's entry point leaves the exception to the
+        // in-process caller unchanged.
+        OptionsValidationException validation = await Assert.ThrowsAsync<OptionsValidationException>(async () =>
+        {
+            await using FacadeFactory started = await FacadeFactory.StartAsync(settings, ct);
+        });
+
+        Assert.True(validation.OptionsType == typeof(RoutingOptions), "start-up was stopped by options other than RoutingOptions");
+        Assert.Equal(failure, Assert.Single(validation.Failures));
+    }
+
+    /// <summary>
+    /// Changing one operation's routing key in the running facade's configuration moves that operation,
+    /// and only it, from stub A (target <c>backend</c>) to stub B (target <c>stub</c>) from the next
+    /// request on; before the change every catalogue operation reaches stub A.
+    /// </summary>
+    /// <param name="surface">The moved operation's surface, <c>Rest</c> or <c>Soap</c>.</param>
+    /// <param name="operation">The moved operation's JADE method name, its routing key.</param>
+    [Theory]
+    [InlineData("Rest", "getCompany")]
+    [InlineData("Soap", "getAgentNames")]
+    public async Task ChangingOneOperationKeyInTheRunningFacadeMovesOnlyThatOperation(string surface, string operation)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        OperationDescriptor moved = OperationCatalogue.Default.Find(Enum.Parse<Surface>(surface), operation);
+
+        // Both stubs start before the facade: the factory must not run while another host is built.
+        await using StubBackend backend = await StubBackend.StartAsync(BackendStubId, null, ct);
+        await using StubBackend stub = await StubBackend.StartAsync(StubStubId, new StubBackendOptions { Status = StubStatus }, ct);
+
+        // Target stub is defined from the start, and no operation is routed to it.
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(Hosted(backend, stub, logs: null), ct);
+        using HttpClient client = facade.CreateRawClient();
+
+        await AssertEveryOperationReachesAsync(client, facade, backend, stub, movedId: null, "before the change", ct);
+
+        IReadOnlyList<OptionsValidationException> rejections =
+            Reload(facade, ($"Routing:Operations:{moved.Surface}:{moved.RoutingKey}", StubTarget));
+        Assert.True(rejections.Count == 0, "the facade rejected the reload that moves one operation");
+
+        await AssertEveryOperationReachesAsync(client, facade, backend, stub, moved.Id, "after the change", ct);
+    }
+
+    /// <summary>
+    /// A reload the facade rejects before its first request, through the validator or the shape check,
+    /// leaves the table published while the facade started serving every request and is logged once as
+    /// an error naming the entry; the next valid reload replaces that table and is logged once as accepted.
+    /// </summary>
+    /// <param name="key">The routing key the rejected reload sets.</param>
+    /// <param name="value">The value that makes the reload invalid.</param>
+    /// <param name="failure">The failure the rejection and its log entry must name.</param>
+    [Theory]
+    [InlineData(GetCompanyKey, "nowhere", "Routing:Operations:Rest:getCompany names undefined target 'nowhere'")]
+    [InlineData(BackendTimeoutKey, "abc", "Routing:Targets:backend:TimeoutSeconds must be an integer greater than 0 (was 'abc')")]
+    public async Task ReloadRejectedBeforeTheFirstRequestKeepsTheStartUpTableInService(string key, string value, string failure)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        OperationCatalogue catalogue = OperationCatalogue.Default;
+        OperationDescriptor getCompany = catalogue.Find(Surface.Rest, "getCompany");
+        OperationDescriptor[] unmoved = [catalogue.Find(Surface.Rest, "getAllAgents"), catalogue.Find(Surface.Soap, "getAgentNames")];
+        var logs = new LogCapture();
+
+        await using StubBackend backend = await StubBackend.StartAsync(BackendStubId, null, ct);
+        await using StubBackend stub = await StubBackend.StartAsync(StubStubId, new StubBackendOptions { Status = StubStatus }, ct);
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(Hosted(backend, stub, logs), ct);
+        using HttpClient client = facade.CreateRawClient();
+
+        // No request has reached the facade yet, so only the table published while it started can serve
+        // the requests below. A rejection the reload itself surfaces must be this entry's.
+        IReadOnlyList<OptionsValidationException> rejections = Reload(facade, (key, value));
+        Assert.True(
+            rejections.All(rejection => rejection.OptionsType == typeof(RoutingOptions) && rejection.Failures.Contains(failure)),
+            "the reload was rejected for another reason than the entry it breaks");
+
+        foreach (OperationDescriptor op in unmoved.Prepend(getCompany))
+        {
+            await AssertCallReachesAsync(client, facade, op, reached: backend, bypassed: stub, $"{op.Id} after the rejected reload", ct);
+        }
+
+        IReadOnlyList<CapturedLog> rejected = RouterLog(logs, ReloadRejectedEventId);
+        Assert.True(rejected.Count == 1, "the rejected reload was not logged exactly once");
+        Assert.True(rejected[0].Level == LogLevel.Error, "the rejected reload was not logged as an error");
+        Assert.True(
+            rejected[0].Message.Contains(failure, StringComparison.Ordinal),
+            "the rejected-reload log entry does not name the rejected entry");
+        Assert.True(RouterLog(logs, ReloadAcceptedEventId).Count == 0, "a reload was logged as accepted while it stayed rejected");
+
+        // One valid reload withdraws the rejected value and moves getCompany to target stub.
+        rejections = Reload(facade, (key, null), (GetCompanyKey, StubTarget));
+        Assert.True(rejections.Count == 0, "the facade rejected the valid reload");
+
+        await AssertCallReachesAsync(client, facade, getCompany, reached: stub, bypassed: backend, $"{getCompany.Id} after the valid reload", ct);
+        foreach (OperationDescriptor op in unmoved)
+        {
+            await AssertCallReachesAsync(client, facade, op, reached: backend, bypassed: stub, $"{op.Id} after the valid reload", ct);
+        }
+
+        IReadOnlyList<CapturedLog> accepted = RouterLog(logs, ReloadAcceptedEventId);
+        Assert.True(accepted.Count == 1, "the valid reload after the rejected one was not logged exactly once as accepted");
+        Assert.True(accepted[0].Level == LogLevel.Information, "the accepted reload was not logged as information");
+        Assert.True(RouterLog(logs, ReloadRejectedEventId).Count == 1, "the rejected reload was logged again after the valid one");
+    }
+
+    /// <summary>
+    /// An initialised router moves exactly the operation whose key a reload changes: every other
+    /// operation and every unmatched request still resolves to the default target, and the routing
+    /// snapshot that <c>/admin/info</c> reports shows the same routes.
+    /// </summary>
+    /// <param name="surface">The moved operation's surface, <c>Rest</c> or <c>Soap</c>.</param>
+    /// <param name="operation">The moved operation's JADE method name, its routing key.</param>
+    [Theory]
+    [InlineData("Rest", "getCompany")]
+    [InlineData("Soap", "getAgentNames")]
+    public void InitializedRouterMovesOnlyTheChangedOperationOnReload(string surface, string operation)
+    {
+        OperationDescriptor moved = OperationCatalogue.Default.Find(Enum.Parse<Surface>(surface), operation);
+        var logs = new LogCapture();
+        using ILoggerFactory loggers = LoggersFor(logs);
+        var routing = new ReloadableOptionsMonitor<RoutingOptions>(Table());
+        OperationRouter router = Router(routing, new ReloadableOptionsMonitor<BackendOptions>(new BackendOptions()), loggers);
+
+        router.Initialize();
+        AssertResolvesTo(router, moved: null, StubTarget, "start-up");
+        IReadOnlySet<ResolvedTarget> startUpTargets = router.TargetsInService();
+
+        routing.Reload(Table(moved));
+        AssertResolvesTo(router, moved, StubTarget, "after the reload");
+
+        Assert.False(
+            ReferenceEquals(router.TargetsInService(), startUpTargets),
+            "the reload that moves an operation did not rebuild the routing table");
+        Assert.True(logs.Entries.Count == 0, "a valid reload was logged as rejected or as accepted after a rejection");
+    }
+
+    /// <summary>
+    /// A reload rejected after the router published its start-up table and before the first resolution,
+    /// by the validator (routing options) or by the configuration binder (backend options), leaves that
+    /// table in service and is logged once as an error; the next valid reload replaces the table and is
+    /// logged once as accepted. Before any table is published the same rejection propagates unchanged,
+    /// so invalid start-up configuration still stops the facade.
+    /// </summary>
+    /// <param name="rejection">How the reload is rejected: <c>validator</c> or <c>binder</c>.</param>
+    [Theory]
+    [InlineData(ValidatorRejection)]
+    [InlineData(BinderRejection)]
+    public void ReloadRejectedBeforeTheFirstResolutionKeepsTheStartUpTableUntilAValidReload(string rejection)
+    {
+        OperationDescriptor getCompany = OperationCatalogue.Default.Find(Surface.Rest, "getCompany");
+        var logs = new LogCapture();
+        using ILoggerFactory loggers = LoggersFor(logs);
+
+        var unpublishedRouting = new ReloadableOptionsMonitor<RoutingOptions>(Table());
+        var unpublishedBackend = new ReloadableOptionsMonitor<BackendOptions>(new BackendOptions());
+        OperationRouter unpublished = Router(unpublishedRouting, unpublishedBackend, loggers);
+        Exception refused = Reject(rejection, unpublishedRouting, unpublishedBackend).Rejected;
+        Exception thrown = Assert.ThrowsAny<Exception>(unpublished.Initialize);
+        Assert.True(ReferenceEquals(thrown, refused), "a router with no published table did not rethrow the rejected configuration unchanged");
+        Assert.True(logs.Entries.Count == 0, "a router with no published table logged the rejected configuration");
+
+        var routing = new ReloadableOptionsMonitor<RoutingOptions>(Table());
+        var backend = new ReloadableOptionsMonitor<BackendOptions>(new BackendOptions());
+        OperationRouter router = Router(routing, backend, loggers);
+        router.Initialize();
+        (Exception rejected, string optionsType, string failure) = Reject(rejection, routing, backend);
+
+        AssertResolvesTo(router, moved: null, StubTarget, "after the rejected reload");
+        AssertResolvesTo(router, moved: null, StubTarget, "after the rejected reload, again");
+
+        IReadOnlyList<CapturedLog> rejectedEntries = RouterLog(logs, ReloadRejectedEventId);
+        Assert.True(rejectedEntries.Count == 1, "the rejected reload was not logged exactly once");
+        Assert.True(rejectedEntries[0].Level == LogLevel.Error, "the rejected reload was not logged as an error");
+        Assert.True(
+            Equals(rejectedEntries[0].Value("OptionsType"), optionsType)
+                && Equals(rejectedEntries[0].Value("ExceptionType"), rejected.GetType().FullName)
+                && rejectedEntries[0].Message.Contains(failure, StringComparison.Ordinal),
+            "the rejected-reload log entry does not name the rejected options, the rejection and its entry");
+        Assert.True(RouterLog(logs, ReloadAcceptedEventId).Count == 0, "a reload was logged as accepted while it stayed rejected");
+
+        // A valid reload of both sections, which also moves getCompany to target stub.
+        routing.Reload(Table(getCompany));
+        backend.Reload(new BackendOptions());
+        AssertResolvesTo(router, getCompany, StubTarget, "after the valid reload");
+
+        IReadOnlyList<CapturedLog> accepted = RouterLog(logs, ReloadAcceptedEventId);
+        Assert.True(accepted.Count == 1, "the valid reload after the rejected one was not logged exactly once as accepted");
+        Assert.True(accepted[0].Level == LogLevel.Information, "the accepted reload was not logged as information");
+        Assert.True(RouterLog(logs, ReloadRejectedEventId).Count == 1, "the rejected reload was logged again after the valid one");
+    }
+
+    /// <summary>
+    /// A resolution that read older options before a newer table was published neither resolves from
+    /// those options nor publishes a table of them: it resolves from the newer table, which stays the one
+    /// in service.
+    /// </summary>
+    [Fact]
+    public async Task AResolutionThatReadOlderOptionsNeverReplacesANewerTable()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        OperationDescriptor getCompany = OperationCatalogue.Default.Find(Surface.Rest, "getCompany");
+        var routing = new ReloadableOptionsMonitor<RoutingOptions>(Table());
+        OperationRouter router = new(
+            routing,
+            new ReloadableOptionsMonitor<BackendOptions>(new BackendOptions()),
+            OperationCatalogue.Default,
+            NullLogger<OperationRouter>.Instance);
+        router.Initialize();
+
+        // A reload newer than the published table moves getCompany to target stub. The reader's first read
+        // returns it only after the test has published a still newer reload, which moves getCompany to
+        // target orders.
+        routing.Reload(Table(getCompany, StubTarget));
+        var paused = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var release = new ManualResetEventSlim();
+        routing.OnNextRead(read =>
+        {
+            paused.TrySetResult();
+            if (!release.Wait(WaitBound, ct))
+            {
+                throw new TimeoutException("the paused routing read was not released in time");
+            }
+
+            return read;
+        });
+
+        Task<ResolvedTarget> reader = Task.Factory.StartNew(
+            () => router.Resolve(Surface.Rest, getCompany),
+            CancellationToken.None,
+            TaskCreationOptions.LongRunning,
+            TaskScheduler.Default);
+
+        ResolvedTarget newest;
+        IReadOnlySet<ResolvedTarget> published;
+        try
+        {
+            await paused.Task.WaitAsync(WaitBound, ct);
+            routing.Reload(Table(getCompany, OrdersTarget));
+            newest = router.Resolve(Surface.Rest, getCompany);
+            published = router.TargetsInService();
+        }
+        finally
+        {
+            release.Set();
+        }
+
+        ResolvedTarget delayed = await reader.WaitAsync(WaitBound, ct);
+
+        Assert.True(string.Equals(newest.Name, OrdersTarget, StringComparison.Ordinal), "the newest reload was not published");
+        Assert.True(
+            string.Equals(delayed.Name, OrdersTarget, StringComparison.Ordinal),
+            "a resolution that read older options before a newer table was published resolved from the older options");
+        Assert.True(
+            ReferenceEquals(router.TargetsInService(), published),
+            "a resolution that read older options before a newer table was published replaced that table");
+    }
+
+    // Both stubs as targets of the hosted facade: backend at stub A and stub at stub B, each with both
+    // base URLs, so the shipped table, which routes every operation to backend, stays valid.
+    private static FacadeTestSettings Hosted(StubBackend backend, StubBackend stub, LogCapture? logs) => new()
+    {
+        BackendRestBaseUrl = backend.RestBaseUrl,
+        BackendSoapBaseUrl = backend.SoapBaseUrl,
+        StubRestBaseUrl = stub.RestBaseUrl,
+        StubSoapBaseUrl = stub.SoapBaseUrl,
+        LoggerProvider = logs,
+    };
+
+    // Sets each key on every provider of the hosted facade's configuration root, then reloads the root.
+    // The options monitor rebuilds the routing options as the root reports the change, so a table the
+    // facade rejects surfaces here as nested AggregateExceptions over OptionsValidationException; those
+    // rejections are returned for the caller to judge. Any other exception propagates.
+    private static IReadOnlyList<OptionsValidationException> Reload(FacadeFactory facade, params (string Key, string? Value)[] settings)
+    {
+        if (facade.Services.GetRequiredService<IConfiguration>() is not IConfigurationRoot configuration)
+        {
+            Assert.Fail("the facade's configuration is not a reloadable configuration root");
+            throw new UnreachableException();
+        }
+
+        foreach ((string key, string? value) in settings)
+        {
+            configuration[key] = value;
+        }
+
+        try
+        {
+            configuration.Reload();
+            return [];
+        }
+        catch (AggregateException exception) when (exception.Flatten().InnerExceptions.All(static inner => inner is OptionsValidationException))
+        {
+            return [.. exception.Flatten().InnerExceptions.Cast<OptionsValidationException>()];
+        }
+    }
+
+    // Calls every catalogue operation once at its normal address and asserts that the operation with id
+    // movedId reached stub alone and every other operation reached backend alone.
+    private static async Task AssertEveryOperationReachesAsync(
+        HttpClient client,
+        FacadeFactory facade,
+        StubBackend backend,
+        StubBackend stub,
+        string? movedId,
+        string phase,
+        CancellationToken ct)
+    {
+        IReadOnlyList<OperationDescriptor> operations = OperationCatalogue.Default.Operations;
+        Assert.True(operations.Count == CatalogueOperationCount, "the catalogue does not hold the 22 carried-over operations");
+
+        int movedCalls = 0;
+        foreach (OperationDescriptor op in operations)
+        {
+            bool isMoved = string.Equals(op.Id, movedId, StringComparison.Ordinal);
+            movedCalls += isMoved ? 1 : 0;
+            await AssertCallReachesAsync(
+                client, facade, op, reached: isMoved ? stub : backend, bypassed: isMoved ? backend : stub, $"{op.Id} {phase}", ct);
+        }
+
+        Assert.True(
+            movedCalls == (movedId is null ? 0 : 1),
+            $"{phase}: the moved operation was not called exactly once among the catalogue operations");
+    }
+
+    // Sends the operation's request to the socket of its surface and asserts that it reached 'reached'
+    // once, on the listener of that surface, and 'bypassed' never, and that the facade returned the
+    // status, X-Stub-Id and body bytes 'reached' sent.
+    private static async Task AssertCallReachesAsync(
+        HttpClient client,
+        FacadeFactory facade,
+        OperationDescriptor op,
+        StubBackend reached,
+        StubBackend bypassed,
+        string label,
+        CancellationToken ct)
+    {
+        reached.ClearLog();
+        bypassed.ClearLog();
+
+        Uri socket = op.Surface == Surface.Rest ? facade.RestBaseAddress : facade.SoapBaseAddress;
+        RawResponse response = await FacadeFactory.SendAsync(client, OperationRequests.For(op).ToMessage(socket), ct);
+
+        IReadOnlyList<StubRequest> received = reached.Received;
+        int bypassedCount = bypassed.Received.Count;
+        Assert.True(received.Count == 1, $"{label}: stub {reached.Id} did not receive exactly one request");
+        Assert.True(bypassedCount == 0, $"{label}: stub {bypassed.Id} received an unexpected request, expected none");
+
+        StubRequest request = received[0];
+        StubListener expectedListener = op.Surface == Surface.Rest ? StubListener.Rest : StubListener.Soap;
+        Assert.True(
+            request.Listener == expectedListener,
+            $"{label}: stub {reached.Id} received the call on its {request.Listener} listener, expected {expectedListener}");
+
+        Assert.True(
+            response.Status == request.ResponseStatus,
+            $"{label}: facade answered status {response.Status}, expected stub {reached.Id}'s status {request.ResponseStatus}");
+        string? stubId = response.Header(StubIdHeader);
+        Assert.True(
+            string.Equals(stubId, reached.Id, StringComparison.Ordinal),
+            $"{label}: facade response carried X-Stub-Id {stubId ?? "(absent)"}, expected {reached.Id}");
+        Assert.True(
+            response.Body.AsSpan().SequenceEqual(request.ResponseBody),
+            $"{label}: facade response body differs from the bytes stub {reached.Id} sent");
+    }
+
+    // Resolves every catalogue operation, then an unmatched request on each surface, then reads the
+    // routing snapshot, and asserts that 'moved' resolves to movedTo and everything else to target
+    // backend, each with that target's base URL for the surface, and that the snapshot names the same
+    // target for every operation.
+    private static void AssertResolvesTo(OperationRouter router, OperationDescriptor? moved, string movedTo, string phase)
+    {
+        IReadOnlyList<OperationDescriptor> operations = OperationCatalogue.Default.Operations;
+        foreach (OperationDescriptor op in operations)
+        {
+            string expected = ExpectedTarget(op, moved, movedTo);
+            ResolvedTarget resolved = router.Resolve(op.Surface, op);
+            Assert.True(
+                string.Equals(resolved.Name, expected, StringComparison.Ordinal),
+                $"{phase}: {op.Id} resolved to target {resolved.Name}, expected {expected}");
+            Assert.True(
+                resolved.BaseUrl == new Uri(BaseUrl(expected, op.Surface)),
+                $"{phase}: {op.Id} resolved to another base URL than the {op.Surface} base URL of target {expected}");
+        }
+
+        foreach (Surface surface in new[] { Surface.Rest, Surface.Soap })
+        {
+            ResolvedTarget unmatched = router.Resolve(surface, operation: null);
+            Assert.True(
+                string.Equals(unmatched.Name, BackendTarget, StringComparison.Ordinal),
+                $"{phase}: an unmatched {surface} request resolved to target {unmatched.Name}, expected {BackendTarget}");
+        }
+
+        IReadOnlyList<RoutedOperation> rows = router.Describe().Operations;
+        Assert.True(rows.Count == operations.Count, $"{phase}: the routing snapshot does not list every catalogue operation once");
+        foreach (OperationDescriptor op in operations)
+        {
+            string expected = ExpectedTarget(op, moved, movedTo);
+            RoutedOperation? row = rows.FirstOrDefault(candidate => string.Equals(candidate.Id, op.Id, StringComparison.Ordinal));
+            Assert.True(
+                row is not null && string.Equals(row.Target, expected, StringComparison.Ordinal),
+                $"{phase}: the routing snapshot does not show {op.Id} routed to target {expected}");
+        }
+    }
+
+    private static string ExpectedTarget(OperationDescriptor op, OperationDescriptor? moved, string movedTo) =>
+        string.Equals(op.Id, moved?.Id, StringComparison.Ordinal) ? movedTo : BackendTarget;
+
+    // The router's own entries with the given event id.
+    private static IReadOnlyList<CapturedLog> RouterLog(LogCapture logs, int eventId) =>
+        [.. logs.Entries.Where(entry => entry.EventId.Id == eventId && string.Equals(entry.Category, RouterCategory, StringComparison.Ordinal))];
+
+    // The shipped shape with every catalogue operation listed: each names target backend, except
+    // 'moved', which names movedTo. Targets backend, stub and orders each have both base URLs.
+    private static RoutingOptions Table(OperationDescriptor? moved = null, string movedTo = StubTarget)
+    {
+        var table = new RoutingOptions { DefaultTarget = BackendTarget };
+        foreach (string target in new[] { BackendTarget, StubTarget, OrdersTarget })
+        {
+            table.Targets[target] = new RoutingTarget
+            {
+                RestBaseUrl = BaseUrl(target, Surface.Rest),
+                SoapBaseUrl = BaseUrl(target, Surface.Soap),
+            };
+        }
+
+        foreach (OperationDescriptor op in OperationCatalogue.Default.Operations)
+        {
+            Dictionary<string, string> section = op.Surface == Surface.Rest ? table.Operations.Rest : table.Operations.Soap;
+            section[op.RoutingKey] = string.Equals(op.Id, moved?.Id, StringComparison.Ordinal) ? movedTo : BackendTarget;
+        }
+
+        return table;
+    }
+
+    // A synthetic base URL per target and surface.
+    private static string BaseUrl(string target, Surface surface) =>
+        surface == Surface.Rest ? "http://" + target + ".invalid:65000" : "http://" + target + ".invalid:21001";
+
+    private static ILoggerFactory LoggersFor(LogCapture logs) =>
+        LoggerFactory.Create(logging => logging.SetMinimumLevel(LogLevel.Trace).AddProvider(logs));
+
+    private static OperationRouter Router(
+        IOptionsMonitor<RoutingOptions> routing,
+        IOptionsMonitor<BackendOptions> backend,
+        ILoggerFactory loggers) =>
+        new(routing, backend, OperationCatalogue.Default, loggers.CreateLogger<OperationRouter>());
+
+    // Makes every read of one monitor fail until its next reload, as the options monitor's reads do
+    // after a reload it cannot build: the routing monitor with the validator's failure for an entry
+    // naming an undefined target, or the backend monitor with the binder's failure for a
+    // Backend:TimeoutSeconds that is no integer. Returns the exception, the options type the router
+    // names and the text that names the entry.
+    private static (Exception Rejected, string OptionsType, string Failure) Reject(
+        string rejection,
+        ReloadableOptionsMonitor<RoutingOptions> routing,
+        ReloadableOptionsMonitor<BackendOptions> backend)
+    {
+        switch (rejection)
+        {
+            case ValidatorRejection:
+                ValidateOptionsResult result = new RoutingOptionsValidator(OperationCatalogue.Default)
+                    .Validate(Options.DefaultName, Table(OperationCatalogue.Default.Find(Surface.Rest, "getCompany"), "nowhere"));
+                Assert.True(result.Failed, "the validator accepted a table naming an undefined target");
+                var invalid = new OptionsValidationException(Options.DefaultName, typeof(RoutingOptions), result.Failures);
+                routing.Reject(invalid);
+                return (invalid, nameof(RoutingOptions), "Routing:Operations:Rest:getCompany names undefined target 'nowhere'");
+
+            case BinderRejection:
+                IConfigurationRoot malformed = new ConfigurationBuilder()
+                    .AddInMemoryCollection(new Dictionary<string, string?>(StringComparer.Ordinal) { [BackendOptions.TimeoutKey] = "abc" })
+                    .Build();
+                InvalidOperationException unbound = Assert.Throws<InvalidOperationException>(
+                    () => malformed.GetSection(BackendOptions.SectionName).Get<BackendOptions>());
+                backend.Reject(unbound);
+                return (unbound, nameof(BackendOptions), BackendOptions.TimeoutKey);
+
+            default:
+                throw new ArgumentOutOfRangeException(nameof(rejection), rejection, "Unknown reload rejection.");
+        }
+    }
+
+    /// <summary>
+    /// An options monitor whose value a test replaces, as a configuration reload does; whose reads can
+    /// all fail with one exception until the next reload, as the options monitor's do after a reload that
+    /// fails binding or validation; and which can hand the next read's value through a hook.
+    /// </summary>
+    /// <param name="initial">The value served until the first reload.</param>
+    private sealed class ReloadableOptionsMonitor<TOptions>(TOptions initial) : IOptionsMonitor<TOptions>
+        where TOptions : class
+    {
+        private TOptions _value = initial;
+        private Exception? _rejection;
+        private Func<TOptions, TOptions>? _onNextRead;
+
+        public TOptions CurrentValue
+        {
+            get
+            {
+                if (Volatile.Read(ref _rejection) is { } rejection)
+                {
+                    throw rejection;
+                }
+
+                TOptions value = Volatile.Read(ref _value);
+                return Interlocked.Exchange(ref _onNextRead, null) is { } onRead ? onRead(value) : value;
+            }
+        }
+
+        /// <summary>Serves <paramref name="value"/> from now on and clears any rejection.</summary>
+        public void Reload(TOptions value)
+        {
+            Volatile.Write(ref _value, value);
+            Volatile.Write(ref _rejection, null);
+        }
+
+        /// <summary>Makes every read throw <paramref name="rejection"/> until the next <see cref="Reload"/>.</summary>
+        public void Reject(Exception rejection) => Volatile.Write(ref _rejection, rejection);
+
+        /// <summary>Passes the value of the next read through <paramref name="onRead"/>, once, on the reading thread.</summary>
+        public void OnNextRead(Func<TOptions, TOptions> onRead) => Volatile.Write(ref _onNextRead, onRead);
 
         public TOptions Get(string? name) => CurrentValue;
 
