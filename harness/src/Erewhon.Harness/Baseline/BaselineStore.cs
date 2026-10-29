@@ -1251,4 +1251,3 @@ public sealed class BaselineStore
 /// <param name="Record">The verified record.</param>
 /// <param name="Body">The raw response body the record describes, byte for byte.</param>
 public sealed record BaselineEntry(BaselineRecord Record, ReadOnlyMemory<byte> Body);
-

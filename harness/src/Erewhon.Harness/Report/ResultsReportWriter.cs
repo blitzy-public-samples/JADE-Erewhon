@@ -1,3 +1,4 @@
+using System.Collections.ObjectModel;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
@@ -340,7 +341,7 @@ public sealed class ResultsReport
         UndocumentedDifferenceCount = CountResult(operations, OperationResults.UndocumentedDifference);
         NotComparedCount = CountResult(operations, OperationResults.NotCompared);
 
-        UndocumentedFailures = failures.Where(failure => !failure.Documented).Select(failure => failure.Item).ToArray();
+        UndocumentedFailures = Array.AsReadOnly(failures.Where(failure => !failure.Documented).Select(failure => failure.Item).ToArray());
         AllFailuresDocumented = UndocumentedFailures.Count == 0;
         FinalLine = FormatFinalLine(EquivalentCount, DocumentedDifferenceCount);
 
@@ -361,7 +362,11 @@ public sealed class ResultsReport
         DemoAcceptanceMet = DemoAcceptanceShortfall.Count == 0;
     }
 
-    /// <summary>The source the report was built from.</summary>
+    /// <summary>
+    /// The source the report was built from, as given and still live. <see cref="Build"/> copies
+    /// everything the report holds from it, so no value of the report reads it afterwards and a later
+    /// change to it changes neither the report nor its rendering.
+    /// </summary>
     public IReportSource Source { get; }
 
     /// <summary>The register failing items were matched against.</summary>
@@ -516,7 +521,7 @@ public sealed class ResultsReport
                 cases.Count(result => result.Compared),
                 cases.Count(result => result.Compared && result.Equivalent),
                 Classify(planned, cases, caseFailures),
-                caseFailures.Select(failure => failure.Item).ToArray()));
+                Array.AsReadOnly(caseFailures.Select(failure => failure.Item).ToArray())));
         }
 
         return new ResultsReport(source, register, snapshot, rows.AsReadOnly(), failures, catalogue is not null);
@@ -570,7 +575,7 @@ public sealed class ResultsReport
     private static string? AttributeCase(string caseId, Dictionary<string, string> caseOperations) =>
         caseOperations.GetValueOrDefault(caseId) ?? FailureItemIds.OperationIdFromCaseId(caseId);
 
-    private static ReportedFailure[] CollectFailures(
+    private static ReadOnlyCollection<ReportedFailure> CollectFailures(
         Snapshot snapshot,
         Dictionary<string, string> caseOperations,
         KnownLimitationsRegister register)
@@ -624,9 +629,9 @@ public sealed class ResultsReport
             Add(new FailureItem(FailureItemIds.Case(result.CaseId), nature, OperationOf(result)));
         }
 
-        return items
+        return Array.AsReadOnly(items
             .Select(item => new ReportedFailure(item, register.FindEntry(item), register.IsDocumented(item)))
-            .ToArray();
+            .ToArray());
     }
 
     private static IEnumerable<(string Id, string JadeMethod, Surface? Surface)> DeriveOperations(
@@ -743,7 +748,7 @@ public sealed class ResultsReport
 
     // AAP 0.7.7 demo acceptance: at least 20 equivalent operations, and every other operation returns the
     // baseline status code with a well-formed payload in each of its compared cases.
-    private static string[] DemoShortfall(int equivalent, IReadOnlyList<OperationRow> rows, IReadOnlyList<CaseResult> cases)
+    private static ReadOnlyCollection<string> DemoShortfall(int equivalent, IReadOnlyList<OperationRow> rows, IReadOnlyList<CaseResult> cases)
     {
         var shortfall = new List<string>();
         if (equivalent < DemoAcceptanceThreshold)
@@ -784,7 +789,7 @@ public sealed class ResultsReport
             }
         }
 
-        return [.. shortfall];
+        return shortfall.AsReadOnly();
     }
 
     private static string StatusText(int? status) =>
@@ -812,7 +817,10 @@ public sealed class ResultsReport
 
     /// <summary>
     /// A null-free copy of the source taken once, so a source that changes during or after
-    /// <see cref="Build"/> cannot make the computed results and the rendered text disagree.
+    /// <see cref="Build"/> cannot make the computed results and the rendered text disagree. The copy is
+    /// deep: every collection, nested ones included, is copied into a read-only collection that only the
+    /// snapshot holds, and what it keeps by reference (failure items, discrepancies, check results, run
+    /// facts and JADE-unchanged counts) is immutable.
     /// </summary>
     private sealed record Snapshot(
         IReadOnlyList<FailureItem> Failures,
@@ -851,15 +859,23 @@ public sealed class ResultsReport
                 }
             }
 
-            return new Snapshot(
-                NonNull(source.Failures),
+            // A case result and a conformance summary are records, but their lists are the source's own.
+            var cases = Array.ConvertAll(
                 NonNull(source.Cases),
-                planned,
-                checks,
+                result => result with { Discrepancies = Array.AsReadOnly(NonNull(result.Discrepancies)) });
+            var conformance = source.Conformance is { } summary
+                ? summary with { GapsByNature = ReadOnlyCopy(summary.GapsByNature) }
+                : null;
+
+            return new Snapshot(
+                Array.AsReadOnly(NonNull(source.Failures)),
+                Array.AsReadOnly(cases),
+                planned.AsReadOnly(),
+                checks.AsReadOnly(),
                 source.Facts,
-                baseline,
+                baseline with { NotCaptured = Array.AsReadOnly(NonNull(baseline.NotCaptured)) },
                 DistinctIds(baseline.NotCaptured),
-                source.Conformance,
+                conformance,
                 source.JadeUnchanged,
                 source.ExternalBackend);
         }
@@ -868,10 +884,25 @@ public sealed class ResultsReport
             where T : class =>
             items is null ? [] : items.Where(item => item is not null).ToArray();
 
-        private static string[] DistinctIds(IReadOnlyList<string>? ids) =>
+        private static ReadOnlyCollection<string> DistinctIds(IReadOnlyList<string>? ids) =>
             ids is null
-                ? []
-                : ids.Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.Ordinal).ToArray();
+                ? ReadOnlyCollection<string>.Empty
+                : Array.AsReadOnly(ids.Where(id => !string.IsNullOrWhiteSpace(id)).Distinct(StringComparer.Ordinal).ToArray());
+
+        // An entry-for-entry copy; a null dictionary reads as empty.
+        private static ReadOnlyDictionary<string, int> ReadOnlyCopy(IReadOnlyDictionary<string, int>? counts)
+        {
+            var copy = new Dictionary<string, int>(StringComparer.Ordinal);
+            foreach (var (key, count) in counts ?? new Dictionary<string, int>())
+            {
+                if (key is not null)
+                {
+                    copy[key] = count;
+                }
+            }
+
+            return copy.AsReadOnly();
+        }
     }
 }
 
@@ -904,6 +935,10 @@ public sealed class ResultsReportWriter : IResultsReportWriter
     // The same literal as CaptureExecutionValues.NotRun in Baseline/BaselineManifest.cs, restated here so
     // the report does not depend on the Baseline folder.
     private const string CaptureExecutionNotRun = "not-run";
+
+    // The ASCII punctuation PlainText escapes: each can open or close an inline construct (emphasis,
+    // strikethrough, code span, link, autolink, raw HTML, entity reference) or escape the next character.
+    private const string InlineMarkupCharacters = "\\`*_~<>&[]";
 
     private const string DiffNaturePrefix = "d:";
     private const string DiscrepancyArtifactDirectory = "artifacts/discrepancies/";
@@ -1020,7 +1055,7 @@ public sealed class ResultsReportWriter : IResultsReportWriter
             ".NET (facade runtime)",
             string.IsNullOrWhiteSpace(facts?.FacadeFrameworkDescription)
                 ? "unavailable (facade /admin/info not reached)"
-                : facts.FacadeFrameworkDescription);
+                : PlainText(facts.FacadeFrameworkDescription));
         md.Row("SDK pin (`harness/global.json`)", Code(facts?.SdkPin));
         md.Row("Harness version", Code(HarnessOptions.HarnessVersion));
         md.Row("Target REST URL", Code(facts?.TargetRestUrl));
@@ -1138,7 +1173,7 @@ public sealed class ResultsReportWriter : IResultsReportWriter
 
         if (!string.IsNullOrWhiteSpace(check?.Detail))
         {
-            md.Row(area, detailLabel, check.Detail);
+            md.Row(area, detailLabel, PlainText(check.Detail));
         }
     }
 
@@ -1210,7 +1245,7 @@ public sealed class ResultsReportWriter : IResultsReportWriter
         md.Line("Not met.").Blank();
         foreach (var line in report.DemoAcceptanceShortfall)
         {
-            md.Line($"- {MarkdownBuilder.SingleLine(line)}");
+            md.Line($"- {PlainText(line)}");
         }
 
         md.Blank();
@@ -1266,7 +1301,7 @@ public sealed class ResultsReportWriter : IResultsReportWriter
                 Code(failure.Entry?.Id),
                 AttemptsText(failure),
                 ArtifactText(item),
-                item.Detail);
+                PlainText(item.Detail));
         }
 
         md.Blank();
@@ -1312,7 +1347,7 @@ public sealed class ResultsReportWriter : IResultsReportWriter
             failure.Entry is not null && string.Equals(failure.Entry.Id, entry.Id, StringComparison.Ordinal));
         return string.Create(
             CultureInfo.InvariantCulture,
-            $"- **{MarkdownBuilder.SingleLine(entry.Id)}** ({MarkdownBuilder.SingleLine(entry.Category)}{operation}) — Not done / why: {Sentence(entry.Reason)} Done instead: {Sentence(entry.ActionTaken)} Attempts: {entry.Attempts}. Documents {documents} failing item(s).");
+            $"- **{PlainText(entry.Id)}** ({PlainText(entry.Category)}{operation}) — Not done / why: {Sentence(entry.Reason)} Done instead: {Sentence(entry.ActionTaken)} Attempts: {entry.Attempts}. Documents {documents} failing item(s).");
     }
 
     private static void RenderHowToRun(MarkdownBuilder md)
@@ -1353,14 +1388,14 @@ public sealed class ResultsReportWriter : IResultsReportWriter
         }
 
         var outcome = OutcomeText(check.Outcome);
-        return string.IsNullOrWhiteSpace(check.Detail) ? outcome : $"{outcome} — {check.Detail}";
+        return string.IsNullOrWhiteSpace(check.Detail) ? outcome : $"{outcome} — {PlainText(check.Detail)}";
     }
 
     private static string OutcomeText(string? outcome) => outcome switch
     {
         null or "" => Dash,
         CheckOutcomes.NotRun => NotRun,
-        _ => outcome,
+        _ => PlainText(outcome),
     };
 
     private static bool IsNotRun(string? outcome) =>
@@ -1377,7 +1412,11 @@ public sealed class ResultsReportWriter : IResultsReportWriter
 
     private static string OrNotFound(string? value) => string.IsNullOrWhiteSpace(value) ? "not found" : Code(value);
 
-    // A code span on one line; a value holding a backtick uses a double-backtick fence so it stays intact.
+    // A code span on one line whose content, under CommonMark's code-span rules, is the value exactly. The
+    // fence is one backtick longer than the value's longest backtick run, so no run inside closes it early.
+    // One space pads each side when the value starts or ends with a backtick, which would otherwise join
+    // the fence, or starts and ends with a space without being all spaces, since CommonMark strips exactly
+    // one space from each side of such content. Any other value is written as `value`.
     private static string Code(string? value)
     {
         if (string.IsNullOrEmpty(value))
@@ -1386,11 +1425,25 @@ public sealed class ResultsReportWriter : IResultsReportWriter
         }
 
         var text = MarkdownBuilder.SingleLine(value);
-        return text.Contains('`', StringComparison.Ordinal) ? $"`` {text} ``" : $"`{text}`";
+        var longestRun = 0;
+        var run = 0;
+        foreach (var character in text)
+        {
+            run = character == '`' ? run + 1 : 0;
+            longestRun = Math.Max(longestRun, run);
+        }
+
+        var fence = new string('`', longestRun + 1);
+        var padded = text[0] == '`'
+            || text[^1] == '`'
+            || (text[0] == ' ' && text[^1] == ' ' && text.AsSpan().ContainsAnyExcept(' '));
+        var padding = padded ? " " : string.Empty;
+        return string.Concat(fence, padding, text, padding, fence);
     }
 
     // Register text as one sentence ending in punctuation, so the fixed "Done instead:" and "Attempts:"
-    // parts read correctly whether or not the register's text ends with a full stop.
+    // parts read correctly whether or not the register's text ends with a full stop. The sentence is
+    // escaped as PlainText, so it renders exactly as the register holds it.
     private static string Sentence(string? text)
     {
         var line = MarkdownBuilder.SingleLine(text ?? string.Empty).Trim();
@@ -1399,7 +1452,33 @@ public sealed class ResultsReportWriter : IResultsReportWriter
             return Dash + ".";
         }
 
-        return line[^1] is '.' or '!' or '?' ? line : line + ".";
+        return PlainText(line[^1] is '.' or '!' or '?' ? line : line + ".");
+    }
+
+    // Plain text as Markdown inline text whose rendering is the text itself: on one line, with a backslash
+    // before each InlineMarkupCharacters character. CommonMark renders a backslash followed by ASCII
+    // punctuation as that character, so a placeholder such as <op> is not read as raw HTML, and the
+    // backslashes of \/Date(ms)\/ stay visible. MarkdownBuilder.Row escapes '|' afterwards.
+    private static string PlainText(string? value)
+    {
+        var text = MarkdownBuilder.SingleLine(value);
+        if (text.AsSpan().IndexOfAny(InlineMarkupCharacters) < 0)
+        {
+            return text;
+        }
+
+        var escaped = new StringBuilder(text.Length * 2);
+        foreach (var character in text)
+        {
+            if (InlineMarkupCharacters.Contains(character, StringComparison.Ordinal))
+            {
+                escaped.Append('\\');
+            }
+
+            escaped.Append(character);
+        }
+
+        return escaped.ToString();
     }
 
     /// <summary>Markdown text with <c>\n</c> line endings only, independent of the platform's newline.</summary>
@@ -1464,4 +1543,3 @@ public sealed class ResultsReportWriter : IResultsReportWriter
         public override string ToString() => _text.ToString();
     }
 }
-

@@ -20,8 +20,10 @@ namespace Erewhon.Harness.Tests;
 /// <see cref="OperationCatalogue.Default"/>, the id and request helpers never decode or reinterpret what
 /// the matrix states, and a malformed matrix, built in memory as a mutated copy of the committed one, is
 /// rejected with a message that starts <c>case-matrix: </c> and names the offending case by id, or by
-/// JSON path where the text does not parse. The committed <c>harness/config/known-limitations.json</c>
-/// and <c>harness/config/case-matrix.json</c> are only ever read here.
+/// JSON path where the text does not parse. The results report built on the register's decisions is
+/// covered from inline sources and registers, and its rendered text is checked in memory without writing
+/// a file. The committed <c>harness/config/known-limitations.json</c> and
+/// <c>harness/config/case-matrix.json</c> are only ever read here.
 /// </summary>
 public sealed partial class KnownLimitationsRegisterTests
 {
@@ -1009,6 +1011,1804 @@ public sealed partial class KnownLimitationsRegisterTests
         }
 
         throw new DirectoryNotFoundException(RepoRootNotFound);
+    }
+
+    // ---- Results report: build ------------------------------------------------------------------
+
+    /// <summary>Each operation of <see cref="FourResultsRun"/> with the AAP 0.7.7 result it shows.</summary>
+    public static TheoryData<string, string> FourResultsByOperation { get; } = new()
+    {
+        { "Rest.getAgent", OperationResults.Equivalent },
+        { "Rest.getClient", OperationResults.DocumentedDifference },
+        { "Rest.getCompany", OperationResults.UndocumentedDifference },
+        { "Soap.getPhoto", OperationResults.NotCompared },
+    };
+
+    [Theory]
+    [MemberData(nameof(FourResultsByOperation))]
+    public void Build_ClassifiesEachOperation(string operationId, string expected)
+    {
+        var report = BuildReport(FourResultsRun.Source(), FourResultsRun.Entries());
+
+        Assert.Equal(expected, OperationRowOf(report, operationId).Result);
+    }
+
+    [Fact]
+    public void Build_CountsEachResult()
+    {
+        var report = BuildReport(FourResultsRun.Source(), FourResultsRun.Entries());
+
+        Assert.Equal(OperationCatalogue.Default.Operations.Select(operation => operation.Id), report.Operations.Select(row => row.OperationId));
+        Assert.Equal(1, report.EquivalentCount);
+        Assert.Equal(1, report.DocumentedDifferenceCount);
+        Assert.Equal(1, report.UndocumentedDifferenceCount);
+        Assert.Equal(19, report.NotComparedCount);
+        Assert.Equal(
+            ResultsReport.TotalOperations,
+            report.EquivalentCount + report.DocumentedDifferenceCount + report.UndocumentedDifferenceCount + report.NotComparedCount);
+        Assert.Equal("1 of 22 operations equivalent, 1 documented differences", report.FinalLine);
+
+        var client = OperationRowOf(report, "Rest.getClient");
+        Assert.Equal((2, 2, 2, 1), (client.Planned, client.Captured, client.Compared, client.EquivalentCases));
+        Assert.Equal("CASE:" + FourResultsRun.ClientDifferingCaseId, Assert.Single(client.FailingItems).ItemId);
+    }
+
+    [Theory]
+    [InlineData(true, OperationResults.DocumentedDifference)]
+    [InlineData(false, OperationResults.UndocumentedDifference)]
+    public void Build_PartlyCapturedOperation_IsDocumentedOnlyWhenItsNotCapturedCaseIs(bool documented, string expected)
+    {
+        var source = new ReportSourceFixture
+        {
+            Cases = [EquivalentCase("REST-getAgent-01", "Rest.getAgent")],
+            PlannedCasesByOperation = Plan(("Rest.getAgent", ["REST-getAgent-01", "REST-getAgent-02"])),
+            Baseline = FixtureBaseline with { NotCaptured = ["REST-getAgent-02"] },
+        };
+        RegisterEntry[] entries = documented ? [Entry(NotCapturedPair("REST-getAgent-02"))] : [];
+
+        var report = BuildReport(source, entries);
+
+        var row = OperationRowOf(report, "Rest.getAgent");
+        Assert.Equal(expected, row.Result);
+        Assert.Equal((2, 1, 1, 1), (row.Planned, row.Captured, row.Compared, row.EquivalentCases));
+        Assert.Equal(0, report.EquivalentCount);
+        Assert.Equal(documented ? 1 : 0, report.DocumentedDifferenceCount);
+        Assert.Equal(documented ? 0 : 1, report.UndocumentedDifferenceCount);
+
+        // The uncaptured case is a failing item of its operation, never a compared case.
+        var notCaptured = Assert.Single(report.Failures);
+        Assert.Equal(new FailureItem("CASE:REST-getAgent-02", "not-captured", "Rest.getAgent"), notCaptured.Item);
+        Assert.Equal(documented, notCaptured.Documented);
+        Assert.Equal(documented, report.AllFailuresDocumented);
+    }
+
+    [Fact]
+    public void Build_OperationWithNoCapturedCase_IsNotCompared()
+    {
+        // SOAP-getPhoto-03 is in no plan, so its operation comes from the case id alone.
+        var source = new ReportSourceFixture
+        {
+            PlannedCasesByOperation = Plan(("Rest.getAllAgents", ["REST-getAllAgents-01"])),
+            Baseline = FixtureBaseline with { NotCaptured = ["REST-getAllAgents-01", "SOAP-getPhoto-03"] },
+        };
+
+        var report = BuildReport(source);
+
+        var row = OperationRowOf(report, "Rest.getAllAgents");
+        Assert.Equal(OperationResults.NotCompared, row.Result);
+        Assert.Equal((1, 0, 0), (row.Planned, row.Captured, row.Compared));
+        Assert.Equal(OperationResults.NotCompared, OperationRowOf(report, "Soap.getPhoto").Result);
+        Assert.Equal(
+            new[]
+            {
+                new FailureItem("CASE:REST-getAllAgents-01", "not-captured", "Rest.getAllAgents"),
+                new FailureItem("CASE:SOAP-getPhoto-03", "not-captured", "Soap.getPhoto"),
+            },
+            report.Failures.Select(failure => failure.Item));
+        Assert.False(report.AllFailuresDocumented);
+        Assert.Equal(ResultsReport.TotalOperations, report.NotComparedCount);
+        Assert.Equal("0 of 22 operations equivalent, 0 documented differences", report.FinalLine);
+    }
+
+    [Theory]
+    [InlineData(true, OperationResults.Equivalent)]
+    [InlineData(false, OperationResults.UndocumentedDifference)]
+    public void Build_Equivalent_NeedsEveryPlannedCaseCaptured(bool secondCaptured, string expected)
+    {
+        // No failing item either way; without the second case's result, a planned case was neither
+        // captured nor listed as not captured.
+        var source = new ReportSourceFixture
+        {
+            Cases = secondCaptured
+                ? [EquivalentCase("REST-getSale-01", "Rest.getSale"), EquivalentCase("REST-getSale-02", "Rest.getSale")]
+                : [EquivalentCase("REST-getSale-01", "Rest.getSale")],
+            PlannedCasesByOperation = Plan(("Rest.getSale", ["REST-getSale-01", "REST-getSale-02"])),
+        };
+
+        var report = BuildReport(source);
+
+        Assert.Empty(report.Failures);
+        Assert.Equal(expected, OperationRowOf(report, "Rest.getSale").Result);
+    }
+
+    [Theory]
+    [InlineData(true, OperationResults.DocumentedDifference)]
+    [InlineData(false, OperationResults.UndocumentedDifference)]
+    public void Build_DocumentedDifference_NeedsEveryPlannedCaseAccountedFor(bool secondCaptured, string expected)
+    {
+        // The documented difference is the only failing item either way; without the second case's
+        // result, a planned case was neither compared nor reported as a failing item.
+        var difference = DifferingCase("REST-getSale-01", "Rest.getSale", Website);
+        var source = new ReportSourceFixture
+        {
+            Cases = secondCaptured ? [difference, EquivalentCase("REST-getSale-02", "Rest.getSale")] : [difference],
+            PlannedCasesByOperation = Plan(("Rest.getSale", ["REST-getSale-01", "REST-getSale-02"])),
+        };
+
+        var report = BuildReport(source, Entry(CasePair(difference)));
+
+        Assert.True(Assert.Single(report.Failures).Documented);
+        Assert.Equal(expected, OperationRowOf(report, "Rest.getSale").Result);
+    }
+
+    [Fact]
+    public void Build_AllFailuresDocumented_TracksTheRegister()
+    {
+        var ordering = new FailureItem(FailureItemIds.Ordering, FailureItemIds.NotRun);
+        var drift = new FailureItem(FailureItemIds.OpenApiDrift, FailureItemIds.Missing);
+        var entry = NamedEntry("KL-TEST-NOGIT", (ordering.ItemId, ordering.Nature));
+
+        // Vacuously true without failing items.
+        var none = BuildReport(new ReportSourceFixture(), entry);
+        Assert.True(none.AllFailuresDocumented);
+        Assert.Empty(none.Failures);
+        Assert.Empty(none.UndocumentedFailures);
+
+        var documented = BuildReport(new ReportSourceFixture { Failures = [ordering] }, entry);
+        Assert.True(documented.AllFailuresDocumented);
+        var reported = Assert.Single(documented.Failures);
+        Assert.True(reported.Documented);
+        Assert.Equal("KL-TEST-NOGIT", reported.Entry?.Id);
+        Assert.Empty(documented.UndocumentedFailures);
+
+        var mixed = BuildReport(new ReportSourceFixture { Failures = [ordering, drift] }, entry);
+        Assert.False(mixed.AllFailuresDocumented);
+        Assert.Equal(new[] { drift }, mixed.UndocumentedFailures);
+        Assert.Collection(
+            mixed.Failures,
+            failure =>
+            {
+                Assert.True(failure.Documented);
+                Assert.Equal("KL-TEST-NOGIT", failure.Entry?.Id);
+            },
+            failure =>
+            {
+                Assert.False(failure.Documented);
+                Assert.Null(failure.Entry);
+            });
+    }
+
+    [Theory]
+    [MemberData(nameof(NeverDocumentablePairs))]
+    public void Build_NeverDocumentableItem_IsAnUndocumentedFailure(string itemId, string nature)
+    {
+        // The register lists the item; the documented control shows the register is otherwise honoured.
+        var control = new FailureItem(FailureItemIds.Ordering, FailureItemIds.NotRun);
+        var item = new FailureItem(itemId, nature);
+
+        var report = BuildReport(
+            new ReportSourceFixture { Failures = [control, item] },
+            Entry((control.ItemId, control.Nature), (itemId, nature)));
+
+        Assert.Collection(
+            report.Failures,
+            failure => Assert.True(failure.Documented),
+            failure =>
+            {
+                Assert.Equal(item, failure.Item);
+                Assert.False(failure.Documented);
+                Assert.Null(failure.Entry);
+            });
+        Assert.Equal(new[] { item }, report.UndocumentedFailures);
+        Assert.False(report.AllFailuresDocumented);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData(" ")]
+    public void Build_DifferingCaseWithoutNature_GetsItsSignatureNature(string? suppliedNature)
+    {
+        var result = DifferingCase("REST-getCompany-01", "Rest.getCompany", Website, Fax) with { ItemNature = suppliedNature };
+        var expectedNature = "d:" + DiscrepancySignature.Compute([Website, Fax]);
+        var source = new ReportSourceFixture
+        {
+            Cases = [result],
+            PlannedCasesByOperation = Plan(("Rest.getCompany", ["REST-getCompany-01"])),
+        };
+
+        var report = BuildReport(source, Entry(("CASE:REST-getCompany-01", expectedNature)));
+
+        var failure = Assert.Single(report.Failures);
+        Assert.Equal(new FailureItem("CASE:REST-getCompany-01", expectedNature, "Rest.getCompany"), failure.Item);
+        Assert.True(failure.Documented);
+        Assert.Equal(OperationResults.DocumentedDifference, OperationRowOf(report, "Rest.getCompany").Result);
+    }
+
+    [Fact]
+    public void Build_DeduplicatesFailuresByItemIdAndNature()
+    {
+        var company = DifferingCase("REST-getCompany-01", "Rest.getCompany", Website);
+        var sale = DifferingCase("REST-getSale-01", "Rest.getSale", Fax);
+        var drift = new FailureItem(FailureItemIds.OpenApiDrift, FailureItemIds.Missing, Detail: "first");
+        var photoNotCaptured = new FailureItem("CASE:SOAP-getPhoto-01", FailureItemIds.NotCaptured);
+        var companyFromSource = new FailureItem("CASE:REST-getCompany-01", company.ItemNature!, Detail: "from the source");
+        var source = new ReportSourceFixture
+        {
+            Failures =
+            [
+                drift,
+                photoNotCaptured,
+                drift with { Detail = "second" },
+                companyFromSource,
+                new FailureItem(FailureItemIds.OpenApiDrift, FailureItemIds.NotRun),
+                photoNotCaptured,
+            ],
+            Cases = [company, sale],
+            PlannedCasesByOperation = Plan(
+                ("Rest.getCompany", ["REST-getCompany-01"]),
+                ("Rest.getSale", ["REST-getSale-01"]),
+                ("Soap.getPhoto", ["SOAP-getPhoto-01", "SOAP-getPhoto-02"])),
+            Baseline = FixtureBaseline with { NotCaptured = ["SOAP-getPhoto-01", "SOAP-getPhoto-02"] },
+        };
+
+        var report = BuildReport(source);
+
+        // The source's items first, in source order and first occurrence kept, case items attributed
+        // to their operation; then the not-captured and case items the source did not already hold.
+        Assert.Equal(
+            new[]
+            {
+                new FailureItem(FailureItemIds.OpenApiDrift, "missing", Detail: "first"),
+                new FailureItem("CASE:SOAP-getPhoto-01", "not-captured", "Soap.getPhoto"),
+                new FailureItem("CASE:REST-getCompany-01", company.ItemNature!, "Rest.getCompany", "from the source"),
+                new FailureItem(FailureItemIds.OpenApiDrift, "not-run"),
+                new FailureItem("CASE:SOAP-getPhoto-02", "not-captured", "Soap.getPhoto"),
+                new FailureItem("CASE:REST-getSale-01", sale.ItemNature!, "Rest.getSale"),
+            },
+            report.Failures.Select(failure => failure.Item));
+        Assert.Single(OperationRowOf(report, "Rest.getCompany").FailingItems);
+    }
+
+    [Fact]
+    public void Build_NotComparedOperation_CountsTowardsNeitherNNorM()
+    {
+        // The only case of Soap.getPhoto is not captured, and the register documents that item.
+        var report = BuildReport(
+            CatalogueRun(["Soap.getPhoto"]),
+            Entry(NotCapturedPair(CaseIdOf("Soap.getPhoto"))));
+
+        Assert.Equal(OperationResults.NotCompared, OperationRowOf(report, "Soap.getPhoto").Result);
+        Assert.True(Assert.Single(report.Failures).Documented);
+        Assert.True(report.AllFailuresDocumented);
+        Assert.Equal(
+            (21, 0, 0, 1),
+            (report.EquivalentCount, report.DocumentedDifferenceCount, report.UndocumentedDifferenceCount, report.NotComparedCount));
+        Assert.Equal("21 of 22 operations equivalent, 0 documented differences", report.FinalLine);
+        Assert.Equal(ResultsReport.FormatFinalLine(report.EquivalentCount, report.DocumentedDifferenceCount), report.FinalLine);
+    }
+
+    [Theory]
+    [InlineData(0, 0, "0 of 22 operations equivalent, 0 documented differences")]
+    [InlineData(20, 2, "20 of 22 operations equivalent, 2 documented differences")]
+    [InlineData(22, 0, "22 of 22 operations equivalent, 0 documented differences")]
+    public void FormatFinalLine_StatesNAndM(int n, int m, string expected)
+    {
+        Assert.Equal(expected, ResultsReport.FormatFinalLine(n, m));
+    }
+
+    [Theory]
+    [InlineData(-1, 0)]
+    [InlineData(0, -1)]
+    public void FormatFinalLine_RejectsNegativeCounts(int n, int m)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => ResultsReport.FormatFinalLine(n, m));
+    }
+
+    [Theory]
+    [InlineData(2)]
+    [InlineData(3, "N = 19, below 20")]
+    public void DemoAcceptance_NeedsTwentyEquivalentOperations(int differing, params string[] expectedShortfall)
+    {
+        // The differing operations return the baseline status with a well-formed payload, so only the
+        // number of equivalent operations decides.
+        var report = BuildReport(CatalogueRunEndingInDifferences(differing));
+
+        Assert.Equal(ResultsReport.TotalOperations - differing, report.EquivalentCount);
+        Assert.Equal(expectedShortfall.Length == 0, report.DemoAcceptanceMet);
+        Assert.Equal(expectedShortfall, report.DemoAcceptanceShortfall);
+    }
+
+    [Theory]
+    [InlineData("Rest.getCompany", 200, 502, "Rest.getCompany: status differs in REST-getCompany-01 (baseline 200, observed 502)")]
+    [InlineData("Rest.getAgent", 404, 200, "Rest.getAgent: status differs in REST-getAgent-01 (baseline 404, observed 200)")]
+    [InlineData("Soap.getAgent", 200, null, "Soap.getAgent: status differs in SOAP-getAgent-01 (baseline 200, observed none)")]
+    public void DemoAcceptance_StatusDifference_IsAShortfall(string operationId, int baselineStatus, int? observedStatus, string expected)
+    {
+        var report = BuildReport(CatalogueRun([], StatusMismatchCase(CaseIdOf(operationId), operationId, baselineStatus, observedStatus)));
+
+        Assert.Equal(21, report.EquivalentCount);
+        Assert.False(report.DemoAcceptanceMet);
+        Assert.Equal(expected, Assert.Single(report.DemoAcceptanceShortfall));
+    }
+
+    [Fact]
+    public void DemoAcceptance_MalformedPayload_IsAShortfall()
+    {
+        var report = BuildReport(CatalogueRun([], MalformedCase(CaseIdOf("Soap.getAgent"), "Soap.getAgent")));
+
+        Assert.Equal(21, report.EquivalentCount);
+        Assert.False(report.DemoAcceptanceMet);
+        Assert.Equal("Soap.getAgent: malformed payload in SOAP-getAgent-01", Assert.Single(report.DemoAcceptanceShortfall));
+    }
+
+    [Fact]
+    public void DemoAcceptance_ListsTheShortfallInCatalogueOrder()
+    {
+        var statusAndMalformed = StatusMismatchCase(CaseIdOf("Rest.getCompany"), "Rest.getCompany", 200, 502) with { WellFormed = false };
+
+        var report = BuildReport(CatalogueRun(
+            ["Rest.getAgent"],
+            StatusMismatchCase(CaseIdOf("Soap.getAgent"), "Soap.getAgent", 200, null),
+            statusAndMalformed));
+
+        Assert.Equal(19, report.EquivalentCount);
+        Assert.False(report.DemoAcceptanceMet);
+        Assert.Equal(
+            new[]
+            {
+                "N = 19, below 20",
+                "Rest.getAgent: not compared",
+                "Rest.getCompany: status differs in REST-getCompany-01 (baseline 200, observed 502)",
+                "Rest.getCompany: malformed payload in REST-getCompany-01",
+                "Soap.getAgent: status differs in SOAP-getAgent-01 (baseline 200, observed none)",
+            },
+            report.DemoAcceptanceShortfall);
+    }
+
+    /// <summary>Each change <see cref="MutableReportRun.Change"/> makes to the source after a build.</summary>
+    public static TheoryData<string> SourceChangesAfterBuild { get; } = new()
+    {
+        MutableReportRun.GapCountChanged,
+        MutableReportRun.GapNatureAdded,
+        MutableReportRun.FailuresCleared,
+        MutableReportRun.FailureAppended,
+        MutableReportRun.CaseReplaced,
+        MutableReportRun.CasesCleared,
+        MutableReportRun.DiscrepancyAppended,
+        MutableReportRun.NotCapturedCaseAppended,
+        MutableReportRun.PlannedOperationAdded,
+        MutableReportRun.PlannedCaseAppended,
+        MutableReportRun.ChecksCleared,
+    };
+
+    /// <summary>Each collection a built report holds, as <see cref="ChangeAttempts"/> names it.</summary>
+    public static TheoryData<string> ReportCollections { get; } = new()
+    {
+        "Failures",
+        "UndocumentedFailures",
+        "DemoAcceptanceShortfall",
+        "Operations",
+        "Operations[].FailingItems",
+        "Cases",
+        "Cases[].Discrepancies",
+        "NotCaptured",
+        "Baseline.NotCaptured",
+        "Conformance.GapsByNature",
+        "Checks",
+    };
+
+    [Theory]
+    [MemberData(nameof(SourceChangesAfterBuild))]
+    public void Build_SnapshotsTheSource_SoALaterChangeAltersNeitherTextNorDecisions(string change)
+    {
+        var run = new MutableReportRun();
+        var report = BuildReport(run.Source, FourResultsRun.Entries());
+        var text = RenderReport(report);
+        var decisions = DecisionsOf(report);
+        var held = HeldCollectionsOf(report);
+
+        run.Change(change);
+
+        Assert.Equal(text, RenderReport(report));
+        Assert.Equal(decisions, DecisionsOf(report));
+        Assert.Equal(held, HeldCollectionsOf(report));
+
+        // A new build does see the change, so the comparisons above are not vacuous.
+        var rebuilt = BuildReport(run.Source, FourResultsRun.Entries());
+        Assert.False(
+            string.Equals(text, RenderReport(rebuilt), StringComparison.Ordinal)
+                && decisions.SequenceEqual(DecisionsOf(rebuilt))
+                && held.SequenceEqual(HeldCollectionsOf(rebuilt)),
+            "The source change alters nothing a new build reads.");
+    }
+
+    [Theory]
+    [MemberData(nameof(ReportCollections))]
+    public void Build_ReportCollections_RejectChangesThroughCasts(string collection)
+    {
+        var report = BuildReport(new MutableReportRun().Source, FourResultsRun.Entries());
+        var text = RenderReport(report);
+        var decisions = DecisionsOf(report);
+        var held = HeldCollectionsOf(report);
+
+        foreach (var attempt in ChangeAttempts(report, collection))
+        {
+            Assert.Throws<NotSupportedException>(attempt);
+        }
+
+        Assert.Equal(text, RenderReport(report));
+        Assert.Equal(decisions, DecisionsOf(report));
+        Assert.Equal(held, HeldCollectionsOf(report));
+    }
+
+    /// <summary>
+    /// The report's decisions as text: N, M, whether every failure is documented, the final line, every
+    /// failure with its documentation, the undocumented failures, the demo shortfall and each operation row.
+    /// </summary>
+    private static string[] DecisionsOf(ResultsReport report) =>
+    [
+        "N = " + Number(report.EquivalentCount),
+        "M = " + Number(report.DocumentedDifferenceCount),
+        "all failures documented: " + report.AllFailuresDocumented,
+        "final line: " + report.FinalLine,
+        .. report.Failures.Select(failure =>
+            $"failure {failure.Item.ItemId} {failure.Item.Nature} {failure.Item.Operation} documented: {failure.Documented} by {failure.Entry?.Id}"),
+        .. report.UndocumentedFailures.Select(item => $"undocumented {item.ItemId} {item.Nature}"),
+        .. report.DemoAcceptanceShortfall.Select(line => "shortfall: " + line),
+        .. report.Operations.Select(row =>
+            $"{row.OperationId}: {row.Result}, planned {Number(row.Planned)}, failing {string.Join(" ", row.FailingItems.Select(item => item.ItemId))}"),
+    ];
+
+    /// <summary>
+    /// The collections the report holds for rendering, as text: each case with its discrepancies, the
+    /// not-captured ids of the report and of its baseline facts, the conformance gaps and the checks.
+    /// </summary>
+    private static string[] HeldCollectionsOf(ResultsReport report) =>
+    [
+        .. report.Cases.Select(result =>
+            $"case {result.CaseId}: {string.Join(", ", result.Discrepancies.Select(discrepancy => discrepancy.Path + " " + discrepancy.Kind))}"),
+        .. report.NotCaptured.Select(id => "not captured: " + id),
+        .. report.Baseline.NotCaptured.Select(id => "baseline not captured: " + id),
+        .. (report.Conformance?.GapsByNature ?? new Dictionary<string, int>()).Select(gap => $"gap {gap.Key}: {Number(gap.Value)}"),
+        .. report.Checks.Select(check =>
+            $"check {check.Key}: {check.Value.Outcome} {Number(check.Value.Passed)} of {Number(check.Value.Cases)}"),
+    ];
+
+    /// <summary>Every way of changing the named collection of <paramref name="report"/> through a cast.</summary>
+    /// <exception cref="ArgumentOutOfRangeException">No collection has that name.</exception>
+    private static Action[] ChangeAttempts(ResultsReport report, string collection) => collection switch
+    {
+        "Failures" => ListChangeAttempts(report.Failures),
+        "UndocumentedFailures" => ListChangeAttempts(report.UndocumentedFailures),
+        "DemoAcceptanceShortfall" => ListChangeAttempts(report.DemoAcceptanceShortfall),
+        "Operations" => ListChangeAttempts(report.Operations),
+        "Operations[].FailingItems" => ListChangeAttempts(OperationRowOf(report, "Rest.getCompany").FailingItems),
+        "Cases" => ListChangeAttempts(report.Cases),
+        "Cases[].Discrepancies" => ListChangeAttempts(
+            Assert.Single(report.Cases, result => string.Equals(result.CaseId, FourResultsRun.CompanyCaseId, StringComparison.Ordinal)).Discrepancies),
+        "NotCaptured" => ListChangeAttempts(report.NotCaptured),
+        "Baseline.NotCaptured" => ListChangeAttempts(report.Baseline.NotCaptured),
+        "Conformance.GapsByNature" => DictionaryChangeAttempts(
+            report.Conformance?.GapsByNature ?? throw new InvalidOperationException("The report holds no conformance counts.")),
+        "Checks" => DictionaryChangeAttempts(report.Checks),
+        _ => throw new ArgumentOutOfRangeException(nameof(collection), collection, "No report collection has this name."),
+    };
+
+    /// <summary>Replacing, adding, inserting, removing and clearing through <see cref="IList{T}"/>; the list must not be empty.</summary>
+    private static Action[] ListChangeAttempts<T>(IReadOnlyList<T> list)
+    {
+        Assert.NotEmpty(list);
+        var first = list[0];
+        return
+        [
+            () => ((IList<T>)list)[0] = first,
+            () => ((IList<T>)list).Add(first),
+            () => ((IList<T>)list).Insert(0, first),
+            () => ((IList<T>)list).Remove(first),
+            () => ((IList<T>)list).RemoveAt(0),
+            () => ((IList<T>)list).Clear(),
+        ];
+    }
+
+    /// <summary>Replacing, adding, removing and clearing through <see cref="IDictionary{TKey, TValue}"/>; the dictionary must not be empty.</summary>
+    private static Action[] DictionaryChangeAttempts<TValue>(IReadOnlyDictionary<string, TValue> map)
+    {
+        const string addedKey = "added-by-test";
+        Assert.NotEmpty(map);
+        Assert.DoesNotContain(addedKey, map.Keys);
+        var (key, value) = map.First();
+        return
+        [
+            () => ((IDictionary<string, TValue>)map)[key] = value,
+            () => ((IDictionary<string, TValue>)map).Add(addedKey, value),
+            () => ((IDictionary<string, TValue>)map).Remove(key),
+            () => ((IDictionary<string, TValue>)map).Clear(),
+        ];
+    }
+
+    /// <summary>
+    /// <see cref="FourResultsRun"/> with two checks and two conformance gap natures, where every list and
+    /// dictionary of the source, nested ones included, is a mutable instance this run keeps and
+    /// <see cref="Change"/> can alter after a build.
+    /// </summary>
+    private sealed class MutableReportRun
+    {
+        public const string GapCountChanged = "gap count changed";
+        public const string GapNatureAdded = "gap nature added";
+        public const string FailuresCleared = "failures cleared";
+        public const string FailureAppended = "failure appended";
+        public const string CaseReplaced = "case replaced";
+        public const string CasesCleared = "cases cleared";
+        public const string DiscrepancyAppended = "discrepancy appended";
+        public const string NotCapturedCaseAppended = "not-captured case appended";
+        public const string PlannedOperationAdded = "planned operation added";
+        public const string PlannedCaseAppended = "planned case appended";
+        public const string ChecksCleared = "checks cleared";
+
+        private const string CompanyOperation = "Rest.getCompany";
+
+        private readonly List<FailureItem> failures;
+        private readonly List<CaseResult> cases;
+        private readonly List<Discrepancy> companyDiscrepancies;
+        private readonly Dictionary<string, IReadOnlyList<string>> planned;
+        private readonly List<string> companyPlan;
+        private readonly Dictionary<string, CheckResult> checks;
+        private readonly List<string> notCaptured;
+        private readonly Dictionary<string, int> gaps;
+
+        public MutableReportRun()
+        {
+            var source = FourResultsRun.Source();
+
+            failures = [.. source.Failures];
+            cases = source.Cases.Select(result => result with { Discrepancies = result.Discrepancies.ToList() }).ToList();
+            companyDiscrepancies = (List<Discrepancy>)cases
+                .Single(result => string.Equals(result.CaseId, FourResultsRun.CompanyCaseId, StringComparison.Ordinal))
+                .Discrepancies;
+            planned = source.PlannedCasesByOperation.ToDictionary(
+                operation => operation.Key,
+                operation => (IReadOnlyList<string>)operation.Value.ToList(),
+                StringComparer.Ordinal);
+            companyPlan = (List<string>)planned[CompanyOperation];
+            checks = new Dictionary<string, CheckResult>(StringComparer.Ordinal)
+            {
+                [CheckNames.Routing] = new(CheckNames.Routing, CheckOutcomes.Pass, 2, 2, null),
+                [CheckNames.OpenApiDrift] = new(CheckNames.OpenApiDrift, CheckOutcomes.Pass, 0, 0, null),
+            };
+            notCaptured = [.. source.Baseline.NotCaptured];
+            gaps = new Dictionary<string, int>(StringComparer.Ordinal)
+            {
+                ["unobserved"] = 1,
+                ["unreachable-in-source"] = 9,
+            };
+
+            source.Failures = failures;
+            source.Cases = cases;
+            source.PlannedCasesByOperation = planned;
+            source.Checks = checks;
+            source.Baseline = source.Baseline with { NotCaptured = notCaptured };
+            source.Conformance = new ConformanceSummary(40, 30, gaps);
+            Source = source;
+        }
+
+        /// <summary>The source, whose collections are the instances <see cref="Change"/> alters.</summary>
+        public ReportSourceFixture Source { get; }
+
+        /// <summary>Alters one collection of <see cref="Source"/> in place.</summary>
+        /// <param name="change">One of this class's change names.</param>
+        /// <exception cref="ArgumentOutOfRangeException">No change has that name.</exception>
+        public void Change(string change)
+        {
+            switch (change)
+            {
+                case GapCountChanged:
+                    gaps["unobserved"] += 1;
+                    break;
+                case GapNatureAdded:
+                    gaps["null-only"] = 2;
+                    break;
+                case FailuresCleared:
+                    failures.Clear();
+                    break;
+                case FailureAppended:
+                    failures.Add(new FailureItem(FailureItemIds.OpenApiDrift, FailureItemIds.Missing));
+                    break;
+                case CaseReplaced:
+                    cases[0] = DifferingCase(cases[0].CaseId, cases[0].Operation, Website);
+                    break;
+                case CasesCleared:
+                    cases.Clear();
+                    break;
+                case DiscrepancyAppended:
+                    companyDiscrepancies.Add(Website);
+                    break;
+                case NotCapturedCaseAppended:
+                    notCaptured.Add("REST-getSale-01");
+                    break;
+                case PlannedOperationAdded:
+                    planned.Add("Rest.getSale", new List<string> { "REST-getSale-01" });
+                    break;
+                case PlannedCaseAppended:
+                    companyPlan.Add("REST-getCompany-02");
+                    break;
+                case ChecksCleared:
+                    checks.Clear();
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(change), change, "No source change has this name.");
+            }
+        }
+    }
+
+    // ---- Results report: rendering --------------------------------------------------------------
+
+    [Fact]
+    public void Render_EmitsEverySectionOnceInOrder()
+    {
+        var text = RenderReport(BuildReport(FourResultsRun.Source(), FourResultsRun.Entries()));
+
+        // Every heading and banner line of the report, in order: nothing missing, repeated or extra.
+        Assert.Equal(
+            new[]
+            {
+                "# Erewhon strangler facade — results",
+                "> Backend used: JADE stand-in (`jade-standin`), not live JADE. Baseline and stand-in responses are stand-in output.",
+                "## Run facts",
+                "## Counts",
+                "## Per-operation results",
+                "## Demo acceptance",
+                "## Differences",
+                "### Equivalence cases",
+                "### Other failing items",
+                "## Known limitations",
+                "## How to run",
+            },
+            Lines(text).Where(line => line.StartsWith('#') || line.StartsWith('>')));
+        Assert.Contains("docker compose up --build", SectionLines(text, "## How to run"));
+    }
+
+    [Fact]
+    public void Render_RunFactsStateTheRun()
+    {
+        var lines = SectionLines(RenderReport(BuildReport(new ReportSourceFixture())), "## Run facts");
+
+        Assert.Contains(TableRow("Date (UTC)", "2026-01-02T03:04:05Z"), lines);
+        Assert.Contains(TableRow("Execution mode", InlineCode("docker")), lines);
+        Assert.Contains(TableRow(".NET (facade runtime)", ".NET 10.0.14"), lines);
+        Assert.Contains(TableRow("Backend REST URL", InlineCode("http://standin:65000")), lines);
+        Assert.Contains(TableRow("Backend admin URL", InlineCode("http://standin:9090")), lines);
+        Assert.Contains(TableRow("Starting commit", InlineCode(StartingCommit)), lines);
+        Assert.Contains(TableRow("Baseline commit", "not found"), lines);
+    }
+
+    [Fact]
+    public void Render_UsesLineFeedsOnlyAndEndsWithTheFinalLine()
+    {
+        // Carriage returns in item details and register prose must not reach the report.
+        var source = FourResultsRun.Source();
+        source.Failures = [new FailureItem(FailureItemIds.Ordering, FailureItemIds.NotRun, Detail: "first line\r\nsecond line\rthird line")];
+        var multiline = NamedEntry("KL-TEST-MULTILINE") with { Reason = "First line\r\nsecond line", ActionTaken = "Recorded\rin the register" };
+        var report = BuildReport(source, [.. FourResultsRun.Entries(), multiline]);
+
+        var text = RenderReport(report);
+
+        Assert.DoesNotContain("\r", text, StringComparison.Ordinal);
+        Assert.EndsWith("\n\n" + report.FinalLine + "\n", text, StringComparison.Ordinal);
+        Assert.False(text.EndsWith("\n\n", StringComparison.Ordinal), "The report ends with more than one line feed.");
+        var lines = Lines(text);
+        Assert.Equal(report.FinalLine, lines[^2]);
+        Assert.Empty(lines[^3]);
+    }
+
+    [Fact]
+    public void Render_CountsTableStatesTheBaselineFacts()
+    {
+        var lines = SectionLines(RenderReport(BuildReport(FourResultsRun.Source(), FourResultsRun.Entries())), "## Counts");
+
+        Assert.Equal(
+            new[]
+            {
+                TableRow("Baseline", "operations (planned)", "4"),
+                TableRow("Baseline", "cases (planned)", "6"),
+                TableRow("Baseline", "operations captured", "3"),
+                TableRow("Baseline", "cases captured", "5"),
+                TableRow("Baseline", "cases not captured", "1: " + InlineCode(FourResultsRun.PhotoCaseId)),
+                TableRow("Baseline", "WSDL record", "captured"),
+                TableRow("Baseline", "capture execution", InlineCode("local-processes")),
+            },
+            lines.Where(line => line.StartsWith("| Baseline |", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public void Render_CountsTableAgreesWithTheReport()
+    {
+        // One case per operation; every count of a kind differs, so a value in the wrong row shows.
+        var source = CatalogueRun(
+            ["Soap.getAgent", "Soap.getClient", "Soap.getPhoto"],
+            DifferingCase(CaseIdOf("Rest.getClient"), "Rest.getClient", Website),
+            DifferingCase(CaseIdOf("Rest.getCompany"), "Rest.getCompany", Fax),
+            DifferingCase(CaseIdOf("Rest.getSale"), "Rest.getSale", Website));
+        var documented = Assert.Single(source.Cases, result => string.Equals(result.Operation, "Rest.getClient", StringComparison.Ordinal));
+        var report = BuildReport(source, Entry(CasePair(documented)));
+
+        var lines = SectionLines(RenderReport(report), "## Counts");
+
+        Assert.Equal(
+            (16, 1, 2, 3),
+            (report.EquivalentCount, report.DocumentedDifferenceCount, report.UndocumentedDifferenceCount, report.NotComparedCount));
+        Assert.Contains(
+            TableRow("Baseline", "cases not captured", "3: `SOAP-getAgent-01`, `SOAP-getClient-01`, `SOAP-getPhoto-01`"),
+            lines);
+        Assert.Equal(
+            new[]
+            {
+                TableRow("Equivalence", "cases compared", "19"),
+                TableRow("Equivalence", "cases equivalent", "16"),
+                TableRow("Equivalence", "cases with documented difference", "1"),
+                TableRow("Equivalence", "cases with undocumented difference", "2"),
+                TableRow("Equivalence", "cases not compared", "3"),
+                TableRow("Equivalence", "operations equivalent", Number(report.EquivalentCount)),
+                TableRow("Equivalence", "operations with documented difference", Number(report.DocumentedDifferenceCount)),
+                TableRow("Equivalence", "operations with undocumented difference", Number(report.UndocumentedDifferenceCount)),
+                TableRow("Equivalence", "operations not compared", Number(report.NotComparedCount)),
+            },
+            lines.Where(line => line.StartsWith("| Equivalence |", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public void Render_PerOperationTableFollowsTheCatalogue()
+    {
+        var report = BuildReport(FourResultsRun.Source(), FourResultsRun.Entries());
+
+        var rows = TableBody(SectionLines(RenderReport(report), "## Per-operation results"));
+
+        var catalogue = OperationCatalogue.Default.Operations;
+        Assert.Equal(ResultsReport.TotalOperations, rows.Length);
+        for (var index = 0; index < catalogue.Count; index++)
+        {
+            var operation = catalogue[index];
+            var row = report.Operations[index];
+            Assert.Equal(
+                TableRow(
+                    InlineCode(operation.JadeMethod),
+                    operation.Surface == Surface.Rest ? "REST" : "SOAP",
+                    InlineCode(operation.Id),
+                    Number(row.Planned),
+                    Number(row.Captured),
+                    Number(row.Compared),
+                    row.Result),
+                rows[index]);
+        }
+
+        Assert.Equal(TableRow("`getAgent`", "REST", "`Rest.getAgent`", "2", "2", "2", "equivalent"), rows[0]);
+        Assert.Contains(TableRow("`getClient`", "REST", "`Rest.getClient`", "2", "2", "2", "documented difference"), rows);
+        Assert.Contains(TableRow("`getCompany`", "REST", "`Rest.getCompany`", "1", "1", "1", "undocumented difference"), rows);
+        Assert.Contains(TableRow("`getPhoto`", "SOAP", "`Soap.getPhoto`", "1", "0", "0", "not compared"), rows);
+    }
+
+    [Fact]
+    public void Render_DifferencesListEveryFailingItem()
+    {
+        var text = RenderReport(BuildReport(FourResultsRun.Source(), FourResultsRun.Entries()));
+
+        Assert.Empty(NonBlank(SectionLines(text, "## Differences")));
+        Assert.Equal(
+            new[]
+            {
+                TableRow(InlineCode(FourResultsRun.PhotoCaseId), "`Soap.getPhoto`", "`not-captured`", "no", NoValue, NoValue, NoValue),
+                TableRow(
+                    InlineCode(FourResultsRun.ClientDifferingCaseId),
+                    "`Rest.getClient`",
+                    InlineCode(FourResultsRun.ClientNature),
+                    "yes",
+                    InlineCode(FourResultsRun.DifferenceEntryId),
+                    "3",
+                    "`artifacts/discrepancies/CASE_REST-getClient-02.json`"),
+                TableRow(
+                    InlineCode(FourResultsRun.CompanyCaseId),
+                    "`Rest.getCompany`",
+                    InlineCode(FourResultsRun.CompanyNature),
+                    "no",
+                    NoValue,
+                    NoValue,
+                    "`artifacts/discrepancies/CASE_REST-getCompany-01.json`"),
+            },
+            TableBody(SectionLines(text, "### Equivalence cases")));
+        Assert.Equal(
+            TableRow("`CHK-ORDERING`", NoValue, "`not-run`", "yes", InlineCode(FourResultsRun.OrderingEntryId), "0", NoValue, FourResultsRun.OrderingDetail),
+            Assert.Single(TableBody(SectionLines(text, "### Other failing items"))));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Render_KnownLimitations_ListMandatoryEntriesFirst(bool externalBackend)
+    {
+        // The register holds one mandatory entry, between two others, and no KL-SUB-NORESET.
+        var source = FourResultsRun.Source();
+        source.ExternalBackend = externalBackend;
+        var soapActions = new RegisterEntry(
+            KnownLimitationIds.SoapActions, RegisterCategories.Assumption, Operation: null, [], "The SOAP action names are assumed", 0, "Used the JADE default form");
+        var photo = new RegisterEntry(
+            "KL-TEST-ASSUMPTION", RegisterCategories.Assumption, "Soap.getPhoto", [], "Photo bytes are assumed.", 0, "Used the raw file bytes.");
+        var entries = FourResultsRun.Entries();
+
+        var lines = NonBlank(SectionLines(RenderReport(BuildReport(source, entries[0], soapActions, entries[1], photo)), "## Known limitations"));
+
+        var expectedIds = new List<string>(KnownLimitationIds.Mandatory);
+        if (externalBackend)
+        {
+            expectedIds.Add(KnownLimitationIds.SubNoReset);
+        }
+
+        expectedIds.AddRange([FourResultsRun.DifferenceEntryId, FourResultsRun.OrderingEntryId, "KL-TEST-ASSUMPTION"]);
+        Assert.Equal(expectedIds, lines.Select(LimitationIdOf));
+
+        Assert.StartsWith(BuiltInLimitationPrefix(KnownLimitationIds.BaselineStandIn), lines[0], StringComparison.Ordinal);
+        Assert.StartsWith(BuiltInLimitationPrefix(KnownLimitationIds.RestPaths), lines[1], StringComparison.Ordinal);
+        Assert.Equal(
+            "- **KL-SOAP-ACTIONS** (assumption) — Not done / why: The SOAP action names are assumed. Done instead: Used the JADE default form. Attempts: 0. Documents 0 failing item(s).",
+            lines[2]);
+        Assert.StartsWith(BuiltInLimitationPrefix(KnownLimitationIds.SoapWsdl), lines[3], StringComparison.Ordinal);
+        Assert.StartsWith(BuiltInLimitationPrefix(KnownLimitationIds.JadeTestsNotRun), lines[4], StringComparison.Ordinal);
+        if (externalBackend)
+        {
+            Assert.StartsWith(BuiltInLimitationPrefix(KnownLimitationIds.SubNoReset), lines[5], StringComparison.Ordinal);
+        }
+
+        Assert.Equal(
+            "- **KL-TEST-DIFFERENCE** (difference; `Rest.getClient`) — Not done / why: The difference persisted after three facade attempts. Done instead: Registered as a documented difference. Attempts: 3. Documents 1 failing item(s).",
+            lines[^3]);
+        Assert.Equal(
+            "- **KL-TEST-NOGIT** (check) — Not done / why: No git metadata in the checkout. Done instead: Reported the ordering check as not run. Attempts: 0. Documents 1 failing item(s).",
+            lines[^2]);
+        Assert.Equal(
+            "- **KL-TEST-ASSUMPTION** (assumption; `Soap.getPhoto`) — Not done / why: Photo bytes are assumed. Done instead: Used the raw file bytes. Attempts: 0. Documents 0 failing item(s).",
+            lines[^1]);
+    }
+
+    [Fact]
+    public void Render_ExternalBackend_BannerShowsTheUnverifiedUrls()
+    {
+        var source = new ReportSourceFixture
+        {
+            ExternalBackend = true,
+            Facts = FixtureFacts with
+            {
+                BackendRestUrl = "http://jade-host:65000",
+                BackendSoapUrl = "http://jade-host:21001",
+                BackendAdminUrl = null,
+            },
+        };
+
+        var lines = Lines(RenderReport(BuildReport(source)));
+
+        Assert.Equal(
+            new[]
+            {
+                "> Backend used: external backend at `http://jade-host:65000` / `http://jade-host:21001` (unverified).",
+                ">",
+                "> Baseline responses are JADE stand-in (`jade-standin`) output.",
+            },
+            lines.Where(line => line.StartsWith('>')));
+        Assert.Contains(TableRow("Backend admin URL", "none (external backend: no reset)"), lines);
+    }
+
+    [Theory]
+    [InlineData(2, "Met: at least 20 of 22 operations equivalent (20 of 22), and every other operation returns the baseline status code with a well-formed payload.")]
+    [InlineData(3, "Not met.", "- N = 19, below 20")]
+    public void Render_DemoAcceptance_StatesTheOutcome(int differing, params string[] expected)
+    {
+        var lines = NonBlank(SectionLines(RenderReport(BuildReport(CatalogueRunEndingInDifferences(differing))), "## Demo acceptance"));
+
+        Assert.Equal(
+            "Reported, not enforced: met when at least 20 of 22 operations are equivalent and every other operation returns the baseline status code with a well-formed payload.",
+            lines[0]);
+        Assert.Equal(expected, lines[1..]);
+    }
+
+    [Fact]
+    public void Render_EmptySource_ReportsEveryOperationNotCompared()
+    {
+        var report = BuildReport(new ReportSourceFixture());
+
+        var text = RenderReport(report);
+
+        Assert.True(report.CatalogueAvailable);
+        Assert.Equal(OperationCatalogue.Default.Operations.Select(operation => operation.Id), report.Operations.Select(row => row.OperationId));
+        var rows = TableBody(SectionLines(text, "## Per-operation results"));
+        Assert.Equal(ResultsReport.TotalOperations, rows.Length);
+        Assert.All(rows, row => Assert.EndsWith(" | 0 | 0 | 0 | not compared |", row, StringComparison.Ordinal));
+        Assert.Equal("None.", Assert.Single(NonBlank(SectionLines(text, "### Equivalence cases"))));
+        Assert.Equal("None.", Assert.Single(NonBlank(SectionLines(text, "### Other failing items"))));
+        Assert.Equal("0 of 22 operations equivalent, 0 documented differences", report.FinalLine);
+        Assert.EndsWith("\n\n0 of 22 operations equivalent, 0 documented differences\n", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Render_WithoutCatalogue_DerivesRowsFromThePlanAndCases()
+    {
+        var report = ResultsReport.Build(FourResultsRun.Source(), Register(FourResultsRun.Entries()), catalogue: null);
+
+        var text = RenderReport(report);
+
+        Assert.False(report.CatalogueAvailable);
+        var section = SectionLines(text, "## Per-operation results");
+        Assert.Contains(CatalogueUnavailableNote, section);
+        Assert.Equal(
+            new[]
+            {
+                TableRow("`getAgent`", "REST", "`Rest.getAgent`", "2", "2", "2", "equivalent"),
+                TableRow("`getClient`", "REST", "`Rest.getClient`", "2", "2", "2", "documented difference"),
+                TableRow("`getCompany`", "REST", "`Rest.getCompany`", "1", "1", "1", "undocumented difference"),
+                TableRow("`getPhoto`", "SOAP", "`Soap.getPhoto`", "1", "0", "0", "not compared"),
+            },
+            TableBody(section));
+        Assert.Equal("1 of 22 operations equivalent, 1 documented differences", report.FinalLine);
+        Assert.EndsWith("\n\n" + report.FinalLine + "\n", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Render_WithoutCatalogueOrCases_ListsNoOperations()
+    {
+        var report = ResultsReport.Build(new ReportSourceFixture(), KnownLimitationsRegister.Empty, catalogue: null);
+
+        var text = RenderReport(report);
+
+        Assert.False(report.CatalogueAvailable);
+        Assert.Empty(report.Operations);
+        Assert.Equal(new[] { CatalogueUnavailableNote, "None." }, NonBlank(SectionLines(text, "## Per-operation results")));
+        Assert.Equal("0 of 22 operations equivalent, 0 documented differences", report.FinalLine);
+        Assert.EndsWith("\n\n0 of 22 operations equivalent, 0 documented differences\n", text, StringComparison.Ordinal);
+    }
+
+    // Plain text holding every character the report escapes, and no '|', which table rows escape themselves.
+    private const string MarkupFreeText = @"a\b `c` *d* _e_ ~f~ <g> &amp; [h](i)";
+
+    // MarkupFreeText as the report must write it, so that it renders as MarkupFreeText.
+    private const string EscapedMarkupFreeText = @"a\\b \`c\` \*d\* \_e\_ \~f\~ \<g\> \&amp; \[h\](i)";
+
+    // CommonMark's ASCII punctuation: a backslash before any of these renders as that character.
+    private const string CommonMarkAsciiPunctuation = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~";
+
+    // The characters that can open inline markup, which the report escapes in plain text.
+    private const string EscapedInlineMarkup = "\\`*_~<>&[]";
+
+    [Theory]
+    [InlineData(KnownLimitationIds.RestPaths, @"/\<alias\>/jadehttp.dll/\<path\>?ErewhonREST")]
+    [InlineData(KnownLimitationIds.SoapActions, @"urn:JadeWebServices/WebServiceHTTP/\<op\>")]
+    [InlineData("KL-SOAP-SHAPES", @"\<op\>Response/\<op\>Result")]
+    [InlineData("KL-REST-FORMAT", @"\\/Date(ms)\\/")]
+    public void Render_CommittedRegister_EscapesPlaceholdersAndBackslashes(string id, string escaped)
+    {
+        // Unescaped, CommonMark reads <alias>, <path> and <op> as raw HTML and \/ as an escaped slash.
+        var register = LoadCommittedRegister();
+        var entry = register.FindById(id);
+        Assert.NotNull(entry);
+        Assert.Contains(DecodeBackslashEscapes(escaped).Text, entry.Reason, StringComparison.Ordinal);
+
+        var line = Assert.Single(CommittedLimitationLines(register), candidate => string.Equals(LimitationIdOf(candidate), id, StringComparison.Ordinal));
+
+        Assert.Contains(escaped, line, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Render_CommittedRegister_EachLineRendersTheRegisterText()
+    {
+        var register = LoadCommittedRegister();
+
+        var lines = CommittedLimitationLines(register).Select(DecodeBackslashEscapes).ToArray();
+
+        // Every mandatory entry is in the register, so each entry gives exactly one line and nothing else does.
+        Assert.Equal(register.Entries.Count, lines.Length);
+        foreach (var entry in register.Entries)
+        {
+            var operation = string.IsNullOrWhiteSpace(entry.Operation) ? string.Empty : "; " + InlineCode(entry.Operation);
+            var line = Assert.Single(lines, candidate => candidate.Text.StartsWith($"- **{entry.Id}** (", StringComparison.Ordinal));
+
+            Assert.Equal(
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"- **{entry.Id}** ({entry.Category}{operation}) — Not done / why: {ReportSentence(entry.Reason)} Done instead: {ReportSentence(entry.ActionTaken)} Attempts: {entry.Attempts}. Documents 0 failing item(s)."),
+                line.Text);
+
+            // Only the writer's own markup stays unescaped: the bold id, and the operation's code span.
+            Assert.Equal(operation.Length == 0 ? "****" : "****``", line.Markup);
+        }
+    }
+
+    [Fact]
+    public void Render_FreeText_RendersAsItself()
+    {
+        // Each kind of free text the report writes outside a code span holds every escaped character:
+        // the facade runtime, a check's outcome and detail, a failing item's detail and a shortfall line.
+        var source = CatalogueRun([], StatusMismatchCase("REST-getAgent-" + MarkupFreeText, "Rest.getAgent", 200, 502));
+        source.Facts = FixtureFacts with { FacadeFrameworkDescription = MarkupFreeText };
+        source.Failures = [new FailureItem(FailureItemIds.Ordering, FailureItemIds.NotRun, Detail: MarkupFreeText)];
+        source.Checks = new Dictionary<string, CheckResult>(StringComparer.Ordinal)
+        {
+            [CheckNames.Failure] = new(CheckNames.Failure, MarkupFreeText, Cases: 2, Passed: 1, Detail: MarkupFreeText),
+            [CheckNames.OpenApiDrift] = new(CheckNames.OpenApiDrift, CheckOutcomes.Fail, Cases: 0, Passed: 0, Detail: MarkupFreeText),
+        };
+
+        var text = RenderReport(BuildReport(source, FourResultsRun.Entries()));
+
+        Assert.Equal((MarkupFreeText, string.Empty), DecodeBackslashEscapes(EscapedMarkupFreeText));
+        Assert.Contains(TableRow(".NET (facade runtime)", EscapedMarkupFreeText), SectionLines(text, "## Run facts"));
+        var counts = SectionLines(text, "## Counts");
+        Assert.Contains(TableRow("Failure (unreachable and timeout)", "outcome", EscapedMarkupFreeText), counts);
+        Assert.Contains(TableRow("Failure (unreachable and timeout)", "unreachable / timeout", EscapedMarkupFreeText), counts);
+        Assert.Contains(TableRow("Contracts", "OpenAPI drift", "fail — " + EscapedMarkupFreeText), counts);
+        Assert.Equal(
+            TableRow("`CHK-ORDERING`", NoValue, "`not-run`", "yes", InlineCode(FourResultsRun.OrderingEntryId), "0", NoValue, EscapedMarkupFreeText),
+            Assert.Single(TableBody(SectionLines(text, "### Other failing items"))));
+        Assert.Equal(
+            new[] { "Not met.", "- Rest.getAgent: status differs in REST-getAgent-" + EscapedMarkupFreeText + " (baseline 200, observed 502)" },
+            NonBlank(SectionLines(text, "## Demo acceptance"))[1..]);
+    }
+
+    [Theory]
+    [InlineData("not-run", "`not-run`")]
+    [InlineData("differs:a`b", "``differs:a`b``")]
+    [InlineData("differs:a``b", "```differs:a``b```")]
+    [InlineData("differs:a```b", "````differs:a```b````")]
+    [InlineData("`differs", "`` `differs ``")]
+    [InlineData("```differs", "```` ```differs ````")]
+    [InlineData("differs``", "``` differs`` ```")]
+    [InlineData("`differs:a``b`", "``` `differs:a``b` ```")]
+    [InlineData(" differs ", "`  differs  `")]
+    [InlineData(" `differs` ", "``  `differs`  ``")]
+    [InlineData(" differs", "` differs`")]
+    [InlineData("   ", "`   `")]
+    public void Render_CodeSpan_HoldsTheValueExactly(string value, string expected)
+    {
+        // A nature is never blank, so the all-space value is checked through the item's Operation column,
+        // which every value also passes through.
+        var blank = string.IsNullOrWhiteSpace(value);
+        var source = new ReportSourceFixture
+        {
+            Failures = [new FailureItem(FailureItemIds.Ordering, blank ? FailureItemIds.NotRun : value, Operation: value)],
+        };
+
+        var row = Assert.Single(TableBody(SectionLines(RenderReport(BuildReport(source)), "### Other failing items")));
+
+        Assert.Equal(TableRow("`CHK-ORDERING`", expected, blank ? "`not-run`" : expected, "no", NoValue, NoValue, NoValue, NoValue), row);
+        Assert.Equal(value, CodeSpanContent(expected));
+    }
+
+    /// <summary>The "Known limitations" lines of the report of an empty run against <paramref name="register"/>.</summary>
+    private static string[] CommittedLimitationLines(KnownLimitationsRegister register) =>
+        NonBlank(SectionLines(
+            RenderReport(ResultsReport.Build(new ReportSourceFixture(), register, OperationCatalogue.Default)),
+            "## Known limitations"));
+
+    /// <summary>
+    /// Register text as the report's sentence: on one line, trimmed, with a full stop unless it already
+    /// ends in '.', '!' or '?'; a dash and a full stop when blank.
+    /// </summary>
+    private static string ReportSentence(string? text)
+    {
+        var line = (text ?? string.Empty)
+            .Replace("\r\n", " ", StringComparison.Ordinal)
+            .Replace('\r', ' ')
+            .Replace('\n', ' ')
+            .Trim();
+        if (line.Length == 0)
+        {
+            return NoValue + ".";
+        }
+
+        return line[^1] is '.' or '!' or '?' ? line : line + ".";
+    }
+
+    /// <summary>
+    /// The text <paramref name="markdown"/> renders as when its only inline constructs are CommonMark
+    /// backslash escapes (a backslash before ASCII punctuation is that punctuation), and the characters of
+    /// <see cref="EscapedInlineMarkup"/> it holds unescaped, in order.
+    /// </summary>
+    private static (string Text, string Markup) DecodeBackslashEscapes(string markdown)
+    {
+        var text = new System.Text.StringBuilder(markdown.Length);
+        var markup = new System.Text.StringBuilder();
+        for (var index = 0; index < markdown.Length; index++)
+        {
+            var character = markdown[index];
+            if (character == '\\'
+                && index + 1 < markdown.Length
+                && CommonMarkAsciiPunctuation.Contains(markdown[index + 1], StringComparison.Ordinal))
+            {
+                index++;
+                text.Append(markdown[index]);
+                continue;
+            }
+
+            if (EscapedInlineMarkup.Contains(character, StringComparison.Ordinal))
+            {
+                markup.Append(character);
+            }
+
+            text.Append(character);
+        }
+
+        return (text.ToString(), markup.ToString());
+    }
+
+    /// <summary>
+    /// The content of <paramref name="markdown"/> read as one CommonMark code span: an opening run of n
+    /// backticks, closed by the next run of exactly n backticks, with one space removed from each side
+    /// when the content both starts and ends with a space and is not all spaces. Null unless the text
+    /// is exactly one such span.
+    /// </summary>
+    private static string? CodeSpanContent(string markdown)
+    {
+        var fence = markdown.Length - markdown.TrimStart('`').Length;
+        var index = fence;
+        while (fence > 0 && index < markdown.Length)
+        {
+            if (markdown[index] != '`')
+            {
+                index++;
+                continue;
+            }
+
+            var runStart = index;
+            while (index < markdown.Length && markdown[index] == '`')
+            {
+                index++;
+            }
+
+            if (index - runStart != fence)
+            {
+                continue;
+            }
+
+            if (index != markdown.Length)
+            {
+                return null;
+            }
+
+            var content = markdown[fence..runStart];
+            return content.StartsWith(' ') && content.EndsWith(' ') && content.AsSpan().ContainsAnyExcept(' ')
+                ? content[1..^1]
+                : content;
+        }
+
+        return null;
+    }
+
+    // The Counts table's areas for the separate checks, as the report names them.
+    private const string ConformanceArea = "Stand-in conformance";
+    private const string RoutingArea = "Routing";
+    private const string FailureArea = "Failure (unreachable and timeout)";
+    private const string ListenerIsolationArea = "Listener isolation";
+    private const string TrxArea = "Facade test results (TRX)";
+    private const string ContractsArea = "Contracts";
+    private const string JadeUnchangedArea = "JADE unchanged";
+    private const string OrderingArea = "Ordering evidence";
+
+    /// <summary>Each alternative of the Counts table's separate-check rows, as <see cref="SeparateCheckBranch"/> names it.</summary>
+    public static TheoryData<string> SeparateCheckBranches { get; } = new()
+    {
+        "nothing run",
+        "conformance not counted, check not run",
+        "conformance without gaps",
+        "test checks not run without cases",
+        "test check not run with cases",
+        "test check failed without cases",
+        "TRX from its check",
+        "TRX missing",
+        "TRX read",
+        "contracts and ordering not run",
+        "check with a blank outcome",
+        "JADE unchanged not counted, check not run",
+    };
+
+    [Fact]
+    public void Render_CountsTableStatesTheSeparateChecks()
+    {
+        // Every rendered count differs from every other and from zero, so a value in the wrong row, a
+        // swapped pair or a constant shows. The gap natures are added in reverse ordinal order.
+        var source = new ReportSourceFixture
+        {
+            Conformance = new ConformanceSummary(
+                MembersChecked: 41,
+                Passed: 31,
+                GapsByNature: new Dictionary<string, int>(StringComparer.Ordinal) { ["unobserved"] = 9, ["null-only"] = 1 }),
+            JadeUnchanged = new JadeUnchangedSummary(PathsChecked: 123, Modified: 2),
+            Checks = CheckSet(
+            [
+                new(CheckNames.Conformance, CheckOutcomes.Fail, Cases: 43, Passed: 33, Detail: "2 of 2 seed-token assertions hold"),
+                new(CheckNames.Routing, CheckOutcomes.Fail, Cases: 4, Passed: 3, Detail: "Rest.getCompany reached backend A"),
+                new(CheckNames.Failure, CheckOutcomes.Fail, Cases: 6, Passed: 5, Detail: "unreachable 3/4 passed; timeout 2/2 passed"),
+                new(CheckNames.ListenerIsolation, CheckOutcomes.Fail, Cases: 8, Passed: 7, Detail: null),
+                new(CheckNames.OpenApiDrift, CheckOutcomes.Pass, Cases: 1, Passed: 1, Detail: null),
+                new(CheckNames.WsdlContract, CheckOutcomes.Fail, Cases: 1, Passed: 0, Detail: "soap:address missing on the facade side"),
+                new(CheckNames.JadeUnchanged, CheckOutcomes.Fail, Cases: 1, Passed: 0, Detail: "2 paths modified"),
+                new(CheckNames.Ordering, CheckOutcomes.Pass, Cases: 1, Passed: 1, Detail: null),
+            ]),
+        };
+
+        var lines = SectionLines(RenderReport(BuildReport(source)), "## Counts");
+
+        // Every row from the first conformance row to the end of the table, in order: nothing missing,
+        // repeated or extra. The JADE-unchanged counts take the place of that check's outcome.
+        Assert.Equal(
+            new[]
+            {
+                TableRow(ConformanceArea, "members checked", "41"),
+                TableRow(ConformanceArea, "members passed", "31"),
+                TableRow(ConformanceArea, "gaps: " + InlineCode("null-only"), "1"),
+                TableRow(ConformanceArea, "gaps: " + InlineCode("unobserved"), "9"),
+                TableRow(ConformanceArea, "outcome", "fail — 2 of 2 seed-token assertions hold"),
+                TableRow(RoutingArea, "cases", "4"),
+                TableRow(RoutingArea, "passed", "3"),
+                TableRow(RoutingArea, "outcome", "fail"),
+                TableRow(RoutingArea, "detail", "Rest.getCompany reached backend A"),
+                TableRow(FailureArea, "cases", "6"),
+                TableRow(FailureArea, "passed", "5"),
+                TableRow(FailureArea, "outcome", "fail"),
+                TableRow(FailureArea, "unreachable / timeout", "unreachable 3/4 passed; timeout 2/2 passed"),
+                TableRow(ListenerIsolationArea, "cases", "8"),
+                TableRow(ListenerIsolationArea, "passed", "7"),
+                TableRow(ListenerIsolationArea, "outcome", "fail"),
+                TableRow(TrxArea, "result", "read"),
+                TableRow(ContractsArea, "OpenAPI drift", "pass"),
+                TableRow(ContractsArea, "WSDL contract", "fail — soap:address missing on the facade side"),
+                TableRow(JadeUnchangedArea, "paths checked", "123"),
+                TableRow(JadeUnchangedArea, "paths modified", "2"),
+                TableRow(OrderingArea, "result", "pass"),
+            },
+            SeparateCheckRows(lines));
+    }
+
+    [Theory]
+    [MemberData(nameof(SeparateCheckBranches))]
+    public void Render_CountsTableSeparateChecks_StateEachAlternative(string branch)
+    {
+        var (source, expected) = SeparateCheckBranch(branch);
+
+        var lines = SectionLines(RenderReport(BuildReport(source)), "## Counts");
+
+        // Every row of the areas the branch states, in table order: nothing missing, repeated or extra.
+        var areas = expected.Select(AreaOf).ToHashSet(StringComparer.Ordinal);
+        Assert.Equal(expected, lines.Where(line => areas.Contains(AreaOf(line))));
+    }
+
+    /// <summary>
+    /// The source of one <see cref="SeparateCheckBranches"/> alternative, with the Counts rows its areas
+    /// must show. Each source holds only the checks, failures and counts the branch names.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">No branch has that name.</exception>
+    private static (ReportSourceFixture Source, string[] Rows) SeparateCheckBranch(string branch) => branch switch
+    {
+        "nothing run" => (
+            new ReportSourceFixture(),
+            [
+                TableRow(ConformanceArea, "members checked", "not run"),
+                TableRow(RoutingArea, "cases", "not run"),
+                TableRow(FailureArea, "cases", "not run"),
+                TableRow(ListenerIsolationArea, "cases", "not run"),
+                TableRow(TrxArea, "result", "not run"),
+                TableRow(ContractsArea, "OpenAPI drift", "not run"),
+                TableRow(ContractsArea, "WSDL contract", "not run"),
+                TableRow(JadeUnchangedArea, "paths checked", "not run"),
+                TableRow(OrderingArea, "result", "not run"),
+            ]),
+        "conformance not counted, check not run" => (
+            new ReportSourceFixture
+            {
+                Checks = CheckSet([new(CheckNames.Conformance, CheckOutcomes.NotRun, Cases: 0, Passed: 0, Detail: "baseline/conformance.json absent")]),
+            },
+            [
+                TableRow(ConformanceArea, "members checked", "not run"),
+                TableRow(ConformanceArea, "outcome", "not run — baseline/conformance.json absent"),
+            ]),
+        "conformance without gaps" => (
+            new ReportSourceFixture
+            {
+                Conformance = new ConformanceSummary(MembersChecked: 12, Passed: 12, GapsByNature: new Dictionary<string, int>(StringComparer.Ordinal)),
+                Checks = CheckSet([new(CheckNames.Conformance, CheckOutcomes.Pass, Cases: 14, Passed: 14, Detail: null)]),
+            },
+            [
+                TableRow(ConformanceArea, "members checked", "12"),
+                TableRow(ConformanceArea, "members passed", "12"),
+                TableRow(ConformanceArea, "gaps", "0"),
+                TableRow(ConformanceArea, "outcome", "pass"),
+            ]),
+        "test checks not run without cases" => (
+            new ReportSourceFixture
+            {
+                Checks = CheckSet(
+                [
+                    new(CheckNames.Routing, CheckOutcomes.NotRun, Cases: 0, Passed: 0, Detail: null),
+                    new(CheckNames.Failure, CheckOutcomes.NotRun, Cases: 0, Passed: 0, Detail: "TRX held no failure tests"),
+                    new(CheckNames.ListenerIsolation, CheckOutcomes.NotRun, Cases: 0, Passed: 0, Detail: null),
+                ]),
+            },
+            [
+                TableRow(RoutingArea, "cases", "not run"),
+                TableRow(FailureArea, "cases", "not run"),
+                TableRow(FailureArea, "unreachable / timeout", "TRX held no failure tests"),
+                TableRow(ListenerIsolationArea, "cases", "not run"),
+                TableRow(TrxArea, "result", "not run"),
+            ]),
+        "test check not run with cases" => (
+            new ReportSourceFixture
+            {
+                Checks = CheckSet([new(CheckNames.ListenerIsolation, CheckOutcomes.NotRun, Cases: 3, Passed: 0, Detail: "admin socket not reached")]),
+            },
+            [
+                TableRow(ListenerIsolationArea, "cases", "3"),
+                TableRow(ListenerIsolationArea, "passed", "0"),
+                TableRow(ListenerIsolationArea, "outcome", "not run"),
+                TableRow(ListenerIsolationArea, "detail", "admin socket not reached"),
+                TableRow(TrxArea, "result", "read"),
+            ]),
+        "test check failed without cases" => (
+            new ReportSourceFixture
+            {
+                Checks = CheckSet([new(CheckNames.Routing, CheckOutcomes.Fail, Cases: 0, Passed: 0, Detail: null)]),
+            },
+            [
+                TableRow(RoutingArea, "cases", "0"),
+                TableRow(RoutingArea, "passed", "0"),
+                TableRow(RoutingArea, "outcome", "fail"),
+                TableRow(TrxArea, "result", "not run"),
+            ]),
+        "TRX from its check" => (
+            new ReportSourceFixture
+            {
+                Failures = [new FailureItem(FailureItemIds.FacadeTrx, FailureItemIds.Missing)],
+                Checks = CheckSet(
+                [
+                    new(CheckNames.Routing, CheckOutcomes.Pass, Cases: 2, Passed: 2, Detail: null),
+                    new(CheckNames.FacadeTrx, CheckOutcomes.Fail, Cases: 0, Passed: 0, Detail: "exit code 1"),
+                ]),
+            },
+            [TableRow(TrxArea, "result", "fail — exit code 1")]),
+        "TRX missing" => (
+            new ReportSourceFixture
+            {
+                // The same item twice, which the report lists once, and a check that read cases.
+                Failures =
+                [
+                    new FailureItem(FailureItemIds.FacadeTrx, FailureItemIds.Missing, Detail: "TRX file not found"),
+                    new FailureItem(FailureItemIds.FacadeTrx, FailureItemIds.Missing, Detail: "TRX file not found"),
+                ],
+                Checks = CheckSet([new(CheckNames.Routing, CheckOutcomes.Pass, Cases: 2, Passed: 2, Detail: null)]),
+            },
+            [TableRow(TrxArea, "result", "fail (" + InlineCode(FailureItemIds.Missing) + ")")]),
+        "TRX read" => (
+            new ReportSourceFixture
+            {
+                Checks = CheckSet([new(CheckNames.Failure, CheckOutcomes.Pass, Cases: 2, Passed: 2, Detail: null)]),
+            },
+            [TableRow(TrxArea, "result", "read")]),
+        "contracts and ordering not run" => (
+            new ReportSourceFixture
+            {
+                Checks = CheckSet(
+                [
+                    new(CheckNames.OpenApiDrift, CheckOutcomes.NotRun, Cases: 0, Passed: 0, Detail: null),
+                    new(CheckNames.WsdlContract, CheckOutcomes.NotRun, Cases: 0, Passed: 0, Detail: "contracts/wsdl/ErewhonWebService.wsdl absent"),
+                    new(CheckNames.Ordering, CheckOutcomes.NotRun, Cases: 0, Passed: 0, Detail: "no git metadata"),
+                ]),
+            },
+            [
+                TableRow(ContractsArea, "OpenAPI drift", "not run"),
+                TableRow(ContractsArea, "WSDL contract", "not run — contracts/wsdl/ErewhonWebService.wsdl absent"),
+                TableRow(OrderingArea, "result", "not run — no git metadata"),
+            ]),
+        "check with a blank outcome" => (
+            new ReportSourceFixture
+            {
+                Checks = CheckSet([new(CheckNames.Ordering, string.Empty, Cases: 0, Passed: 0, Detail: null)]),
+            },
+            [TableRow(OrderingArea, "result", NoValue)]),
+        "JADE unchanged not counted, check not run" => (
+            new ReportSourceFixture
+            {
+                Checks = CheckSet([new(CheckNames.JadeUnchanged, CheckOutcomes.NotRun, Cases: 0, Passed: 0, Detail: "no git metadata")]),
+            },
+            [TableRow(JadeUnchangedArea, "paths checked", "not run — no git metadata")]),
+        _ => throw new ArgumentOutOfRangeException(nameof(branch), branch, "No separate-check branch has this name."),
+    };
+
+    /// <summary>Checks keyed by their names, as <see cref="IReportSource.Checks"/> holds them.</summary>
+    private static Dictionary<string, CheckResult> CheckSet(IEnumerable<CheckResult> checks) =>
+        checks.ToDictionary(check => check.Name, StringComparer.Ordinal);
+
+    /// <summary>The Counts table's rows from its first stand-in conformance row to the end of the table.</summary>
+    private static string[] SeparateCheckRows(IEnumerable<string> countsLines) =>
+        countsLines
+            .SkipWhile(line => !line.StartsWith($"| {ConformanceArea} |", StringComparison.Ordinal))
+            .TakeWhile(line => line.StartsWith('|'))
+            .ToArray();
+
+    /// <summary>The first cell of a table row, <c>| area | ... |</c>; empty for any other line.</summary>
+    private static string AreaOf(string line)
+    {
+        const string start = "| ";
+        var end = line.StartsWith(start, StringComparison.Ordinal)
+            ? line.IndexOf(" | ", start.Length, StringComparison.Ordinal)
+            : -1;
+        return end > start.Length ? line[start.Length..end] : string.Empty;
+    }
+
+    // ---- Results report: fixtures ---------------------------------------------------------------
+
+    private const string StartingCommit = "19a5189e9075349aca54de1fb5fdf2d8727403e7";
+
+    // The report's text for an empty table cell.
+    private const string NoValue = "—";
+
+    private const string CatalogueUnavailableNote =
+        "The operation catalogue could not be loaded, so rows are derived from the planned and replayed cases and an operation with neither is not listed.";
+
+    /// <summary>
+    /// Fixed run facts: 2026-01-02T03:04:05Z, Docker mode, the facade and stand-in URLs of the Compose
+    /// network, the stand-in admin URL and the starting commit; no baseline or facade commit found.
+    /// </summary>
+    private static RunFacts FixtureFacts { get; } = new(
+        new DateTimeOffset(2026, 1, 2, 3, 4, 5, TimeSpan.Zero),
+        "docker",
+        ".NET 10.0.14",
+        "10.0.403",
+        "http://facade:65000",
+        "http://facade:21001",
+        "http://standin:65000",
+        "http://standin:21001",
+        "http://standin:9090",
+        StartingCommit,
+        BaselineCommit: null,
+        FacadeCommit: null);
+
+    /// <summary>
+    /// Baseline facts of a run whose manifest was read, captured by local processes with the WSDL:
+    /// every count zero and no case listed as not captured. Tests set the counts they state with
+    /// <c>with</c>.
+    /// </summary>
+    private static BaselineFacts FixtureBaseline { get; } = new(
+        PlannedOperations: 0,
+        PlannedCases: 0,
+        CapturedOperations: 0,
+        CapturedCases: 0,
+        NotCaptured: [],
+        WsdlCaptured: true,
+        ManifestPresent: true,
+        CaptureExecution: "local-processes");
+
+    /// <summary>
+    /// The planned case ids by operation id, as <see cref="IReportSource.PlannedCasesByOperation"/> holds them.
+    /// </summary>
+    /// <param name="operations">Each operation id with its planned case ids, in matrix order.</param>
+    private static Dictionary<string, IReadOnlyList<string>> Plan(params (string Operation, string[] CaseIds)[] operations) =>
+        operations.ToDictionary(operation => operation.Operation, operation => (IReadOnlyList<string>)operation.CaseIds, StringComparer.Ordinal);
+
+    /// <summary>A captured case that was compared and found equivalent: status 200 on both sides, well formed.</summary>
+    private static CaseResult EquivalentCase(string caseId, string operation) =>
+        new(
+            caseId,
+            operation,
+            Order: 1,
+            Compared: true,
+            Equivalent: true,
+            Discrepancies: [],
+            WellFormed: true,
+            StatusMatched: true,
+            BaselineStatus: 200,
+            ObservedStatus: 200,
+            ItemNature: null);
+
+    /// <summary>
+    /// A captured case that was compared and differs only in <paramref name="discrepancies"/>, with the
+    /// baseline status 200 and a well-formed payload. Its item nature is <c>d:</c> followed by the
+    /// signature of the discrepancies.
+    /// </summary>
+    private static CaseResult DifferingCase(string caseId, string operation, params Discrepancy[] discrepancies) =>
+        EquivalentCase(caseId, operation) with
+        {
+            Equivalent = false,
+            Discrepancies = discrepancies,
+            ItemNature = "d:" + DiscrepancySignature.Compute(discrepancies),
+        };
+
+    /// <summary>
+    /// A captured, compared case whose observed status is not the baseline's, with a well-formed payload:
+    /// a <c>$status</c> value discrepancy, or no response at all (<c>no-response:connect</c>) when
+    /// <paramref name="observedStatus"/> is null.
+    /// </summary>
+    private static CaseResult StatusMismatchCase(string caseId, string operation, int baselineStatus, int? observedStatus)
+    {
+        var discrepancy = observedStatus is { } observed
+            ? new Discrepancy(
+                "$status",
+                DiscrepancyKinds.Value,
+                DiscrepancyValue.Literal(Number(baselineStatus)),
+                DiscrepancyValue.Literal(Number(observed)))
+            : new Discrepancy(
+                "$response",
+                DiscrepancyKinds.NoResponse(NoResponseReasons.Connect),
+                DiscrepancyValue.Absent,
+                DiscrepancyValue.Absent);
+
+        return DifferingCase(caseId, operation, discrepancy) with
+        {
+            StatusMatched = false,
+            BaselineStatus = baselineStatus,
+            ObservedStatus = observedStatus,
+        };
+    }
+
+    /// <summary>A captured, compared case with the baseline status whose observed body is not well formed.</summary>
+    private static CaseResult MalformedCase(string caseId, string operation) =>
+        DifferingCase(
+            caseId,
+            operation,
+            new Discrepancy("$body", DiscrepancyKinds.Malformed, DiscrepancyValue.Literal("well formed"), DiscrepancyValue.Literal("truncated")))
+        with
+        {
+            WellFormed = false,
+        };
+
+    /// <summary>The one case <see cref="CatalogueRun"/> plans for an operation: <c>REST-getAgent-01</c> for <c>Rest.getAgent</c>.</summary>
+    private static string CaseIdOf(string operationId)
+    {
+        var dot = operationId.IndexOf('.', StringComparison.Ordinal);
+        if (dot <= 0 || dot == operationId.Length - 1)
+        {
+            throw new ArgumentException("An operation id has the form <Surface>.<method>.", nameof(operationId));
+        }
+
+        return string.Concat(operationId[..dot].ToUpperInvariant(), "-", operationId[(dot + 1)..], "-01");
+    }
+
+    /// <summary>
+    /// A run of the 22 catalogue operations with one planned case each (<see cref="CaseIdOf"/>), every case
+    /// captured and equivalent, except that the case of each operation in
+    /// <paramref name="notCapturedOperations"/> is listed as not captured, and a case in
+    /// <paramref name="replacements"/> replaces its operation's case. The baseline counts agree with the cases.
+    /// </summary>
+    /// <exception cref="ArgumentException">A replacement names no catalogue operation, or one listed as not captured.</exception>
+    private static ReportSourceFixture CatalogueRun(string[] notCapturedOperations, params CaseResult[] replacements)
+    {
+        var operations = OperationCatalogue.Default.Operations;
+        var notCaptured = notCapturedOperations.ToHashSet(StringComparer.Ordinal);
+        foreach (var replacement in replacements)
+        {
+            if (notCaptured.Contains(replacement.Operation)
+                || !operations.Any(operation => string.Equals(operation.Id, replacement.Operation, StringComparison.Ordinal)))
+            {
+                throw new ArgumentException("A replacement must name a captured catalogue operation.", nameof(replacements));
+            }
+        }
+
+        var cases = new List<CaseResult>();
+        foreach (var operation in operations)
+        {
+            if (notCaptured.Contains(operation.Id))
+            {
+                continue;
+            }
+
+            var replacement = replacements.SingleOrDefault(result => string.Equals(result.Operation, operation.Id, StringComparison.Ordinal));
+            cases.Add((replacement ?? EquivalentCase(CaseIdOf(operation.Id), operation.Id)) with { Order = cases.Count + 1 });
+        }
+
+        return new ReportSourceFixture
+        {
+            Cases = cases,
+            PlannedCasesByOperation = Plan(operations.Select(operation => (operation.Id, new[] { CaseIdOf(operation.Id) })).ToArray()),
+            Baseline = FixtureBaseline with
+            {
+                PlannedOperations = operations.Count,
+                PlannedCases = operations.Count,
+                CapturedOperations = cases.Count,
+                CapturedCases = cases.Count,
+                NotCaptured = notCapturedOperations.Select(CaseIdOf).ToArray(),
+            },
+        };
+    }
+
+    /// <summary>
+    /// A <see cref="CatalogueRun"/> whose last <paramref name="differing"/> catalogue operations differ in a
+    /// body value while returning the baseline status with a well-formed payload; every other operation is
+    /// equivalent.
+    /// </summary>
+    private static ReportSourceFixture CatalogueRunEndingInDifferences(int differing) =>
+        CatalogueRun(
+            [],
+            OperationCatalogue.Default.Operations
+                .TakeLast(differing)
+                .Select(operation => DifferingCase(CaseIdOf(operation.Id), operation.Id, Website))
+                .ToArray());
+
+    /// <summary>An <see cref="Entry"/> with the id <paramref name="id"/>, for registers that need several entries.</summary>
+    private static RegisterEntry NamedEntry(string id, params (string itemId, string nature)[] pairs) =>
+        Entry(pairs) with { Id = id };
+
+    /// <summary>The (<c>itemId</c>, <c>nature</c>) pair of a compared, non-equivalent case's <c>CASE:</c> item.</summary>
+    /// <exception cref="ArgumentException">The case has no item nature.</exception>
+    private static (string itemId, string nature) CasePair(CaseResult result) =>
+        (FailureItemIds.Case(result.CaseId),
+            result.ItemNature ?? throw new ArgumentException("The case has no item nature.", nameof(result)));
+
+    /// <summary>The (<c>itemId</c>, <c>nature</c>) pair of a case listed in <see cref="BaselineFacts.NotCaptured"/>.</summary>
+    private static (string itemId, string nature) NotCapturedPair(string caseId) =>
+        (FailureItemIds.Case(caseId), FailureItemIds.NotCaptured);
+
+    /// <summary>Builds the report of <paramref name="source"/> with an inline register and the embedded 22-operation catalogue.</summary>
+    /// <param name="source">The run's observations.</param>
+    /// <param name="entries">The register's entries, in file order.</param>
+    private static ResultsReport BuildReport(IReportSource source, params RegisterEntry[] entries) =>
+        ResultsReport.Build(source, Register(entries), OperationCatalogue.Default);
+
+    /// <summary>Renders <paramref name="report"/> as the text of <c>RESULTS.md</c>, without writing a file.</summary>
+    private static string RenderReport(ResultsReport report) => new ResultsReportWriter().Render(report);
+
+    /// <summary>The report's row for <paramref name="operationId"/>; fails unless there is exactly one.</summary>
+    private static OperationRow OperationRowOf(ResultsReport report, string operationId) =>
+        Assert.Single(report.Operations, row => string.Equals(row.OperationId, operationId, StringComparison.Ordinal));
+
+    /// <summary>Rendered text split at <c>\n</c>; the element after the last line feed is empty.</summary>
+    private static string[] Lines(string markdown) => markdown.Split('\n');
+
+    /// <summary>The non-blank lines of <paramref name="lines"/>, in order.</summary>
+    private static string[] NonBlank(IEnumerable<string> lines) => lines.Where(line => line.Length > 0).ToArray();
+
+    /// <summary>
+    /// The lines after the heading line <paramref name="heading"/>, up to the next heading of any level or
+    /// the end of the text; fails when the heading is absent.
+    /// </summary>
+    private static string[] SectionLines(string markdown, string heading)
+    {
+        var lines = Lines(markdown);
+        var start = Array.IndexOf(lines, heading);
+        Assert.True(start >= 0, $"The report has no heading \"{heading}\".");
+        return lines.Skip(start + 1).TakeWhile(line => !line.StartsWith('#')).ToArray();
+    }
+
+    /// <summary>The body rows of the first Markdown table in <paramref name="lines"/>: without its header and separator rows.</summary>
+    private static string[] TableBody(IEnumerable<string> lines) =>
+        lines
+            .SkipWhile(line => !line.StartsWith('|'))
+            .TakeWhile(line => line.StartsWith('|'))
+            .Skip(2)
+            .ToArray();
+
+    /// <summary>A Markdown table row as the report writes it, <c>| a | b |</c>.</summary>
+    private static string TableRow(params string[] cells) => "| " + string.Join(" | ", cells) + " |";
+
+    /// <summary>A Markdown code span around a value that holds no backtick and no edge space.</summary>
+    private static string InlineCode(string value) => "`" + value + "`";
+
+    /// <summary>An integer as the report writes it, in the invariant culture.</summary>
+    private static string Number(int value) => value.ToString(CultureInfo.InvariantCulture);
+
+    /// <summary>The entry id a "Known limitations" line starts with, <c>- **&lt;id&gt;**</c>; empty for any other line.</summary>
+    private static string LimitationIdOf(string line)
+    {
+        const string start = "- **";
+        var end = line.StartsWith(start, StringComparison.Ordinal)
+            ? line.IndexOf("**", start.Length, StringComparison.Ordinal)
+            : -1;
+        return end > start.Length ? line[start.Length..end] : string.Empty;
+    }
+
+    /// <summary>The start of the line for a mandatory or KL-SUB-NORESET entry the register does not hold.</summary>
+    private static string BuiltInLimitationPrefix(string id) => $"- **{id}** (built-in text; not in the register) — ";
+
+    /// <summary>
+    /// An inline <see cref="IReportSource"/>. Every member is settable and defaults to an empty but valid
+    /// run: no failures, cases, plans or checks, <see cref="FixtureFacts"/>, <see cref="FixtureBaseline"/>,
+    /// no conformance or JADE-unchanged counts, and the stand-in as the backend.
+    /// </summary>
+    private sealed class ReportSourceFixture : IReportSource
+    {
+        public IReadOnlyList<FailureItem> Failures { get; set; } = [];
+
+        public IReadOnlyList<CaseResult> Cases { get; set; } = [];
+
+        public IReadOnlyDictionary<string, IReadOnlyList<string>> PlannedCasesByOperation { get; set; } = Plan();
+
+        public IReadOnlyDictionary<string, CheckResult> Checks { get; set; } = new Dictionary<string, CheckResult>(StringComparer.Ordinal);
+
+        public RunFacts Facts { get; set; } = FixtureFacts;
+
+        public BaselineFacts Baseline { get; set; } = FixtureBaseline;
+
+        public ConformanceSummary? Conformance { get; set; }
+
+        public JadeUnchangedSummary? JadeUnchanged { get; set; }
+
+        public bool ExternalBackend { get; set; }
+    }
+
+    /// <summary>
+    /// A run that shows each AAP 0.7.7 operation result once against <see cref="Entries"/>:
+    /// <c>Rest.getAgent</c> equivalent (two equivalent cases); <c>Rest.getClient</c> a documented
+    /// difference (one equivalent case, one documented differing case); <c>Rest.getCompany</c> an
+    /// undocumented difference; <c>Soap.getPhoto</c> not compared (its only case not captured and
+    /// undocumented). It also holds a documented <c>CHK-ORDERING</c> item. The other 18 catalogue
+    /// operations have no plan and no case.
+    /// </summary>
+    private static class FourResultsRun
+    {
+        public const string AgentFirstCaseId = "REST-getAgent-01";
+        public const string AgentSecondCaseId = "REST-getAgent-02";
+        public const string ClientEquivalentCaseId = "REST-getClient-01";
+        public const string ClientDifferingCaseId = "REST-getClient-02";
+        public const string CompanyCaseId = "REST-getCompany-01";
+        public const string PhotoCaseId = "SOAP-getPhoto-01";
+
+        /// <summary>The <see cref="Entry"/> id, which documents <see cref="ClientDifferingCaseId"/>.</summary>
+        public const string DifferenceEntryId = "KL-TEST-DIFFERENCE";
+
+        /// <summary>The check entry that documents the <c>CHK-ORDERING</c> item.</summary>
+        public const string OrderingEntryId = "KL-TEST-NOGIT";
+
+        /// <summary>The <c>CHK-ORDERING</c> item's detail.</summary>
+        public const string OrderingDetail = "no git metadata";
+
+        /// <summary>The nature of the documented <see cref="ClientDifferingCaseId"/> difference.</summary>
+        public static string ClientNature => "d:" + DiscrepancySignature.Compute([Website]);
+
+        /// <summary>The nature of the undocumented <see cref="CompanyCaseId"/> difference.</summary>
+        public static string CompanyNature => "d:" + DiscrepancySignature.Compute([Fax]);
+
+        /// <summary>A new source for the run, with baseline counts that agree with its cases.</summary>
+        public static ReportSourceFixture Source() => new()
+        {
+            Failures = [new FailureItem(FailureItemIds.Ordering, FailureItemIds.NotRun, Detail: OrderingDetail)],
+            Cases =
+            [
+                EquivalentCase(AgentFirstCaseId, "Rest.getAgent") with { Order = 1 },
+                EquivalentCase(AgentSecondCaseId, "Rest.getAgent") with { Order = 2 },
+                EquivalentCase(ClientEquivalentCaseId, "Rest.getClient") with { Order = 3 },
+                DifferingCase(ClientDifferingCaseId, "Rest.getClient", Website) with { Order = 4 },
+                DifferingCase(CompanyCaseId, "Rest.getCompany", Fax) with { Order = 5 },
+            ],
+            PlannedCasesByOperation = Plan(
+                ("Rest.getAgent", [AgentFirstCaseId, AgentSecondCaseId]),
+                ("Rest.getClient", [ClientEquivalentCaseId, ClientDifferingCaseId]),
+                ("Rest.getCompany", [CompanyCaseId]),
+                ("Soap.getPhoto", [PhotoCaseId])),
+            Baseline = FixtureBaseline with
+            {
+                PlannedOperations = 4,
+                PlannedCases = 6,
+                CapturedOperations = 3,
+                CapturedCases = 5,
+                NotCaptured = [PhotoCaseId],
+            },
+        };
+
+        /// <summary>
+        /// The run's register entries, in file order: <see cref="DifferenceEntryId"/> for
+        /// <c>Rest.getClient</c> after three attempts, then <see cref="OrderingEntryId"/>.
+        /// </summary>
+        public static RegisterEntry[] Entries() =>
+        [
+            Entry((FailureItemIds.Case(ClientDifferingCaseId), ClientNature)) with { Operation = "Rest.getClient" },
+            NamedEntry(OrderingEntryId, (FailureItemIds.Ordering, FailureItemIds.NotRun)) with
+            {
+                Category = RegisterCategories.Check,
+                Attempts = 0,
+                Reason = "No git metadata in the checkout",
+                ActionTaken = "Reported the ordering check as not run",
+            },
+        ];
     }
 }
 

@@ -579,4 +579,3 @@ public sealed class KnownLimitationsRegister
     private static InvalidDataException Invalid(string message, Exception? innerException = null) =>
         new(ErrorPrefix + message, innerException);
 }
-
