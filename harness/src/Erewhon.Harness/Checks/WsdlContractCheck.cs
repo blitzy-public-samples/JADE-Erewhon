@@ -1,31 +1,42 @@
 using System.Globalization;
 using System.Security;
 using System.Text;
+using Erewhon.Contracts.Admin;
 using Erewhon.Contracts.Catalogue;
 using Erewhon.Harness.Compare;
 using Erewhon.Harness.Http;
+using Erewhon.Harness.Lifecycle;
 using Erewhon.Harness.Report;
 
 namespace Erewhon.Harness.Checks;
 
 /// <summary>
-/// Checks that the WSDL the facade publishes equals the backend's WSDL under XML semantic comparison,
-/// with the single <c>soap:address/@location</c> value left uncompared: the facade rewrites only that
-/// value per request, and the attribute must still be present on both sides. Comments are ignored, so the
-/// stand-in label comment of <c>contracts/wsdl/ErewhonWebService.wsdl</c> never causes a difference.
+/// Checks that the facade publishes the contracts WSDL and that the WSDL it publishes equals the backend's
+/// WSDL under XML semantic comparison, with the single <c>soap:address/@location</c> value left uncompared:
+/// the facade rewrites only that value per request, and the attribute must still be present on both sides.
+/// Comments are ignored, so the stand-in label comment of <c>contracts/wsdl/ErewhonWebService.wsdl</c> never
+/// causes a difference.
 /// </summary>
 /// <remarks>
 /// <para>Evaluation order, first match wins:</para>
 /// <list type="number">
 ///   <item>No <c>contracts/wsdl/ErewhonWebService.wsdl</c> (capture obtained no WSDL): <c>CHK-WSDL-CONTRACT</c>
 ///   <c>not-run</c>, outcome <c>not-run</c>, with no request and no comparison.</item>
-///   <item>A SOAP base URL from which no WSDL address can be formed: <c>not-run</c>, with no request.</item>
-///   <item><c>GET</c> of the catalogue's WSDL path and query on <c>Harness:Backend:SoapBaseUrl</c> and on
-///   <c>Harness:Target:SoapBaseUrl</c>, each within the per-request limit. Each answered body, whatever its
-///   status, is saved byte for byte to <c>artifacts/wsdl/backend.wsdl</c> or <c>artifacts/wsdl/facade.wsdl</c>.</item>
+///   <item>A SOAP base URL from which no WSDL address can be formed, or a <c>Harness:Target:AdminUrl</c> from
+///   which no <c>/admin/info</c> address can be formed: <c>not-run</c>, with no request.</item>
+///   <item>Concurrently, each within the per-request limit: <c>GET</c> of the catalogue's WSDL path and query on
+///   <c>Harness:Backend:SoapBaseUrl</c> and on <c>Harness:Target:SoapBaseUrl</c>, and <c>GET</c> of
+///   <c>/admin/info</c> on <c>Harness:Target:AdminUrl</c>. Each answered WSDL body, whatever its status, is
+///   saved byte for byte to <c>artifacts/wsdl/backend.wsdl</c> or <c>artifacts/wsdl/facade.wsdl</c>; the info
+///   body is only read.</item>
 ///   <item>A side that was not answered gives <c>$response.&lt;side&gt;</c> with kind
 ///   <c>no-response:&lt;reason&gt;</c>; a side answered with a status other than 200 gives
 ///   <c>$status.&lt;side&gt;</c> with kind <c>value</c>.</item>
+///   <item>Unless the facade answered its info with 200 and a JSON object whose <c>wsdl</c> string is exactly
+///   <c>present</c>, one <c>$published.facade</c> entry whose baseline is <c>present</c>: kind <c>value</c>
+///   with the reported string as observed, or kind <c>missing</c> with nothing observed when no <c>wsdl</c>
+///   string could be read. A facade that cannot publish the contract forwards WSDL requests to the backend,
+///   so its WSDL is the backend's own and the comparison alone would pass.</item>
 ///   <item>Only when both sides answered 200 are the bodies compared, the backend as the baseline and the
 ///   facade as the observed side.</item>
 ///   <item>Any discrepancy: <c>d:&lt;signature&gt;</c> over the canonical list, outcome <c>fail</c>; none: pass.</item>
@@ -40,10 +51,13 @@ namespace Erewhon.Harness.Checks;
 /// <para>The instance keeps no per-run state, but concurrent runs would race on the artifact files, so one
 /// run at a time is expected. The <see cref="CaseRunner"/> belongs to the caller and is not disposed here.</para>
 /// </remarks>
-/// <param name="options">The harness settings: both SOAP base URLs, the request limit, the contract and artifact paths.</param>
+/// <param name="options">
+/// The harness settings: both SOAP base URLs, the facade admin URL, the request limit, the contract and
+/// artifact paths.
+/// </param>
 /// <param name="catalogue">The operation catalogue, whose SOAP address supplies the WSDL path and query.</param>
 /// <param name="comparer">The XML comparer; it is called with the WSDL context.</param>
-/// <param name="http">The runner both documents are fetched with.</param>
+/// <param name="http">The runner both documents and the facade's info are fetched with.</param>
 /// <exception cref="ArgumentNullException">An argument is null.</exception>
 public sealed class WsdlContractCheck(
     HarnessOptions options,
@@ -57,6 +71,15 @@ public sealed class WsdlContractCheck(
     // with the side so the two sides' entries never share a path and canonical ordering stays total.
     private const string ResponsePath = "$response";
     private const string StatusPath = "$status";
+
+    // The path root of the publication discrepancy, in the same convention and suffixed with the facade side.
+    private const string PublishedPath = "$published";
+
+    // The wsdl value of the facade's /admin/info when it loaded the contracts WSDL and serves it; the facade
+    // reports absent, and forwards WSDL requests to its default target, when it could not.
+    private const string PublishedStatus = "present";
+
+    private const string FacadeInfoSettingName = "Harness:Target:AdminUrl";
 
     // The body as a whole, in the convention every comparer in Compare/ uses: a body that is not UTF-8 has no XML
     // tree, and no XML path is this one, so its entries never match those XmlSemanticComparer reports.
@@ -82,8 +105,9 @@ public sealed class WsdlContractCheck(
     private readonly CaseRunner _http = http ?? throw new ArgumentNullException(nameof(http));
 
     /// <summary>
-    /// Fetches the backend and facade WSDLs, saves them as artifacts and compares them, unless the contracts
-    /// WSDL is absent.
+    /// Fetches the backend and facade WSDLs and the facade's <c>/admin/info</c>, saves the two WSDLs as
+    /// artifacts, requires the facade to report the contracts WSDL as published and compares the two WSDLs,
+    /// unless the contracts WSDL is absent.
     /// </summary>
     /// <param name="ct">The caller's cancellation, which propagates as <see cref="OperationCanceledException"/>.</param>
     /// <returns>The check row, the failing item when the check did not pass, and the discrepancies of a difference.</returns>
@@ -99,11 +123,13 @@ public sealed class WsdlContractCheck(
         }
 
         // An unusable base URL is reported as not-run, as the OpenAPI drift check does for its admin URL:
-        // with either address missing there is nothing the facade WSDL could be compared with.
+        // with either WSDL address missing there is nothing the facade WSDL could be compared with, and
+        // without the facade's admin address its publication of the contract cannot be established.
         var addressProblems = new List<string>();
         var backendUri = Address(Backend, _options.Backend.SoapBaseUrl, addressProblems);
         var facadeUri = Address(Facade, _options.Target.SoapBaseUrl, addressProblems);
-        if (backendUri is null || facadeUri is null)
+        var infoUri = Address("facade info", FacadeInfoSettingName, _options.Target.AdminUrl, AdminRoutes.Info, addressProblems);
+        if (backendUri is null || facadeUri is null || infoUri is null)
         {
             return NotRun(Join(string.Join("; ", addressProblems), RemoveArtifacts()));
         }
@@ -111,10 +137,12 @@ public sealed class WsdlContractCheck(
         var timeout = CaseRunner.RequestTimeoutOf(_options);
         var responses = await Task.WhenAll(
                 _http.GetAsync(backendUri, timeout, ct),
-                _http.GetAsync(facadeUri, timeout, ct))
+                _http.GetAsync(facadeUri, timeout, ct),
+                _http.GetAsync(infoUri, timeout, ct))
             .ConfigureAwait(false);
         var backend = responses[0];
         var facade = responses[1];
+        var facadeInfo = responses[2];
 
         var artifactNotes = new List<string>();
         AddNote(artifactNotes, await KeepArtifactAsync(Backend, backend, ct).ConfigureAwait(false));
@@ -125,6 +153,7 @@ public sealed class WsdlContractCheck(
         var fetchProblems = new List<string>();
         AddFetchDiscrepancies(Backend, backend, discrepancies, fetchProblems);
         AddFetchDiscrepancies(Facade, facade, discrepancies, fetchProblems);
+        AddPublicationDiscrepancy(facadeInfo, infoUri, discrepancies, fetchProblems);
 
         if (backend.Status == ExpectedStatus && facade.Status == ExpectedStatus)
         {
@@ -144,8 +173,8 @@ public sealed class WsdlContractCheck(
         var first = canonical.Entries[0];
         var summary = string.Create(
             CultureInfo.InvariantCulture,
-            $"{discrepancies.Count} difference{(discrepancies.Count == 1 ? "" : "s")} between the backend WSDL ({backendUri}) "
-            + $"and the facade WSDL ({facadeUri}); first at {first.Path} ({first.Kind})");
+            $"{discrepancies.Count} difference{(discrepancies.Count == 1 ? "" : "s")} for the facade WSDL ({facadeUri}) "
+            + $"against the backend WSDL ({backendUri}); first at {first.Path} ({first.Kind})");
         foreach (var problem in fetchProblems)
         {
             summary = Join(summary, problem);
@@ -178,16 +207,21 @@ public sealed class WsdlContractCheck(
     }
 
     // Returns the side's WSDL address, or null after adding the reason to problems.
-    private Uri? Address(WsdlSide side, string baseUrl, List<string> problems)
+    private Uri? Address(WsdlSide side, string baseUrl, List<string> problems) =>
+        Address($"{side.Name} WSDL", side.SettingName, baseUrl, _wsdlPathAndQuery, problems);
+
+    // Returns pathAndQuery on the authority of baseUrl, or null after adding the reason to problems. The
+    // reason names the setting and never quotes its value, which may carry a password.
+    private static Uri? Address(string target, string settingName, string baseUrl, string pathAndQuery, List<string> problems)
     {
         try
         {
-            return CaseRunner.Combine(baseUrl, _wsdlPathAndQuery);
+            return CaseRunner.Combine(baseUrl, pathAndQuery);
         }
         catch (ArgumentException ex)
         {
             // A null or blank base URL lands here too; ArgumentNullException derives from ArgumentException.
-            problems.Add($"no {side.Name} WSDL address can be formed from {side.SettingName}: {ex.Message}");
+            problems.Add($"no {target} address can be formed from {settingName}: {ex.Message}");
             return null;
         }
     }
@@ -225,6 +259,73 @@ public sealed class WsdlContractCheck(
                 CultureInfo.InvariantCulture,
                 $"the {side.Name} answered status {status}, not {ExpectedStatus}"));
         }
+    }
+
+    /// <summary>
+    /// Adds the <c>$published.facade</c> entry unless the facade's info declares the contracts WSDL published:
+    /// status 200 and a UTF-8 JSON object whose <c>wsdl</c> string is exactly <c>present</c>. A reported string
+    /// that is not <c>present</c> is kind <c>value</c> with that string as observed; an info that cannot be read
+    /// (no response, another status, a body that is not such an object, no <c>wsdl</c> string) is kind
+    /// <c>missing</c> with nothing observed. The values never carry transport text, a status or a parse
+    /// problem, so the same facade state gives the same signature on every run; the reason goes to the detail.
+    /// </summary>
+    /// <param name="response">The facade's answer to <c>GET /admin/info</c>.</param>
+    /// <param name="infoUri">The address it was fetched from, named in the detail only.</param>
+    /// <param name="discrepancies">Receives the entry.</param>
+    /// <param name="problems">Receives the reason.</param>
+    private static void AddPublicationDiscrepancy(
+        CaseResponse response,
+        Uri infoUri,
+        List<Discrepancy> discrepancies,
+        List<string> problems)
+    {
+        var path = $"{PublishedPath}.{Facade.Name}";
+        string unreadable;
+        if (!response.Answered)
+        {
+            var kind = DiscrepancyKinds.NoResponse(response.NoResponse!);
+            var reason = response.Detail is null ? "" : $"; {response.Detail}";
+            unreadable = $"no response from {infoUri} ({kind}{reason})";
+        }
+        else if (response.Status != ExpectedStatus)
+        {
+            unreadable = string.Create(
+                CultureInfo.InvariantCulture,
+                $"{infoUri} answered status {response.Status}, not {ExpectedStatus}");
+        }
+        else if (TryDecode(WithoutBom(response.Body)) is not { } text || AdminInfo.Parse(text) is not { } info)
+        {
+            // Strict decoding, as for the WSDL bodies: replacement decoding would turn different invalid bytes
+            // into the same reported text, so two different answers would share one signature.
+            unreadable = $"{infoUri} answered a body that is not a UTF-8 JSON object whose strings can be decoded";
+        }
+        else if (info.Wsdl is not { } reported)
+        {
+            unreadable = $"{infoUri} answered no wsdl string";
+        }
+        else
+        {
+            if (!string.Equals(reported, PublishedStatus, StringComparison.Ordinal))
+            {
+                discrepancies.Add(new Discrepancy(
+                    path,
+                    DiscrepancyKinds.Value,
+                    DiscrepancyValue.Literal(PublishedStatus),
+                    DiscrepancyValue.Literal(reported)));
+                problems.Add(
+                    $"the facade reports wsdl '{reported}', not '{PublishedStatus}', at {infoUri}: it does not declare "
+                    + "the contracts WSDL published, and a facade that reports absent forwards WSDL requests to its default target");
+            }
+
+            return;
+        }
+
+        discrepancies.Add(new Discrepancy(
+            path,
+            DiscrepancyKinds.Missing,
+            DiscrepancyValue.Literal(PublishedStatus),
+            DiscrepancyValue.Absent));
+        problems.Add($"the facade's publication of the contracts WSDL is unconfirmed: {unreadable}");
     }
 
     // The backend WSDL is the baseline side and the facade WSDL the observed side.

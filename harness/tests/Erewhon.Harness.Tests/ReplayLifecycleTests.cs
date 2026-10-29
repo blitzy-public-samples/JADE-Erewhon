@@ -2496,12 +2496,15 @@ public sealed partial class ReplayLifecycleTests
 // the stand-in is contacted; a capture-start reset whose seed hash or reference date differs from the
 // first capture's or the manifest's refuses it before any write; an empty-state bracket reset that is
 // not confirmed stops it after the bracket's seed restore, with no manifest; and a confirmed capture
-// publishes the confirmed seed facts in a manifest written after every other file. Each refusal or
-// stop exits 1.
+// publishes the confirmed seed facts in a manifest written after every other file. A served WSDL the
+// facade would publish is stored in the baseline and written as the contract only when none exists; one
+// it would refuse writes neither WSDL file and is recorded as not captured; and a contracts directory
+// linked out of the repository fails the capture without writing outside. Each refusal or stop exits 1.
 // These members live in this class because the harness test project keeps its fixed set of test
 // classes, and capture's refusals and stops follow the reset confirmation covered above. The field
-// names and the reset requests come from the state-reset members, and ReferenceDate from the
-// console-sink members.
+// names and the reset requests come from the state-reset members, ReferenceDate from the console-sink
+// members, and the protected directory, its snapshot and the sentinel bytes from the confinement
+// members.
 public sealed partial class ReplayLifecycleTests
 {
     private const string CaptureOtherReferenceDate = "2025-06-01";
@@ -2511,6 +2514,24 @@ public sealed partial class ReplayLifecycleTests
     private const string ManifestTemporaryFile = "baseline/.manifest.json.tmp";
     private const string ConformanceFile = "baseline/conformance.json";
     private const string ContractsWsdlFile = "contracts/wsdl/ErewhonWebService.wsdl";
+    private const string BaselineWsdlFile = "baseline/wsdl/standin-ErewhonWebService.wsdl";
+
+    // A WSDL the facade publishes: well-formed, with exactly one soap:address that carries a location.
+    private const string PublishableWsdl = """
+        <?xml version="1.0" encoding="utf-8"?>
+        <wsdl:definitions xmlns:wsdl="http://schemas.xmlsoap.org/wsdl/" xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/" name="ErewhonWebService">
+          <wsdl:service name="ErewhonWebService">
+            <wsdl:port name="WebServiceHTTP" binding="WebServiceHTTPBinding">
+              <soap:address location="http://127.0.0.1:15001/jade/jadehttp.dll?WebServiceHTTP&amp;serviceName=ErewhonWebService&amp;listName=WebServiceHTTP" />
+            </wsdl:port>
+          </wsdl:service>
+        </wsdl:definitions>
+
+        """;
+    private const string PublishableWsdlAddress =
+        """<soap:address location="http://127.0.0.1:15001/jade/jadehttp.dll?WebServiceHTTP&amp;serviceName=ErewhonWebService&amp;listName=WebServiceHTTP" />""";
+
+    private const string WsdlDropSuffix = "; baseline WSDL removed, contracts WSDL left as it is";
 
     // A record file no case of the matrix writes, so only a clear can remove it.
     private const string SentinelRecord = "baseline/records/rest/999-getAgent-99.json";
@@ -2667,8 +2688,9 @@ public sealed partial class ReplayLifecycleTests
     [InlineData(true)]
     public async Task ConfirmedCapture_PublishesTheConfirmedSeedFactsInTheManifestLast(bool recapture)
     {
+        // A publishable WSDL, so the contracts WSDL is among the files the manifest must follow.
         await using var standIn = await CaptureStandInStub.StartAsync(
-            CaptureSeedSha256, ReferenceDate, failEmptyReset: false, TestCancellation);
+            CaptureSeedSha256, ReferenceDate, failEmptyReset: false, Encoding.UTF8.GetBytes(PublishableWsdl), TestCancellation);
         var options = CaptureOptions(standIn);
         if (recapture)
         {
@@ -2693,6 +2715,105 @@ public sealed partial class ReplayLifecycleTests
                 .Where(file => file != Full(ManifestFile)),
             file => Assert.True(File.GetLastWriteTimeUtc(file) <= published, Relative(file)));
     }
+
+    // The baseline WSDL is the served bytes; the contracts WSDL is those bytes labelled, written only when absent,
+    // so an existing contract keeps its bytes.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PublishableWsdl_IsStoredInTheBaseline_AndWrittenAsTheContractOnlyWhenAbsent(bool contractPresent)
+    {
+        var served = Encoding.UTF8.GetBytes(PublishableWsdl);
+        await using var standIn = await CaptureStandInStub.StartAsync(
+            CaptureSeedSha256, ReferenceDate, failEmptyReset: false, served, TestCancellation);
+        var options = CaptureOptions(standIn);
+        if (contractPresent)
+        {
+            Directory.CreateDirectory(Full("contracts/wsdl"));
+            File.WriteAllBytes(Full(ContractsWsdlFile), SentinelBytes);
+        }
+
+        Assert.Equal(0, await CaptureAsync(options));
+
+        Assert.True(new BaselineStore(options).TryReadManifest(out var manifest));
+        Assert.True(manifest.WsdlCaptured, "A publishable WSDL must be recorded as captured.");
+        Assert.Equal(served, File.ReadAllBytes(Full(BaselineWsdlFile)));
+        Assert.Equal(contractPresent ? SentinelBytes : CaptureMode.WithHeaderComment(served), File.ReadAllBytes(Full(ContractsWsdlFile)));
+        Assert.Equal(["ErewhonWebService.wsdl"], SpecialFileSupport.Names(Full("contracts/wsdl")));
+        Assert.Contains(
+            contractPresent ? "[jade-standin] contracts WSDL present; not overwritten" : "[jade-standin] wrote contracts WSDL",
+            Lines());
+    }
+
+    // Each body the facade would refuse to publish, with the reason the capture gives. A baseline WSDL from an
+    // earlier capture is removed, so neither file records the body.
+    [Theory]
+    [InlineData("truncated", "not well-formed XML")]
+    [InlineData("dtd", "not well-formed XML")]
+    [InlineData("two-soap-addresses", "expected exactly one soap:address, found 2")]
+    [InlineData("no-soap-address", "expected exactly one soap:address, found 0")]
+    [InlineData("no-location", "soap:address has no location attribute")]
+    [InlineData("invalid-utf8", "not UTF-8")]
+    [InlineData("utf16", "not UTF-8")]
+    public async Task UnpublishableWsdl_IsNotCaptured_AndNeitherWsdlFileIsWritten(string form, string problem)
+    {
+        await using var standIn = await CaptureStandInStub.StartAsync(
+            CaptureSeedSha256, ReferenceDate, failEmptyReset: false, UnpublishableWsdl(form), TestCancellation);
+        var options = CaptureOptions(standIn);
+        Directory.CreateDirectory(Full("baseline/wsdl"));
+        File.WriteAllBytes(Full(BaselineWsdlFile), Encoding.UTF8.GetBytes(PublishableWsdl));
+
+        Assert.Equal(0, await CaptureAsync(options));
+
+        Assert.True(new BaselineStore(options).TryReadManifest(out var manifest));
+        Assert.False(manifest.WsdlCaptured, "A WSDL the facade would not publish must not be recorded as captured.");
+        Assert.False(File.Exists(Full(BaselineWsdlFile)), "A WSDL the facade would not publish must leave no baseline WSDL.");
+        Assert.False(Directory.Exists(Full("contracts")), "A WSDL the facade would not publish must write no contracts WSDL.");
+        Assert.Contains($"[jade-standin] WARN WSDL not captured: the facade would not publish it ({problem}){WsdlDropSuffix}", Lines());
+    }
+
+    // A contracts directory linked out of the repository is refused like a linked baseline directory: the
+    // capture exits 1 with no manifest, and nothing outside changes. The protected directory, its snapshot and
+    // the refusal check come from the confinement members.
+    [Theory]
+    [InlineData("contracts")]
+    [InlineData("contracts/wsdl")]
+    public async Task ContractsWsdl_ThroughLinkedAncestor_FailsTheCaptureAndWritesNothingOutside(string linkedDirectory)
+    {
+        await using var standIn = await CaptureStandInStub.StartAsync(
+            CaptureSeedSha256, ReferenceDate, failEmptyReset: false, Encoding.UTF8.GetBytes(PublishableWsdl), TestCancellation);
+        var options = CaptureOptions(standIn);
+        ProtectedTree();
+        Directory.CreateDirectory(Path.GetDirectoryName(Full(linkedDirectory))!);
+        Directory.CreateSymbolicLink(Full(linkedDirectory), ConfinedOutside);
+        var before = ConfinedSnapshot(ConfinedOutside);
+
+        Assert.Equal(1, await CaptureAsync(options));
+
+        Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
+        Assert.False(File.Exists(Full(ManifestFile)), "A refused contracts WSDL must leave no manifest.");
+        Assert.NotNull(new FileInfo(Full(linkedDirectory)).LinkTarget);
+        Assert.StartsWith("[jade-standin] capture failed: System.IO.IOException: ", LastLine(), StringComparison.Ordinal);
+        Assert.Contains(
+            $"{LinkRefusal}: refused '{ContractsWsdlFile}', because '{linkedDirectory}' is a symbolic link.",
+            LastLine(),
+            StringComparison.Ordinal);
+    }
+
+    // The publishable WSDL broken in one way the facade's publication rule refuses.
+    private static byte[] UnpublishableWsdl(string form) => form switch
+    {
+        "truncated" => Encoding.UTF8.GetBytes(PublishableWsdl[..(PublishableWsdl.Length / 2)]),
+        "dtd" => Encoding.UTF8.GetBytes(PublishableWsdl.Replace(
+            "?>\n", "?>\n<!DOCTYPE wsdl:definitions [<!ENTITY e \"e\">]>\n", StringComparison.Ordinal)),
+        "two-soap-addresses" => Encoding.UTF8.GetBytes(PublishableWsdl.Replace(
+            PublishableWsdlAddress, PublishableWsdlAddress + PublishableWsdlAddress, StringComparison.Ordinal)),
+        "no-soap-address" => Encoding.UTF8.GetBytes(PublishableWsdl.Replace(PublishableWsdlAddress, "", StringComparison.Ordinal)),
+        "no-location" => Encoding.UTF8.GetBytes(PublishableWsdl.Replace(PublishableWsdlAddress, "<soap:address />", StringComparison.Ordinal)),
+        "invalid-utf8" => [.. Encoding.UTF8.GetBytes(PublishableWsdl), 0xFF],
+        "utf16" => [.. Encoding.Unicode.Preamble, .. Encoding.Unicode.GetBytes(PublishableWsdl.Replace("utf-8", "utf-16", StringComparison.Ordinal))],
+        _ => throw new ArgumentOutOfRangeException(nameof(form), form, "Unknown WSDL form."),
+    };
 
     // The message is fixed: a path would differ between checkouts and runs.
     private static string FindCaptureRepoRoot()
@@ -4508,30 +4629,36 @@ public sealed partial class ReplayLifecycleTests
 /// An in-process stand-in on 127.0.0.1 and an ephemeral port, as far as capture reaches it: <c>GET /health</c>
 /// answers 200; <c>GET /admin/info</c> reports the source label, the given seed hash and reference date, the
 /// reset generation and no mutations; <c>POST /admin/reset</c> increases the generation and answers 200, except
-/// an empty-state reset when it is told to fail, which answers 500 and changes nothing; and every other request,
-/// each case and the WSDL fetch, answers 200 with the JSON body <c>{}</c>. Every request is recorded as
+/// an empty-state reset when it is told to fail, which answers 500 and changes nothing; the WSDL fetch answers
+/// 200 with the WSDL bytes it is given, as <c>text/xml</c>; and every other request, each case and a WSDL fetch
+/// of a stub given no WSDL included, answers 200 with the JSON body <c>{}</c>. Every request is recorded as
 /// <c>METHOD raw-target</c> before it is answered.
 /// </summary>
 internal sealed class CaptureStandInStub : IAsyncDisposable
 {
     private const string JsonContentType = "application/json; charset=utf-8";
+    private const string WsdlContentType = "text/xml; charset=utf-8";
     private const string ResetPrefix = "POST " + AdminRoutes.Reset + "?" + AdminRoutes.ResetStateQueryKey + "=";
 
     // Bounds the graceful stop; idle keep-alive connections close at once, so it is never reached.
     private static readonly TimeSpan ShutdownLimit = TimeSpan.FromSeconds(5);
 
+    private static readonly string WsdlRequest = "GET " + OperationCatalogue.Default.Addresses.Soap.WsdlPathAndQuery;
+
     private readonly ConcurrentQueue<string> _requests = new();
     private readonly string _seedSha256;
     private readonly string _referenceDate;
     private readonly bool _failEmptyReset;
+    private readonly byte[]? _wsdl;
     private WebApplication? _app;
     private long _generation;
 
-    private CaptureStandInStub(string seedSha256, string referenceDate, bool failEmptyReset)
+    private CaptureStandInStub(string seedSha256, string referenceDate, bool failEmptyReset, byte[]? wsdl)
     {
         _seedSha256 = seedSha256;
         _referenceDate = referenceDate;
         _failEmptyReset = failEmptyReset;
+        _wsdl = wsdl;
     }
 
     /// <summary>The stub's base URL, <c>http://127.0.0.1:&lt;port&gt;</c>, for the REST, SOAP and admin URLs alike.</summary>
@@ -4546,10 +4673,24 @@ internal sealed class CaptureStandInStub : IAsyncDisposable
     /// <param name="failEmptyReset">Whether an empty-state reset answers 500.</param>
     /// <param name="ct">Cancels the start.</param>
     /// <returns>The running stub, which the caller disposes.</returns>
+    public static Task<CaptureStandInStub> StartAsync(
+        string seedSha256, string referenceDate, bool failEmptyReset, CancellationToken ct) =>
+        StartAsync(seedSha256, referenceDate, failEmptyReset, wsdl: null, ct);
+
+    /// <summary>
+    /// Starts a stub reporting <paramref name="seedSha256"/> and <paramref name="referenceDate"/> that serves
+    /// <paramref name="wsdl"/> to the WSDL fetch.
+    /// </summary>
+    /// <param name="seedSha256">The seed hash <c>/admin/info</c> reports.</param>
+    /// <param name="referenceDate">The reference date <c>/admin/info</c> reports.</param>
+    /// <param name="failEmptyReset">Whether an empty-state reset answers 500.</param>
+    /// <param name="wsdl">The exact bytes the WSDL fetch answers with, or null for the JSON body <c>{}</c>.</param>
+    /// <param name="ct">Cancels the start.</param>
+    /// <returns>The running stub, which the caller disposes.</returns>
     public static async Task<CaptureStandInStub> StartAsync(
-        string seedSha256, string referenceDate, bool failEmptyReset, CancellationToken ct)
+        string seedSha256, string referenceDate, bool failEmptyReset, byte[]? wsdl, CancellationToken ct)
     {
-        var stub = new CaptureStandInStub(seedSha256, referenceDate, failEmptyReset);
+        var stub = new CaptureStandInStub(seedSha256, referenceDate, failEmptyReset, wsdl);
         var builder = WebApplication.CreateSlimBuilder();
         builder.Logging.ClearProviders();
         builder.Services.Configure<HostOptions>(options => options.ShutdownTimeout = ShutdownLimit);
@@ -4588,10 +4729,21 @@ internal sealed class CaptureStandInStub : IAsyncDisposable
         var request = $"{context.Request.Method} {target}";
         _requests.Enqueue(request);
 
+        // The WSDL goes out as the exact bytes given, which may on purpose be no UTF-8 text at all.
+        if (_wsdl is { } wsdl && request == WsdlRequest)
+        {
+            await WriteAsync(context, StatusCodes.Status200OK, WsdlContentType, wsdl);
+            return;
+        }
+
         var (status, body) = Answer(request);
-        var bytes = Encoding.UTF8.GetBytes(body);
+        await WriteAsync(context, status, JsonContentType, Encoding.UTF8.GetBytes(body));
+    }
+
+    private static async Task WriteAsync(HttpContext context, int status, string contentType, byte[] bytes)
+    {
         context.Response.StatusCode = status;
-        context.Response.ContentType = JsonContentType;
+        context.Response.ContentType = contentType;
         context.Response.ContentLength = bytes.Length;
         await context.Response.Body.WriteAsync(bytes, context.RequestAborted);
     }
@@ -4637,7 +4789,9 @@ internal sealed class CaptureStandInStub : IAsyncDisposable
 /// no recreate, write or delete through <see cref="ConfinedTree"/> reaches the protected directory through a
 /// symbolic link, whether the link sits on <c>artifacts/</c>, on a directory below it, at the target, inside a
 /// cleared directory, dangles, is a hard link or is swapped in mid-way; that a published file replaces only a
-/// regular file and never opens or follows the entry at its name, a FIFO included; that paths not strictly
+/// regular file and never opens or follows the entry at its name, a FIFO included; that a file published
+/// create-only, as capture publishes the contracts WSDL, keeps a regular file at its name and refuses every
+/// other entry there and every linked directory above it; that paths not strictly
 /// below the root are refused; and that <see cref="DiscrepancySignature.ArtifactFileName"/> keeps an item id
 /// byte for byte. The repository's own tree is never touched.
 /// </summary>
@@ -4655,6 +4809,9 @@ public sealed partial class ReplayLifecycleTests
     private const string NotRegularFileRefusal = "it is not a regular file, so it is left in place.";
     private const string PublishedName = "RESULTS.md";
     private const string SentinelName = "SENTINEL";
+
+    // The file capture publishes create-only, two directories below the root.
+    private const string NewFileName = "contracts/wsdl/ErewhonWebService.wsdl";
 
     // Rounds of every recreate, write and delete the swap test runs while its directories are swapped.
     private const int SwapIterations = 300;
@@ -4949,25 +5106,7 @@ public sealed partial class ReplayLifecycleTests
         ProtectedTree();
         const string name = "harness";
         var target = ConfinedFull(name);
-        switch (entry)
-        {
-            case "fifo":
-                SpecialFileSupport.CreateFifo(target);
-                break;
-            case "file-link":
-                File.CreateSymbolicLink(target, Path.Combine(ConfinedOutside, SentinelName));
-                break;
-            case "dangling-link":
-                File.CreateSymbolicLink(target, Path.Combine(ConfinedOutside, "created-through-link"));
-                break;
-            case "directory-link":
-                Directory.CreateSymbolicLink(target, ConfinedOutside);
-                break;
-            case "directory":
-                Directory.CreateDirectory(target);
-                break;
-        }
-
+        PlaceRefusedPublishTarget(entry, target);
         var before = ConfinedSnapshot(ConfinedOutside);
 
         var publish = Task.Run(() => ConfinedTreeUnderTest.PublishFile(target, FirstBytes), TestCancellation);
@@ -4976,13 +5115,7 @@ public sealed partial class ReplayLifecycleTests
         Assert.Contains($"ConfinedTree could not publish '{name}': {refusal}", failure.Message, StringComparison.Ordinal);
         Assert.Equal([name], SpecialFileSupport.Names(ConfinedRoot));
         Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
-        var kept = entry switch
-        {
-            "fifo" => SpecialFileSupport.IsFifo(target),
-            "directory" => !IsLink(name) && Directory.Exists(target) && SpecialFileSupport.Names(target).Count == 0,
-            _ => IsLink(name),
-        };
-        Assert.True(kept, "A refused publication must leave the entry at the name as it was.");
+        Assert.True(RefusedPublishTargetKept(entry, name), "A refused publication must leave the entry at the name as it was.");
     }
 
     [Theory]
@@ -5041,6 +5174,95 @@ public sealed partial class ReplayLifecycleTests
         Assert.True(Volatile.Read(ref _confinedRaceSwaps) >= MinimumRaceSwaps, "The swapper must have raced the publications.");
         Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
         Assert.DoesNotContain(SpecialFileSupport.Names(ConfinedRoot), name => name.EndsWith(".publishing", StringComparison.Ordinal));
+    }
+
+    // ---- Publishing a new file ----------------------------------------------------------------------
+
+    [Fact]
+    public async Task PublishNewFileAsync_CreatesMissingDirectories_AndWritesTheBytesExactly()
+    {
+        Assert.True(await ConfinedTreeUnderTest.PublishNewFileAsync(ConfinedFull(NewFileName), FirstBytes, TestCancellation));
+
+        Assert.Equal(FirstBytes, await File.ReadAllBytesAsync(ConfinedFull(NewFileName), TestCancellation));
+        Assert.Equal([Path.GetFileName(NewFileName)], SpecialFileSupport.Names(ConfinedFull("contracts/wsdl")));
+    }
+
+    // A regular file at the name is kept byte for byte, a hard link to a file outside included, which is neither
+    // replaced nor written through.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PublishNewFileAsync_RegularFileAtTheName_IsKeptAndReportedAsPresent(bool hardLink)
+    {
+        ProtectedTree();
+        Directory.CreateDirectory(ConfinedFull("contracts/wsdl"));
+        if (hardLink)
+        {
+            CreateHardLink(ConfinedFull(NewFileName), Path.Combine(ConfinedOutside, SentinelName));
+        }
+        else
+        {
+            await File.WriteAllBytesAsync(ConfinedFull(NewFileName), SentinelBytes, TestCancellation);
+        }
+
+        var before = ConfinedSnapshot(ConfinedOutside);
+
+        Assert.False(await ConfinedTreeUnderTest.PublishNewFileAsync(ConfinedFull(NewFileName), FirstBytes, TestCancellation));
+
+        Assert.Equal(SentinelBytes, await File.ReadAllBytesAsync(ConfinedFull(NewFileName), TestCancellation));
+        Assert.Equal([Path.GetFileName(NewFileName)], SpecialFileSupport.Names(ConfinedFull("contracts/wsdl")));
+        Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
+    }
+
+    [Theory]
+    [InlineData("contracts")]
+    [InlineData("contracts/wsdl")]
+    public async Task PublishNewFileAsync_ThroughLinkedAncestor_IsRefusedAndWritesNothingOutside(string linkedDirectory)
+    {
+        ProtectedTree();
+        LinkToOutside(linkedDirectory);
+        var before = ConfinedSnapshot(ConfinedOutside);
+
+        AssertLinkRefusal(
+            await Assert.ThrowsAsync<IOException>(
+                () => ConfinedTreeUnderTest.PublishNewFileAsync(ConfinedFull(NewFileName), FirstBytes, TestCancellation)),
+            linkedDirectory);
+
+        Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
+        Assert.True(IsLink(linkedDirectory), "A refused publication must leave the linked directory in place.");
+    }
+
+    // The entry is examined, never opened, as for PublishFile: an unread FIFO would otherwise block the call for
+    // good, so the call must end within the prompt limit.
+    [Theory]
+    [MemberData(nameof(RefusedPublishTargets))]
+    public async Task PublishNewFileAsync_EntryThatIsNotARegularFile_IsRefusedPromptlyAndKept(string entry, string refusal)
+    {
+        ProtectedTree();
+        const string name = "harness";
+        var target = ConfinedFull(name);
+        PlaceRefusedPublishTarget(entry, target);
+        var before = ConfinedSnapshot(ConfinedOutside);
+
+        var publish = Task.Run(() => ConfinedTreeUnderTest.PublishNewFileAsync(target, FirstBytes, TestCancellation), TestCancellation);
+        var failure = await Assert.ThrowsAsync<IOException>(() => publish.WaitAsync(PromptLimit, TestCancellation));
+
+        Assert.Contains($"ConfinedTree could not publish '{name}': {refusal}", failure.Message, StringComparison.Ordinal);
+        Assert.Equal([name], SpecialFileSupport.Names(ConfinedRoot));
+        Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
+        Assert.True(RefusedPublishTargetKept(entry, name), "A refused publication must leave the entry at the name as it was.");
+    }
+
+    [Fact]
+    public async Task PublishNewFileAsync_CancelledBeforeTheCall_LeavesTheTreeUntouched()
+    {
+        using var cancelled = new CancellationTokenSource();
+        await cancelled.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => ConfinedTreeUnderTest.PublishNewFileAsync(ConfinedFull(NewFileName), FirstBytes, cancelled.Token));
+
+        Assert.Empty(Directory.EnumerateFileSystemEntries(ConfinedRoot));
     }
 
     // ---- Deleting a file ----------------------------------------------------------------------------
@@ -5167,6 +5389,10 @@ public sealed partial class ReplayLifecycleTests
             StringComparison.Ordinal);
         Assert.Contains(OutsideRefusal, Assert.Throws<IOException>(() => ConfinedTreeUnderTest.DeleteFile(path)).Message, StringComparison.Ordinal);
         Assert.Contains(OutsideRefusal, Assert.Throws<IOException>(() => ConfinedTreeUnderTest.PublishFile(path, FirstBytes)).Message, StringComparison.Ordinal);
+        Assert.Contains(
+            OutsideRefusal,
+            (await Assert.ThrowsAsync<IOException>(() => ConfinedTreeUnderTest.PublishNewFileAsync(path, FirstBytes, TestCancellation))).Message,
+            StringComparison.Ordinal);
         Assert.False(ConfinedTreeUnderTest.Contains(path), "A path not strictly below the root must not be contained.");
 
         Assert.Equal(before, ConfinedSnapshot(ConfinedTemp));
@@ -5221,6 +5447,43 @@ public sealed partial class ReplayLifecycleTests
         "utf8-name-over-255-bytes" => new string('\u00E9', 126),
         _ => throw new ArgumentOutOfRangeException(nameof(form), form, "Unknown item id form."),
     };
+
+    // Puts one of the RefusedPublishTargets entries at target.
+    private void PlaceRefusedPublishTarget(string entry, string target)
+    {
+        switch (entry)
+        {
+            case "fifo":
+                SpecialFileSupport.CreateFifo(target);
+                break;
+            case "file-link":
+                File.CreateSymbolicLink(target, Path.Combine(ConfinedOutside, SentinelName));
+                break;
+            case "dangling-link":
+                File.CreateSymbolicLink(target, Path.Combine(ConfinedOutside, "created-through-link"));
+                break;
+            case "directory-link":
+                Directory.CreateSymbolicLink(target, ConfinedOutside);
+                break;
+            case "directory":
+                Directory.CreateDirectory(target);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(entry), entry, "Unknown publish target entry.");
+        }
+    }
+
+    // Whether the entry PlaceRefusedPublishTarget put at the name below the root is still there as it was.
+    private bool RefusedPublishTargetKept(string entry, string name)
+    {
+        var target = ConfinedFull(name);
+        return entry switch
+        {
+            "fifo" => SpecialFileSupport.IsFifo(target),
+            "directory" => !IsLink(name) && Directory.Exists(target) && SpecialFileSupport.Names(target).Count == 0,
+            _ => IsLink(name),
+        };
+    }
 
     private static void AssertLinkRefusal(IOException refusal, string linkedComponent)
     {

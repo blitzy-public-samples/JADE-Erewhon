@@ -17,7 +17,8 @@ namespace Erewhon.Harness.Lifecycle;
 /// <summary>
 /// The members of a component's <c>GET /admin/info</c> response the harness reads. The stand-in reports
 /// its source label, seed fingerprint, reference date, reset generation and mutation count; the facade
-/// reports its framework description. Every member is null when the response did not supply it.
+/// reports its framework description and whether it publishes the contracts WSDL. Every member is null
+/// when the response did not supply it.
 /// </summary>
 /// <param name="Source">The source label; <c>jade-standin</c> for the stand-in.</param>
 /// <param name="SeedSha256">The seed fingerprint, lowercase hexadecimal.</param>
@@ -25,13 +26,19 @@ namespace Erewhon.Harness.Lifecycle;
 /// <param name="Generation">The reset generation, which every reset increases.</param>
 /// <param name="Mutations">The state-changing requests handled since the last reset.</param>
 /// <param name="FrameworkDescription">The component's <c>RuntimeInformation.FrameworkDescription</c>.</param>
+/// <param name="Wsdl">
+/// The facade's WSDL publication status: <c>present</c> when it loaded
+/// <c>contracts/wsdl/ErewhonWebService.wsdl</c> and serves it, <c>absent</c> when it forwards WSDL requests
+/// to its default target instead.
+/// </param>
 public sealed record AdminInfo(
     string? Source,
     string? SeedSha256,
     string? ReferenceDate,
     long? Generation,
     long? Mutations,
-    string? FrameworkDescription)
+    string? FrameworkDescription,
+    string? Wsdl)
 {
     private const string SourceMember = "source";
     private const string SeedSha256Member = "seedSha256";
@@ -39,6 +46,7 @@ public sealed record AdminInfo(
     private const string GenerationMember = "generation";
     private const string MutationsMember = "mutations";
     private const string FrameworkDescriptionMember = "frameworkDescription";
+    private const string WsdlMember = "wsdl";
 
     // The stand-in's /admin/info names the same value "framework", the facade's "frameworkDescription";
     // reading both lets either component's info supply it.
@@ -75,7 +83,8 @@ public sealed record AdminInfo(
                 ReadDateText(root, ReferenceDateMember),
                 ReadInt64(root, GenerationMember),
                 ReadInt64(root, MutationsMember),
-                ReadString(root, FrameworkDescriptionMember) ?? ReadString(root, FrameworkMember));
+                ReadString(root, FrameworkDescriptionMember) ?? ReadString(root, FrameworkMember),
+                ReadString(root, WsdlMember));
         }
         catch (JsonException)
         {

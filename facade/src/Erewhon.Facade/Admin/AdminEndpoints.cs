@@ -44,8 +44,11 @@ public static partial class AdminEndpoints
     // listener owns the socket. MapFallback is not used: its nonfile constraint skips paths with a dot.
     private const string CatchAllPattern = "/{**path}";
 
-    // The /admin/info member names. frameworkDescription is read by the harness (AdminInfo.Parse) and
-    // reported as the facade's .NET version, so it must not be renamed.
+    // The /admin/info member names. The harness reads two of them through AdminInfo.Parse:
+    // frameworkDescription, reported as the facade's .NET version, and wsdl, which its WSDL contract check
+    // requires to be "present" (WsdlDocument.PresentStatus) to confirm the facade publishes the contracts
+    // WSDL, the alternative being "absent" (WsdlDocument.AbsentStatus). Neither member may be renamed, and
+    // the present and absent values must not change.
     private const string ComponentMember = "component";
     private const string FrameworkDescriptionMember = "frameworkDescription";
     private const string WsdlMember = "wsdl";

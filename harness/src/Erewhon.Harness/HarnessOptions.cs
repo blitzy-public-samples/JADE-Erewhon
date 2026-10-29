@@ -443,7 +443,7 @@ internal sealed class ConfinedTree
         var target = Resolve(path);
         var name = target.Segments[^1];
         using var directory = OpenDirectory(target, target.Segments.Length - 1, create: true, flags)!;
-        RequireReplaceableFile(directory, name, target.FullPath);
+        RequireRegularFileOrNothing(directory, name, target.FullPath);
 
         // A fixed-length name, so a target name of any allowed length leaves a valid temporary name.
         var temporaryName = string.Create(CultureInfo.InvariantCulture, $".{Guid.NewGuid():N}.publishing");
@@ -478,6 +478,133 @@ internal sealed class ConfinedTree
                 // one reported either way.
                 _ = Native.UnlinkAt(directory, temporaryName, flags: 0);
             }
+        }
+    }
+
+    /// <summary>
+    /// Publishes <paramref name="bytes"/> at <paramref name="path"/> as one complete new regular file, creating the
+    /// missing directories above it, unless a regular file is already there, which is kept as it is.
+    /// </summary>
+    /// <remarks>
+    /// <para>The entry at the target is examined with <c>statx</c> without following a link and is never opened,
+    /// as <see cref="PublishFile(string, ReadOnlySpan{byte})"/> examines it: a missing entry is published, a
+    /// regular file is kept untouched, and a directory, a link or any other kind of entry is refused and left in
+    /// place.</para>
+    /// <para>The bytes go to a new temporary file in the target's directory, a dot-prefixed unique name created
+    /// exclusively without following a link, which <c>renameat2</c> with <c>RENAME_NOREPLACE</c> then moves to the
+    /// name. Where the file system or the kernel lacks that flag, or the C library lacks <c>renameat2</c>,
+    /// <c>linkat</c> links the temporary file at the name instead. Neither ever replaces an entry, so a reader
+    /// sees no file or the complete one, and an entry that appeared at the name after the check is kept and
+    /// examined again: a regular file is kept as present, anything else is refused. Whatever happens after the
+    /// temporary file was created, its name is removed again unless the rename moved it; after a link the
+    /// published name keeps the file.</para>
+    /// <para>A token cancelled before the call leaves the tree untouched; one cancelled before the publication
+    /// leaves no file at the name.</para>
+    /// </remarks>
+    /// <param name="path">The file to publish, strictly below the root.</param>
+    /// <param name="bytes">The file's complete content.</param>
+    /// <param name="cancellationToken">Cancels the call before the write, the write itself and the publication.</param>
+    /// <returns>True when the file was published; false when a regular file was already at the name and is kept.</returns>
+    /// <exception cref="ArgumentException"><paramref name="path"/> is null, empty or not a usable path.</exception>
+    /// <exception cref="IOException">
+    /// <paramref name="path"/> is not strictly below the root, a directory on the way is a symbolic link or not a
+    /// directory, the target is a directory or another entry that is not a regular file, or the file cannot be
+    /// examined, created, written or published.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">The operating system denies access on the way.</exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown.
+    /// </exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public async Task<bool> PublishNewFileAsync(string path, ReadOnlyMemory<byte> bytes, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var flags = RequireLinuxTraversal();
+        var target = Resolve(path);
+        var name = target.Segments[^1];
+        using var directory = OpenDirectory(target, target.Segments.Length - 1, create: true, flags)!;
+        if (RequireRegularFileOrNothing(directory, name, target.FullPath))
+        {
+            return false;
+        }
+
+        // A fixed-length name, so a target name of any allowed length leaves a valid temporary name.
+        var temporaryName = string.Create(CultureInfo.InvariantCulture, $".{Guid.NewGuid():N}.publishing");
+        var descriptor = Native.OpenAt(directory, temporaryName, flags.CreateFile, Native.NewFileMode);
+        if (descriptor < 0)
+        {
+            throw Failure(Marshal.GetLastPInvokeError(), "create the temporary file for", target.FullPath);
+        }
+
+        var renamed = false;
+        try
+        {
+            using (var handle = new SafeFileHandle(descriptor, ownsHandle: true))
+            {
+                await RandomAccess.WriteAsync(handle, bytes, fileOffset: 0, cancellationToken).ConfigureAwait(false);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            if (RenameWithoutReplacing(directory, temporaryName, name) == 0)
+            {
+                renamed = true;
+                return true;
+            }
+
+            var errno = Marshal.GetLastPInvokeError();
+            if (errno is Native.EINVAL or Native.ENOSYS)
+            {
+                // A hard link fails on an existing entry exactly as RENAME_NOREPLACE does; the temporary name is
+                // removed below, and the published name keeps the file.
+                if (Native.LinkAt(directory, temporaryName, directory, name, flags: 0) == 0)
+                {
+                    return true;
+                }
+
+                errno = Marshal.GetLastPInvokeError();
+            }
+
+            // Neither call replaces an entry of any kind, a directory included, so every entry at the name fails
+            // as EEXIST.
+            if (errno != Native.EEXIST)
+            {
+                throw Failure(errno, "publish", target.FullPath);
+            }
+
+            // An entry appeared at the name after the check and is kept: a regular file is one already present,
+            // anything else is refused as the check refuses it. One that vanished again meanwhile is no entry
+            // to keep, so the refused publication is reported as the error it met.
+            if (RequireRegularFileOrNothing(directory, name, target.FullPath))
+            {
+                return false;
+            }
+
+            throw Failure(errno, "publish", target.FullPath);
+        }
+        finally
+        {
+            if (!renamed)
+            {
+                // As in PublishFile: the call's own entry in a directory it holds open, so the removal only fails
+                // when the directory itself became unwritable, and the outcome already reached stands.
+                _ = Native.UnlinkAt(directory, temporaryName, flags: 0);
+            }
+        }
+    }
+
+    // renameat2 with RENAME_NOREPLACE inside one directory, returning its result with errno set. A C library
+    // without renameat2 sets errno to ENOSYS, as a kernel without the system call does, so the caller falls back
+    // the same way for both.
+    private static int RenameWithoutReplacing(DirectoryHandle directory, string oldName, string newName)
+    {
+        try
+        {
+            return Native.RenameAt2(directory, oldName, directory, newName, Native.RENAME_NOREPLACE);
+        }
+        catch (EntryPointNotFoundException)
+        {
+            Marshal.SetLastPInvokeError(Native.ENOSYS);
+            return -1;
         }
     }
 
@@ -661,10 +788,11 @@ internal sealed class ConfinedTree
             ? fullPath[_rootPrefix.Length..].Split(PathSeparators, StringSplitOptions.RemoveEmptyEntries)
             : [];
 
-    // Refuses a target entry a published file must not replace: a directory, or any other entry that is not a
-    // regular file, a link included. statx with AT_SYMLINK_NOFOLLOW reads the entry's type without following a
-    // link or opening the entry, so a FIFO or a device there cannot block the call. A missing entry is fine.
-    private void RequireReplaceableFile(DirectoryHandle directory, string name, string path)
+    // Examines a publication's target entry, refusing a directory or any other entry that is not a regular file,
+    // a link included: PublishFile replaces only a regular file, and PublishNewFileAsync keeps only one. statx
+    // with AT_SYMLINK_NOFOLLOW reads the entry's type without following a link or opening the entry, so a FIFO or
+    // a device there cannot block the call. Returns true for a regular file and false for a missing entry.
+    private bool RequireRegularFileOrNothing(DirectoryHandle directory, string name, string path)
     {
         Span<byte> status = stackalloc byte[Native.StatxSize];
         if (Native.Statx(directory, name, Native.AT_SYMLINK_NOFOLLOW, Native.STATX_TYPE, ref MemoryMarshal.GetReference(status)) != 0)
@@ -672,7 +800,7 @@ internal sealed class ConfinedTree
             var errno = Marshal.GetLastPInvokeError();
             if (errno == Native.ENOENT)
             {
-                return;
+                return false;
             }
 
             throw Failure(errno, "examine", path);
@@ -687,7 +815,7 @@ internal sealed class ConfinedTree
         var type = MemoryMarshal.Read<ushort>(status[Native.StatxModeOffset..]) & Native.S_IFMT;
         if (type == Native.S_IFREG)
         {
-            return;
+            return true;
         }
 
         throw type == Native.S_IFDIR ? IsDirectory(path) : NotRegularFile(path);
@@ -926,7 +1054,11 @@ internal sealed class ConfinedTree
         public const int ENOTDIR = 20;
         public const int EISDIR = 21;
         public const int EINVAL = 22;
+        public const int ENOSYS = 38;
         public const int ELOOP = 40;
+
+        // renameat2's flag that fails with EEXIST instead of replacing an entry at the new name.
+        public const uint RENAME_NOREPLACE = 0x1;
 
         [DllImport("libc", EntryPoint = "openat", SetLastError = true)]
         public static extern int OpenAt(
@@ -954,6 +1086,22 @@ internal sealed class ConfinedTree
             [MarshalAs(UnmanagedType.LPUTF8Str)] string oldPath,
             DirectoryHandle newDirectory,
             [MarshalAs(UnmanagedType.LPUTF8Str)] string newPath);
+
+        [DllImport("libc", EntryPoint = "renameat2", SetLastError = true)]
+        public static extern int RenameAt2(
+            DirectoryHandle oldDirectory,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string oldPath,
+            DirectoryHandle newDirectory,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string newPath,
+            uint flags);
+
+        [DllImport("libc", EntryPoint = "linkat", SetLastError = true)]
+        public static extern int LinkAt(
+            DirectoryHandle oldDirectory,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string oldPath,
+            DirectoryHandle newDirectory,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string newPath,
+            int flags);
 
         [DllImport("libc", EntryPoint = "close", SetLastError = true)]
         public static extern int Close(int descriptor);

@@ -29,7 +29,11 @@ namespace Erewhon.Harness.Modes;
 /// unchanged stand-in reproduces <c>baseline/</c> byte for byte apart from the manifest's
 /// <c>captureCommit</c>.</para>
 /// <para>Capture writes <c>baseline/**</c> only through <see cref="BaselineStore"/>, and
-/// <c>contracts/wsdl/ErewhonWebService.wsdl</c> only when that file is absent. It never writes the report,
+/// <c>contracts/wsdl/ErewhonWebService.wsdl</c> only when that file is absent, through
+/// <see cref="ConfinedTree.PublishNewFileAsync"/> rooted at the repository, so neither write follows a link out of
+/// the tree: a symbolic link on the way or at the name fails the capture, and an existing contract is never
+/// replaced. A WSDL the facade would refuse to publish (<see cref="IsPublishableWsdl"/>) writes neither WSDL file
+/// and is recorded as not captured. It never writes the report,
 /// <c>artifacts/</c>, the OpenAPI contract or anything under <c>Erewhon/</c>; the seed directory is only
 /// fingerprinted, through <see cref="ResetExpectations.FirstCapture(HarnessOptions)"/>. The backend's state
 /// is reached only through the stand-in's admin endpoints, and no request carries a header the case
@@ -71,11 +75,27 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
 
     private const string NotTouched = "capture cannot start; baseline/ not touched";
 
+    // The WSDL 1.1 SOAP binding namespace and the one element and attribute of it the facade rewrites.
+    private const string SoapBindingNamespace = "http://schemas.xmlsoap.org/wsdl/soap/";
+    private const string SoapAddressElement = "address";
+    private const string SoapAddressLocationAttribute = "location";
+
     private static readonly XmlReaderSettings ResultReaderSettings = new()
     {
         DtdProcessing = DtdProcessing.Prohibit,
         XmlResolver = null,
     };
+
+    // As the facade reads the contracts WSDL: a DTD is refused and nothing is resolved, so a hostile body can
+    // neither expand an entity nor reach the network.
+    private static readonly XmlReaderSettings WsdlReaderSettings = new()
+    {
+        DtdProcessing = DtdProcessing.Prohibit,
+        XmlResolver = null,
+    };
+
+    // Decoding throws on invalid bytes instead of substituting U+FFFD, as the facade's does.
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
     private readonly HarnessOptions _options = options ?? throw new ArgumentNullException(nameof(options));
     private readonly OperationCatalogue _catalogue = catalogue ?? throw new ArgumentNullException(nameof(catalogue));
@@ -522,7 +542,8 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
     }
 
     // The baseline WSDL is exactly what the stand-in served; the contracts WSDL is that file labelled, and is
-    // written only when absent, because once published it is the facade's and capture never replaces it.
+    // written only when absent, because once published it is the facade's and capture never replaces it. A body
+    // the facade would refuse to publish writes neither file.
     private async Task<bool> CaptureWsdlAsync(
         CaseRunner runner,
         BaselineStore store,
@@ -556,19 +577,24 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
             return DropWsdl(store, "the body is empty");
         }
 
+        // A body the facade would refuse to publish is no WSDL obtained: the facade would forward WSDL requests
+        // to the backend instead, so neither file records it and the manifest says wsdlCaptured: false.
+        if (!IsPublishableWsdl(response.Body, out var problem))
+        {
+            return DropWsdl(store, $"the facade would not publish it ({problem})");
+        }
+
         await store.WriteWsdlAsync(response.Body, ct).ConfigureAwait(false);
         Log(string.Create(CultureInfo.InvariantCulture, $"wrote baseline WSDL ({response.Body.Length} bytes)"));
 
-        if (File.Exists(_options.ContractsWsdlPath))
-        {
-            Log("contracts WSDL present; not overwritten");
-        }
-        else
-        {
-            await WriteContractWsdlAsync(WithHeaderComment(response.Body), ct).ConfigureAwait(false);
-            Log("wrote contracts WSDL");
-        }
-
+        // Published create-only through directory handles rooted at the repository, as BaselineStore writes
+        // baseline/: a linked contracts/ or contracts/wsdl, or anything but a regular file at the name, is
+        // refused and fails the capture, and an existing contract is kept byte for byte.
+        var contracts = new ConfinedTree(_options.ResolvePath("."));
+        var published = await contracts
+            .PublishNewFileAsync(_options.ContractsWsdlPath, WithHeaderComment(response.Body), ct)
+            .ConfigureAwait(false);
+        Log(published ? "wrote contracts WSDL" : "contracts WSDL present; not overwritten");
         return true;
     }
 
@@ -579,6 +605,87 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
         store.DeleteWsdl();
         Log($"WARN WSDL not captured: {reason}; baseline WSDL removed, contracts WSDL left as it is");
         return false;
+    }
+
+    /// <summary>
+    /// Whether the facade would publish <paramref name="wsdl"/> as <c>contracts/wsdl/ErewhonWebService.wsdl</c>.
+    /// </summary>
+    /// <remarks>
+    /// This is the facade's own publication rule (<c>WsdlDocument</c> in
+    /// <c>facade/src/Erewhon.Facade/Soap/SoapEndpoints.cs</c>), restated here because the harness does not
+    /// reference the facade, so capture never records a WSDL the facade would refuse and replace by
+    /// forwarding: the bytes after an optional UTF-8 byte-order mark decode as strict UTF-8, the whole
+    /// document reads as well-formed XML without a DTD, and it holds exactly one <c>soap:address</c> element
+    /// (WSDL 1.1 SOAP binding namespace), which carries a <c>location</c> attribute. The problem names the
+    /// rule that failed in the facade's words, never document content.
+    /// </remarks>
+    /// <param name="wsdl">The WSDL bytes as served.</param>
+    /// <param name="problem">
+    /// Empty when the facade would publish the bytes; otherwise <c>not UTF-8</c>, <c>not well-formed XML</c>,
+    /// <c>expected exactly one soap:address, found &lt;count&gt;</c> or
+    /// <c>soap:address has no location attribute</c>.
+    /// </param>
+    /// <returns>True when the facade would publish the bytes.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="wsdl"/> is null.</exception>
+    internal static bool IsPublishableWsdl(byte[] wsdl, out string problem)
+    {
+        ArgumentNullException.ThrowIfNull(wsdl);
+
+        ReadOnlySpan<byte> utf8Bom = [0xEF, 0xBB, 0xBF];
+        var contentStart = wsdl.AsSpan().StartsWith(utf8Bom) ? utf8Bom.Length : 0;
+        string text;
+        try
+        {
+            text = StrictUtf8.GetString(wsdl, contentStart, wsdl.Length - contentStart);
+        }
+        catch (DecoderFallbackException)
+        {
+            problem = "not UTF-8";
+            return false;
+        }
+
+        // Reading to the end proves the whole document well-formed, not only the part before the address.
+        var addresses = 0;
+        var hasLocation = false;
+        try
+        {
+            using var reader = XmlReader.Create(new StringReader(text), WsdlReaderSettings);
+            while (reader.Read())
+            {
+                if (reader.NodeType != XmlNodeType.Element
+                    || !string.Equals(reader.LocalName, SoapAddressElement, StringComparison.Ordinal)
+                    || !string.Equals(reader.NamespaceURI, SoapBindingNamespace, StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                addresses++;
+                if (addresses == 1)
+                {
+                    hasLocation = reader.GetAttribute(SoapAddressLocationAttribute) is not null;
+                }
+            }
+        }
+        catch (XmlException)
+        {
+            problem = "not well-formed XML";
+            return false;
+        }
+
+        if (addresses != 1)
+        {
+            problem = string.Create(CultureInfo.InvariantCulture, $"expected exactly one soap:address, found {addresses}");
+            return false;
+        }
+
+        if (!hasLocation)
+        {
+            problem = "soap:address has no location attribute";
+            return false;
+        }
+
+        problem = "";
+        return true;
     }
 
     /// <summary>
@@ -638,45 +745,6 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
         content.StartsWith("<?xml"u8)
         && content.Length > 5
         && content[5] is 0x20 or 0x09 or 0x0D or 0x0A;
-
-    // A temporary file beside the target is moved into place without overwriting, so the contract is either
-    // absent or complete, and a file that appeared meanwhile is never replaced. The move, not a disk flush,
-    // makes the publication atomic, so the write is flushed asynchronously and never blocks on an fsync.
-    private async Task WriteContractWsdlAsync(byte[] bytes, CancellationToken ct)
-    {
-        var target = _options.ContractsWsdlPath;
-        var directory = Path.GetDirectoryName(target)
-            ?? throw new IOException($"The contracts WSDL path '{target}' has no directory.");
-        Directory.CreateDirectory(directory);
-
-        var temporary = Path.Combine(
-            directory,
-            string.Create(CultureInfo.InvariantCulture, $".{Path.GetFileName(target)}.{Guid.NewGuid():N}.tmp"));
-        try
-        {
-            await using (var stream = new FileStream(
-                temporary,
-                FileMode.CreateNew,
-                FileAccess.Write,
-                FileShare.None,
-                bufferSize: 4096,
-                FileOptions.Asynchronous))
-            {
-                await stream.WriteAsync(bytes, ct).ConfigureAwait(false);
-                await stream.FlushAsync(ct).ConfigureAwait(false);
-            }
-
-            File.Move(temporary, target, overwrite: false);
-        }
-        finally
-        {
-            // Only reached with the file still present when the write or the move failed.
-            if (File.Exists(temporary))
-            {
-                File.Delete(temporary);
-            }
-        }
-    }
 
     // Each gap is listed so the execution agent can apply the three-attempt correction rule; the
     // unreachable-in-source gaps are expected and registered in harness/config/known-limitations.json.

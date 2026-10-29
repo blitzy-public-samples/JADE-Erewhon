@@ -4,6 +4,7 @@ using System.Net;
 using System.Net.Sockets;
 using System.Security;
 using System.Text;
+using Erewhon.Contracts.Admin;
 using Erewhon.Contracts.Catalogue;
 using Erewhon.Harness.Checks;
 using Erewhon.Harness.Compare;
@@ -32,9 +33,10 @@ namespace Erewhon.Harness.Tests;
 /// The response-level cases send SOAP bodies through <see cref="ResponseComparer"/>: XML dispatch, the
 /// media type, well-formedness as a SOAP 1.1 envelope, the byte-order mark, the encoding XML detection reads
 /// and lossless decoding.
-/// It also covers the WSDL contract check, which compares the facade WSDL with the backend WSDL under this
-/// XML semantic comparison with the <c>soap:address/@location</c> value excluded, against two in-process
-/// loopback stubs in a temporary repository root of its own.
+/// It also covers the WSDL contract check, which requires the facade to report the contracts WSDL as published
+/// and compares the facade WSDL with the backend WSDL under this XML semantic comparison with the
+/// <c>soap:address/@location</c> value excluded, against in-process loopback stubs in a temporary repository
+/// root of its own.
 /// </summary>
 public sealed partial class XmlSemanticComparerTests : IDisposable
 {
@@ -1621,16 +1623,19 @@ public sealed partial class XmlSemanticComparerTests : IDisposable
 }
 
 // ---- The WSDL contract check --------------------------------------------------------------------
-// The WSDL contract check against two in-process loopback stubs standing in for the backend and the facade,
-// in a temporary repository root of its own: an absent contracts WSDL or an unusable SOAP base URL is not-run
-// with no request sent; documents that differ only in the soap:address/@location value, comments, indentation
-// or a byte order mark pass; a location or address that is absent on either side or on both, a changed
-// operation, an unreachable side, a status other than 200 and an undecodable or non-XML body each fail with
-// exactly the discrepancies the signature is computed over, an undecodable body at $body and a non-XML one at
-// /, and undecodable bodies that differ in an invalid byte, in their decodable peer or in which side decodes,
-// or from non-XML texts that spell their hexadecimal, give different natures; and the check writes only the
-// two artifacts/wsdl/** files, removing stale ones and reporting a failed save in its detail, never the
-// contract.
+// The WSDL contract check against in-process loopback stubs standing in for the backend's WSDL, the facade's
+// WSDL and the facade's /admin/info, in a temporary repository root of its own: an absent contracts WSDL, an
+// unusable SOAP base URL or an unusable facade admin URL is not-run with no request sent; documents that differ
+// only in the soap:address/@location value, comments, indentation or a byte order mark pass while the facade
+// reports the contracts WSDL as published; a facade that reports any other wsdl value, or whose info cannot be
+// read, fails at $published.facade even when its WSDL is the backend's own, as a facade that forwards WSDL
+// requests serves it; a location or address that is absent on either side or on both, a changed operation, an
+// unreachable side, a status other than 200 and an undecodable or non-XML body each fail with exactly the
+// discrepancies the signature is computed over, an undecodable body at $body and a non-XML one at /, and
+// undecodable bodies that differ in an invalid byte, in their decodable peer or in which side decodes, or from
+// non-XML texts that spell their hexadecimal, give different natures; and the check writes only the two
+// artifacts/wsdl/** files, removing stale ones and reporting a failed save in its detail, never the contract
+// or the facade's info.
 // These members live in this class because the harness test project keeps its fixed set of test classes,
 // and the check compares the facade WSDL with the backend WSDL under the XML semantic comparison this class
 // covers.
@@ -1643,7 +1648,23 @@ public sealed partial class XmlSemanticComparerTests
     private const string BackendSide = "backend";
     private const string FacadeSide = "facade";
 
+    // The facade's admin listener, which the check asks whether it publishes the contracts WSDL.
+    private const string FacadeInfoSide = "facade info";
+
     private const string SoapHttpTransport = "http://schemas.xmlsoap.org/soap/http";
+
+    // Where the check reports a facade that does not declare the contracts WSDL published, and the value it expects.
+    private const string PublishedPath = "$published.facade";
+    private const string PublishedStatus = "present";
+
+    // How a facade info that cannot be read as a publication status is unreadable.
+    private const string InfoUnanswered = "unanswered";
+    private const string InfoNotFound = "not found";
+    private const string InfoNotJson = "not JSON";
+    private const string InfoNotAnObject = "not an object";
+    private const string InfoWithoutWsdl = "no wsdl member";
+    private const string InfoNonStringWsdl = "non-string wsdl";
+    private const string InfoInvalidUtf8 = "invalid UTF-8";
 
     private const string PortTypeOperationNamePath = "/definitions/portType/operation/@name";
     private const string BindingOperationNamePath = "/definitions/binding/operation/@name";
@@ -1695,6 +1716,9 @@ public sealed partial class XmlSemanticComparerTests
 
     private static readonly byte[] StaleArtifact = Encoding.UTF8.GetBytes("stale artifact of an earlier run");
 
+    // The facade's info while it serves the contracts WSDL.
+    private static readonly byte[] PublishedInfo = FacadeInfo($"\"wsdl\":\"{PublishedStatus}\",");
+
     // Created on first use, so only the WSDL contract check tests touch the file system or hold a runner;
     // removed in Dispose.
     private string? _root;
@@ -1730,6 +1754,7 @@ public sealed partial class XmlSemanticComparerTests
     {
         await using var backend = await ServeAsync(WsdlCheckDocument(StandInLocation));
         await using var facade = await ServeAsync(WsdlCheckDocument(FacadeLocation));
+        await using var info = await ServeInfoAsync(StatusCodes.Status200OK, PublishedInfo);
         if (directoryAtContractPath)
         {
             Directory.CreateDirectory(Options.ContractsWsdlPath);
@@ -1737,11 +1762,12 @@ public sealed partial class XmlSemanticComparerTests
 
         WriteStaleArtifacts();
 
-        var result = await RunAsync(backend.BaseUrl, facade.BaseUrl);
+        var result = await RunAsync(backend.BaseUrl, facade.BaseUrl, info.BaseUrl);
 
         AssertNotRun(result);
         Assert.Empty(backend.Requests);
         Assert.Empty(facade.Requests);
+        Assert.Empty(info.Requests);
         Assert.False(File.Exists(ArtifactPath(BackendSide)), "A stale backend artifact must be removed.");
         Assert.False(File.Exists(ArtifactPath(FacadeSide)), "A stale facade artifact must be removed.");
         Assert.False(File.Exists(Options.ContractsWsdlPath), "The check must never create the contracts WSDL.");
@@ -1756,24 +1782,38 @@ public sealed partial class XmlSemanticComparerTests
     [InlineData(BackendSide, "ftp://" + AuthorityToken + "/")]
     [InlineData(BackendSide, "http://harness:" + UserInfoPassword + "@" + AuthorityToken)]
     [InlineData(FacadeSide, "http://harness:" + UserInfoPassword + "@" + AuthorityToken)]
-    public async Task UnusableSoapBaseUrl_IsNotRun_WithNoRequest(string side, string baseUrl)
+    [InlineData(FacadeInfoSide, "")]
+    [InlineData(FacadeInfoSide, " ")]
+    [InlineData(FacadeInfoSide, "/relative/path")]
+    [InlineData(FacadeInfoSide, "ftp://" + AuthorityToken + "/")]
+    [InlineData(FacadeInfoSide, "http://harness:" + UserInfoPassword + "@" + AuthorityToken)]
+    public async Task UnusableBaseUrl_IsNotRun_WithNoRequest(string side, string baseUrl)
     {
         await using var backend = await ServeAsync(WsdlCheckDocument(StandInLocation));
         await using var facade = await ServeAsync(WsdlCheckDocument(FacadeLocation));
+        await using var info = await ServeInfoAsync(StatusCodes.Status200OK, PublishedInfo);
         var contract = WriteContract();
         WriteStaleArtifacts();
 
         // A URL that names a running stub proves that no request is sent even where one could be answered.
-        var unusable = baseUrl.Replace(AuthorityToken, (side == BackendSide ? backend : facade).Authority, StringComparison.Ordinal);
+        var named = side switch
+        {
+            BackendSide => backend,
+            FacadeSide => facade,
+            _ => info,
+        };
+        var unusable = baseUrl.Replace(AuthorityToken, named.Authority, StringComparison.Ordinal);
         var result = await RunAsync(
             side == BackendSide ? unusable : backend.BaseUrl,
-            side == FacadeSide ? unusable : facade.BaseUrl);
+            side == FacadeSide ? unusable : facade.BaseUrl,
+            side == FacadeInfoSide ? unusable : info.BaseUrl);
 
         AssertNotRun(result);
         Assert.Contains(SettingName(side), result.Result.Detail, StringComparison.Ordinal);
         Assert.DoesNotContain(UserInfoPassword, result.Result.Detail, StringComparison.Ordinal);
         Assert.Empty(backend.Requests);
         Assert.Empty(facade.Requests);
+        Assert.Empty(info.Requests);
         Assert.False(File.Exists(ArtifactPath(BackendSide)), "A stale backend artifact must be removed.");
         Assert.False(File.Exists(ArtifactPath(FacadeSide)), "A stale facade artifact must be removed.");
         AssertOnlyArtifactsWritten(contract);
@@ -1800,16 +1840,20 @@ public sealed partial class XmlSemanticComparerTests
 
         await using var backend = await LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, backendBody, TestContext.Current.CancellationToken);
         await using var facade = await LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, facadeBody, TestContext.Current.CancellationToken);
+        await using var info = await ServeInfoAsync(StatusCodes.Status200OK, PublishedInfo);
         var contract = WriteContract();
         WriteStaleArtifacts();
 
-        var result = await RunAsync(backend.BaseUrl, facade.BaseUrl);
+        var result = await RunAsync(backend.BaseUrl, facade.BaseUrl, info.BaseUrl);
 
         Assert.Equal(new CheckResult(CheckNames.WsdlContract, CheckOutcomes.Pass, Cases: 1, Passed: 1, Detail: null), result.Result);
         Assert.Null(result.Failure);
         Assert.Empty(result.Discrepancies);
         Assert.Equal(WsdlPathAndQuery, Assert.Single(backend.Requests));
         Assert.Equal(WsdlPathAndQuery, Assert.Single(facade.Requests));
+
+        // The pass rests on the facade's own report that it publishes the contracts WSDL, read once and never saved.
+        Assert.Equal(AdminRoutes.Info, Assert.Single(info.Requests));
         Assert.Equal(backendBody, File.ReadAllBytes(ArtifactPath(BackendSide)));
         Assert.Equal(facadeBody, File.ReadAllBytes(ArtifactPath(FacadeSide)));
         AssertOnlyArtifactsWritten(contract, BackendSide, FacadeSide);
@@ -1887,6 +1931,101 @@ public sealed partial class XmlSemanticComparerTests
         var result = await RunAsync(backend.BaseUrl, facade.BaseUrl);
 
         AssertDifference(result, [expected]);
+        AssertOnlyArtifactsWritten(contract, BackendSide, FacadeSide);
+    }
+
+    // ---- Publication -----------------------------------------------------------------------------------
+
+    // A facade that could not load the contracts WSDL reports so and forwards WSDL requests to the backend, so its
+    // WSDL is the backend's own byte for byte: only its report tells the check that it publishes nothing. Any
+    // document difference joins the publication entry in one canonical list.
+    [Theory]
+    [InlineData("absent", false)]
+    [InlineData("Present", false)]
+    [InlineData("", false)]
+    [InlineData("absent", true)]
+    public async Task FacadeNotPublishingTheContract_Fails_WithThePublicationValueDiscrepancy(string reported, bool changedOperation)
+    {
+        var backendBody = Encoding.UTF8.GetBytes(WsdlCheckDocument(StandInLocation));
+        var facadeBody = changedOperation
+            ? Encoding.UTF8.GetBytes(WsdlCheckDocument(StandInLocation, operationName: GetAgentNames.JadeMethod))
+            : backendBody;
+        Discrepancy[] publication =
+        [
+            new(PublishedPath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(PublishedStatus), DiscrepancyValue.Literal(reported)),
+        ];
+        Discrepancy[] expected = changedOperation
+            ?
+            [
+                .. publication,
+                new(BindingOperationNamePath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(GetAgent.JadeMethod), DiscrepancyValue.Literal(GetAgentNames.JadeMethod)),
+                new(PortTypeOperationNamePath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(GetAgent.JadeMethod), DiscrepancyValue.Literal(GetAgentNames.JadeMethod)),
+            ]
+            : publication;
+        var contract = WriteContract();
+
+        // Each run fetches from stubs on other ports, which must not reach the signature.
+        var natures = new List<string>();
+        for (var run = 0; run < 2; run++)
+        {
+            await using var backend = await LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, backendBody, TestContext.Current.CancellationToken);
+            await using var facade = await LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, facadeBody, TestContext.Current.CancellationToken);
+            await using var info = await ServeInfoAsync(StatusCodes.Status200OK, FacadeInfo($"\"wsdl\":\"{reported}\","));
+
+            var result = await RunAsync(backend.BaseUrl, facade.BaseUrl, info.BaseUrl);
+
+            AssertDifference(result, expected);
+            natures.Add(result.Failure!.Nature);
+            Assert.Equal(AdminRoutes.Info, Assert.Single(info.Requests));
+            Assert.Equal(backendBody, File.ReadAllBytes(ArtifactPath(BackendSide)));
+            Assert.Equal(facadeBody, File.ReadAllBytes(ArtifactPath(FacadeSide)));
+        }
+
+        Assert.Equal(natures[0], natures[1]);
+        AssertOnlyArtifactsWritten(contract, BackendSide, FacadeSide);
+    }
+
+    // An info the check cannot read as a publication status never confirms publication: the entry holds nothing
+    // observed, and the reason, which can carry a port, goes to the detail only.
+    [Theory]
+    [InlineData(InfoUnanswered)]
+    [InlineData(InfoNotFound)]
+    [InlineData(InfoNotJson)]
+    [InlineData(InfoNotAnObject)]
+    [InlineData(InfoWithoutWsdl)]
+    [InlineData(InfoNonStringWsdl)]
+    [InlineData(InfoInvalidUtf8)]
+    public async Task UnreadablePublication_Fails_WithThePublicationMissingDiscrepancy(string unreadable)
+    {
+        // A 404 that still carries the published info proves the status decides; an invalid byte inside the
+        // reported present proves strict decoding, because a replacement character would give a value entry.
+        var (status, body) = unreadable switch
+        {
+            InfoUnanswered => (StatusCodes.Status200OK, PublishedInfo),
+            InfoNotFound => (StatusCodes.Status404NotFound, PublishedInfo),
+            InfoNotJson => (StatusCodes.Status200OK, Encoding.UTF8.GetBytes(NotXmlBody)),
+            InfoNotAnObject => (StatusCodes.Status200OK, Encoding.UTF8.GetBytes($"[\"{PublishedStatus}\"]")),
+            InfoWithoutWsdl => (StatusCodes.Status200OK, FacadeInfo("")),
+            InfoNonStringWsdl => (StatusCodes.Status200OK, FacadeInfo("\"wsdl\":true,")),
+            InfoInvalidUtf8 => (StatusCodes.Status200OK, FacadeInfo([.. Encoding.UTF8.GetBytes($"\"wsdl\":\"{PublishedStatus}"), 0xFF, .. "\","u8])),
+            _ => throw new ArgumentOutOfRangeException(nameof(unreadable), unreadable, "Unknown unreadable info."),
+        };
+        await using var backend = await ServeAsync(WsdlCheckDocument(StandInLocation));
+        await using var facade = await ServeAsync(WsdlCheckDocument(FacadeLocation));
+        await using var info = unreadable == InfoUnanswered ? null : await ServeInfoAsync(status, body);
+        var contract = WriteContract();
+
+        var result = await RunAsync(
+            backend.BaseUrl,
+            facade.BaseUrl,
+            info?.BaseUrl ?? $"http://{IPAddress.Loopback}:{ClosedPorts.Take(1)[0]}");
+
+        AssertDifference(result, [new(PublishedPath, DiscrepancyKinds.Missing, DiscrepancyValue.Literal(PublishedStatus), DiscrepancyValue.Absent)]);
+        if (info is not null)
+        {
+            Assert.Equal(AdminRoutes.Info, Assert.Single(info.Requests));
+        }
+
         AssertOnlyArtifactsWritten(contract, BackendSide, FacadeSide);
     }
 
@@ -2152,16 +2291,41 @@ public sealed partial class XmlSemanticComparerTests
 
     // ---- Helpers ---------------------------------------------------------------------------------------
 
-    private Task<ContractCheckResult> RunAsync(string backendSoapBaseUrl, string facadeSoapBaseUrl)
+    /// <summary>
+    /// Runs the check against the given base URLs. Without <paramref name="facadeAdminUrl"/>, the facade's admin
+    /// listener is a stub, running for the call only, that reports the contracts WSDL as published, so a test about
+    /// the WSDL documents sees only their discrepancies.
+    /// </summary>
+    private async Task<ContractCheckResult> RunAsync(string backendSoapBaseUrl, string facadeSoapBaseUrl, string? facadeAdminUrl = null)
     {
+        await using var published = facadeAdminUrl is null ? await ServeInfoAsync(StatusCodes.Status200OK, PublishedInfo) : null;
         Options.Backend.SoapBaseUrl = backendSoapBaseUrl;
         Options.Target.SoapBaseUrl = facadeSoapBaseUrl;
-        return new WsdlContractCheck(Options, Catalogue, _comparer, Http).RunAsync(TestContext.Current.CancellationToken);
+        Options.Target.AdminUrl = facadeAdminUrl ?? published!.BaseUrl;
+        return await new WsdlContractCheck(Options, Catalogue, _comparer, Http).RunAsync(TestContext.Current.CancellationToken);
     }
 
     /// <summary>Starts a stub that answers the catalogue's WSDL request with 200 and <paramref name="document"/> as UTF-8.</summary>
     private static Task<LoopbackStub> ServeAsync(string document) =>
         LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, Encoding.UTF8.GetBytes(document), TestContext.Current.CancellationToken);
+
+    /// <summary>Starts a stub of the facade's admin listener that answers <c>/admin/info</c> with <paramref name="status"/> and <paramref name="body"/>.</summary>
+    private static Task<LoopbackStub> ServeInfoAsync(int status, byte[] body) =>
+        LoopbackStub.StartAsync(AdminRoutes.Info, status, body, TestContext.Current.CancellationToken);
+
+    /// <summary>
+    /// A facade <c>/admin/info</c> body in the facade's compact member order, with <paramref name="wsdlMembers"/>,
+    /// raw JSON members each followed by a comma, where the facade writes its <c>wsdl</c> member.
+    /// </summary>
+    private static byte[] FacadeInfo(string wsdlMembers) => FacadeInfo(Encoding.UTF8.GetBytes(wsdlMembers));
+
+    /// <inheritdoc cref="FacadeInfo(string)"/>
+    private static byte[] FacadeInfo(ReadOnlySpan<byte> wsdlMembers) =>
+    [
+        .. "{\"component\":\"erewhon-facade\",\"frameworkDescription\":\".NET 10.0.14\","u8,
+        .. wsdlMembers,
+        .. "\"backendTimeoutSeconds\":30,\"routing\":{\"defaultTarget\":\"backend\"}}"u8,
+    ];
 
     /// <summary>Writes the contracts WSDL, which only has to exist, and returns its bytes.</summary>
     private byte[] WriteContract()
@@ -2182,9 +2346,14 @@ public sealed partial class XmlSemanticComparerTests
 
     private string ArtifactPath(string side) => Path.Combine(Options.ArtifactsDirectory, "wsdl", $"{side}.wsdl");
 
-    /// <summary>The configuration key of a side's SOAP base URL, for example <c>Harness:Backend:SoapBaseUrl</c>.</summary>
+    /// <summary>
+    /// The configuration key of a side's base URL, for example <c>Harness:Backend:SoapBaseUrl</c>, or
+    /// <c>Harness:Target:AdminUrl</c> for the facade's admin listener.
+    /// </summary>
     private static string SettingName(string side) =>
-        $"{HarnessOptions.SectionName}:{(side == BackendSide ? nameof(HarnessOptions.Backend) : nameof(HarnessOptions.Target))}:{nameof(HarnessEndpoints.SoapBaseUrl)}";
+        side == FacadeInfoSide
+            ? $"{HarnessOptions.SectionName}:{nameof(HarnessOptions.Target)}:{nameof(HarnessEndpoints.AdminUrl)}"
+            : $"{HarnessOptions.SectionName}:{(side == BackendSide ? nameof(HarnessOptions.Backend) : nameof(HarnessOptions.Target))}:{nameof(HarnessEndpoints.SoapBaseUrl)}";
 
     /// <summary>
     /// Asserts that the repository root holds exactly the contracts WSDL, with its bytes unchanged, and the
