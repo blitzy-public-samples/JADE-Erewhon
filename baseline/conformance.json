@@ -1,0 +1,1543 @@
+{
+  "source": "jade-standin",
+  "counts": {
+    "membersChecked": 216,
+    "passed": 117,
+    "gapsByNature": {
+      "unreachable-in-source": 99,
+      "unobserved": 0,
+      "null-only": 0,
+      "wrong-type": 0
+    }
+  },
+  "members": [
+    {
+      "itemId": "CONF:Rest:DTOObject.guid",
+      "surface": "Rest",
+      "class": "DTOObject",
+      "property": "guid",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOAgent.guid",
+      "surface": "Rest",
+      "class": "DTOAgent",
+      "property": "guid",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOAgent.city",
+      "surface": "Rest",
+      "class": "DTOAgent",
+      "property": "city",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOAgent.country",
+      "surface": "Rest",
+      "class": "DTOAgent",
+      "property": "country",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOAgent.email",
+      "surface": "Rest",
+      "class": "DTOAgent",
+      "property": "email",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOAgent.fax",
+      "surface": "Rest",
+      "class": "DTOAgent",
+      "property": "fax",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOAgent.name",
+      "surface": "Rest",
+      "class": "DTOAgent",
+      "property": "name",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOAgent.phone",
+      "surface": "Rest",
+      "class": "DTOAgent",
+      "property": "phone",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOAgent.street",
+      "surface": "Rest",
+      "class": "DTOAgent",
+      "property": "street",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOAgent.website",
+      "surface": "Rest",
+      "class": "DTOAgent",
+      "property": "website",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOClient.guid",
+      "surface": "Rest",
+      "class": "DTOClient",
+      "property": "guid",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOClient.city",
+      "surface": "Rest",
+      "class": "DTOClient",
+      "property": "city",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOClient.country",
+      "surface": "Rest",
+      "class": "DTOClient",
+      "property": "country",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOClient.email",
+      "surface": "Rest",
+      "class": "DTOClient",
+      "property": "email",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOClient.fax",
+      "surface": "Rest",
+      "class": "DTOClient",
+      "property": "fax",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOClient.name",
+      "surface": "Rest",
+      "class": "DTOClient",
+      "property": "name",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOClient.phone",
+      "surface": "Rest",
+      "class": "DTOClient",
+      "property": "phone",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOClient.street",
+      "surface": "Rest",
+      "class": "DTOClient",
+      "property": "street",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOClient.website",
+      "surface": "Rest",
+      "class": "DTOClient",
+      "property": "website",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOCompany.guid",
+      "surface": "Rest",
+      "class": "DTOCompany",
+      "property": "guid",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOCompany.city",
+      "surface": "Rest",
+      "class": "DTOCompany",
+      "property": "city",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOCompany.country",
+      "surface": "Rest",
+      "class": "DTOCompany",
+      "property": "country",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOCompany.email",
+      "surface": "Rest",
+      "class": "DTOCompany",
+      "property": "email",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOCompany.fax",
+      "surface": "Rest",
+      "class": "DTOCompany",
+      "property": "fax",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOCompany.name",
+      "surface": "Rest",
+      "class": "DTOCompany",
+      "property": "name",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOCompany.phone",
+      "surface": "Rest",
+      "class": "DTOCompany",
+      "property": "phone",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOCompany.street",
+      "surface": "Rest",
+      "class": "DTOCompany",
+      "property": "street",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOCompany.website",
+      "surface": "Rest",
+      "class": "DTOCompany",
+      "property": "website",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOError.guid",
+      "surface": "Rest",
+      "class": "DTOError",
+      "property": "guid",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOError.allErrors",
+      "surface": "Rest",
+      "class": "DTOError",
+      "property": "allErrors",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOError.statusCode",
+      "surface": "Rest",
+      "class": "DTOError",
+      "property": "statusCode",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOItem.guid",
+      "surface": "Rest",
+      "class": "DTOItem",
+      "property": "guid",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOItem.agent",
+      "surface": "Rest",
+      "class": "DTOItem",
+      "property": "agent",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOItem.categoryPrefix",
+      "surface": "Rest",
+      "class": "DTOItem",
+      "property": "categoryPrefix",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOItem.description",
+      "surface": "Rest",
+      "class": "DTOItem",
+      "property": "description",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOItem.itemCategory",
+      "surface": "Rest",
+      "class": "DTOItem",
+      "property": "itemCategory",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOItem.listedDate",
+      "surface": "Rest",
+      "class": "DTOItem",
+      "property": "listedDate",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOItem.name",
+      "surface": "Rest",
+      "class": "DTOItem",
+      "property": "name",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOItem.number",
+      "surface": "Rest",
+      "class": "DTOItem",
+      "property": "number",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOItem.photo",
+      "surface": "Rest",
+      "class": "DTOItem",
+      "property": "photo",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOItem.price",
+      "surface": "Rest",
+      "class": "DTOItem",
+      "property": "price",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOItem.region",
+      "surface": "Rest",
+      "class": "DTOItem",
+      "property": "region",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOItem.sale",
+      "surface": "Rest",
+      "class": "DTOItem",
+      "property": "sale",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailItem.guid",
+      "surface": "Rest",
+      "class": "DTORetailItem",
+      "property": "guid",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailItem.agent",
+      "surface": "Rest",
+      "class": "DTORetailItem",
+      "property": "agent",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailItem.categoryPrefix",
+      "surface": "Rest",
+      "class": "DTORetailItem",
+      "property": "categoryPrefix",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailItem.description",
+      "surface": "Rest",
+      "class": "DTORetailItem",
+      "property": "description",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailItem.itemCategory",
+      "surface": "Rest",
+      "class": "DTORetailItem",
+      "property": "itemCategory",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailItem.listedDate",
+      "surface": "Rest",
+      "class": "DTORetailItem",
+      "property": "listedDate",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailItem.name",
+      "surface": "Rest",
+      "class": "DTORetailItem",
+      "property": "name",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailItem.number",
+      "surface": "Rest",
+      "class": "DTORetailItem",
+      "property": "number",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailItem.photo",
+      "surface": "Rest",
+      "class": "DTORetailItem",
+      "property": "photo",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailItem.price",
+      "surface": "Rest",
+      "class": "DTORetailItem",
+      "property": "price",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailItem.region",
+      "surface": "Rest",
+      "class": "DTORetailItem",
+      "property": "region",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailItem.sale",
+      "surface": "Rest",
+      "class": "DTORetailItem",
+      "property": "sale",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderItem.guid",
+      "surface": "Rest",
+      "class": "DTOTenderItem",
+      "property": "guid",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderItem.agent",
+      "surface": "Rest",
+      "class": "DTOTenderItem",
+      "property": "agent",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderItem.categoryPrefix",
+      "surface": "Rest",
+      "class": "DTOTenderItem",
+      "property": "categoryPrefix",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderItem.description",
+      "surface": "Rest",
+      "class": "DTOTenderItem",
+      "property": "description",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderItem.itemCategory",
+      "surface": "Rest",
+      "class": "DTOTenderItem",
+      "property": "itemCategory",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderItem.listedDate",
+      "surface": "Rest",
+      "class": "DTOTenderItem",
+      "property": "listedDate",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderItem.name",
+      "surface": "Rest",
+      "class": "DTOTenderItem",
+      "property": "name",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderItem.number",
+      "surface": "Rest",
+      "class": "DTOTenderItem",
+      "property": "number",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderItem.photo",
+      "surface": "Rest",
+      "class": "DTOTenderItem",
+      "property": "photo",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderItem.price",
+      "surface": "Rest",
+      "class": "DTOTenderItem",
+      "property": "price",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderItem.region",
+      "surface": "Rest",
+      "class": "DTOTenderItem",
+      "property": "region",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderItem.sale",
+      "surface": "Rest",
+      "class": "DTOTenderItem",
+      "property": "sale",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderItem.closureDate",
+      "surface": "Rest",
+      "class": "DTOTenderItem",
+      "property": "closureDate",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOName.guid",
+      "surface": "Rest",
+      "class": "DTOName",
+      "property": "guid",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOName.name",
+      "surface": "Rest",
+      "class": "DTOName",
+      "property": "name",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOPhoto.guid",
+      "surface": "Rest",
+      "class": "DTOPhoto",
+      "property": "guid",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOPhoto.photo",
+      "surface": "Rest",
+      "class": "DTOPhoto",
+      "property": "photo",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOResult.guid",
+      "surface": "Rest",
+      "class": "DTOResult",
+      "property": "guid",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOResult.allErrors",
+      "surface": "Rest",
+      "class": "DTOResult",
+      "property": "allErrors",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOResult.allWarnings",
+      "surface": "Rest",
+      "class": "DTOResult",
+      "property": "allWarnings",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOResult.statusCode",
+      "surface": "Rest",
+      "class": "DTOResult",
+      "property": "statusCode",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOSale.guid",
+      "surface": "Rest",
+      "class": "DTOSale",
+      "property": "guid",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOSale.agentCommission",
+      "surface": "Rest",
+      "class": "DTOSale",
+      "property": "agentCommission",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOSale.client",
+      "surface": "Rest",
+      "class": "DTOSale",
+      "property": "client",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOSale.item",
+      "surface": "Rest",
+      "class": "DTOSale",
+      "property": "item",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailSale.guid",
+      "surface": "Rest",
+      "class": "DTORetailSale",
+      "property": "guid",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailSale.agentCommission",
+      "surface": "Rest",
+      "class": "DTORetailSale",
+      "property": "agentCommission",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailSale.client",
+      "surface": "Rest",
+      "class": "DTORetailSale",
+      "property": "client",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailSale.item",
+      "surface": "Rest",
+      "class": "DTORetailSale",
+      "property": "item",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailSale.timestamp",
+      "surface": "Rest",
+      "class": "DTORetailSale",
+      "property": "timestamp",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderSale.guid",
+      "surface": "Rest",
+      "class": "DTOTenderSale",
+      "property": "guid",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderSale.agentCommission",
+      "surface": "Rest",
+      "class": "DTOTenderSale",
+      "property": "agentCommission",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderSale.client",
+      "surface": "Rest",
+      "class": "DTOTenderSale",
+      "property": "client",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderSale.item",
+      "surface": "Rest",
+      "class": "DTOTenderSale",
+      "property": "item",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderSale.offer",
+      "surface": "Rest",
+      "class": "DTOTenderSale",
+      "property": "offer",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderSale.tender",
+      "surface": "Rest",
+      "class": "DTOTenderSale",
+      "property": "tender",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOSaleDetail.guid",
+      "surface": "Rest",
+      "class": "DTOSaleDetail",
+      "property": "guid",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOSaleDetail.agentCommission",
+      "surface": "Rest",
+      "class": "DTOSaleDetail",
+      "property": "agentCommission",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOSaleDetail.client",
+      "surface": "Rest",
+      "class": "DTOSaleDetail",
+      "property": "client",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailSaleDetail.guid",
+      "surface": "Rest",
+      "class": "DTORetailSaleDetail",
+      "property": "guid",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailSaleDetail.agentCommission",
+      "surface": "Rest",
+      "class": "DTORetailSaleDetail",
+      "property": "agentCommission",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailSaleDetail.client",
+      "surface": "Rest",
+      "class": "DTORetailSaleDetail",
+      "property": "client",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailSaleDetail.price",
+      "surface": "Rest",
+      "class": "DTORetailSaleDetail",
+      "property": "price",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTORetailSaleDetail.soldDate",
+      "surface": "Rest",
+      "class": "DTORetailSaleDetail",
+      "property": "soldDate",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderSaleDetail.guid",
+      "surface": "Rest",
+      "class": "DTOTenderSaleDetail",
+      "property": "guid",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderSaleDetail.agentCommission",
+      "surface": "Rest",
+      "class": "DTOTenderSaleDetail",
+      "property": "agentCommission",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderSaleDetail.client",
+      "surface": "Rest",
+      "class": "DTOTenderSaleDetail",
+      "property": "client",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderSaleDetail.offer",
+      "surface": "Rest",
+      "class": "DTOTenderSaleDetail",
+      "property": "offer",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTenderSaleDetail.tenderDate",
+      "surface": "Rest",
+      "class": "DTOTenderSaleDetail",
+      "property": "tenderDate",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTender.guid",
+      "surface": "Rest",
+      "class": "DTOTender",
+      "property": "guid",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTender.client",
+      "surface": "Rest",
+      "class": "DTOTender",
+      "property": "client",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTender.offer",
+      "surface": "Rest",
+      "class": "DTOTender",
+      "property": "offer",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTender.tenderItem",
+      "surface": "Rest",
+      "class": "DTOTender",
+      "property": "tenderItem",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:DTOTender.timestamp",
+      "surface": "Rest",
+      "class": "DTOTender",
+      "property": "timestamp",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:STATUS:HTTP_Bad_Request",
+      "surface": "Rest",
+      "class": "ErewhonRestService",
+      "constant": "HTTP_Bad_Request",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:STATUS:HTTP_Conflict",
+      "surface": "Rest",
+      "class": "ErewhonRestService",
+      "constant": "HTTP_Conflict",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:STATUS:HTTP_Created",
+      "surface": "Rest",
+      "class": "ErewhonRestService",
+      "constant": "HTTP_Created",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:STATUS:HTTP_Forbidden",
+      "surface": "Rest",
+      "class": "ErewhonRestService",
+      "constant": "HTTP_Forbidden",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Rest:STATUS:HTTP_Not_Found",
+      "surface": "Rest",
+      "class": "ErewhonRestService",
+      "constant": "HTTP_Not_Found",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:STATUS:HTTP_Server_Error",
+      "surface": "Rest",
+      "class": "ErewhonRestService",
+      "constant": "HTTP_Server_Error",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:STATUS:HTTP_Success",
+      "surface": "Rest",
+      "class": "ErewhonRestService",
+      "constant": "HTTP_Success",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Rest:STATUS:HTTP_Unauthorized",
+      "surface": "Rest",
+      "class": "ErewhonRestService",
+      "constant": "HTTP_Unauthorized",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOAgent.city",
+      "surface": "Soap",
+      "class": "DTOAgent",
+      "property": "city",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOAgent.country",
+      "surface": "Soap",
+      "class": "DTOAgent",
+      "property": "country",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOAgent.email",
+      "surface": "Soap",
+      "class": "DTOAgent",
+      "property": "email",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOAgent.fax",
+      "surface": "Soap",
+      "class": "DTOAgent",
+      "property": "fax",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOAgent.name",
+      "surface": "Soap",
+      "class": "DTOAgent",
+      "property": "name",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOAgent.phone",
+      "surface": "Soap",
+      "class": "DTOAgent",
+      "property": "phone",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOAgent.street",
+      "surface": "Soap",
+      "class": "DTOAgent",
+      "property": "street",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOAgent.website",
+      "surface": "Soap",
+      "class": "DTOAgent",
+      "property": "website",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOClient.city",
+      "surface": "Soap",
+      "class": "DTOClient",
+      "property": "city",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOClient.country",
+      "surface": "Soap",
+      "class": "DTOClient",
+      "property": "country",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOClient.email",
+      "surface": "Soap",
+      "class": "DTOClient",
+      "property": "email",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOClient.fax",
+      "surface": "Soap",
+      "class": "DTOClient",
+      "property": "fax",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOClient.name",
+      "surface": "Soap",
+      "class": "DTOClient",
+      "property": "name",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOClient.phone",
+      "surface": "Soap",
+      "class": "DTOClient",
+      "property": "phone",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOClient.street",
+      "surface": "Soap",
+      "class": "DTOClient",
+      "property": "street",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOClient.website",
+      "surface": "Soap",
+      "class": "DTOClient",
+      "property": "website",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOCompany.city",
+      "surface": "Soap",
+      "class": "DTOCompany",
+      "property": "city",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOCompany.country",
+      "surface": "Soap",
+      "class": "DTOCompany",
+      "property": "country",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOCompany.email",
+      "surface": "Soap",
+      "class": "DTOCompany",
+      "property": "email",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOCompany.fax",
+      "surface": "Soap",
+      "class": "DTOCompany",
+      "property": "fax",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOCompany.name",
+      "surface": "Soap",
+      "class": "DTOCompany",
+      "property": "name",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOCompany.phone",
+      "surface": "Soap",
+      "class": "DTOCompany",
+      "property": "phone",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOCompany.street",
+      "surface": "Soap",
+      "class": "DTOCompany",
+      "property": "street",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOCompany.website",
+      "surface": "Soap",
+      "class": "DTOCompany",
+      "property": "website",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOError.allErrors",
+      "surface": "Soap",
+      "class": "DTOError",
+      "property": "allErrors",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOError.statusCode",
+      "surface": "Soap",
+      "class": "DTOError",
+      "property": "statusCode",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOItem.agent",
+      "surface": "Soap",
+      "class": "DTOItem",
+      "property": "agent",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOItem.categoryPrefix",
+      "surface": "Soap",
+      "class": "DTOItem",
+      "property": "categoryPrefix",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOItem.description",
+      "surface": "Soap",
+      "class": "DTOItem",
+      "property": "description",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOItem.itemCategory",
+      "surface": "Soap",
+      "class": "DTOItem",
+      "property": "itemCategory",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOItem.listedDate",
+      "surface": "Soap",
+      "class": "DTOItem",
+      "property": "listedDate",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOItem.name",
+      "surface": "Soap",
+      "class": "DTOItem",
+      "property": "name",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOItem.number",
+      "surface": "Soap",
+      "class": "DTOItem",
+      "property": "number",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOItem.photo",
+      "surface": "Soap",
+      "class": "DTOItem",
+      "property": "photo",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOItem.price",
+      "surface": "Soap",
+      "class": "DTOItem",
+      "property": "price",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOItem.region",
+      "surface": "Soap",
+      "class": "DTOItem",
+      "property": "region",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOItem.sale",
+      "surface": "Soap",
+      "class": "DTOItem",
+      "property": "sale",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailItem.agent",
+      "surface": "Soap",
+      "class": "DTORetailItem",
+      "property": "agent",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailItem.categoryPrefix",
+      "surface": "Soap",
+      "class": "DTORetailItem",
+      "property": "categoryPrefix",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailItem.description",
+      "surface": "Soap",
+      "class": "DTORetailItem",
+      "property": "description",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailItem.itemCategory",
+      "surface": "Soap",
+      "class": "DTORetailItem",
+      "property": "itemCategory",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailItem.listedDate",
+      "surface": "Soap",
+      "class": "DTORetailItem",
+      "property": "listedDate",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailItem.name",
+      "surface": "Soap",
+      "class": "DTORetailItem",
+      "property": "name",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailItem.number",
+      "surface": "Soap",
+      "class": "DTORetailItem",
+      "property": "number",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailItem.photo",
+      "surface": "Soap",
+      "class": "DTORetailItem",
+      "property": "photo",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailItem.price",
+      "surface": "Soap",
+      "class": "DTORetailItem",
+      "property": "price",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailItem.region",
+      "surface": "Soap",
+      "class": "DTORetailItem",
+      "property": "region",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailItem.sale",
+      "surface": "Soap",
+      "class": "DTORetailItem",
+      "property": "sale",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderItem.agent",
+      "surface": "Soap",
+      "class": "DTOTenderItem",
+      "property": "agent",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderItem.categoryPrefix",
+      "surface": "Soap",
+      "class": "DTOTenderItem",
+      "property": "categoryPrefix",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderItem.description",
+      "surface": "Soap",
+      "class": "DTOTenderItem",
+      "property": "description",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderItem.itemCategory",
+      "surface": "Soap",
+      "class": "DTOTenderItem",
+      "property": "itemCategory",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderItem.listedDate",
+      "surface": "Soap",
+      "class": "DTOTenderItem",
+      "property": "listedDate",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderItem.name",
+      "surface": "Soap",
+      "class": "DTOTenderItem",
+      "property": "name",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderItem.number",
+      "surface": "Soap",
+      "class": "DTOTenderItem",
+      "property": "number",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderItem.photo",
+      "surface": "Soap",
+      "class": "DTOTenderItem",
+      "property": "photo",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderItem.price",
+      "surface": "Soap",
+      "class": "DTOTenderItem",
+      "property": "price",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderItem.region",
+      "surface": "Soap",
+      "class": "DTOTenderItem",
+      "property": "region",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderItem.sale",
+      "surface": "Soap",
+      "class": "DTOTenderItem",
+      "property": "sale",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderItem.closureDate",
+      "surface": "Soap",
+      "class": "DTOTenderItem",
+      "property": "closureDate",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOName.name",
+      "surface": "Soap",
+      "class": "DTOName",
+      "property": "name",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOPhoto.photo",
+      "surface": "Soap",
+      "class": "DTOPhoto",
+      "property": "photo",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOResult.allErrors",
+      "surface": "Soap",
+      "class": "DTOResult",
+      "property": "allErrors",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOResult.allWarnings",
+      "surface": "Soap",
+      "class": "DTOResult",
+      "property": "allWarnings",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOResult.statusCode",
+      "surface": "Soap",
+      "class": "DTOResult",
+      "property": "statusCode",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:DTOSale.agentCommission",
+      "surface": "Soap",
+      "class": "DTOSale",
+      "property": "agentCommission",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOSale.client",
+      "surface": "Soap",
+      "class": "DTOSale",
+      "property": "client",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOSale.item",
+      "surface": "Soap",
+      "class": "DTOSale",
+      "property": "item",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailSale.agentCommission",
+      "surface": "Soap",
+      "class": "DTORetailSale",
+      "property": "agentCommission",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailSale.client",
+      "surface": "Soap",
+      "class": "DTORetailSale",
+      "property": "client",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailSale.item",
+      "surface": "Soap",
+      "class": "DTORetailSale",
+      "property": "item",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailSale.timestamp",
+      "surface": "Soap",
+      "class": "DTORetailSale",
+      "property": "timestamp",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderSale.agentCommission",
+      "surface": "Soap",
+      "class": "DTOTenderSale",
+      "property": "agentCommission",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderSale.client",
+      "surface": "Soap",
+      "class": "DTOTenderSale",
+      "property": "client",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderSale.item",
+      "surface": "Soap",
+      "class": "DTOTenderSale",
+      "property": "item",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderSale.offer",
+      "surface": "Soap",
+      "class": "DTOTenderSale",
+      "property": "offer",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderSale.tender",
+      "surface": "Soap",
+      "class": "DTOTenderSale",
+      "property": "tender",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOSaleDetail.agentCommission",
+      "surface": "Soap",
+      "class": "DTOSaleDetail",
+      "property": "agentCommission",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOSaleDetail.client",
+      "surface": "Soap",
+      "class": "DTOSaleDetail",
+      "property": "client",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailSaleDetail.agentCommission",
+      "surface": "Soap",
+      "class": "DTORetailSaleDetail",
+      "property": "agentCommission",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailSaleDetail.client",
+      "surface": "Soap",
+      "class": "DTORetailSaleDetail",
+      "property": "client",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailSaleDetail.price",
+      "surface": "Soap",
+      "class": "DTORetailSaleDetail",
+      "property": "price",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTORetailSaleDetail.soldDate",
+      "surface": "Soap",
+      "class": "DTORetailSaleDetail",
+      "property": "soldDate",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderSaleDetail.agentCommission",
+      "surface": "Soap",
+      "class": "DTOTenderSaleDetail",
+      "property": "agentCommission",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderSaleDetail.client",
+      "surface": "Soap",
+      "class": "DTOTenderSaleDetail",
+      "property": "client",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderSaleDetail.offer",
+      "surface": "Soap",
+      "class": "DTOTenderSaleDetail",
+      "property": "offer",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTenderSaleDetail.tenderDate",
+      "surface": "Soap",
+      "class": "DTOTenderSaleDetail",
+      "property": "tenderDate",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTender.client",
+      "surface": "Soap",
+      "class": "DTOTender",
+      "property": "client",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTender.offer",
+      "surface": "Soap",
+      "class": "DTOTender",
+      "property": "offer",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTender.tenderItem",
+      "surface": "Soap",
+      "class": "DTOTender",
+      "property": "tenderItem",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:DTOTender.timestamp",
+      "surface": "Soap",
+      "class": "DTOTender",
+      "property": "timestamp",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:STATUS:Error_Bad_Request",
+      "surface": "Soap",
+      "class": "ErewhonWebService",
+      "constant": "Error_Bad_Request",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:STATUS:Error_Conflict",
+      "surface": "Soap",
+      "class": "ErewhonWebService",
+      "constant": "Error_Conflict",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:STATUS:Error_Forbidden",
+      "surface": "Soap",
+      "class": "ErewhonWebService",
+      "constant": "Error_Forbidden",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:STATUS:Error_Not_Found",
+      "surface": "Soap",
+      "class": "ErewhonWebService",
+      "constant": "Error_Not_Found",
+      "result": "pass"
+    },
+    {
+      "itemId": "CONF:Soap:STATUS:Error_Server_Error",
+      "surface": "Soap",
+      "class": "ErewhonWebService",
+      "constant": "Error_Server_Error",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:STATUS:Error_Unauthorized",
+      "surface": "Soap",
+      "class": "ErewhonWebService",
+      "constant": "Error_Unauthorized",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:STATUS:Status_Created",
+      "surface": "Soap",
+      "class": "ErewhonWebService",
+      "constant": "Status_Created",
+      "result": "unreachable-in-source"
+    },
+    {
+      "itemId": "CONF:Soap:STATUS:Status_Success",
+      "surface": "Soap",
+      "class": "ErewhonWebService",
+      "constant": "Status_Success",
+      "result": "pass"
+    }
+  ],
+  "seedAssertions": [
+    {
+      "assertionId": "pauline-wild-website",
+      "itemId": "CONF:SEED:pauline-wild-website",
+      "expected": "\"\"",
+      "observed": "\"\"",
+      "result": "pass"
+    },
+    {
+      "assertionId": "brian-olsen-email",
+      "itemId": "CONF:SEED:brian-olsen-email",
+      "expected": "\"bo@wol.com\"",
+      "observed": "\"bo@wol.com\"",
+      "result": "pass"
+    }
+  ]
+}
