@@ -35,9 +35,16 @@ namespace Erewhon.Harness.Baseline;
 /// <para>Directory handles of this kind are a Linux facility, so every write and delete throws
 /// <see cref="PlatformNotSupportedException"/> on any other operating system, and on a processor architecture
 /// whose Linux open flags this store does not know. Reads use ordinary paths and run on every platform.</para>
-/// <para>Files are written straight to their final path with one fixed JSON format and no timestamp, so a
-/// re-capture of an unchanged stand-in reproduces every file byte for byte (the manifest's
-/// <c>captureCommit</c> aside) and no temporary file is ever left in the tree.</para>
+/// <para>Files are written with one fixed JSON format and no timestamp, so a re-capture of an unchanged
+/// stand-in reproduces every file byte for byte (the manifest's <c>captureCommit</c> aside). Every file but
+/// the manifest is written straight to its final path. The manifest is the capture's completion record, so
+/// capture publishes it last, and atomically: its bytes go to the fixed temporary file
+/// <c>baseline/.manifest.json.tmp</c>, created as every other file is, which is then renamed onto
+/// <c>manifest.json</c> inside the same directory handle. The manifest is therefore either the previous
+/// complete file or the new complete one, never a part of either. A publication that fails or is cancelled
+/// removes its temporary file; one a crash interrupts leaves at most that one file, which the next
+/// publication replaces and <see cref="DeleteManifest"/> removes. No other temporary file is ever left in
+/// the tree.</para>
 /// <para>Reads verify what they return: every record must sit at the path its own members name, and its
 /// body must match its <c>bodySha256</c>, so replay never compares against a damaged baseline. Each body is
 /// read once: <see cref="ReadEntries"/> returns the verified bytes with their record, and
@@ -59,6 +66,10 @@ public sealed class BaselineStore
     private const string SoapCasePrefix = "SOAP-";
     private const int MinPosition = 1;
     private const int MaxPosition = 999;
+
+    // The one temporary file the manifest is published through, beside it in baseline/. Its name is fixed,
+    // so an interrupted publication leaves at most this file, which the next one replaces.
+    private const string ManifestTemporaryFileName = ".manifest.json.tmp";
 
     // FileSystemInfo.Attributes reports a path that does not exist as -1.
     private const FileAttributes MissingEntryAttributes = (FileAttributes)(-1);
@@ -434,37 +445,54 @@ public sealed class BaselineStore
         return (recordPath, bodyPath);
     }
 
-    /// <summary>Writes <c>baseline/manifest.json</c>.</summary>
+    /// <summary>
+    /// Publishes <c>baseline/manifest.json</c> atomically: the bytes are written to the fixed temporary file
+    /// <c>baseline/.manifest.json.tmp</c>, which then replaces the manifest in one rename, so the manifest is
+    /// either the previous complete file or this one. Capture publishes it last, as its completion record.
+    /// </summary>
+    /// <remarks>
+    /// A stale temporary file is replaced. A link at either name refuses the write and is left in place; a hard
+    /// link at the manifest is replaced, so its other name keeps its content. A write that fails removes its
+    /// temporary file and leaves the manifest as it was.
+    /// </remarks>
     /// <param name="manifest">The manifest.</param>
     /// <exception cref="InvalidOperationException">
-    /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
-    /// symbolic link or reparse point.
+    /// The path resolves outside <c>baseline/</c>, or it, its temporary file or a directory on it at or below
+    /// <c>baseline/</c> is a symbolic link or reparse point.
     /// </exception>
     /// <exception cref="PlatformNotSupportedException">
     /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown to this store.
     /// </exception>
-    /// <exception cref="IOException">The file cannot be written.</exception>
+    /// <exception cref="IOException">The file cannot be written or renamed into place.</exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
     /// </exception>
     public void WriteManifest(BaselineManifest manifest)
     {
         ArgumentNullException.ThrowIfNull(manifest);
-        WriteFile(options.ManifestPath, SerializeDocument(manifest));
+        PublishManifest(SerializeDocument(manifest));
     }
 
-    /// <summary>Writes <c>baseline/manifest.json</c> without blocking, as <see cref="WriteManifest"/> does.</summary>
+    /// <summary>
+    /// Publishes <c>baseline/manifest.json</c> atomically without blocking, as <see cref="WriteManifest"/> does:
+    /// through the fixed temporary file <c>baseline/.manifest.json.tmp</c> and one rename.
+    /// </summary>
+    /// <remarks>
+    /// The token is observed before the temporary file is created, passed to its write and observed again
+    /// before the rename, so a cancelled write never publishes: it removes its temporary file and leaves the
+    /// manifest as it was. No synchronous disk flush is made; the rename alone makes the publication atomic.
+    /// </remarks>
     /// <param name="manifest">The manifest.</param>
     /// <param name="cancellationToken">Cancels the write.</param>
-    /// <returns>A task that completes when the file is written.</returns>
+    /// <returns>A task that completes when the manifest is published.</returns>
     /// <exception cref="InvalidOperationException">
-    /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
-    /// symbolic link or reparse point.
+    /// The path resolves outside <c>baseline/</c>, or it, its temporary file or a directory on it at or below
+    /// <c>baseline/</c> is a symbolic link or reparse point.
     /// </exception>
     /// <exception cref="PlatformNotSupportedException">
     /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown to this store.
     /// </exception>
-    /// <exception cref="IOException">The file cannot be written.</exception>
+    /// <exception cref="IOException">The file cannot be written or renamed into place.</exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
     /// </exception>
@@ -472,7 +500,7 @@ public sealed class BaselineStore
     public Task WriteManifestAsync(BaselineManifest manifest, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(manifest);
-        return WriteFileAsync(options.ManifestPath, SerializeDocument(manifest), cancellationToken);
+        return PublishManifestAsync(SerializeDocument(manifest), cancellationToken);
     }
 
     /// <summary>Writes <c>baseline/normalisation-rules.json</c> from a document the caller produced.</summary>
@@ -637,6 +665,52 @@ public sealed class BaselineStore
         {
             DeleteFile(directory, path.Segments[^1], path.FullPath);
         }
+    }
+
+    /// <summary>
+    /// Deletes <c>baseline/manifest.json</c> when present, together with the temporary file
+    /// <c>baseline/.manifest.json.tmp</c> an interrupted publication left, so a capture withdraws the old
+    /// completion record before it clears or rewrites any other baseline file, and a capture that does not
+    /// finish leaves no manifest beside a partial baseline.
+    /// </summary>
+    /// <remarks>
+    /// Both names are checked before the first delete, so a refusal deletes neither. A missing directory or
+    /// file is nothing to delete, and nothing is created.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">
+    /// The path resolves outside <c>baseline/</c>, or the manifest, its temporary file or a directory on the
+    /// way at or below <c>baseline/</c> is a symbolic link or reparse point.
+    /// </exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown to this store.
+    /// </exception>
+    /// <exception cref="IOException">
+    /// A file cannot be deleted, or a component on the way is not a directory.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
+    public void DeleteManifest()
+    {
+        var (flags, target, temporary) = ManifestPaths();
+
+        // Nothing is created: a missing directory on the way holds no manifest to delete.
+        using var directory = OpenDirectory(target, target.Segments.Length - 1, create: false, flags);
+        if (directory is null)
+        {
+            return;
+        }
+
+        foreach (var entry in (BaselinePath[])[target, temporary])
+        {
+            if (IsLink(directory, entry.Segments[^1], entry.FullPath))
+            {
+                throw LinkRefusal(entry.FullPath, entry.FullPath);
+            }
+        }
+
+        DeleteFile(directory, target.Segments[^1], target.FullPath);
+        DeleteFile(directory, temporary.Segments[^1], temporary.FullPath);
     }
 
 
@@ -1241,8 +1315,15 @@ public sealed class BaselineStore
     {
         var flags = RequireLinuxTraversal();
         var target = ResolveWritePath(path);
-        var name = target.Segments[^1];
         using var directory = OpenDirectory(target, target.Segments.Length - 1, create: true, flags)!;
+        return CreateReplacementFile(directory, target, flags);
+    }
+
+    // CreateReplacementFile for the final name of target inside the directory handle that holds it, which the
+    // caller keeps open.
+    private SafeFileHandle CreateReplacementFile(DirectoryHandle directory, BaselinePath target, TraversalFlags flags)
+    {
+        var name = target.Segments[^1];
         if (IsLink(directory, name, target.FullPath))
         {
             throw LinkRefusal(target.FullPath, target.FullPath);
@@ -1270,6 +1351,105 @@ public sealed class BaselineStore
         }
 
         return new SafeFileHandle(descriptor, ownsHandle: true);
+    }
+
+    // The manifest and its fixed temporary file, which sit in the same directory, with this process's open flags.
+    private (TraversalFlags Flags, BaselinePath Target, BaselinePath Temporary) ManifestPaths()
+    {
+        var flags = RequireLinuxTraversal();
+        var target = ResolveWritePath(options.ManifestPath);
+        var temporary = ResolveWritePath(
+            Path.Join(Path.GetDirectoryName(target.FullPath), ManifestTemporaryFileName));
+        return (flags, target, temporary);
+    }
+
+    // Writes the manifest's bytes to its temporary file, created as CreateReplacementFile creates every file,
+    // and renames that complete file onto the manifest inside the same directory handle. Whatever ends the
+    // publication early, the temporary file this call created is removed, and the manifest is left as it was.
+    private void PublishManifest(ReadOnlySpan<byte> bytes)
+    {
+        var (flags, target, temporary) = ManifestPaths();
+        using var directory = OpenDirectory(target, target.Segments.Length - 1, create: true, flags)!;
+        var created = false;
+        var published = false;
+        try
+        {
+            using (var handle = CreateReplacementFile(directory, temporary, flags))
+            {
+                created = true;
+                RandomAccess.Write(handle, bytes, fileOffset: 0);
+            }
+
+            RenameOntoManifest(directory, temporary, target);
+            published = true;
+        }
+        finally
+        {
+            if (created && !published)
+            {
+                DiscardTemporary(directory, temporary.Segments[^1]);
+            }
+        }
+    }
+
+    // PublishManifest without blocking. The token is observed before anything is created and again before the
+    // rename, so a cancelled publication leaves the manifest as it was. There is no synchronous disk flush,
+    // which would block this continuation: the rename alone makes the publication atomic.
+    private async Task PublishManifestAsync(ReadOnlyMemory<byte> bytes, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var (flags, target, temporary) = ManifestPaths();
+        using var directory = OpenDirectory(target, target.Segments.Length - 1, create: true, flags)!;
+        var created = false;
+        var published = false;
+        try
+        {
+            using (var handle = CreateReplacementFile(directory, temporary, flags))
+            {
+                created = true;
+                await RandomAccess.WriteAsync(handle, bytes, fileOffset: 0, cancellationToken).ConfigureAwait(false);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            RenameOntoManifest(directory, temporary, target);
+            published = true;
+        }
+        finally
+        {
+            if (created && !published)
+            {
+                DiscardTemporary(directory, temporary.Segments[^1]);
+            }
+        }
+    }
+
+    // Replaces the manifest's entry with the complete temporary file in one renameat inside one directory
+    // handle, so no reader ever sees part of a manifest, and a hard link at the name keeps its other name's
+    // content. A link at the name is refused and left in place, as it is for every other write.
+    private void RenameOntoManifest(DirectoryHandle directory, BaselinePath temporary, BaselinePath target)
+    {
+        var name = target.Segments[^1];
+        if (IsLink(directory, name, target.FullPath))
+        {
+            throw LinkRefusal(target.FullPath, target.FullPath);
+        }
+
+        if (Native.RenameAt(directory, temporary.Segments[^1], directory, name) != 0)
+        {
+            throw Failure(Marshal.GetLastPInvokeError(), "publish", target.FullPath);
+        }
+    }
+
+    // Removes the temporary file of a publication that did not complete. It is best effort and never throws,
+    // so the failure that ended the publication is the one reported; a file it cannot remove is replaced by
+    // the next publication. A link found at the name instead is left in place, as every link is.
+    private static void DiscardTemporary(DirectoryHandle directory, string name)
+    {
+        byte firstTargetByte = 0;
+        if (Native.ReadLinkAt(directory, name, ref firstTargetByte, size: 1) < 0)
+        {
+            _ = Native.UnlinkAt(directory, name, flags: 0);
+        }
     }
 
     // Deletes the entry name inside a directory handle: a link there is refused, a missing entry is nothing to
@@ -1611,6 +1791,13 @@ public sealed class BaselineStore
         [DllImport("libc", EntryPoint = "unlinkat", SetLastError = true)]
         public static extern int UnlinkAt(
             DirectoryHandle directory, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags);
+
+        [DllImport("libc", EntryPoint = "renameat", SetLastError = true)]
+        public static extern int RenameAt(
+            DirectoryHandle oldDirectory,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string oldPath,
+            DirectoryHandle newDirectory,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string newPath);
 
         [DllImport("libc", EntryPoint = "close", SetLastError = true)]
         public static extern int Close(int descriptor);

@@ -11,7 +11,8 @@ namespace Erewhon.Harness.Tests;
 /// <summary>
 /// Baseline persistence against real files: every test owns a fresh temporary repository root, writes and
 /// reads it only through <see cref="BaselineStore"/>, and checks file names, byte-exact and deterministic
-/// output, verified reads, the refusal of inconsistent, malformed and damaged records, and physical
+/// output, verified reads, the refusal of inconsistent, malformed and damaged records, the manifest's
+/// withdrawal and its atomic publication through one fixed temporary file, and physical
 /// containment: no write or delete reaches outside <c>baseline/</c> through a symbolic link, whether the link
 /// sits on <c>baseline/</c> itself, on a directory below it or at the target, dangles, or is swapped in for a
 /// directory while the store works. Links point into a simulated <c>Erewhon/DataFiles</c> inside the
@@ -23,6 +24,7 @@ public sealed class BaselineStoreTests : IDisposable
     private const string PhotoRecordPath = "baseline/records/soap/002-getPhoto-02.json";
     private const string PhotoBodyPath = "baseline/records/soap/002-getPhoto-02.body.bin";
     private const string ManifestFile = "baseline/manifest.json";
+    private const string ManifestTemporaryFile = "baseline/.manifest.json.tmp";
     private const string RulesFile = "baseline/normalisation-rules.json";
     private const string ConformanceFile = "baseline/conformance.json";
     private const string WsdlFile = "baseline/wsdl/standin-ErewhonWebService.wsdl";
@@ -40,6 +42,9 @@ public sealed class BaselineStoreTests : IDisposable
 
     // Rounds of every write and delete the parent-swap test runs while its directories are swapped.
     private const int SwapIterations = 300;
+
+    // Manifest publications the cancellation-race test cancels while they run.
+    private const int CancellationIterations = 200;
 
     private static readonly string[] DocumentNames =
         ["record", "body-file", "manifest", "normalisation-rules", "conformance", "wsdl"];
@@ -595,6 +600,32 @@ public sealed class BaselineStoreTests : IDisposable
         Assert.True(File.Exists(Full(ManifestFile)));
     }
 
+    [Fact]
+    public async Task DeleteManifest_RemovesTheManifestAndAStaleTemporaryAndIsANoOpWhenAbsent()
+    {
+        _store.DeleteManifest();
+        Assert.Empty(Directory.EnumerateFileSystemEntries(_root));
+
+        Directory.CreateDirectory(Full("baseline"));
+        _store.DeleteManifest();
+        Assert.Empty(Directory.EnumerateFileSystemEntries(Full("baseline")));
+
+        await WriteFixture(_store, useAsync: false);
+        await WriteRaw(ManifestTemporaryFile, "{\"source\":\"jade-"u8.ToArray());
+        var kept = Snapshot(Full("baseline"))
+            .Where(static entry => !entry.StartsWith("manifest.json=", StringComparison.Ordinal)
+                && !entry.StartsWith(".manifest.json.tmp=", StringComparison.Ordinal))
+            .ToList();
+
+        _store.DeleteManifest();
+
+        Assert.Null(ReadManifest());
+        Assert.False(File.Exists(Full(ManifestFile)));
+        Assert.False(File.Exists(Full(ManifestTemporaryFile)));
+        Assert.Equal(6, kept.Count);
+        Assert.Equal(kept, Snapshot(Full("baseline")));
+    }
+
     // ---- Containment through links ------------------------------------------------------------------
 
     [Fact]
@@ -653,6 +684,59 @@ public sealed class BaselineStoreTests : IDisposable
 
         Assert.Equal(SentinelBytes, await File.ReadAllBytesAsync(target, TestCancellation));
         Assert.Equal(SentinelPath, LinkTargetOf(ManifestFile));
+    }
+
+    // Both names are checked before either is deleted, so a link at one refuses the delete and keeps the other.
+    [Theory]
+    [InlineData(ManifestFile)]
+    [InlineData(ManifestTemporaryFile)]
+    public async Task LinkAtManifestOrItsTemporary_RefusesDeleteAndDeletesNothing(string link)
+    {
+        await WriteFixture(_store, useAsync: false);
+        await WriteRaw(ManifestTemporaryFile, "stale"u8.ToArray());
+        CreateProtectedDirectory();
+        File.Delete(Full(link));
+        File.CreateSymbolicLink(Full(link), Path.Combine(ProtectedDirectory, SentinelName));
+        var before = Snapshot(_root);
+
+        AssertLinkRefusal(Assert.Throws<InvalidOperationException>(() => _store.DeleteManifest()), link);
+
+        Assert.Equal(before, Snapshot(_root));
+        Assert.Equal(SentinelPath, LinkTargetOf(link));
+    }
+
+    // A link at the temporary name, to a file or dangling, refuses the write before any byte is written; it is
+    // never followed, it is left in place, and the published manifest stays as it was.
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task LinkAtManifestTemporary_RefusesTheWriteAndIsNeverFollowed(bool useAsync, bool dangling)
+    {
+        _store.WriteManifest(Manifest);
+        var previous = await ReadBytes(ManifestFile);
+        CreateProtectedDirectory();
+        var target = Path.Combine(ProtectedDirectory, dangling ? "written-through-link" : SentinelName);
+        File.CreateSymbolicLink(Full(ManifestTemporaryFile), target);
+        var changed = Manifest with { CaptureCommit = "fedcba9876543210fedcba9876543210fedcba98" };
+
+        var refusal = useAsync
+            ? await Assert.ThrowsAsync<InvalidOperationException>(
+                () => _store.WriteManifestAsync(changed, TestCancellation))
+            : Assert.Throws<InvalidOperationException>(() => _store.WriteManifest(changed));
+
+        AssertLinkRefusal(refusal, ManifestTemporaryFile);
+        Assert.Equal(Relative(target), LinkTargetOf(ManifestTemporaryFile));
+        Assert.Equal(previous, await ReadBytes(ManifestFile));
+        if (dangling)
+        {
+            Assert.False(File.Exists(target));
+        }
+        else
+        {
+            Assert.Equal(SentinelBytes, await File.ReadAllBytesAsync(target, TestCancellation));
+        }
     }
 
     [Fact]
@@ -752,6 +836,96 @@ public sealed class BaselineStoreTests : IDisposable
 
         Assert.Equal(BaselineStore.SerializeDocument(Manifest), await ReadBytes(ManifestFile));
         Assert.Equal(before, await File.ReadAllBytesAsync(target, TestCancellation));
+    }
+
+    // ---- Atomic manifest publication ----------------------------------------------------------------
+
+    // A temporary file a crash left, plain or a hard link to a file elsewhere, is replaced without writing
+    // through it, and publication leaves only the manifest behind.
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public async Task WriteManifest_ReplacesAStaleTemporaryAndLeavesNone(bool useAsync, bool hardLinked)
+    {
+        _store.WriteManifest(Manifest);
+        CreateProtectedDirectory();
+        var protectedFile = Path.Combine(ProtectedDirectory, SentinelName);
+        if (hardLinked)
+        {
+            CreateHardLink(Full(ManifestTemporaryFile), protectedFile);
+        }
+        else
+        {
+            await WriteRaw(ManifestTemporaryFile, "{\"source\":\"jade-"u8.ToArray());
+        }
+
+        var changed = Manifest with { CaptureCommit = "fedcba9876543210fedcba9876543210fedcba98" };
+        if (useAsync)
+        {
+            await _store.WriteManifestAsync(changed, TestCancellation);
+        }
+        else
+        {
+            _store.WriteManifest(changed);
+        }
+
+        Assert.Equal(BaselineStore.SerializeDocument(changed), await ReadBytes(ManifestFile));
+        Assert.Equal(
+            [ManifestFile], Directory.EnumerateFileSystemEntries(Full("baseline"), "*", SearchOption.AllDirectories).Select(Relative));
+        Assert.Equal(SentinelBytes, await File.ReadAllBytesAsync(protectedFile, TestCancellation));
+    }
+
+    // A rename that fails after the bytes were written (here onto a directory at the manifest's name) removes
+    // the temporary file and leaves the entry at the manifest's name as it was.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task FailedRename_RemovesTheTemporaryAndLeavesTheManifestEntryAsItWas(bool useAsync)
+    {
+        await WriteRaw(ManifestFile + "/kept.json", "{}"u8.ToArray());
+        var before = Snapshot(Full("baseline"));
+
+        var failure = useAsync
+            ? await Assert.ThrowsAsync<IOException>(() => _store.WriteManifestAsync(Manifest, TestCancellation))
+            : Assert.Throws<IOException>(() => _store.WriteManifest(Manifest));
+
+        Assert.StartsWith($"BaselineStore could not publish '{ManifestFile}'", failure.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(Full(ManifestTemporaryFile)));
+        Assert.Equal(before, Snapshot(Full("baseline")));
+    }
+
+    // A publication cancelled while it runs either completes or leaves the previous manifest, never part of
+    // one, and never leaves its temporary file. Where each cancellation lands depends on timing, so only
+    // that is asserted, in every round.
+    [Fact]
+    public async Task CancelledManifestPublication_LeavesThePreviousOrTheNewManifestAndNoTemporary()
+    {
+        var previous = BaselineStore.SerializeDocument(Manifest);
+        var changed = Manifest with { CaptureCommit = "fedcba9876543210fedcba9876543210fedcba98" };
+        var published = BaselineStore.SerializeDocument(changed);
+
+        for (var iteration = 0; iteration < CancellationIterations; iteration++)
+        {
+            _store.WriteManifest(Manifest);
+            using var cancellation = new CancellationTokenSource();
+            var cancel = Task.Run(cancellation.Cancel, TestCancellation);
+            var outcome = await Outcome(() => _store.WriteManifestAsync(changed, cancellation.Token));
+            await cancel;
+
+            if (outcome is null)
+            {
+                Assert.Equal(published, await ReadBytes(ManifestFile));
+            }
+            else
+            {
+                Assert.IsAssignableFrom<OperationCanceledException>(outcome);
+                Assert.Equal(previous, await ReadBytes(ManifestFile));
+            }
+
+            Assert.False(File.Exists(Full(ManifestTemporaryFile)));
+        }
     }
 
     // A directory swapped for a link while the store works must never redirect it. A background thread keeps

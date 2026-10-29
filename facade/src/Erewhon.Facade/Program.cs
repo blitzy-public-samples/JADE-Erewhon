@@ -116,14 +116,25 @@ try
     builder.Services.AddSingleton<SoapOperationResolver>();
 
     // A routing table that leaves a catalogue operation without a usable target, or lists a key that is
-    // not a catalogue operation, stops start-up with one message per bad entry.
+    // not a catalogue operation, stops start-up with one message per bad entry. The binder would silently
+    // ignore a misspelled key and drop a target whose TimeoutSeconds is not an integer, so the raw section
+    // is checked first, by path, in a configure step that runs before Bind each time the options are built
+    // (start-up and every reload). Strict binding stays as a safety net, and Bind also registers the
+    // change-token source that propagates reloads.
+    var routingSection = builder.Configuration.GetSection(RoutingOptions.SectionName);
     builder.Services.AddOptions<RoutingOptions>()
-        .Bind(builder.Configuration.GetSection(RoutingOptions.SectionName))
+        .Configure(_ => RoutingOptionsValidator.ThrowIfConfigurationInvalid(Options.DefaultName, routingSection))
+        .Bind(routingSection, binder => binder.ErrorOnUnknownConfiguration = true)
         .ValidateOnStart();
     builder.Services.AddSingleton<IValidateOptions<RoutingOptions>, RoutingOptionsValidator>();
 
     builder.Services.AddHttpForwarder();
     builder.Services.AddSingleton<OperationRouter>();
+
+    // Publishes the routing table of the validated start-up options before the listeners start, so a
+    // reload rejected before the first request still leaves that table in service.
+    builder.Services.AddHostedService<OperationRouterStartup>();
+
     builder.Services.AddSingleton<PassThroughTransformer>();
     builder.Services.AddSingleton<SoapFaultWriter>();
     builder.Services.AddSingleton<BackendForwarder>();

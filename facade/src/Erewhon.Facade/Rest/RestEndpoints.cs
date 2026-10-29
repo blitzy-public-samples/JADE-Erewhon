@@ -2,7 +2,6 @@ using Erewhon.Contracts.Catalogue;
 using Erewhon.Contracts.Hosting;
 using Erewhon.Contracts.Matching;
 using Erewhon.Facade.Forwarding;
-using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Mvc;
 
 namespace Erewhon.Facade.Rest;
@@ -21,6 +20,14 @@ namespace Erewhon.Facade.Rest;
 /// <para>
 /// Every endpoint carries <see cref="ListenerKind.Rest"/>, because <see cref="ListenerPortMatcherPolicy"/>
 /// dispatches by the socket a request arrived on and drops endpoints without listener metadata.
+/// </para>
+/// <para>
+/// Which operation a request is, and therefore which target serves it, is decided only by the shared
+/// <see cref="RestOperationMatcher"/> over the verb and the raw path, exactly as the stand-in and the
+/// harness decide it, whichever endpoint ASP.NET Core routing selected. Routing matches templates
+/// decoded, ignoring case and tolerating a trailing slash, so <c>/COMPANY</c>, <c>/%63ompany</c> and
+/// <c>/company/</c> select the <c>getCompany</c> endpoint but are not that operation for the matcher;
+/// they go to <c>Routing:DefaultTarget</c> like <c>/COMPANY.json</c>.
 /// </para>
 /// </remarks>
 public static class RestEndpoints
@@ -62,8 +69,14 @@ public static class RestEndpoints
     /// The catch-all accepts every method and has the highest order, so the operation endpoints always
     /// win on the REST socket. It receives the relay form <c>/&lt;alias&gt;/jadehttp.dll/&lt;path&gt;</c>,
     /// unknown paths, wrong verbs, <c>HEAD</c> and <c>OPTIONS</c>, and suffixed forms such as
-    /// <c>/company.json</c>. A suffixed form of a catalogue operation goes to that operation's target;
-    /// anything else goes to <c>Routing:DefaultTarget</c>.
+    /// <c>/company.json</c>.
+    /// </para>
+    /// <para>
+    /// Every endpoint, operation and catch-all alike, resolves the operation through
+    /// <see cref="RestOperationMatcher"/> from the verb and the raw path. A match, a suffixed form
+    /// included, goes to that operation's target; anything else goes to <c>Routing:DefaultTarget</c>,
+    /// also when routing selected an operation endpoint for a case variant, an escaped literal, a dot
+    /// segment or a trailing slash of its template.
     /// </para>
     /// <para>
     /// The services <see cref="BackendForwarder"/> and <see cref="RestOperationMatcher"/> are resolved per
@@ -85,14 +98,16 @@ public static class RestEndpoints
             var rest = operation.Rest
                 ?? throw new InvalidOperationException($"Catalogue REST operation {operation.Id} has no REST binding.");
 
-            // [FromServices] keeps the request delegate factory from ever inferring the forwarder as a
-            // JSON body on the POST operations; the body stream must stay unread for the forwarder.
+            // The endpoint supplies the route, name and listener that OpenAPI describes; the operation
+            // forwarded is the matcher's, as on the catch-all. [FromServices] keeps the request delegate
+            // factory from ever inferring a service as a JSON body on the POST operations; the body
+            // stream must stay unread for the forwarder.
             endpoints
                 .MapMethods(
                     rest.PathTemplate,
                     [rest.Verb],
-                    ([FromServices] BackendForwarder forwarder, HttpContext context) =>
-                        forwarder.ForwardAsync(context, Surface.Rest, operation))
+                    ([FromServices] RestOperationMatcher matcher, [FromServices] BackendForwarder forwarder, HttpContext context) =>
+                        ForwardMatchedAsync(context, matcher, forwarder))
                 .WithName(operation.JadeMethod)
                 .RequireListener(ListenerKind.Rest);
         }
@@ -102,7 +117,7 @@ public static class RestEndpoints
             .Map(
                 CatchAllPattern,
                 ([FromServices] RestOperationMatcher matcher, [FromServices] BackendForwarder forwarder, HttpContext context) =>
-                    ForwardUnmatchedAsync(context, matcher, forwarder))
+                    ForwardMatchedAsync(context, matcher, forwarder))
             .WithOrder(int.MaxValue)
             .ExcludeFromDescription()
             .RequireListener(ListenerKind.Rest);
@@ -111,34 +126,51 @@ public static class RestEndpoints
     }
 
     /// <summary>
-    /// Returns the request path exactly as the caller sent it, still percent-encoded and without the query.
+    /// Returns the request path exactly as the caller sent it, still percent-encoded and without the
+    /// query, or null when the request target has no path.
     /// </summary>
     /// <remarks>
-    /// The origin-form request target is used as sent, so <c>/agent/Hank%20Williams</c> is never decoded
-    /// or re-encoded. For an absolute-form or asterisk-form target, or when the server exposes no request
-    /// feature, the escaped <c>PathBase + Path</c> is returned instead; such a target matches no catalogue
-    /// operation, and the forwarder sends the original target either way.
+    /// <para>
+    /// The path comes from the origin form of the raw request target
+    /// (<see cref="PassThroughTransformer.TryGetOriginForm"/>), the same target the forwarder sends: an
+    /// origin-form target as sent, so <c>/agent/Hank%20Williams</c> is never decoded or re-encoded, or
+    /// the path after the authority of an absolute-form target, the empty path read as <c>/</c>. An
+    /// asterisk-form or any other target has no path and is no catalogue operation.
+    /// </para>
+    /// <para>
+    /// When the server exposes no raw request target, the escaped <c>PathBase + Path</c> is returned
+    /// instead. That reconstructed path is matched like a raw one, so <c>/company</c> is still
+    /// <c>getCompany</c>; only a path that matches no operation goes to <c>Routing:DefaultTarget</c>.
+    /// </para>
     /// </remarks>
     /// <param name="context">The incoming request.</param>
-    /// <returns>The raw path, starting with <c>/</c>.</returns>
-    internal static string GetRawPath(HttpContext context)
+    /// <returns>The raw path, starting with <c>/</c>; null for a target without a path.</returns>
+    internal static string? GetRawPath(HttpContext context)
     {
-        var rawTarget = context.Features.Get<IHttpRequestFeature>()?.RawTarget;
-        if (!string.IsNullOrEmpty(rawTarget) && rawTarget[0] == '/')
+        var rawTarget = PassThroughTransformer.GetRawTarget(context);
+        if (string.IsNullOrEmpty(rawTarget))
         {
-            var queryStart = rawTarget.IndexOf('?', StringComparison.Ordinal);
-            return queryStart < 0 ? rawTarget : rawTarget[..queryStart];
+            return (context.Request.PathBase + context.Request.Path).ToUriComponent();
         }
 
-        return (context.Request.PathBase + context.Request.Path).ToUriComponent();
+        if (!PassThroughTransformer.TryGetOriginForm(rawTarget, out var originForm))
+        {
+            return null;
+        }
+
+        var queryStart = originForm.IndexOf('?', StringComparison.Ordinal);
+        return queryStart < 0 ? originForm : originForm[..queryStart];
     }
 
-    // Unmatched requests go through the shared matcher so that a suffixed form of a catalogue operation
-    // follows that operation's routing entry; the forwarder owns every error and every response.
-    private static Task ForwardUnmatchedAsync(HttpContext context, RestOperationMatcher matcher, BackendForwarder forwarder)
+    // Every REST endpoint resolves the operation through the shared matcher, so a request is the same
+    // operation here as in the stand-in and the harness, and a suffixed form of a catalogue operation
+    // follows that operation's routing entry. The forwarder owns every error and every response.
+    private static Task ForwardMatchedAsync(HttpContext context, RestOperationMatcher matcher, BackendForwarder forwarder)
     {
         var rawPath = GetRawPath(context);
-        var operation = matcher.TryMatch(context.Request.Method, rawPath, out var match) ? match.Operation : null;
+        var operation = rawPath is not null && matcher.TryMatch(context.Request.Method, rawPath, out var match)
+            ? match.Operation
+            : null;
         return forwarder.ForwardAsync(context, Surface.Rest, operation);
     }
 }

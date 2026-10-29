@@ -49,12 +49,17 @@ public sealed class RoutingOptions
     /// <summary>
     /// <c>Routing:Targets:&lt;name&gt;</c> (env <c>Routing__Targets__&lt;name&gt;__&lt;property&gt;</c>):
     /// the forwarding targets by name. Starts empty; names are matched case-insensitively. A target
-    /// section with no values binds to a null entry, which <see cref="TryGetTarget"/> treats as not
-    /// found.
+    /// section with no values, only empty values, or an empty value in place of the section (such as
+    /// <c>Routing__Targets__&lt;name&gt;=</c>) binds to a <see cref="RoutingTarget"/> with no base URL and
+    /// no timeout, which <c>RoutingOptionsValidator</c> reports as empty. A key that is not a
+    /// <see cref="RoutingTarget"/> property, and a <c>TimeoutSeconds</c> that is not an integer, are
+    /// rejected before binding, so neither is ignored and neither drops its target.
     /// </summary>
     /// <remarks>
     /// A concrete <see cref="Dictionary{TKey, TValue}"/>, so the configuration binder fills this
-    /// instance and keeps its <see cref="StringComparer.OrdinalIgnoreCase"/> comparer.
+    /// instance and keeps its <see cref="StringComparer.OrdinalIgnoreCase"/> comparer. Binding never
+    /// stores a null entry: one can come only from a dictionary built in code, and
+    /// <see cref="TryGetTarget"/> treats it as not found.
     /// </remarks>
     public Dictionary<string, RoutingTarget> Targets { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
@@ -75,9 +80,9 @@ public sealed class RoutingOptions
     /// <param name="target">The target; null when not found.</param>
     /// <returns>
     /// True when a target with a non-null entry is configured under that name. False for a null or
-    /// whitespace name, an undefined name, or a target section that bound to a null entry. When a
-    /// hand-built case-sensitive dictionary holds several spellings of the name, an exact match wins,
-    /// and otherwise the first match in ordinal key order.
+    /// whitespace name, an undefined name, or a null entry, which only a dictionary built in code can
+    /// hold. When a hand-built case-sensitive dictionary holds several spellings of the name, an exact
+    /// match wins, and otherwise the first match in ordinal key order.
     /// </returns>
     public bool TryGetTarget(
         string? name,
@@ -160,7 +165,10 @@ public sealed class RoutingOperations
     /// </summary>
     public Dictionary<string, string> Soap { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>The entries of one surface, keyed as configured; empty when the section bound to null.</summary>
+    /// <summary>
+    /// The entries of one surface, keyed as configured; empty when the dictionary is null, which only
+    /// code can assign.
+    /// </summary>
     /// <param name="surface"><see cref="Surface.Rest"/> or <see cref="Surface.Soap"/>.</param>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="surface"/> is neither value.</exception>
     public IReadOnlyDictionary<string, string> For(Surface surface) =>
@@ -205,7 +213,7 @@ public sealed class RoutingOperations
         return false;
     }
 
-    // The properties are non-nullable, but binding or a test may still assign null.
+    // The properties are non-nullable and binding never sets them to null, but code may still assign null.
     private Dictionary<string, string>? DictionaryFor(Surface surface) => surface switch
     {
         Surface.Rest => Rest,

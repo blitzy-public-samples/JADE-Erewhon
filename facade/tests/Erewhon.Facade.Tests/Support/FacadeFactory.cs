@@ -246,6 +246,68 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
         }
     }
 
+    /// <summary>
+    /// Sends one body-less HTTP/1.1 request whose request line is written byte for byte as given, over a
+    /// new TCP connection to 127.0.0.1:<paramref name="port"/>, and returns the response. It sends what
+    /// <see cref="HttpClient"/> cannot: a method token in any letter case, an absolute-form or asterisk-form
+    /// target, and dot segments or escapes that must stay as written.
+    /// </summary>
+    /// <param name="port">A facade listener port, for example <see cref="RestPort"/>.</param>
+    /// <param name="requestLine">
+    /// The request line without its CRLF, for example <c>get /company HTTP/1.1</c>: printable ASCII and spaces.
+    /// </param>
+    /// <param name="host">The <c>Host</c> header value, for example the authority of <see cref="RestBaseAddress"/>.</param>
+    /// <param name="ct">The test's cancellation token.</param>
+    /// <returns>The response status, content type, headers, body bytes and elapsed time.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="requestLine"/> or <paramref name="host"/> is null.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="requestLine"/> or <paramref name="host"/> is empty or holds a character other than
+    /// printable ASCII and space.
+    /// </exception>
+    /// <remarks>
+    /// The request carries only <c>Host</c> and <c>Connection: close</c>, so the facade closes the
+    /// connection after its response, and the response ends at the end of the stream. The body is
+    /// returned as it arrived, with no transfer coding removed. A connection failure, no response within
+    /// 15 s, or a response without a status line and complete header section fails the test with a fixed
+    /// message. Cancellation of <paramref name="ct"/> propagates as <see cref="OperationCanceledException"/>.
+    /// </remarks>
+    public static async Task<RawResponse> SendRawAsync(int port, string requestLine, string host, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(requestLine);
+        ArgumentNullException.ThrowIfNull(host);
+        if (!IsRawHeadText(requestLine) || !IsRawHeadText(host))
+        {
+            throw new ArgumentException("raw request line and host must be non-empty printable ASCII");
+        }
+
+        byte[] head = Encoding.ASCII.GetBytes(requestLine + "\r\nHost: " + host + "\r\nConnection: close\r\n\r\n");
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(RawClientTimeout);
+
+        byte[] received;
+        var stopwatch = Stopwatch.StartNew();
+        try
+        {
+            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+            await socket.ConnectAsync(new IPEndPoint(IPAddress.Loopback, port), timeout.Token);
+            await using var stream = new NetworkStream(socket, ownsSocket: true);
+            await stream.WriteAsync(head, timeout.Token);
+
+            using var response = new MemoryStream();
+            await stream.CopyToAsync(response, timeout.Token);
+            received = response.ToArray();
+        }
+        catch (Exception exception) when (exception is SocketException or IOException
+            || (exception is OperationCanceledException && !ct.IsCancellationRequested))
+        {
+            Assert.Fail("raw facade request failed at the transport level (" + exception.GetType().Name + ")");
+            throw new UnreachableException();
+        }
+
+        stopwatch.Stop();
+        return ParseRawResponse(received, stopwatch.Elapsed);
+    }
+
     /// <inheritdoc />
     /// <remarks>
     /// Runs the facade as in production, never in the factory's default Development environment, whose
@@ -387,6 +449,55 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
     private static bool IsTransportFailure(Exception exception, CancellationToken ct) =>
         exception is HttpRequestException or IOException
         || (exception is OperationCanceledException && !ct.IsCancellationRequested);
+
+    private static bool IsRawHeadText(string text) =>
+        text.Length > 0 && text.All(c => c is >= ' ' and <= '~');
+
+    // The status line, the header fields and the bytes after the empty line of a response read to the end
+    // of its connection; a repeated header name keeps every value in received order.
+    private static RawResponse ParseRawResponse(byte[] received, TimeSpan elapsed)
+    {
+        int headEnd = received.AsSpan().IndexOf("\r\n\r\n"u8);
+        if (headEnd < 0)
+        {
+            Assert.Fail("raw facade response has no complete header section");
+            throw new UnreachableException();
+        }
+
+        string[] lines = Encoding.Latin1.GetString(received, 0, headEnd).Split("\r\n");
+        string[] statusLine = lines[0].Split(' ', 3);
+        if (statusLine.Length < 2
+            || !statusLine[0].StartsWith("HTTP/", StringComparison.Ordinal)
+            || statusLine[1].Length != 3
+            || !int.TryParse(statusLine[1], NumberStyles.None, CultureInfo.InvariantCulture, out int status))
+        {
+            Assert.Fail("raw facade response has no valid status line");
+            throw new UnreachableException();
+        }
+
+        var headers = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        foreach (string line in lines.Skip(1))
+        {
+            int colon = line.IndexOf(':', StringComparison.Ordinal);
+            if (colon <= 0)
+            {
+                Assert.Fail("raw facade response has a malformed header line");
+                throw new UnreachableException();
+            }
+
+            string name = line[..colon];
+            string value = line[(colon + 1)..].Trim(' ', '\t');
+            headers[name] = headers.TryGetValue(name, out string[]? existing) ? [.. existing, value] : [value];
+        }
+
+        MediaTypeHeaderValue? contentType =
+            headers.TryGetValue("Content-Type", out string[]? contentTypes)
+            && MediaTypeHeaderValue.TryParse(contentTypes[0], out MediaTypeHeaderValue? parsed)
+                ? parsed
+                : null;
+
+        return new RawResponse(status, contentType?.MediaType, contentType?.CharSet, headers, received[(headEnd + 4)..], elapsed);
+    }
 
     // Response and content headers in one case-insensitive map, values as received on the wire (the
     // non-validated view never reformats them); a name present in both keeps both sets of values.

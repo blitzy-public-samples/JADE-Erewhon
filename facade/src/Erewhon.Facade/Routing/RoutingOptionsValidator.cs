@@ -1,3 +1,4 @@
+using System.ComponentModel;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using Erewhon.Contracts.Catalogue;
@@ -27,6 +28,12 @@ namespace Erewhon.Facade.Routing;
 /// <item><description>every target is non-empty and every base URL it carries is an absolute http or https URL with a host and no user information, query or fragment;</description></item>
 /// <item><description>every target timeout is greater than 0.</description></item>
 /// </list>
+/// <para>
+/// These rules see only the bound table, from which the configuration binder has already left out any
+/// key it does not recognise and any target whose <c>TimeoutSeconds</c> it cannot convert. The raw
+/// section is therefore checked first, before binding, by <see cref="ValidateConfiguration"/>; when that
+/// check reports anything, binding and these rules do not run.
+/// </para>
 /// <para>
 /// No message quotes a configured base URL: a rejected one is named by its configuration path and the
 /// rule it breaks, for example <c>Routing:Targets:backend:RestBaseUrl must not contain user information</c>.
@@ -63,7 +70,121 @@ public sealed class RoutingOptionsValidator(OperationCatalogue catalogue) : IVal
         new(Surface.Soap, nameof(RoutingOperations.Soap), "SOAP", nameof(RoutingTarget.SoapBaseUrl), static target => target.SoapBaseUrl),
     ];
 
+    // The keys each section of the raw Routing configuration may hold, as written in messages.
+    private const string RoutingSettings =
+        $"{nameof(RoutingOptions.DefaultTarget)}, {nameof(RoutingOptions.Targets)} or {nameof(RoutingOptions.Operations)}";
+    private const string OperationSections = $"{nameof(RoutingOperations.Rest)} or {nameof(RoutingOperations.Soap)}";
+    private const string TargetSettings =
+        $"{nameof(RoutingTarget.RestBaseUrl)}, {nameof(RoutingTarget.SoapBaseUrl)} or {nameof(RoutingTarget.TimeoutSeconds)}";
+
+    // The converter the configuration binder converts an int? value with once it is not null or empty,
+    // so every value the binder accepts, such as ' 5 ' or '0x10', is accepted here too.
+    private static readonly TypeConverter IntegerConverter = TypeDescriptor.GetConverter(typeof(int));
+
     private readonly OperationCatalogue _catalogue = catalogue ?? throw new ArgumentNullException(nameof(catalogue));
+
+    /// <summary>
+    /// Checks the raw <c>Routing</c> configuration section against the shape <see cref="RoutingOptions"/>
+    /// is bound from, before it is bound. The configuration binder silently ignores a key it does not
+    /// recognise and drops a whole target whose <c>TimeoutSeconds</c> it cannot convert, so without this
+    /// check a misspelled key would leave the table as it was, and a malformed timeout would surface only
+    /// as every entry naming an undefined target.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The recognised shape, with names compared case-insensitively as configuration keys are:
+    /// <c>DefaultTarget</c>, a value; <c>Targets:&lt;name&gt;</c>, a section or an empty value, holding the
+    /// values <c>RestBaseUrl</c>, <c>SoapBaseUrl</c> and <c>TimeoutSeconds</c>; and
+    /// <c>Operations:Rest|Soap:&lt;jadeMethod&gt;</c>, values. Each of these is reported by its
+    /// configuration path, with keys as configured: a key outside that shape, a key under a value, a
+    /// non-empty value where a section belongs, and a non-empty <c>TimeoutSeconds</c> that does not
+    /// convert to an integer. Messages never carry a base URL. A key or <c>TimeoutSeconds</c> value
+    /// holding an at-sign may be part of a URL with user information pasted into the section, so it is
+    /// not shown: such a path is named only by the fixed section it lies in, as
+    /// <see cref="NamesUndefinedTarget"/> withholds a target name.
+    /// </para>
+    /// <para>
+    /// Whether a key names a catalogue operation, a target is defined, a URL is well formed or a timeout
+    /// is greater than 0 is left to <see cref="Validate"/>, which checks the bound table. Messages come
+    /// in ordinal path order, so the same section always gives the same output.
+    /// </para>
+    /// </remarks>
+    /// <param name="section">The <c>Routing</c> configuration section.</param>
+    /// <returns>One message per offending path; empty when the section has the recognised shape.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="section"/> is null.</exception>
+    public static IReadOnlyList<string> ValidateConfiguration(IConfigurationSection section)
+    {
+        ArgumentNullException.ThrowIfNull(section);
+
+        // Each check is given the path of the fixed section the checked key lies in, which names a key
+        // that is not shown.
+        var failures = new List<(string Path, string Message)>();
+        RequireSection(section, section.Path, failures);
+        foreach (var setting in section.GetChildren())
+        {
+            if (IsKey(setting, nameof(RoutingOptions.DefaultTarget)))
+            {
+                RequireValue(setting, section.Path, failures);
+            }
+            else if (IsKey(setting, nameof(RoutingOptions.Targets)))
+            {
+                RequireSection(setting, section.Path, failures);
+                foreach (var target in setting.GetChildren())
+                {
+                    CheckTargetSection(target, setting.Path, failures);
+                }
+            }
+            else if (IsKey(setting, nameof(RoutingOptions.Operations)))
+            {
+                RequireSection(setting, section.Path, failures);
+                foreach (var surfaceSection in setting.GetChildren())
+                {
+                    if (!Surfaces.Any(surface => IsKey(surfaceSection, surface.Section)))
+                    {
+                        RejectUnknown(surfaceSection, OperationSections, setting.Path, failures);
+                        continue;
+                    }
+
+                    RequireSection(surfaceSection, setting.Path, failures);
+                    foreach (var entry in surfaceSection.GetChildren())
+                    {
+                        RequireValue(entry, surfaceSection.Path, failures);
+                    }
+                }
+            }
+            else
+            {
+                RejectUnknown(setting, RoutingSettings, section.Path, failures);
+            }
+        }
+
+        return [.. failures.OrderBy(static failure => failure.Path, StringComparer.Ordinal).Select(static failure => failure.Message)];
+    }
+
+    /// <summary>
+    /// Runs <see cref="ValidateConfiguration"/> and throws when it reports anything. <c>Program.cs</c>
+    /// calls it from a configure step registered before the section is bound, so it runs each time the
+    /// options are built, at start-up and after every configuration reload, and its failures surface
+    /// exactly as those of <see cref="Validate"/> do. Only these failures are then reported: a target
+    /// the binder would have dropped is never also reported as undefined.
+    /// </summary>
+    /// <param name="name">The options instance name the exception reports.</param>
+    /// <param name="section">The <c>Routing</c> configuration section.</param>
+    /// <exception cref="OptionsValidationException">
+    /// The section does not have the recognised shape; <see cref="OptionsValidationException.Failures"/>
+    /// lists every offending path.
+    /// </exception>
+    /// <exception cref="ArgumentNullException"><paramref name="name"/> or <paramref name="section"/> is null.</exception>
+    public static void ThrowIfConfigurationInvalid(string name, IConfigurationSection section)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+
+        var failures = ValidateConfiguration(section);
+        if (failures.Count > 0)
+        {
+            throw new OptionsValidationException(name, typeof(RoutingOptions), failures);
+        }
+    }
 
     /// <summary>Validates one routing table; every named instance is validated alike.</summary>
     /// <param name="name">The options instance name; it does not change the rules.</param>
@@ -317,12 +438,117 @@ public sealed class RoutingOptionsValidator(OperationCatalogue catalogue) : IVal
     // A null, empty or whitespace-only URL counts as not configured.
     private static bool IsAbsent(string? url) => string.IsNullOrWhiteSpace(url);
 
-    // The configuration binder turns an empty target section, or one holding only unrecognised keys
-    // such as a misspelled property name, into a target with nothing set rather than a null entry, so
-    // both forms count as an empty section.
+    // The configuration binder turns a target section with no values, only empty values, or an empty
+    // value in place of the section into a target with no base URL and no timeout, never into a null
+    // entry; a section holding an unrecognised key is rejected before binding by ValidateConfiguration.
+    // A null entry can come only from a dictionary built in code. Both forms count as an empty section.
     private static bool IsEmpty([NotNullWhen(false)] RoutingTarget? target) =>
         target is null
         || (IsAbsent(target.RestBaseUrl) && IsAbsent(target.SoapBaseUrl) && target.TimeoutSeconds is null);
+
+    // One raw Routing:Targets:<name> section, which lies in the fixed section targetsPath. Only
+    // TimeoutSeconds is converted when bound; the base URLs bind as strings whatever they hold and are
+    // checked by rule 4 on the bound table.
+    private static void CheckTargetSection(
+        IConfigurationSection target,
+        string targetsPath,
+        List<(string Path, string Message)> failures)
+    {
+        RequireSection(target, targetsPath, failures);
+        foreach (var setting in target.GetChildren())
+        {
+            if (IsKey(setting, nameof(RoutingTarget.RestBaseUrl)) || IsKey(setting, nameof(RoutingTarget.SoapBaseUrl)))
+            {
+                RequireValue(setting, targetsPath, failures);
+            }
+            else if (IsKey(setting, nameof(RoutingTarget.TimeoutSeconds)))
+            {
+                RequireValue(setting, targetsPath, failures);
+
+                // The binder leaves an int? unset for a null or empty value and converts anything else.
+                if (!string.IsNullOrEmpty(setting.Value) && !ConvertsToInteger(setting.Value))
+                {
+                    var value = HoldsAtSign(setting.Value)
+                        ? "the value is not shown because it may contain user information"
+                        : $"was '{setting.Value}'";
+                    failures.Add(Failure(setting, targetsPath, $"must be an integer greater than 0 ({value})"));
+                }
+            }
+            else
+            {
+                RejectUnknown(setting, TargetSettings, targetsPath, failures);
+            }
+        }
+    }
+
+    // A position the binder fills from child keys ignores a value of its own, so a non-empty one is
+    // reported. An empty value is what an emptied section, such as Routing__Targets__<name>=, reads as.
+    private static void RequireSection(
+        IConfigurationSection section,
+        string fixedPath,
+        List<(string Path, string Message)> failures)
+    {
+        if (!string.IsNullOrEmpty(section.Value))
+        {
+            failures.Add(Failure(section, fixedPath, "must be a section, not a value"));
+        }
+    }
+
+    // A position the binder fills from its own value ignores every key under it, so each one is reported.
+    private static void RequireValue(
+        IConfigurationSection setting,
+        string fixedPath,
+        List<(string Path, string Message)> failures)
+    {
+        foreach (var child in setting.GetChildren())
+        {
+            failures.Add(Failure(
+                child,
+                fixedPath,
+                $"is not a routing setting ({setting.Path} takes a value, not a section)",
+                "is not a routing setting (it lies under a value, not a section)"));
+        }
+    }
+
+    // The key and everything under it are left unread by the binder, so only the key itself is reported.
+    private static void RejectUnknown(
+        IConfigurationSection setting,
+        string expected,
+        string fixedPath,
+        List<(string Path, string Message)> failures) =>
+        failures.Add(Failure(setting, fixedPath, $"is not a routing setting (expected {expected})"));
+
+    // Names a raw-section failure by the key's path. A key holding an at-sign may be part of a URL with
+    // user information pasted into the section, and the keys before it may hold the rest of that URL, so
+    // such a key is named only by fixedPath, the Routing, Targets, Operations or surface section it lies
+    // in, and the rule is worded by maskedRule, which quotes no other path. The returned path orders the
+    // failures and is never shown.
+    private static (string Path, string Message) Failure(
+        IConfigurationSection setting,
+        string fixedPath,
+        string rule,
+        string? maskedRule = null) =>
+        HoldsAtSign(setting.Path)
+            ? (setting.Path, $"{fixedPath} holds a key that {maskedRule ?? rule}; the key is not shown because it may contain user information")
+            : (setting.Path, $"{setting.Path} {rule}");
+
+    // Configuration keys are case-insensitive, as the binder matches property names.
+    private static bool IsKey(IConfigurationSection setting, string name) =>
+        string.Equals(setting.Key, name, StringComparison.OrdinalIgnoreCase);
+
+    // The binder's own conversion; a value it rejects makes it drop the whole target entry.
+    private static bool ConvertsToInteger(string value)
+    {
+        try
+        {
+            _ = IntegerConverter.ConvertFromInvariantString(value);
+            return true;
+        }
+        catch (Exception exception) when (exception is ArgumentException or FormatException or NotSupportedException)
+        {
+            return false;
+        }
+    }
 
     /// <summary>One surface's section, label and base URL in the routing table.</summary>
     /// <param name="Surface">The catalogue surface.</param>

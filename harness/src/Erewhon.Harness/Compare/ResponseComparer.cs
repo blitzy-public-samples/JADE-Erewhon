@@ -307,9 +307,11 @@ public sealed record ResponseSnapshot(int? Status, string? ContentType, ReadOnly
 /// <param name="Equivalent">True when <paramref name="Discrepancies"/> is empty.</param>
 /// <param name="Discrepancies">Every difference found, in <see cref="Discrepancy.CanonicalOrder"/>.</param>
 /// <param name="WellFormed">
-/// True when the OBSERVED body is well formed for its surface: after one leading UTF-8 byte-order mark is
-/// removed, its bytes are valid UTF-8 and the text parses as JSON for REST, or loads as a SOAP 1.1
-/// envelope with a <c>Body</c> for SOAP. Demo acceptance judges a non-equivalent operation by it.
+/// True when the OBSERVED body is well formed for its surface. For REST, after one leading UTF-8 byte-order
+/// mark is removed, its bytes are valid UTF-8 and the text parses as JSON. For SOAP, its bytes, byte-order
+/// mark included, decode losslessly in the encoding XML detection reads from the mark, the leading bytes or
+/// the XML declaration, UTF-8 when they name none, and load as a SOAP 1.1 envelope with a <c>Body</c>. Demo
+/// acceptance judges a non-equivalent operation by it.
 /// </param>
 /// <param name="StatusMatched">True when the observed status code equals the baseline's.</param>
 public sealed record ResponseComparison(
@@ -326,19 +328,24 @@ public sealed record ResponseComparison(
 /// </summary>
 /// <remarks>
 /// <para>
-/// Every body is decoded strictly: one leading UTF-8 byte-order mark is removed and the remaining bytes
-/// must be valid UTF-8. A body that is not has no text, so it neither parses nor is well formed. It is
-/// never decoded with replacement characters, which would let different bytes, or a corrupt body and one
-/// that holds U+FFFD, compare equal. The <c>getPhoto</c> bodies are still compared as raw bytes, mark
-/// included.
+/// Every body is decoded strictly, and never with replacement characters, which would let different bytes,
+/// or a corrupt body and one that holds U+FFFD, compare equal. A REST body loses one leading UTF-8
+/// byte-order mark, and the remaining bytes must be valid UTF-8. A SOAP body is loaded from its bytes as
+/// received, mark included, in the encoding XML detection reads from a UTF-8, UTF-16 or UTF-32 byte-order
+/// mark, the leading bytes or the XML declaration, UTF-8 when they name none, so a UTF-16 envelope and the
+/// same envelope in UTF-8 are equal. Its bytes must decode losslessly in that encoding, and a declaration
+/// must name an encoding the runtime supports that agrees with the mark or the leading bytes. A body that
+/// does not decode neither parses nor is well formed. The <c>getPhoto</c> bodies are still compared as raw
+/// bytes, mark included.
 /// </para>
 /// <para>
-/// When the two bodies do not both parse, they are compared exactly as one value at <c>$body</c>: two
-/// decoded texts ordinally, otherwise the bytes after the mark. Identical bytes give no discrepancy, a
-/// decoded text against bytes that are not valid UTF-8 gives a <c>type</c> discrepancy, and two different
-/// byte sequences that are not valid UTF-8 give a <c>value</c> discrepancy. Each side's literal is its
-/// exact text when it decodes and the lowercase hexadecimal of its bytes after the mark when it does not,
-/// so, against one baseline, two different observed bodies never yield the same discrepancy list.
+/// When the two bodies do not both parse, they are compared exactly as one value at <c>$body</c>, after one
+/// leading UTF-8 byte-order mark: as texts decoded strictly as UTF-8, ordinally, when both decode, otherwise
+/// as bytes. Identical bytes give no discrepancy, a decoded text against bytes that are not valid UTF-8
+/// gives a <c>type</c> discrepancy, and two different byte sequences that are not valid UTF-8 give a
+/// <c>value</c> discrepancy. Each side's literal is its exact text when it decodes and the lowercase
+/// hexadecimal of its bytes after the mark when it does not, so, against one baseline, two different
+/// observed bodies never yield the same discrepancy list.
 /// </para>
 /// <para>
 /// The instance holds only immutable state and performs no I/O, so concurrent <see cref="Compare"/>
@@ -488,15 +495,12 @@ public sealed class ResponseComparer(OperationCatalogue catalogue, Normaliser no
         ResponseSnapshot observed,
         List<Discrepancy> discrepancies)
     {
-        var baselineBody = WithoutBom(baseline.Body.Span);
-        var observedBody = WithoutBom(observed.Body.Span);
-        var baselineText = DecodeBody(baselineBody);
-        var observedText = DecodeBody(observedBody);
-
-        // A body that does not decode does not load, so it is never a well-formed envelope, getPhoto included.
-        // Each body is loaded once, and the XML comparer walks the same trees.
-        var baselineRoot = baselineText is null ? null : XmlSemanticComparer.TryLoadRoot(baselineText);
-        var observedRoot = observedText is null ? null : XmlSemanticComparer.TryLoadRoot(observedText);
+        // Each body is loaded once, from its bytes as received with any byte-order mark, in the encoding XML
+        // detection reads from the mark, the leading bytes or the declaration. A body that does not decode
+        // losslessly in it does not load, so it is never a well-formed envelope, getPhoto included. The XML
+        // comparer walks the same trees.
+        var baselineRoot = XmlSemanticComparer.TryLoadRoot(baseline.Body);
+        var observedRoot = XmlSemanticComparer.TryLoadRoot(observed.Body);
         var baselineWellFormed = IsSoapEnvelope(baselineRoot);
         var observedWellFormed = IsSoapEnvelope(observedRoot);
 
@@ -511,7 +515,11 @@ public sealed class ResponseComparer(OperationCatalogue catalogue, Normaliser no
         }
         else
         {
-            AddExactBodyDifference(baselineBody, baselineText, observedBody, observedText, discrepancies);
+            // Bodies that do not both load are compared exactly, as REST bodies are: as strict UTF-8 text when
+            // both decode, otherwise by their bytes after a UTF-8 byte-order mark.
+            var baselineBody = WithoutBom(baseline.Body.Span);
+            var observedBody = WithoutBom(observed.Body.Span);
+            AddExactBodyDifference(baselineBody, DecodeBody(baselineBody), observedBody, DecodeBody(observedBody), discrepancies);
         }
 
         AddMalformed(baselineWellFormed, observedWellFormed, discrepancies);

@@ -33,11 +33,18 @@ namespace Erewhon.Harness.Modes;
 /// fingerprinted, through <see cref="ResetExpectations.FirstCapture(HarnessOptions)"/>. The backend's state
 /// is reached only through the stand-in's admin endpoints, and no request carries a header the case
 /// matrix does not state.</para>
-/// <para>Every check that can refuse a capture (settings, case matrix, an existing manifest, readiness)
-/// runs before the first write, so a capture that cannot start leaves an existing baseline untouched.
-/// Every line this mode prints starts with <see cref="SourceLabels.ConsolePrefix"/>. The exit code is 0
-/// when the manifest was written, even when some cases were not captured (replay reports each as
-/// <c>not-captured</c>), and 1 otherwise; <see cref="RunAsync"/> never throws.</para>
+/// <para>Every check that can refuse a capture (settings, case matrix, an existing manifest, expected seed
+/// facts no stand-in can confirm, readiness, and the confirmation of the capture-start seed reset) runs
+/// before the first write, so a capture that cannot start leaves an existing baseline untouched, and the
+/// seed facts a manifest records are always the ones that reset confirmed. The first write then withdraws
+/// the existing manifest (<see cref="BaselineStore.DeleteManifest"/>), and the new one is published last and
+/// atomically, so a capture that fails or is cancelled once it has begun writing leaves no manifest beside
+/// the partial baseline. An empty-state bracket reset that is not confirmed stops the capture once the
+/// bracket's seed restore has been attempted, and no manifest is written. Every line this mode prints
+/// starts with <see cref="SourceLabels.ConsolePrefix"/>.
+/// The exit code is 0 when the manifest was written, even when some cases were not captured (replay
+/// reports each as <c>not-captured</c>), and 1 otherwise, a refused or stopped capture included;
+/// <see cref="RunAsync"/> never throws.</para>
 /// </remarks>
 /// <param name="options">The harness settings: the backend URLs, limits and every baseline path.</param>
 /// <param name="catalogue">The operation catalogue, normally <see cref="OperationCatalogue.Default"/>.</param>
@@ -111,6 +118,11 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
         var binaryOperationId = _catalogue.Find(Surface.Soap, BinaryBodySoapMethod).Id;
         var store = new BaselineStore(_options);
         var expectations = ResolveExpectations(store);
+        if (UnconfirmableSeedFacts(expectations) is { } unconfirmable)
+        {
+            Log($"seed facts cannot be confirmed (expected {unconfirmable}); {NotTouched}");
+            return 1;
+        }
 
         using (var readiness = new Readiness(_options, _stdout))
         {
@@ -127,12 +139,22 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
             .ResetAsync(ResetPoints.CaptureStart, AdminRoutes.ResetStateSeed, expectations, ct)
             .ConfigureAwait(false);
         LogResetFailures(start);
+        if (!start.Succeeded || start.After is null)
+        {
+            Log($"{ResetPoints.CaptureStart} reset not confirmed; {NotTouched}");
+            return 1;
+        }
 
+        // The first write withdraws the old completion record, so a capture that ends early, by failure or
+        // cancellation, never leaves a manifest beside the partial baseline it replaces.
+        store.DeleteManifest();
+        Log("baseline/manifest.json withdrawn until this capture completes");
         store.ClearRecords(ct);
 
         var records = new List<BaselineRecord>(matrix.PlannedCaseCount);
         var bodies = new Dictionary<string, byte[]>(StringComparer.Ordinal);
         var notCaptured = new List<string>();
+        var unconfirmedBrackets = new List<StateResetResult>();
         bool wsdlCaptured;
 
         using (var runner = CaseRunner.FromOptions(_options))
@@ -142,8 +164,17 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
             {
                 ct.ThrowIfCancellationRequested();
                 var baseUri = definition.Surface == Surface.Rest ? restUri : soapUri;
-                var response = await SendCaseAsync(runner, reset, expectations, baseUri, definition, timeout, ct)
+                var response = await SendCaseAsync(
+                        runner, reset, expectations, baseUri, definition, timeout, unconfirmedBrackets, ct)
                     .ConfigureAwait(false);
+
+                // A case recorded against an unconfirmed state is no baseline, so the capture ends here with
+                // no manifest, once the bracket's seed restore has been attempted.
+                if (unconfirmedBrackets.Count > 0)
+                {
+                    Log($"reset bracket of {definition.Id} not confirmed; capture stopped, baseline/manifest.json not written");
+                    return 1;
+                }
 
                 if (!response.Answered || response.Status is not int status)
                 {
@@ -191,8 +222,8 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
             BlockingError = null,
         };
 
-        // Written last: a capture that fails before this point never writes a manifest for records it did
-        // not finish, and exits 1.
+        // Published last, and atomically: a capture that fails before this point leaves no manifest, because
+        // the old one was withdrawn before the first write, and exits 1.
         await store.WriteManifestAsync(manifest, ct).ConfigureAwait(false);
 
         var missing = notCaptured.Count == 0 ? "none" : string.Join(", ", notCaptured);
@@ -272,8 +303,30 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
         return expectations;
     }
 
+    // The seed facts a capture could never confirm, or null when both can be: the placeholders a first
+    // capture expects when the seed directory cannot be fingerprinted or the configured reference date is
+    // malformed, which no stand-in reports, or a fact the manifest leaves blank, which no reset checks. The
+    // manifest records only facts the capture-start reset confirmed, so such a capture is refused instead.
+    private static string? UnconfirmableSeedFacts(ResetExpectations expectations)
+    {
+        string[] unconfirmable =
+        [
+            .. Unconfirmable("seedSha256", expectations.SeedSha256, ResetExpectations.UnavailableSeedSha256),
+            .. Unconfirmable("referenceDate", expectations.ReferenceDate, ResetExpectations.InvalidExpectedReferenceDate),
+        ];
+        return unconfirmable.Length == 0 ? null : string.Join(" and ", unconfirmable);
+
+        static string[] Unconfirmable(string field, string? expected, string placeholder) => expected switch
+        {
+            null => [$"{field} blank"],
+            _ when string.Equals(expected, placeholder, StringComparison.Ordinal) => [$"{field} '{placeholder}'"],
+            _ => [],
+        };
+    }
+
     // The empty-state case is bracketed by an empty reset before it and a seed reset after it, the latter
-    // whatever the case obtained, so nothing after it runs against the empty state.
+    // whatever the case obtained, so nothing after it runs against the empty state. Each bracket reset that
+    // is not confirmed is added to unconfirmed, which ends the capture.
     private async Task<CaseResponse> SendCaseAsync(
         CaseRunner runner,
         StateReset reset,
@@ -281,6 +334,7 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
         Uri baseUri,
         CaseDefinition definition,
         TimeSpan timeout,
+        ICollection<StateResetResult> unconfirmed,
         CancellationToken ct)
     {
         if (!definition.IsEmptyState)
@@ -290,7 +344,7 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
 
         LogResetFailures(await reset
             .ResetAsync(ResetPoints.Before(definition.Id), AdminRoutes.ResetStateEmpty, expectations, ct)
-            .ConfigureAwait(false));
+            .ConfigureAwait(false), unconfirmed);
         try
         {
             return await runner.SendAsync(baseUri, definition.Request, timeout, ct).ConfigureAwait(false);
@@ -299,7 +353,7 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
         {
             LogResetFailures(await reset
                 .ResetAsync(ResetPoints.After(definition.Id), AdminRoutes.ResetStateSeed, expectations, ct)
-                .ConfigureAwait(false));
+                .ConfigureAwait(false), unconfirmed);
         }
     }
 
@@ -520,7 +574,8 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
         && content[5] is 0x20 or 0x09 or 0x0D or 0x0A;
 
     // A temporary file beside the target is moved into place without overwriting, so the contract is either
-    // absent or complete, and a file that appeared meanwhile is never replaced.
+    // absent or complete, and a file that appeared meanwhile is never replaced. The move, not a disk flush,
+    // makes the publication atomic, so the write is flushed asynchronously and never blocks on an fsync.
     private async Task WriteContractWsdlAsync(byte[] bytes, CancellationToken ct)
     {
         var target = _options.ContractsWsdlPath;
@@ -542,7 +597,7 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
                 FileOptions.Asynchronous))
             {
                 await stream.WriteAsync(bytes, ct).ConfigureAwait(false);
-                stream.Flush(flushToDisk: true);
+                await stream.FlushAsync(ct).ConfigureAwait(false);
             }
 
             File.Move(temporary, target, overwrite: false);
@@ -612,11 +667,17 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
         return null;
     }
 
-    private void LogResetFailures(StateResetResult result)
+    // Prints each mismatch of a reset, and adds an unconfirmed reset to unconfirmed when one is given.
+    private void LogResetFailures(StateResetResult result, ICollection<StateResetResult>? unconfirmed = null)
     {
         foreach (var failure in result.Failures)
         {
             Log($"WARN {failure.ItemId} {failure.Nature}");
+        }
+
+        if (!result.Succeeded)
+        {
+            unconfirmed?.Add(result);
         }
     }
 

@@ -2,6 +2,7 @@ using System.Collections.Immutable;
 using System.Collections.ObjectModel;
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Xml;
 using System.Xml.Linq;
@@ -122,8 +123,10 @@ public abstract record XmlComparisonContext
 /// </summary>
 /// <remarks>
 /// <para>
-/// Both bodies are loaded with whitespace preserved, DTDs prohibited and no resolver. The XML
-/// declaration, comments and processing instructions are ignored everywhere; CDATA sections are text.
+/// Both bodies are loaded with whitespace preserved, DTDs prohibited and no resolver; a body held as bytes
+/// is decoded losslessly in the encoding XML detection reads from its byte-order mark, leading bytes or XML
+/// declaration, UTF-8 when they name none. The XML declaration, comments and processing instructions are
+/// ignored everywhere; CDATA sections are text.
 /// </para>
 /// <para>
 /// Each element has a role known from the context and its position, never from its content. In an
@@ -139,7 +142,9 @@ public abstract record XmlComparisonContext
 /// set excluding namespace declarations; QName-valued attributes compare by resolved expanded name;
 /// differently named siblings form an unordered set of name groups, and same-named siblings pair in
 /// document order. At a SOAP-exposed DTO property that a normalisation rule targets, the pairwise rule of
-/// <see cref="Normaliser"/> decides equality.
+/// <see cref="Normaliser"/> decides equality, and an <c>xsi:nil</c> element that holds no text is its null.
+/// Content there that is neither a valid value nor a plain nil, element children or an <c>xsi:nil</c> element
+/// that holds text, is compared exactly.
 /// </para>
 /// <para>
 /// In a WSDL compared with <c>soap:address/@location</c> excluded, the location's value is never compared
@@ -162,6 +167,14 @@ public abstract record XmlComparisonContext
 public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser normaliser)
 {
     private const string RootPath = "/";
+
+    // The decoders of the encodings a body's first bytes can name. Each throws on bytes that are invalid or
+    // incomplete in its encoding instead of replacing or dropping them.
+    private static readonly Encoding StrictUtf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+    private static readonly Encoding StrictUtf16LittleEndian = new UnicodeEncoding(bigEndian: false, byteOrderMark: false, throwOnInvalidBytes: true);
+    private static readonly Encoding StrictUtf16BigEndian = new UnicodeEncoding(bigEndian: true, byteOrderMark: false, throwOnInvalidBytes: true);
+    private static readonly Encoding StrictUtf32LittleEndian = new UTF32Encoding(bigEndian: false, byteOrderMark: false, throwOnInvalidCharacters: true);
+    private static readonly Encoding StrictUtf32BigEndian = new UTF32Encoding(bigEndian: true, byteOrderMark: false, throwOnInvalidCharacters: true);
 
     private readonly OperationCatalogue _catalogue = catalogue ?? throw new ArgumentNullException(nameof(catalogue));
     private readonly Normaliser _normaliser = normaliser ?? throw new ArgumentNullException(nameof(normaliser));
@@ -206,8 +219,14 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
     /// well-formedness does not load them again. The result is the one
     /// <see cref="Compare(string, string, XmlComparisonContext)"/> returns for the same two texts when both load.
     /// </summary>
-    /// <param name="baselineRoot">The baseline root element as <see cref="TryLoadRoot"/> returned it; it is not modified.</param>
-    /// <param name="observedRoot">The observed root element as <see cref="TryLoadRoot"/> returned it; it is not modified.</param>
+    /// <param name="baselineRoot">
+    /// The baseline root element as <see cref="TryLoadRoot(string)"/> or <see cref="TryLoadRoot(ReadOnlyMemory{byte})"/>
+    /// returned it; it is not modified.
+    /// </param>
+    /// <param name="observedRoot">
+    /// The observed root element as <see cref="TryLoadRoot(string)"/> or <see cref="TryLoadRoot(ReadOnlyMemory{byte})"/>
+    /// returned it; it is not modified.
+    /// </param>
     /// <param name="context">What the bodies are, which types their elements.</param>
     /// <returns>Every discrepancy in <see cref="Discrepancy.CanonicalOrder"/>; empty when the bodies are equal.</returns>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
@@ -238,20 +257,16 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
     /// Loads <paramref name="text"/> with whitespace preserved, DTDs prohibited and no resolver, and returns
     /// its root element; null when it does not load. Whitespace must be preserved: the default load drops
     /// whitespace-only text even inside leaf elements, which would make <c>&lt;a&gt; &lt;/a&gt;</c> equal
-    /// <c>&lt;a/&gt;</c>. The one load every XML body comparison uses, well-formedness checks included.
+    /// <c>&lt;a/&gt;</c>. The text is already decoded, so an encoding its XML declaration names is not applied;
+    /// a body held as bytes loads with <see cref="TryLoadRoot(ReadOnlyMemory{byte})"/>, which applies it. Both
+    /// loads use the same reader settings, so every XML body comparison and well-formedness check loads alike.
     /// </summary>
     internal static XElement? TryLoadRoot(string text)
     {
-        var settings = new XmlReaderSettings
-        {
-            DtdProcessing = DtdProcessing.Prohibit,
-            XmlResolver = null,
-        };
-
         try
         {
             using var input = new StringReader(text);
-            using var reader = XmlReader.Create(input, settings);
+            using var reader = XmlReader.Create(input, LoadSettings());
             return XDocument.Load(reader, LoadOptions.PreserveWhitespace).Root;
         }
         catch (XmlException)
@@ -259,6 +274,146 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
             return null;
         }
     }
+
+    /// <summary>
+    /// Loads a body from its bytes exactly as received, byte-order mark included, as
+    /// <see cref="TryLoadRoot(string)"/> loads text, and returns its root element; null when it does not load.
+    /// The XML reader detects the encoding: a UTF-8, UTF-16 or UTF-32 byte-order mark names it, else the UTF-16
+    /// or UTF-32 form of a leading <c>&lt;</c>, else the XML declaration, else it is UTF-8.
+    /// </summary>
+    /// <remarks>
+    /// The body loads only when its bytes decode losslessly in that one encoding. The reader alone would drop
+    /// an incomplete sequence at the end of the body and decode a declared encoding such as <c>us-ascii</c>
+    /// with replacement characters, so different bodies could load as the same tree. A body therefore does
+    /// not load when it is empty, when any of its bytes is invalid or incomplete in the encoding, when its
+    /// declaration names an encoding the runtime does not support, or when the declaration names an encoding
+    /// other than the one a byte-order mark or the leading bytes name; the two UTF-16 byte orders count as one
+    /// encoding there, as do the two UTF-32 ones. It never throws for a malformed body.
+    /// </remarks>
+    /// <param name="body">The raw body bytes.</param>
+    internal static XElement? TryLoadRoot(ReadOnlyMemory<byte> body)
+    {
+        XDocument document;
+        try
+        {
+            using var input = ReadOnlyStream(body);
+            using var reader = XmlReader.Create(input, LoadSettings());
+            document = XDocument.Load(reader, LoadOptions.PreserveWhitespace);
+        }
+        catch (XmlException)
+        {
+            // The reader reports every malformed body this way, bytes invalid in their encoding and an
+            // encoding it does not support included.
+            return null;
+        }
+
+        return DecodesLosslessly(body.Span, document.Declaration?.Encoding) ? document.Root : null;
+    }
+
+    /// <summary>
+    /// The reader settings of every load: DTDs prohibited and no resolver, so a body can neither declare
+    /// entities nor make the reader fetch anything. Each load gets its own instance, because the settings are
+    /// mutable.
+    /// </summary>
+    private static XmlReaderSettings LoadSettings() => new()
+    {
+        DtdProcessing = DtdProcessing.Prohibit,
+        XmlResolver = null,
+    };
+
+    /// <summary>A read-only stream over <paramref name="bytes"/>, sharing their array when they have one.</summary>
+    private static MemoryStream ReadOnlyStream(ReadOnlyMemory<byte> bytes) =>
+        MemoryMarshal.TryGetArray(bytes, out var segment) && segment.Array is not null
+            ? new MemoryStream(segment.Array, segment.Offset, segment.Count, writable: false)
+            : new MemoryStream(bytes.ToArray(), writable: false);
+
+    /// <summary>
+    /// True when <paramref name="body"/>, which has loaded, decodes losslessly in the one encoding it was read
+    /// in: the encoding its first bytes name, which <paramref name="declaredEncoding"/> must agree with; else
+    /// the declared encoding; else UTF-8. The bytes after the byte-order mark are decoded strictly, so one that
+    /// is invalid or incomplete, or that a replacement character would stand for, makes it false.
+    /// </summary>
+    /// <param name="body">The raw body bytes, byte-order mark included.</param>
+    /// <param name="declaredEncoding">The encoding the XML declaration names; null or empty when it names none.</param>
+    private static bool DecodesLosslessly(ReadOnlySpan<byte> body, string? declaredEncoding)
+    {
+        if (ReadSignature(body) is not { } signature)
+        {
+            return false;
+        }
+
+        var encoding = signature.Encoding ?? StrictUtf8;
+        if (!string.IsNullOrEmpty(declaredEncoding))
+        {
+            Encoding declared;
+            try
+            {
+                declared = Encoding.GetEncoding(declaredEncoding, EncoderFallback.ExceptionFallback, DecoderFallback.ExceptionFallback);
+            }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException)
+            {
+                // A name the runtime does not support, such as ucs-4, which the reader accepts without decoding by it.
+                return false;
+            }
+
+            if (signature.Encoding is not null && EncodingForm(declared) != EncodingForm(signature.Encoding))
+            {
+                return false;
+            }
+
+            encoding = signature.Encoding ?? declared;
+        }
+
+        try
+        {
+            encoding.GetCharCount(body[signature.MarkLength..]);
+            return true;
+        }
+        catch (DecoderFallbackException)
+        {
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Reads the encoding the first bytes of <paramref name="body"/> name, as XML encoding detection does:
+    /// a UTF-32, UTF-8 or UTF-16 byte-order mark, or, without one, the UTF-32 or UTF-16 form of a leading
+    /// <c>&lt;</c>.
+    /// </summary>
+    /// <returns>
+    /// The named encoding's strict decoder and its mark length, 0 without a mark; an encoding of null when the
+    /// bytes name none. Null when they name UCS-4 in the 2143 or 3412 byte order, which no runtime encoding decodes.
+    /// </returns>
+    private static ByteSignature? ReadSignature(ReadOnlySpan<byte> body) => body switch
+    {
+        [0x00, 0x00, 0xFE, 0xFF, ..] => new(StrictUtf32BigEndian, 4),
+        [0x00, 0x00, 0x00, 0x3C, ..] => new(StrictUtf32BigEndian, 0),
+        [0x00, 0x00, 0xFF, 0xFE, ..] or [0x00, 0x00, 0x3C, 0x00, ..] => null,
+        [0xFF, 0xFE, 0x00, 0x00, ..] => new(StrictUtf32LittleEndian, 4),
+        [0x3C, 0x00, 0x00, 0x00, ..] => new(StrictUtf32LittleEndian, 0),
+        [0xFE, 0xFF, 0x00, 0x00, ..] or [0x00, 0x3C, 0x00, 0x00, ..] => null,
+        [0xEF, 0xBB, 0xBF, ..] => new(StrictUtf8, 3),
+        [0xFE, 0xFF, ..] => new(StrictUtf16BigEndian, 2),
+        [0xFF, 0xFE, ..] => new(StrictUtf16LittleEndian, 2),
+        [0x00, 0x3C, ..] => new(StrictUtf16BigEndian, 0),
+        [0x3C, 0x00, ..] => new(StrictUtf16LittleEndian, 0),
+        _ => new(null, 0),
+    };
+
+    /// <summary>
+    /// The code page of <paramref name="encoding"/>, with UTF-16 big-endian (1201) as UTF-16 (1200) and UTF-32
+    /// big-endian (12001) as UTF-32 (12000): the byte-order mark or the leading bytes decide the byte order, and
+    /// a declared <c>utf-16</c> or <c>utf-32</c> stands for either.
+    /// </summary>
+    private static int EncodingForm(Encoding encoding) => encoding.CodePage switch
+    {
+        1201 => 1200,
+        12001 => 12000,
+        var codePage => codePage,
+    };
+
+    /// <summary>The encoding a body's first bytes name, null when they name none, and the length of its byte-order mark.</summary>
+    private readonly record struct ByteSignature(Encoding? Encoding, int MarkLength);
 
     /// <summary>What an element is, which decides how its text and children are compared.</summary>
     private enum RoleKind
@@ -1034,9 +1189,13 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
 
         /// <summary>
         /// Compares a pair of targeted elements with simple content: their attributes as usual, and their
-        /// values under the pairwise rule, reported once at the element's path, the current one. A targeted
-        /// element with element children is compared exactly instead, because such content is never a valid
-        /// value. The scopes are the two elements' own, which their attributes resolve in.
+        /// values, reported once at the element's path, the current one. Two slots follow the pairwise rule.
+        /// An element that is nil and holds text has no slot: its content is never a valid value and never a
+        /// plain nil, so it equals only another such element with the same exact text, and a difference reports
+        /// it as its markup while the other side keeps its normalised value. The kind is <c>type</c> when
+        /// exactly one side is nil and <c>value</c> otherwise. A targeted element with element children is
+        /// compared exactly instead, because such content is never a valid value. The scopes are the two
+        /// elements' own, which their attributes resolve in.
         /// </summary>
         private void CompareTargeted(XElement baseline, NamespaceScope baselineScope, XElement observed, NamespaceScope observedScope, string rule)
         {
@@ -1044,30 +1203,64 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
 
             var baselineSlot = Slot(baseline);
             var observedSlot = Slot(observed);
-            if (_normaliser.PairEquals(rule, baselineSlot, observedSlot, WireSyntax.Xml))
+            if (baselineSlot is not null && observedSlot is not null)
+            {
+                if (_normaliser.PairEquals(rule, baselineSlot, observedSlot, WireSyntax.Xml))
+                {
+                    return;
+                }
+            }
+            else if (baselineSlot is null
+                && observedSlot is null
+                && string.Equals(baseline.Value, observed.Value, StringComparison.Ordinal))
             {
                 return;
             }
 
             Add(
-                baselineSlot.IsNull != observedSlot.IsNull ? DiscrepancyKinds.Type : DiscrepancyKinds.Value,
-                _normaliser.ToValue(rule, baselineSlot, WireSyntax.Xml),
-                _normaliser.ToValue(rule, observedSlot, WireSyntax.Xml));
+                IsNil(baseline) != IsNil(observed) ? DiscrepancyKinds.Type : DiscrepancyKinds.Value,
+                TargetedValue(baseline, baselineSlot, rule),
+                TargetedValue(observed, observedSlot, rule));
         }
 
-        /// <summary>The value of an element present on one side only: its normalised value when targeted, else its markup.</summary>
+        /// <summary>
+        /// The value of an element present on one side only: its normalised value when it is targeted and has
+        /// a slot, else its markup, as for element children or a nil element that holds text.
+        /// </summary>
         private DiscrepancyValue OneSidedValue(XElement element, string? rule) =>
             rule is not null && !element.HasElements
-                ? _normaliser.ToValue(rule, Slot(element), WireSyntax.Xml)
-                : DiscrepancyValue.Literal(element.ToString(SaveOptions.DisableFormatting));
+                ? TargetedValue(element, Slot(element), rule)
+                : Markup(element);
 
         /// <summary>
-        /// The slot of a targeted element with simple content: null for <c>xsi:nil</c> <c>true</c> or <c>1</c>,
-        /// otherwise its exact text, comments and processing instructions excluded.
+        /// The value of a targeted element with simple content whose slot is <paramref name="slot"/>: the
+        /// slot's normalised value, or the element's markup when it has no slot.
         /// </summary>
-        private static NormalisedSlot Slot(XElement element) =>
-            element.Attribute(XsiNil)?.Value is "true" or "1"
-                ? NormalisedSlot.Null
-                : NormalisedSlot.Of(element.Value);
+        private DiscrepancyValue TargetedValue(XElement element, NormalisedSlot? slot, string rule) =>
+            slot is null ? Markup(element) : _normaliser.ToValue(rule, slot, WireSyntax.Xml);
+
+        /// <summary>The markup of <paramref name="element"/>, unformatted, as a literal value.</summary>
+        private static DiscrepancyValue Markup(XElement element) =>
+            DiscrepancyValue.Literal(element.ToString(SaveOptions.DisableFormatting));
+
+        /// <summary>
+        /// The slot of a targeted element with simple content: <see cref="NormalisedSlot.Null"/> when it is nil
+        /// and holds no text, its exact text when it is not nil, comments and processing instructions excluded;
+        /// null when it is nil and holds text, which no slot represents, because a null slot holds no text. As
+        /// for any text run, empty text, an empty CDATA section included, is no text.
+        /// </summary>
+        private static NormalisedSlot? Slot(XElement element)
+        {
+            var text = element.Value;
+            if (!IsNil(element))
+            {
+                return NormalisedSlot.Of(text);
+            }
+
+            return text.Length == 0 ? NormalisedSlot.Null : null;
+        }
+
+        /// <summary>True when <paramref name="element"/> carries <c>xsi:nil</c> <c>true</c> or <c>1</c>.</summary>
+        private static bool IsNil(XElement element) => element.Attribute(XsiNil)?.Value is "true" or "1";
     }
 }

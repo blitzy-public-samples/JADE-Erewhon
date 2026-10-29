@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using Erewhon.Contracts.Catalogue;
 using Erewhon.Harness.Compare;
@@ -13,7 +14,8 @@ namespace Erewhon.Harness.Tests;
 /// synthetic declared type. Operation, element and namespace names come from the contracts catalogue, and every
 /// equivalence has a neighbouring case that must differ, so a comparer that never reports cannot pass.
 /// The response-level cases send SOAP bodies through <see cref="ResponseComparer"/>: XML dispatch, the
-/// media type, well-formedness as a SOAP 1.1 envelope, the byte-order mark and strict UTF-8 decoding.
+/// media type, well-formedness as a SOAP 1.1 envelope, the byte-order mark, the encoding XML detection reads
+/// and lossless decoding.
 /// </summary>
 public sealed class XmlSemanticComparerTests
 {
@@ -46,6 +48,7 @@ public sealed class XmlSemanticComparerTests
 
     private static readonly OperationDescriptor GetAgent = Catalogue.GetById("Soap.getAgent");
     private static readonly OperationDescriptor GetAgentNames = Catalogue.GetById("Soap.getAgentNames");
+    private static readonly OperationDescriptor GetPhoto = Catalogue.GetById("Soap.getPhoto");
 
     private static readonly ArrayDefinition NameArray = Catalogue.TryGetArray(GetAgentNames.ReturnType, out var array)
         ? array
@@ -659,6 +662,138 @@ public sealed class XmlSemanticComparerTests
         Assert.Contains(StampA, simpleThenWrapped[1].Observed.Text, StringComparison.Ordinal);
     }
 
+    // An empty CDATA section is no text, and comments and processing instructions are dropped, so each is an empty nil.
+    [Theory]
+    [InlineData(ByXsiType, "<![CDATA[]]>")]
+    [InlineData(ByDeclaredType, "<![CDATA[]]>")]
+    [InlineData(ByXsiType, "<!-- c --><?pi x?>")]
+    [InlineData(ByDeclaredType, "<!-- c --><?pi x?>")]
+    public void TimestampSlot_NilWithNoText_EqualsAnEmptyNil(string route, string content)
+    {
+        var context = SaleContext(route);
+        var emptyNil = SaleEnvelope(route, $"<{SaleTimestamp} {NilLiteral}/>");
+
+        AssertEquivalent(emptyNil, SaleEnvelope(route, NilStamp(content)), context);
+
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(NilLiteral), DiscrepancyValue.Literal(NilStampMarkup("A"))),
+            Assert.Single(_comparer.Compare(SaleEnvelope(route, NilStamp(content)), SaleEnvelope(route, NilStamp("A")), context)));
+    }
+
+    // A nil element that holds text is neither a valid value nor a plain nil: it equals only the same exact text.
+    [Theory]
+    [InlineData(ByXsiType, "A", "B")]
+    [InlineData(ByDeclaredType, "A", "B")]
+    [InlineData(ByXsiType, StampA, StampB)]
+    [InlineData(ByDeclaredType, StampA, StampB)]
+    [InlineData(ByXsiType, "A", "A ")]
+    [InlineData(ByDeclaredType, "A", "A ")]
+    public void TimestampSlot_NilWithText_ComparesItsTextExactly(string route, string baselineText, string observedText)
+    {
+        var context = SaleContext(route);
+        var baseline = SaleEnvelope(route, NilStamp(baselineText));
+        var observed = SaleEnvelope(route, NilStamp(observedText));
+
+        AssertEquivalent(baseline, SaleEnvelope(route, NilStamp(baselineText), indent: false), context);
+
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(NilStampMarkup(baselineText)), DiscrepancyValue.Literal(NilStampMarkup(observedText))),
+            Assert.Single(_comparer.Compare(baseline, observed, context)));
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(NilStampMarkup(observedText)), DiscrepancyValue.Literal(NilStampMarkup(baselineText))),
+            Assert.Single(_comparer.Compare(observed, baseline, context)));
+    }
+
+    [Theory]
+    [InlineData(ByXsiType)]
+    [InlineData(ByDeclaredType)]
+    public void TimestampSlot_NilWithWhitespace_DiffersFromAnEmptyNil(string route)
+    {
+        var context = SaleContext(route);
+        var emptyNil = SaleEnvelope(route, $"<{SaleTimestamp} {NilLiteral} />");
+        var spacedNil = SaleEnvelope(route, NilStamp(" "));
+
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(NilLiteral), DiscrepancyValue.Literal(NilStampMarkup(" "))),
+            Assert.Single(_comparer.Compare(emptyNil, spacedNil, context)));
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(NilStampMarkup(" ")), DiscrepancyValue.Literal(NilLiteral)),
+            Assert.Single(_comparer.Compare(spacedNil, emptyNil, context)));
+    }
+
+    // Each distinct text gives its own discrepancy list, so its own failure signature.
+    [Theory]
+    [InlineData(ByXsiType)]
+    [InlineData(ByDeclaredType)]
+    public void TimestampSlot_NilWithDistinctTexts_GiveDistinctDiscrepancies(string route)
+    {
+        var context = SaleContext(route);
+        var nilA = SaleEnvelope(route, NilStamp("A"));
+
+        var againstB = _comparer.Compare(nilA, SaleEnvelope(route, NilStamp("B")), context);
+        var againstC = _comparer.Compare(nilA, SaleEnvelope(route, NilStamp("C")), context);
+        var againstEmpty = _comparer.Compare(nilA, SaleEnvelope(route, NilStamp(string.Empty)), context);
+
+        Assert.NotEmpty(againstB);
+        Assert.NotEqual(againstB, againstC);
+        Assert.NotEqual(againstB, againstEmpty);
+        Assert.NotEqual(againstC, againstEmpty);
+    }
+
+    // The same text with and without nil differs; a valid side keeps its normalised value.
+    [Theory]
+    [InlineData(ByXsiType, StampA)]
+    [InlineData(ByDeclaredType, StampA)]
+    [InlineData(ByXsiType, StampB)]
+    [InlineData(ByDeclaredType, StampB)]
+    public void TimestampSlot_NilWithValidText_NeverEqualsValid(string route, string nilText)
+    {
+        var context = SaleContext(route);
+        var valid = SaleEnvelope(route, Stamp(StampA));
+        var nil = SaleEnvelope(route, NilStamp(nilText));
+        var nilAttributePath = $"{SaleTimestampPath}/@{{{XsiNamespace}}}nil";
+
+        Discrepancy[] validThenNil =
+        [
+            new(SaleTimestampPath, DiscrepancyKinds.Type, DiscrepancyValue.Valid(NormalisationRuleIds.N2), DiscrepancyValue.Literal(NilStampMarkup(nilText))),
+            new(nilAttributePath, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal("true")),
+        ];
+        Assert.Equal(validThenNil, _comparer.Compare(valid, nil, context));
+
+        Discrepancy[] nilThenValid =
+        [
+            new(SaleTimestampPath, DiscrepancyKinds.Type, DiscrepancyValue.Literal(NilStampMarkup(nilText)), DiscrepancyValue.Valid(NormalisationRuleIds.N2)),
+            new(nilAttributePath, DiscrepancyKinds.Missing, DiscrepancyValue.Literal("true"), DiscrepancyValue.Absent),
+        ];
+        Assert.Equal(nilThenValid, _comparer.Compare(nil, valid, context));
+    }
+
+    // A nil timestamp on one side only reports its markup when it holds text, and the nil literal when it holds none.
+    [Theory]
+    [InlineData(ByXsiType)]
+    [InlineData(ByDeclaredType)]
+    public void TimestampSlot_NilOnOneSideOnly_IsMissingOrExtraWithItsContent(string route)
+    {
+        var context = SaleContext(route);
+        var withoutStamp = SaleEnvelope(route, null);
+
+        var missingA = Assert.Single(_comparer.Compare(SaleEnvelope(route, NilStamp("A")), withoutStamp, context));
+        var missingB = Assert.Single(_comparer.Compare(SaleEnvelope(route, NilStamp("B")), withoutStamp, context));
+        Assert.Equal(new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Missing, DiscrepancyValue.Literal(NilStampMarkup("A")), DiscrepancyValue.Absent), missingA);
+        Assert.Equal(new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Missing, DiscrepancyValue.Literal(NilStampMarkup("B")), DiscrepancyValue.Absent), missingB);
+
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal(NilStampMarkup("B"))),
+            Assert.Single(_comparer.Compare(withoutStamp, SaleEnvelope(route, NilStamp("B")), context)));
+
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Missing, DiscrepancyValue.Literal(NilLiteral), DiscrepancyValue.Absent),
+            Assert.Single(_comparer.Compare(SaleEnvelope(route, $"<{SaleTimestamp} {NilLiteral}/>"), withoutStamp, context)));
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal(NilLiteral)),
+            Assert.Single(_comparer.Compare(withoutStamp, SaleEnvelope(route, NilStamp(string.Empty)), context)));
+    }
+
     [Fact]
     public void XsiTypeOfANestedReference_SwitchesItsClass()
     {
@@ -1090,6 +1225,94 @@ public sealed class XmlSemanticComparerTests
             statusMatched: true);
     }
 
+    // The encodings Encoded writes a body in.
+    private const string Utf8 = "utf-8";
+    private const string Utf16LittleEndian = "utf-16 little-endian";
+    private const string Utf16BigEndian = "utf-16 big-endian";
+
+    // A SOAP body in UTF-16, with its byte-order mark and declaration, is the same XML as in UTF-8: in every
+    // pairing, equal envelopes are equivalent and well formed, and a leaf difference is the one discrepancy two
+    // UTF-8 bodies give.
+    [Theory]
+    [InlineData(Utf8, Utf16LittleEndian)]
+    [InlineData(Utf8, Utf16BigEndian)]
+    [InlineData(Utf16LittleEndian, Utf8)]
+    [InlineData(Utf16BigEndian, Utf8)]
+    [InlineData(Utf16LittleEndian, Utf16LittleEndian)]
+    [InlineData(Utf16BigEndian, Utf16BigEndian)]
+    [InlineData(Utf16LittleEndian, Utf16BigEndian)]
+    public void Response_Utf16Soap_IsComparedAsXml(string baselineEncoding, string observedEncoding)
+    {
+        var baseline = SoapSnapshot(Encoded(Envelope(GetAgent, Agent()), baselineEncoding));
+
+        AssertResponse(
+            _responses.Compare(GetAgent, baseline, SoapSnapshot(Encoded(Envelope(GetAgent, Agent(indent: false), indent: false), observedEncoding))),
+            [],
+            wellFormed: true,
+            statusMatched: true);
+        AssertResponse(
+            _responses.Compare(GetAgent, baseline, SoapSnapshot(Encoded(Envelope(GetAgent, AgentWith("email", "<email>hank@it.com </email>")), observedEncoding))),
+            [new($"{AgentResultPath}/email/text()", DiscrepancyKinds.Value, DiscrepancyValue.Literal("hank@it.com"), DiscrepancyValue.Literal("hank@it.com "))],
+            wellFormed: true,
+            statusMatched: true);
+    }
+
+    // getPhoto compares raw bytes, so the same envelope in UTF-16 is well formed but differs from its UTF-8
+    // baseline in length and from the first byte, its byte-order mark.
+    [Theory]
+    [InlineData(Utf16LittleEndian, "ff")]
+    [InlineData(Utf16BigEndian, "fe")]
+    public void Response_Utf16GetPhoto_IsWellFormedAndComparedAsBytes(string observedEncoding, string observedFirstByte)
+    {
+        var photo = Catalogue.GetDto(GetPhoto.ReturnType).SoapProperties.Single().Name;
+        var envelope = Envelope(GetPhoto, $"<{photo}>/9j/4AAQSkZJRgABAgAAZABkAAD/2Q==</{photo}>", indent: false);
+        var baseline = Encoded(envelope, Utf8);
+        var observed = Encoded(envelope, observedEncoding);
+
+        AssertResponse(
+            _responses.Compare(GetPhoto, SoapSnapshot(baseline), SoapSnapshot(observed)),
+            [
+                new("$body", DiscrepancyKinds.Length, CountLiteral(baseline.Length), CountLiteral(observed.Length)),
+                new("$body[0]", DiscrepancyKinds.Value, DiscrepancyValue.Literal("3c"), DiscrepancyValue.Literal(observedFirstByte)),
+            ],
+            wellFormed: true,
+            statusMatched: true);
+    }
+
+    // A SOAP body that does not decode losslessly in the encoding XML detection reads does not load, and
+    // comparing it never throws: it is not well formed and is compared exactly, as UTF-8 text when it is valid
+    // UTF-8 and by its bytes otherwise. The XML reader alone would load the bodies with a mark the declaration
+    // contradicts, a truncated end, an odd length, a us-ascii or utf-32 declaration over bytes invalid there,
+    // or a UCS-4 byte order, dropping or replacing what does not decode.
+    [Theory]
+    [InlineData("unsupported declared encoding", DiscrepancyKinds.Value)]
+    [InlineData("unknown declared encoding", DiscrepancyKinds.Value)]
+    [InlineData("utf-8 mark with latin-1 declared", DiscrepancyKinds.Value)]
+    [InlineData("utf-16 mark with utf-8 declared", DiscrepancyKinds.Type)]
+    [InlineData("utf-8 truncated at the end", DiscrepancyKinds.Type)]
+    [InlineData("utf-16 of odd length", DiscrepancyKinds.Type)]
+    [InlineData("utf-16 lone surrogate", DiscrepancyKinds.Type)]
+    [InlineData("us-ascii declared over a non-ascii character", DiscrepancyKinds.Value)]
+    [InlineData("utf-32 declared over an invalid code point", DiscrepancyKinds.Value)]
+    [InlineData("ucs-4 in the 2143 byte order", DiscrepancyKinds.Value)]
+    [InlineData("empty", DiscrepancyKinds.Value)]
+    public void Response_SoapThatDoesNotDecodeLosslessly_IsMalformed(string variant, string exactKind)
+    {
+        var baselineBody = Envelope(GetAgent, Agent());
+        var observed = UndecodableBody(variant, baselineBody);
+        var afterMark = observed.AsSpan().StartsWith(Encoding.UTF8.Preamble) ? observed[Encoding.UTF8.Preamble.Length..] : observed;
+        var exact = exactKind == DiscrepancyKinds.Value ? Encoding.UTF8.GetString(afterMark) : Convert.ToHexStringLower(afterMark);
+
+        AssertResponse(
+            _responses.Compare(GetAgent, SoapSnapshot(baselineBody), SoapSnapshot(observed)),
+            [
+                new("$body", DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, DiscrepancyValue.Absent),
+                new("$body", exactKind, DiscrepancyValue.Literal(baselineBody), DiscrepancyValue.Literal(exact)),
+            ],
+            wellFormed: false,
+            statusMatched: true);
+    }
+
     // ---- Helpers ---------------------------------------------------------------------------------
 
     /// <summary>A SOAP response with the catalogue status and content type whose body is <paramref name="body"/> in UTF-8, without a byte-order mark.</summary>
@@ -1101,6 +1324,73 @@ public sealed class XmlSemanticComparerTests
     /// <summary>A SOAP response with the catalogue status and <paramref name="contentType"/>, null for none, whose body is <paramref name="body"/> in UTF-8.</summary>
     private static ResponseSnapshot SoapSnapshot(string body, string? contentType) =>
         new(SoapStatus, contentType, Encoding.UTF8.GetBytes(body));
+
+    /// <summary>An XML declaration naming <paramref name="encoding"/>.</summary>
+    private static string XmlDeclaration(string encoding) => $"<?xml version=\"1.0\" encoding=\"{encoding}\"?>";
+
+    /// <summary>
+    /// <paramref name="xml"/> after its XML declaration in <paramref name="encoding"/>: <see cref="Utf8"/> without a
+    /// byte-order mark, declared <c>utf-8</c>, as the stand-in writes a body; <see cref="Utf16LittleEndian"/> or
+    /// <see cref="Utf16BigEndian"/> after that byte order's mark, declared <c>utf-16</c>.
+    /// </summary>
+    private static byte[] Encoded(string xml, string encoding)
+    {
+        (Encoding Text, string Declared) form = encoding switch
+        {
+            Utf8 => (new UTF8Encoding(encoderShouldEmitUTF8Identifier: false), "utf-8"),
+            Utf16LittleEndian => (new UnicodeEncoding(bigEndian: false, byteOrderMark: true), "utf-16"),
+            Utf16BigEndian => (new UnicodeEncoding(bigEndian: true, byteOrderMark: true), "utf-16"),
+            _ => throw new ArgumentOutOfRangeException(nameof(encoding), encoding, "Unknown test encoding."),
+        };
+
+        return [.. form.Text.Preamble, .. form.Text.GetBytes(XmlDeclaration(form.Declared) + xml)];
+    }
+
+    /// <summary>
+    /// The body of <paramref name="variant"/> in <see cref="Response_SoapThatDoesNotDecodeLosslessly_IsMalformed"/>,
+    /// built from <paramref name="envelope"/>, the ASCII getAgent envelope that holds the agent's name once.
+    /// </summary>
+    private static byte[] UndecodableBody(string variant, string envelope)
+    {
+        const string AgentName = "Hank Williams";
+        Assert.True(Ascii.IsValid(envelope), "The envelope fixture must be ASCII, one code unit per character.");
+        var name = envelope.IndexOf(AgentName, StringComparison.Ordinal);
+        Assert.True(name >= 0, "The envelope fixture must hold the agent's name.");
+
+        // Overwrites the code unit of the text's character at index, which follows a mark of markLength bytes,
+        // with unit, which the encoding does not allow there.
+        static byte[] WithUnitAt(byte[] bytes, int markLength, int index, byte[] unit)
+        {
+            unit.CopyTo(bytes, markLength + (index * unit.Length));
+            return bytes;
+        }
+
+        return variant switch
+        {
+            "unsupported declared encoding" => Encoding.UTF8.GetBytes(XmlDeclaration("windows-1252") + envelope),
+            "unknown declared encoding" => Encoding.UTF8.GetBytes(XmlDeclaration("bogus") + envelope),
+            "utf-8 mark with latin-1 declared" => [.. Encoding.UTF8.Preamble, .. Encoding.UTF8.GetBytes(XmlDeclaration("iso-8859-1") + envelope)],
+            "utf-16 mark with utf-8 declared" => [.. Encoding.Unicode.Preamble, .. Encoding.Unicode.GetBytes(XmlDeclaration("utf-8") + envelope)],
+            "utf-8 truncated at the end" => [.. Encoding.UTF8.GetBytes(envelope), 0xE2, 0x82],
+            "utf-16 of odd length" => [.. Encoded(envelope, Utf16LittleEndian), 0x20],
+            "utf-16 lone surrogate" => WithUnitAt(
+                [.. Encoding.Unicode.Preamble, .. Encoding.Unicode.GetBytes(envelope)], Encoding.Unicode.Preamble.Length, name, [0x00, 0xD8]),
+            "us-ascii declared over a non-ascii character" =>
+                Encoding.UTF8.GetBytes(XmlDeclaration("us-ascii") + envelope.Replace(AgentName, "Hank W\u00EDlliams", StringComparison.Ordinal)),
+            "utf-32 declared over an invalid code point" => WithUnitAt(
+                new UTF32Encoding(bigEndian: false, byteOrderMark: false).GetBytes(XmlDeclaration("utf-32") + envelope),
+                0,
+                XmlDeclaration("utf-32").Length + name,
+                [0x00, 0x00, 0x11, 0x00]),
+            "ucs-4 in the 2143 byte order" => [.. envelope.SelectMany(character => new byte[] { 0x00, 0x00, (byte)character, 0x00 })],
+            "empty" => [],
+            _ => throw new ArgumentOutOfRangeException(nameof(variant), variant, "Unknown undecodable body variant."),
+        };
+    }
+
+    /// <summary>The literal of a byte count, as a binary <c>length</c> discrepancy holds it.</summary>
+    private static DiscrepancyValue CountLiteral(int count) =>
+        DiscrepancyValue.Literal(count.ToString(CultureInfo.InvariantCulture));
 
     /// <summary>Asserts the complete, ordered discrepancy list and all three flags of a response comparison.</summary>
     private static void AssertResponse(ResponseComparison comparison, Discrepancy[] expected, bool wellFormed, bool statusMatched)
@@ -1179,6 +1469,16 @@ public sealed class XmlSemanticComparerTests
 
     /// <summary>The sale's timestamp element holding <paramref name="content"/>, which may be markup.</summary>
     private static string Stamp(string content) => $"<{SaleTimestamp}>{content}</{SaleTimestamp}>";
+
+    /// <summary>The sale's timestamp element carrying <c>xsi:nil="true"</c> and holding <paramref name="content"/>, which may be markup.</summary>
+    private static string NilStamp(string content) => $"<{SaleTimestamp} {NilLiteral}>{content}</{SaleTimestamp}>";
+
+    /// <summary>
+    /// The literal a discrepancy reports for <see cref="NilStamp"/> holding <paramref name="text"/> in a sale envelope:
+    /// the element's unformatted markup with the declarations of the namespaces it inherits, xsi and the body's default.
+    /// </summary>
+    private static string NilStampMarkup(string text) =>
+        $"<{SaleTimestamp} {NilLiteral} xmlns:xsi=\"{XsiNamespace}\" xmlns=\"{TargetNamespace}\">{text}</{SaleTimestamp}>";
 
     /// <summary>The comparison context of a typing route: getAgent's for <see cref="ByXsiType"/>, the synthetic operation's otherwise.</summary>
     private static XmlComparisonContext SaleContext(string route) => route switch

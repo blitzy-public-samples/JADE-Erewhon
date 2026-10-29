@@ -6,7 +6,6 @@ using Erewhon.Contracts.Hosting;
 using Erewhon.Facade.Routing;
 using Erewhon.Facade.Soap;
 using Microsoft.AspNetCore.Mvc;
-using Microsoft.Extensions.Options;
 
 namespace Erewhon.Facade.Admin;
 
@@ -103,13 +102,12 @@ public static partial class AdminEndpoints
             .RequireListener(ListenerKind.Admin)
             .ExcludeFromDescription();
 
+        // Everything but the WSDL status comes from the table in service, so a rejected reload reports
+        // the table and Backend:TimeoutSeconds that requests are still routed with.
         endpoints.MapGet(
                 AdminRoutes.Info,
-                (HttpContext context,
-                    [FromServices] OperationRouter router,
-                    [FromServices] WsdlDocument wsdl,
-                    [FromServices] IOptionsMonitor<BackendOptions> backend) =>
-                    WriteInfoAsync(context.Response, router.Describe(), wsdl.Status, backend.CurrentValue.TimeoutSeconds, context.RequestAborted))
+                (HttpContext context, [FromServices] OperationRouter router, [FromServices] WsdlDocument wsdl) =>
+                    WriteInfoAsync(context.Response, router.Describe(), wsdl.Status, context.RequestAborted))
             .RequireListener(ListenerKind.Admin)
             .ExcludeFromDescription();
 
@@ -177,7 +175,8 @@ public static partial class AdminEndpoints
 
     /// <summary>
     /// Writes the <see cref="AdminRoutes.Info"/> body: compact JSON whose members appear in the fixed order
-    /// component, frameworkDescription, wsdl, backendTimeoutSeconds, routing. <c>routing</c> projects
+    /// component, frameworkDescription, wsdl, backendTimeoutSeconds, routing. <c>backendTimeoutSeconds</c>
+    /// is the snapshot's <see cref="RoutingSnapshot.BackendTimeoutSeconds"/>, and <c>routing</c> projects
     /// <paramref name="routing"/> as <see cref="OperationRouter.Resolve"/> uses it: the default target, the
     /// targets keyed by name in the snapshot's ordinal order, and one row per catalogue operation in the
     /// snapshot's order, REST first, then SOAP. Each target's <c>restBaseUrl</c> and <c>soapBaseUrl</c>
@@ -188,7 +187,6 @@ public static partial class AdminEndpoints
         HttpResponse response,
         RoutingSnapshot routing,
         string wsdlStatus,
-        int backendTimeoutSeconds,
         CancellationToken cancellationToken)
     {
         var buffer = new ArrayBufferWriter<byte>(4096);
@@ -198,7 +196,7 @@ public static partial class AdminEndpoints
             writer.WriteString(ComponentMember, ComponentName);
             writer.WriteString(FrameworkDescriptionMember, RuntimeInformation.FrameworkDescription);
             writer.WriteString(WsdlMember, wsdlStatus);
-            writer.WriteNumber(BackendTimeoutSecondsMember, backendTimeoutSeconds);
+            writer.WriteNumber(BackendTimeoutSecondsMember, routing.BackendTimeoutSeconds);
 
             writer.WriteStartObject(RoutingMember);
             writer.WriteString(DefaultTargetMember, routing.DefaultTarget);
