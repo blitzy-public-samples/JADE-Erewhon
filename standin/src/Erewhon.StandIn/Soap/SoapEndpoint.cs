@@ -456,7 +456,7 @@ public static partial class SoapEndpoint
             foreach (RetailSale sale in client.AllRetailSales)
             {
                 Item item = sale.MyItem
-                    ?? throw new InvalidOperationException($"Retail sale (oid {sale.Oid}) of client {client.Name} has no item.");
+                    ?? throw new InvalidOperationException($"Retail sale (oid {sale.Oid}) of client (oid {client.Oid}) has no item.");
                 if (item.Photo is { Length: > 0 } bytes)
                 {
                     photo = bytes;

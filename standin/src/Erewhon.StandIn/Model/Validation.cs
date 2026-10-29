@@ -1024,7 +1024,7 @@ public sealed class AgentTA : AddressOwnerTA
     {
         ArgumentNullException.ThrowIfNull(agent);
         Address address = agent.MyAddress
-            ?? throw new InvalidOperationException($"Agent {agent.Name} (oid {agent.Oid}) has no address.");
+            ?? throw new InvalidOperationException($"Agent (oid {agent.Oid}) has no address.");
 
         ModelObject = agent;
         var addressTA = new AddressTA();
@@ -1170,7 +1170,7 @@ public sealed class ClientTA : AddressOwnerTA
     {
         ArgumentNullException.ThrowIfNull(client);
         Address address = client.MyAddress
-            ?? throw new InvalidOperationException($"Client {client.Name} (oid {client.Oid}) has no address.");
+            ?? throw new InvalidOperationException($"Client (oid {client.Oid}) has no address.");
 
         ModelObject = client;
         var addressTA = new AddressTA();
