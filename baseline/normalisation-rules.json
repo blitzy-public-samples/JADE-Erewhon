@@ -1,0 +1,87 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "N1",
+      "name": "{generated-guid}",
+      "description": "Generated identifiers: the guid of every DTO whose source object's identifier is generated at load or request time. Values are equal when both are valid braced 38-character JADE GUIDs, or when neither is valid and both are exactly equal.",
+      "validForm": {
+        "json": "jade-guid",
+        "xml": "jade-guid"
+      },
+      "targets": [
+        {
+          "class": "DTOAgent",
+          "property": "guid"
+        },
+        {
+          "class": "DTOClient",
+          "property": "guid"
+        },
+        {
+          "class": "DTOCompany",
+          "property": "guid"
+        },
+        {
+          "class": "DTOResult",
+          "property": "guid"
+        },
+        {
+          "class": "DTORetailSale",
+          "property": "guid"
+        },
+        {
+          "class": "DTORetailSaleDetail",
+          "property": "guid"
+        },
+        {
+          "class": "DTOSale",
+          "property": "guid"
+        },
+        {
+          "class": "DTOSaleDetail",
+          "property": "guid"
+        },
+        {
+          "class": "DTOTender",
+          "property": "guid"
+        },
+        {
+          "class": "DTOTenderSale",
+          "property": "guid"
+        },
+        {
+          "class": "DTOTenderSaleDetail",
+          "property": "guid"
+        }
+      ]
+    },
+    {
+      "id": "N2",
+      "name": "{timestamp}",
+      "description": "Timestamps: every TimeStamp-typed value. Values are equal when both are valid (Microsoft JSON date in JSON, xsd:dateTime in XML), or when neither is valid and both are exactly equal.",
+      "validForm": {
+        "json": "microsoft-json-date",
+        "xml": "xsd:dateTime"
+      },
+      "targets": [
+        {
+          "class": "DTORetailSale",
+          "property": "timestamp"
+        },
+        {
+          "class": "DTORetailSaleDetail",
+          "property": "soldDate"
+        },
+        {
+          "class": "DTOTender",
+          "property": "timestamp"
+        },
+        {
+          "class": "DTOTenderSaleDetail",
+          "property": "tenderDate"
+        }
+      ]
+    }
+  ]
+}
