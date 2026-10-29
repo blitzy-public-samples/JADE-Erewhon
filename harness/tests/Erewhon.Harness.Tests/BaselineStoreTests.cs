@@ -13,8 +13,9 @@ namespace Erewhon.Harness.Tests;
 /// reads it only through <see cref="BaselineStore"/>, and checks file names, byte-exact and deterministic
 /// output, verified reads, the refusal of inconsistent, malformed and damaged records, and physical
 /// containment: no write or delete reaches outside <c>baseline/</c> through a symbolic link, whether the link
-/// sits on <c>baseline/</c> itself, on a directory below it or at the target, or dangles. Links point into a
-/// simulated <c>Erewhon/DataFiles</c> inside the temporary root; the repository's own tree is never touched.
+/// sits on <c>baseline/</c> itself, on a directory below it or at the target, dangles, or is swapped in for a
+/// directory while the store works. Links point into a simulated <c>Erewhon/DataFiles</c> inside the
+/// temporary root; the repository's own tree is never touched.
 /// </summary>
 public sealed class BaselineStoreTests : IDisposable
 {
@@ -37,10 +38,19 @@ public sealed class BaselineStoreTests : IDisposable
     private const string ProtectedPath = "Erewhon/DataFiles";
     private const string SentinelPath = ProtectedPath + "/" + SentinelName;
 
+    // Rounds of every write and delete the parent-swap test runs while its directories are swapped.
+    private const int SwapIterations = 300;
+
     private static readonly string[] DocumentNames =
         ["record", "body-file", "manifest", "normalisation-rules", "conformance", "wsdl"];
 
     private static readonly string[] ReaderNames = ["ReadRecords", "ReadRecordsAsync", "ReadEntries", "ReadEntriesAsync"];
+
+    // The directories the parent-swap test replaces with links, and the protected files an escape through
+    // them would replace or delete.
+    private static readonly string[] SwappedDirectories = ["baseline/records/rest", "baseline/wsdl"];
+
+    private static readonly string[] SwapSentinelNames = ["001-getAgent-01.json", "standin-ErewhonWebService.wsdl"];
 
     private readonly string _root;
     private readonly HarnessOptions _options;
@@ -744,6 +754,60 @@ public sealed class BaselineStoreTests : IDisposable
         Assert.Equal(before, await File.ReadAllBytesAsync(target, TestCancellation));
     }
 
+    // A directory swapped for a link while the store works must never redirect it. A background thread keeps
+    // moving baseline/records/rest and baseline/wsdl aside, putting a link to the protected directory in each
+    // place and moving the directory back, while every write and delete runs against the moving tree. Which
+    // operations succeed and which are refused depends on timing, so only that each one succeeds or is
+    // refused, and that the protected directory is unchanged, is asserted.
+    [Fact]
+    public async Task ConcurrentParentSwap_NeverWritesOrDeletesThroughTheSwappedInLink()
+    {
+        CreateProtectedDirectory();
+        foreach (var name in SwapSentinelNames)
+        {
+            await File.WriteAllBytesAsync(Path.Combine(ProtectedDirectory, name), SentinelBytes, TestCancellation);
+        }
+
+        await WriteFixture(_store, useAsync: false);
+        var before = Snapshot(ProtectedDirectory);
+        Func<Task>[] operations =
+        [
+            () => Synchronously(() => _store.WriteRecord(AgentRecord, AgentBody)),
+            () => _store.WriteRecordAsync(AgentRecord, AgentBody, TestCancellation),
+            () => Synchronously(() => _store.ClearRecords(TestCancellation)),
+            () => Synchronously(() => _store.WriteWsdl(WsdlBytes)),
+            () => _store.WriteWsdlAsync(WsdlBytes, TestCancellation),
+            () => Synchronously(_store.DeleteWsdl),
+        ];
+
+        Exception? swapFailure = null;
+        using var stop = new CancellationTokenSource();
+        var swapper = new Thread(() => swapFailure = SwapForLinks(stop.Token)) { IsBackground = true };
+        swapper.Start();
+        try
+        {
+            for (var iteration = 0; iteration < SwapIterations; iteration++)
+            {
+                foreach (var operation in operations)
+                {
+                    AssertSucceededOrRefused(await Outcome(operation));
+                }
+            }
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            swapper.Join();
+            RemoveSwappedInLinks();
+        }
+
+        Assert.Null(swapFailure);
+        Assert.Equal(3, before.Count);
+        Assert.Equal(before, Snapshot(ProtectedDirectory));
+        _store.WriteRecord(AgentRecord, AgentBody);
+        Assert.Equal(BaselineStore.SerializeDocument(AgentRecord), await ReadBytes(RestRecordPath));
+    }
+
     // ---- Cancellation -------------------------------------------------------------------------------
 
     [Theory]
@@ -952,6 +1016,103 @@ public sealed class BaselineStoreTests : IDisposable
     // The setup is a real escape route: the sentinel is visible through the linked directory.
     private void AssertLinkReachesProtectedDirectory(string link) =>
         Assert.True(File.Exists(Path.Combine(Full(link), SentinelName)));
+
+    private static Task Synchronously(Action operation)
+    {
+        operation();
+        return Task.CompletedTask;
+    }
+
+    // The exception an operation ends with, or null when it succeeds.
+    private static async Task<Exception?> Outcome(Func<Task> operation)
+    {
+        try
+        {
+            await operation();
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
+    }
+
+    // An operation racing a parent swap succeeds, or meets the swapped-in link and is refused, or finds the
+    // entry it reached changed under it and fails with an I/O error.
+    private static void AssertSucceededOrRefused(Exception? outcome)
+    {
+        if (outcome is InvalidOperationException refusal)
+        {
+            Assert.Contains(LinkRefusal, refusal.Message, StringComparison.Ordinal);
+        }
+        else if (outcome is not null)
+        {
+            Assert.True(outcome is IOException, outcome.ToString());
+        }
+    }
+
+    // Until stop, moves each swapped directory aside, links its path to the protected directory, removes that
+    // link and moves the directory back. A step the store's own work rules out, such as linking a path where
+    // the store has just recreated the directory, is skipped and leaves the directory aside inside baseline/.
+    // No step reaches into the protected directory. Returns the first other failure, or null.
+    private Exception? SwapForLinks(CancellationToken stop)
+    {
+        try
+        {
+            for (var cycle = 0; !stop.IsCancellationRequested; cycle++)
+            {
+                foreach (var directory in SwappedDirectories)
+                {
+                    var path = Full(directory);
+                    var aside = $"{path}.aside-{cycle}";
+                    if (!Attempt(() => Directory.Move(path, aside)))
+                    {
+                        continue;
+                    }
+
+                    if (Attempt(() => Directory.CreateSymbolicLink(path, ProtectedDirectory)))
+                    {
+                        File.Delete(path);
+                    }
+
+                    Attempt(() => Directory.Move(aside, path));
+                }
+            }
+
+            return null;
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
+    }
+
+    // Whether a swap step succeeded; it fails only with the I/O error of a path the store changed first.
+    private static bool Attempt(Action step)
+    {
+        try
+        {
+            step();
+            return true;
+        }
+        catch (IOException)
+        {
+            return false;
+        }
+    }
+
+    // A link the swapper left behind is removed, so the store's final write and the cleanup see directories.
+    private void RemoveSwappedInLinks()
+    {
+        foreach (var directory in SwappedDirectories)
+        {
+            var path = Full(directory);
+            if (new FileInfo(path).LinkTarget is not null)
+            {
+                File.Delete(path);
+            }
+        }
+    }
 
     private BaselineManifest? ReadManifest() => _store.TryReadManifest(out var manifest) ? manifest : null;
 

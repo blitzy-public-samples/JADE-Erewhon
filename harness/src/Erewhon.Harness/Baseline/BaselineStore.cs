@@ -1,11 +1,13 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using Erewhon.Contracts;
+using Microsoft.Win32.SafeHandles;
 
 namespace Erewhon.Harness.Baseline;
 
@@ -18,14 +20,21 @@ namespace Erewhon.Harness.Baseline;
 /// <remarks>
 /// <para>Every path comes from <see cref="HarnessOptions"/>. A write or delete whose path resolves outside
 /// <c>baseline/</c> is refused, so this store never writes <c>contracts/</c> or anything else.</para>
-/// <para>Containment is physical as well as lexical: this store never writes or deletes through a link.
-/// Every existing component from <c>baseline/</c> itself down to the target is examined without following
-/// links before the target's directories are created, again after they are, and immediately before each write
-/// or delete. A symbolic link, junction or other reparse point there, dangling or not, refuses the operation.
-/// Components above <c>baseline/</c> belong to the repository root the caller chose and are trusted. A file
-/// is replaced, never rewritten in place: the old file is deleted and the new one created exclusively, so
-/// neither a link planted at the final path after the last check nor a hard link to a file elsewhere is
-/// written through.</para>
+/// <para>Containment is physical as well as lexical: this store never writes or deletes through a link, even
+/// while another process renames or replaces directories under it. Components above <c>baseline/</c> belong
+/// to the repository root the caller chose and are trusted. From <c>baseline/</c> itself down to the target's
+/// directory, each component is opened as a directory handle relative to the handle of the one above it,
+/// without following a link, and is created first when a write needs it and it is missing. The write or
+/// delete then names only the final entry inside the last handle, so no directory on the way is looked up
+/// again once checked: one swapped for a link after it was opened cannot redirect the operation. A symbolic
+/// link or other reparse point on that chain or at the target, dangling or not, refuses the operation and is
+/// left in place. <see cref="ClearRecords(CancellationToken)"/> also lists each records directory through its
+/// handle. A file is replaced, never rewritten in place: the old entry is removed and the new file created
+/// exclusively without following a link, so neither a link planted at the final name after the check nor a
+/// hard link to a file elsewhere is written through.</para>
+/// <para>Directory handles of this kind are a Linux facility, so every write and delete throws
+/// <see cref="PlatformNotSupportedException"/> on any other operating system, and on a processor architecture
+/// whose Linux open flags this store does not know. Reads use ordinary paths and run on every platform.</para>
 /// <para>Files are written straight to their final path with one fixed JSON format and no timestamp, so a
 /// re-capture of an unchanged stand-in reproduces every file byte for byte (the manifest's
 /// <c>captureCommit</c> aside) and no temporary file is ever left in the tree.</para>
@@ -237,7 +246,13 @@ public sealed class BaselineStore
     /// A records directory resolves outside <c>baseline/</c>, or a records directory, an entry in it or a
     /// directory above them at or below <c>baseline/</c> is a symbolic link or reparse point.
     /// </exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown to this store.
+    /// </exception>
     /// <exception cref="IOException">A directory cannot be created or a file cannot be deleted.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     public void ClearRecords() => ClearRecords(CancellationToken.None);
 
     /// <summary>
@@ -254,26 +269,47 @@ public sealed class BaselineStore
     /// A records directory resolves outside <c>baseline/</c>, or a records directory, an entry in it or a
     /// directory above them at or below <c>baseline/</c> is a symbolic link or reparse point.
     /// </exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown to this store.
+    /// </exception>
     /// <exception cref="IOException">A directory cannot be created or a file cannot be deleted.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public void ClearRecords(CancellationToken cancellationToken)
     {
-        var files = new List<string>();
-        foreach (var surface in SurfaceDirectoryNames)
+        // Both directories stay open from their listing to their last delete, so every delete lands in the
+        // directory that was listed and checked, whatever is renamed or linked in its place meanwhile.
+        var flags = RequireLinuxTraversal();
+        var surfaces = new List<(DirectoryHandle Directory, string Path, List<string> Files)>();
+        try
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var directory = GuardWritePath(Path.Combine(options.RecordsDirectory, surface));
-            Directory.CreateDirectory(directory);
-            foreach (var file in Directory.GetFiles(GuardWritePath(directory)))
+            foreach (var surface in SurfaceDirectoryNames)
             {
-                files.Add(GuardWritePath(file));
+                cancellationToken.ThrowIfCancellationRequested();
+                var path = ResolveWritePath(Path.Combine(options.RecordsDirectory, surface));
+                var directory = OpenDirectory(path, path.Segments.Length, create: true, flags)!;
+                var files = new List<string>();
+                surfaces.Add((directory, path.FullPath, files));
+                ListFiles(directory, path.FullPath, files);
+            }
+
+            foreach (var (directory, path, files) in surfaces)
+            {
+                foreach (var name in files)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    DeleteFile(directory, name, Path.Join(path, name));
+                }
             }
         }
-
-        foreach (var file in files)
+        finally
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            File.Delete(GuardWritePath(file));
+            foreach (var (directory, _, _) in surfaces)
+            {
+                directory.Dispose();
+            }
         }
     }
 
@@ -287,6 +323,9 @@ public sealed class BaselineStore
     /// The record is not labelled <see cref="SourceLabels.StandIn"/>, or a path resolves outside <c>baseline/</c>
     /// or reaches its file through a symbolic link or reparse point at or below <c>baseline/</c>.
     /// </exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown to this store.
+    /// </exception>
     /// <exception cref="InvalidDataException">
     /// <c>bodySha256</c> does not cover <paramref name="rawBody"/>; a named body file is not the record's own
     /// or comes with body text; or, with no body file, the body text does not reproduce
@@ -294,6 +333,9 @@ public sealed class BaselineStore
     /// </exception>
     /// <exception cref="ArgumentException">The record's members are missing, out of range or malformed.</exception>
     /// <exception cref="IOException">A file cannot be written.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     public void WriteRecord(BaselineRecord record, ReadOnlySpan<byte> rawBody)
     {
         var (recordPath, bodyPath) = CheckedRecordPaths(record, rawBody);
@@ -317,6 +359,9 @@ public sealed class BaselineStore
     /// The record is not labelled <see cref="SourceLabels.StandIn"/>, or a path resolves outside <c>baseline/</c>
     /// or reaches its file through a symbolic link or reparse point at or below <c>baseline/</c>.
     /// </exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown to this store.
+    /// </exception>
     /// <exception cref="InvalidDataException">
     /// <c>bodySha256</c> does not cover <paramref name="rawBody"/>; a named body file is not the record's own
     /// or comes with body text; or, with no body file, the body text does not reproduce
@@ -324,6 +369,9 @@ public sealed class BaselineStore
     /// </exception>
     /// <exception cref="ArgumentException">The record's members are missing, out of range or malformed.</exception>
     /// <exception cref="IOException">A file cannot be written.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public async Task WriteRecordAsync(
         BaselineRecord record, ReadOnlyMemory<byte> rawBody, CancellationToken cancellationToken = default)
@@ -392,7 +440,13 @@ public sealed class BaselineStore
     /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
     /// symbolic link or reparse point.
     /// </exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown to this store.
+    /// </exception>
     /// <exception cref="IOException">The file cannot be written.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     public void WriteManifest(BaselineManifest manifest)
     {
         ArgumentNullException.ThrowIfNull(manifest);
@@ -407,7 +461,13 @@ public sealed class BaselineStore
     /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
     /// symbolic link or reparse point.
     /// </exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown to this store.
+    /// </exception>
     /// <exception cref="IOException">The file cannot be written.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public Task WriteManifestAsync(BaselineManifest manifest, CancellationToken cancellationToken = default)
     {
@@ -421,7 +481,13 @@ public sealed class BaselineStore
     /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
     /// symbolic link or reparse point.
     /// </exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown to this store.
+    /// </exception>
     /// <exception cref="IOException">The file cannot be written.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     public void WriteNormalisationRules(JsonNode rules)
     {
         ArgumentNullException.ThrowIfNull(rules);
@@ -439,7 +505,13 @@ public sealed class BaselineStore
     /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
     /// symbolic link or reparse point.
     /// </exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown to this store.
+    /// </exception>
     /// <exception cref="IOException">The file cannot be written.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public Task WriteNormalisationRulesAsync(JsonNode rules, CancellationToken cancellationToken = default)
     {
@@ -453,7 +525,13 @@ public sealed class BaselineStore
     /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
     /// symbolic link or reparse point.
     /// </exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown to this store.
+    /// </exception>
     /// <exception cref="IOException">The file cannot be written.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     public void WriteConformance(JsonNode conformance)
     {
         ArgumentNullException.ThrowIfNull(conformance);
@@ -470,7 +548,13 @@ public sealed class BaselineStore
     /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
     /// symbolic link or reparse point.
     /// </exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown to this store.
+    /// </exception>
     /// <exception cref="IOException">The file cannot be written.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public Task WriteConformanceAsync(JsonNode conformance, CancellationToken cancellationToken = default)
     {
@@ -487,7 +571,13 @@ public sealed class BaselineStore
     /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
     /// symbolic link or reparse point.
     /// </exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown to this store.
+    /// </exception>
     /// <exception cref="IOException">The file cannot be written.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     public void WriteWsdl(byte[] exactBytes)
     {
         ArgumentNullException.ThrowIfNull(exactBytes);
@@ -505,7 +595,13 @@ public sealed class BaselineStore
     /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
     /// symbolic link or reparse point.
     /// </exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown to this store.
+    /// </exception>
     /// <exception cref="IOException">The file cannot be written.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public Task WriteWsdlAsync(byte[] exactBytes, CancellationToken cancellationToken = default)
     {
@@ -521,12 +617,25 @@ public sealed class BaselineStore
     /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
     /// symbolic link or reparse point.
     /// </exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown to this store.
+    /// </exception>
+    /// <exception cref="IOException">
+    /// The file cannot be deleted, or a component on the way is not a directory.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     public void DeleteWsdl()
     {
-        var path = GuardWritePath(options.BaselineWsdlPath);
-        if (File.Exists(path))
+        var flags = RequireLinuxTraversal();
+        var path = ResolveWritePath(options.BaselineWsdlPath);
+
+        // Nothing is created: a missing directory on the way holds no WSDL to delete.
+        using var directory = OpenDirectory(path, path.Segments.Length - 1, create: false, flags);
+        if (directory is not null)
         {
-            File.Delete(GuardWritePath(path));
+            DeleteFile(directory, path.Segments[^1], path.FullPath);
         }
     }
 
@@ -1108,9 +1217,7 @@ public sealed class BaselineStore
 
     private void WriteFile(string path, ReadOnlySpan<byte> bytes)
     {
-        var fullPath = PrepareWrite(path);
-        using var handle = File.OpenHandle(
-            fullPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read, FileOptions.None, bytes.Length);
+        using var handle = CreateReplacementFile(path);
         RandomAccess.Write(handle, bytes, fileOffset: 0);
     }
 
@@ -1120,69 +1227,265 @@ public sealed class BaselineStore
     private async Task WriteFileAsync(string path, ReadOnlyMemory<byte> bytes, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var fullPath = PrepareWrite(path);
-        using var handle = File.OpenHandle(
-            fullPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read, FileOptions.Asynchronous, bytes.Length);
+        using var handle = CreateReplacementFile(path);
         await RandomAccess.WriteAsync(handle, bytes, fileOffset: 0, cancellationToken).ConfigureAwait(false);
     }
 
-    // Creates the target's directories and removes the file it replaces, guarding before and after the
-    // directories are created and immediately before the delete and the write. The caller then creates the
-    // file with FileMode.CreateNew, which never follows a link at the final path and fails if anything
-    // reappeared there, so the bytes land in a new file inside baseline/ and nowhere else.
-    private string PrepareWrite(string path)
+    // Opens the target's directory through handles, creating what is missing, then works on the final name
+    // inside that one directory only: a link there is refused, the entry the file replaces is removed, and the
+    // new file is created exclusively without following a link. A link planted at the name after the check is
+    // removed by that unlink rather than followed, and anything that reappears there fails the exclusive
+    // create, so the bytes land in a new file inside baseline/ and nowhere else. Returns the file open for
+    // writing.
+    private SafeFileHandle CreateReplacementFile(string path)
     {
-        var fullPath = GuardWritePath(path);
-        Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
-        File.Delete(GuardWritePath(fullPath));
-        return GuardWritePath(fullPath);
+        var flags = RequireLinuxTraversal();
+        var target = ResolveWritePath(path);
+        var name = target.Segments[^1];
+        using var directory = OpenDirectory(target, target.Segments.Length - 1, create: true, flags)!;
+        if (IsLink(directory, name, target.FullPath))
+        {
+            throw LinkRefusal(target.FullPath, target.FullPath);
+        }
+
+        // unlinkat removes the entry itself, so a hard link to a file elsewhere is dropped, never written through.
+        if (Native.UnlinkAt(directory, name, flags: 0) != 0)
+        {
+            var errno = Marshal.GetLastPInvokeError();
+            if (errno != Native.ENOENT)
+            {
+                throw Failure(errno, "replace", target.FullPath);
+            }
+        }
+
+        var descriptor = Native.OpenAt(directory, name, flags.CreateFile, Native.NewFileMode);
+        if (descriptor < 0)
+        {
+            var errno = Marshal.GetLastPInvokeError();
+            throw errno == Native.EEXIST
+                ? new IOException(
+                    $"BaselineStore could not create '{Display(target.FullPath)}': an entry appeared there after "
+                    + "the one it replaces was removed.")
+                : Failure(errno, "create", target.FullPath);
+        }
+
+        return new SafeFileHandle(descriptor, ownsHandle: true);
     }
 
-    // Refuses a path that leaves baseline/ lexically, then one that reaches its target through a link: every
-    // existing component from baseline/ itself down to the target is examined, stopping at the first missing
-    // one, because nothing exists below a missing directory.
-    private string GuardWritePath(string path)
+    // Deletes the entry name inside a directory handle: a link there is refused, a missing entry is nothing to
+    // delete, and a directory is kept. unlinkat removes the entry itself, never what a link names.
+    private void DeleteFile(DirectoryHandle directory, string name, string path)
+    {
+        if (IsLink(directory, name, path))
+        {
+            throw LinkRefusal(path, path);
+        }
+
+        if (Native.UnlinkAt(directory, name, flags: 0) != 0)
+        {
+            var errno = Marshal.GetLastPInvokeError();
+            if (errno is not (Native.ENOENT or Native.EISDIR))
+            {
+                throw Failure(errno, "delete", path);
+            }
+        }
+    }
+
+    // Adds to files the name of every file directly inside a records directory handle. The listing goes
+    // through /proc/self/fd, which the kernel resolves to the directory the handle holds, not to whatever sits
+    // at its path now. Attributes come from lstat, so a link carries ReparsePoint even when it dangles; a link
+    // refuses the clear before anything is deleted, and a directory is kept.
+    private void ListFiles(DirectoryHandle directory, string path, List<string> files)
+    {
+        var listing = new DirectoryInfo(
+            string.Create(CultureInfo.InvariantCulture, $"/proc/self/fd/{directory.DangerousGetHandle()}"));
+        List<(string Name, FileAttributes Attributes)> entries;
+        try
+        {
+            entries = [.. listing.EnumerateFileSystemInfos().Select(static entry => (entry.Name, entry.Attributes))];
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // The listing path names a descriptor, so the message names the records directory instead.
+            var message = $"BaselineStore could not list '{Display(path)}'.";
+            throw ex is UnauthorizedAccessException
+                ? new UnauthorizedAccessException(message, ex)
+                : new IOException(message, ex);
+        }
+
+        foreach (var (name, attributes) in entries)
+        {
+            // An entry removed since the directory was read has nothing left to delete.
+            if (attributes == MissingEntryAttributes)
+            {
+                continue;
+            }
+
+            var entryPath = Path.Join(path, name);
+            if ((attributes & FileAttributes.ReparsePoint) != 0 || IsLink(directory, name, entryPath))
+            {
+                throw LinkRefusal(entryPath, entryPath);
+            }
+
+            if ((attributes & FileAttributes.Directory) == 0)
+            {
+                files.Add(name);
+            }
+        }
+    }
+
+    // Refuses a path that leaves baseline/ lexically or names baseline/ itself, and splits the rest into the
+    // components below baseline/ that the directory handles walk.
+    private BaselinePath ResolveWritePath(string path)
     {
         var baselineDirectory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(options.BaselineDirectory));
         var baselineRoot = baselineDirectory + Path.DirectorySeparatorChar;
         var fullPath = Path.GetFullPath(path);
-        if (!fullPath.StartsWith(baselineRoot, StringComparison.Ordinal))
+        string[] segments = fullPath.StartsWith(baselineRoot, StringComparison.Ordinal)
+            ? fullPath[baselineRoot.Length..].Split(PathSeparators, StringSplitOptions.RemoveEmptyEntries)
+            : [];
+        if (segments.Length == 0)
         {
             throw new InvalidOperationException(
                 $"BaselineStore never writes outside baseline/: refused '{fullPath}' (baseline is '{baselineRoot}').");
         }
 
-        var segments = fullPath[baselineRoot.Length..].Split(PathSeparators, StringSplitOptions.RemoveEmptyEntries);
-        var component = baselineDirectory;
-        var next = 0;
-        while (ExistsWithoutLink(component, fullPath) && next < segments.Length)
-        {
-            component = Path.Join(component, segments[next++]);
-        }
-
-        return fullPath;
+        return new BaselinePath(baselineDirectory, fullPath, segments);
     }
 
-    // False when the component is missing; throws when it is a link. Neither FileInfo member follows a link:
-    // Attributes reports the entry itself, so a symbolic link carries ReparsePoint even when it dangles, and
-    // LinkTarget names the target of any symbolic link or junction, dangling or not.
-    private bool ExistsWithoutLink(string component, string refusedPath)
+    // Opens the directory that the first depth segments of target name, starting at baseline/ itself. Each
+    // component is opened relative to the handle of the one above it, never through a link, and with create
+    // it is made first when it is missing. Without create a missing component leaves nothing to act on, and
+    // null is returned. The caller disposes the handle.
+    private DirectoryHandle? OpenDirectory(BaselinePath target, int depth, bool create, TraversalFlags flags)
     {
-        var entry = new FileInfo(component);
-        var attributes = entry.Attributes;
-        if (attributes == MissingEntryAttributes)
+        if (create)
+        {
+            // The repository root and the directories above it are the caller's and trusted, so they are made
+            // the ordinary way.
+            Directory.CreateDirectory(Path.GetDirectoryName(target.BaselineDirectory)!);
+        }
+
+        DirectoryHandle? directory;
+        using (var trusted = DirectoryHandle.CurrentDirectory())
+        {
+            directory = OpenComponent(
+                trusted, target.BaselineDirectory, target.BaselineDirectory, target.FullPath, create, flags);
+        }
+
+        var component = target.BaselineDirectory;
+        for (var index = 0; directory is not null && index < depth; index++)
+        {
+            component = Path.Join(component, target.Segments[index]);
+            using var parent = directory;
+            directory = OpenComponent(parent, target.Segments[index], component, target.FullPath, create, flags);
+        }
+
+        return directory;
+    }
+
+    // The directory name inside parent, opened without following a link at name and, with create, made first
+    // when it is missing; null when it is missing without create. component is the path name stands for, and
+    // refusedPath the target a refusal names.
+    private DirectoryHandle? OpenComponent(
+        DirectoryHandle parent, string name, string component, string refusedPath, bool create, TraversalFlags flags)
+    {
+        var descriptor = Native.OpenAt(parent, name, flags.OpenDirectory, mode: 0);
+        var errno = descriptor < 0 ? Marshal.GetLastPInvokeError() : 0;
+        if (errno == Native.ENOENT)
+        {
+            if (!create)
+            {
+                return null;
+            }
+
+            if (Native.MkDirAt(parent, name, Native.NewDirectoryMode) != 0)
+            {
+                errno = Marshal.GetLastPInvokeError();
+                if (errno != Native.EEXIST)
+                {
+                    throw Failure(errno, "create the directory", component);
+                }
+            }
+
+            descriptor = Native.OpenAt(parent, name, flags.OpenDirectory, mode: 0);
+            errno = descriptor < 0 ? Marshal.GetLastPInvokeError() : 0;
+        }
+
+        if (descriptor >= 0)
+        {
+            return DirectoryHandle.Own(descriptor);
+        }
+
+        // With O_DIRECTORY and O_NOFOLLOW, a link, dangling or not, fails as ENOTDIR (or ELOOP) exactly as a file
+        // does, so only reading the entry as a link tells the two apart.
+        if (errno is Native.ENOTDIR or Native.ELOOP)
+        {
+            throw IsLink(parent, name, component)
+                ? LinkRefusal(refusedPath, component)
+                : new IOException($"BaselineStore could not open '{Display(component)}': it is not a directory.");
+        }
+
+        throw Failure(errno, "open the directory", component);
+    }
+
+    // Whether the entry name inside directory is a symbolic link, dangling or not; readlinkat never follows it.
+    // A missing entry is no link.
+    private bool IsLink(DirectoryHandle directory, string name, string path)
+    {
+        byte firstTargetByte = 0;
+        if (Native.ReadLinkAt(directory, name, ref firstTargetByte, size: 1) >= 0)
+        {
+            return true;
+        }
+
+        var errno = Marshal.GetLastPInvokeError();
+        if (errno is Native.EINVAL or Native.ENOENT)
         {
             return false;
         }
 
-        if ((attributes & FileAttributes.ReparsePoint) != 0 || entry.LinkTarget is not null)
+        throw Failure(errno, "examine", path);
+    }
+
+    private InvalidOperationException LinkRefusal(string refusedPath, string component) =>
+        new($"BaselineStore never writes or deletes through a link: refused '{Display(refusedPath)}', because "
+            + $"'{Display(component)}' is a symbolic link or reparse point.");
+
+    // An operating-system error as the exception .NET raises for it, naming the path relative to the
+    // repository root.
+    private Exception Failure(int errno, string action, string path)
+    {
+        var message = $"BaselineStore could not {action} '{Display(path)}': {Marshal.GetPInvokeErrorMessage(errno)}.";
+        return errno is Native.EACCES or Native.EPERM
+            ? new UnauthorizedAccessException(message)
+            : new IOException(message);
+    }
+
+    // The open(2) flags of every write and delete for this process, refusing a platform without Linux directory
+    // handles.
+    private static TraversalFlags RequireLinuxTraversal()
+    {
+        if (!OperatingSystem.IsLinux())
         {
-            throw new InvalidOperationException(
-                $"BaselineStore never writes or deletes through a link: refused '{Display(refusedPath)}', because "
-                + $"'{Display(component)}' is a symbolic link or reparse point.");
+            throw new PlatformNotSupportedException(
+                "BaselineStore writes and deletes only on Linux: it confines them to baseline/ through Linux "
+                + "directory handles, which this operating system does not provide.");
         }
 
-        return true;
+        // O_DIRECTORY and O_NOFOLLOW are the only flags used here whose values differ between architectures.
+        var (directory, noFollow) = RuntimeInformation.ProcessArchitecture switch
+        {
+            Architecture.X64 or Architecture.X86 or Architecture.S390x or Architecture.RiscV64
+                or Architecture.LoongArch64 => (0x10000, 0x20000),
+            Architecture.Arm or Architecture.Arm64 or Architecture.Armv6 or Architecture.Ppc64le => (0x4000, 0x8000),
+            var architecture => throw new PlatformNotSupportedException(
+                $"BaselineStore writes and deletes only where it knows the Linux open flags, which it does not for "
+                + $"{architecture}."),
+        };
+        return new TraversalFlags(
+            Native.O_RDONLY | directory | noFollow | Native.O_CLOEXEC,
+            Native.O_WRONLY | Native.O_CREAT | Native.O_EXCL | noFollow | Native.O_CLOEXEC);
     }
 
     // Messages name paths relative to the repository root, so an error quoted in a report reads the same in
@@ -1235,6 +1538,82 @@ public sealed class BaselineStore
         }
 
         public List<BaselineRecord> SortedRecords() => Sorted().ConvertAll(static entry => entry.Record);
+    }
+
+    // A write or delete target inside baseline/: the baseline directory, the target's full path and the
+    // components below baseline/ that lead to it, the target's own name last.
+    private readonly record struct BaselinePath(string BaselineDirectory, string FullPath, string[] Segments);
+
+    // The open(2) flags of one write or delete: a directory opened read-only, and a file created write-only and
+    // exclusively, both without following a link and both closed on exec.
+    private readonly record struct TraversalFlags(int OpenDirectory, int CreateFile);
+
+    // A directory held open by its file descriptor, so a call relative to it acts on that directory whatever is
+    // later renamed, removed or linked at the path it was opened by.
+    private sealed class DirectoryHandle : SafeHandleMinusOneIsInvalid
+    {
+        private DirectoryHandle(int descriptor, bool ownsHandle)
+            : base(ownsHandle)
+        {
+            SetHandle(descriptor);
+        }
+
+        // AT_FDCWD, which resolves an absolute path as given; it owns no descriptor and closes nothing.
+        public static DirectoryHandle CurrentDirectory() => new(Native.AT_FDCWD, ownsHandle: false);
+
+        public static DirectoryHandle Own(int descriptor) => new(descriptor, ownsHandle: true);
+
+        protected override bool ReleaseHandle() => Native.Close((int)handle) == 0;
+    }
+
+    // The Linux C library calls behind the directory handles, with the flag, mode and errno values they use.
+    // Paths are passed as UTF-8, and a directory handle stays open for the whole of each call it is passed to.
+    // A handle is passed pointer-sized; its value is the descriptor sign-extended, the form in which every
+    // Linux calling convention passes the C int the calls declare. The calls use DllImport, not the
+    // LibraryImport that SYSLIB1054 suggests, because its generated marshalling needs unsafe code, which this
+    // project does not enable; and strings stay UTF-8 despite CA2101, which asks for the UTF-16 of Windows
+    // APIs, because a Linux path is the UTF-8 bytes the kernel reads.
+    private static class Native
+    {
+        public const int AT_FDCWD = -100;
+
+        public const int O_RDONLY = 0;
+        public const int O_WRONLY = 1;
+        public const int O_CREAT = 0x40;
+        public const int O_EXCL = 0x80;
+        public const int O_CLOEXEC = 0x80000;
+
+        // rw-rw-rw- and rwxrwxrwx before the umask, the modes .NET itself creates files and directories with.
+        public const uint NewFileMode = 0b110_110_110;
+        public const uint NewDirectoryMode = 0b111_111_111;
+
+        public const int EPERM = 1;
+        public const int ENOENT = 2;
+        public const int EACCES = 13;
+        public const int EEXIST = 17;
+        public const int ENOTDIR = 20;
+        public const int EISDIR = 21;
+        public const int EINVAL = 22;
+        public const int ELOOP = 40;
+
+        [DllImport("libc", EntryPoint = "openat", SetLastError = true)]
+        public static extern int OpenAt(
+            DirectoryHandle directory, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags, uint mode);
+
+        [DllImport("libc", EntryPoint = "mkdirat", SetLastError = true)]
+        public static extern int MkDirAt(
+            DirectoryHandle directory, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, uint mode);
+
+        [DllImport("libc", EntryPoint = "readlinkat", SetLastError = true)]
+        public static extern nint ReadLinkAt(
+            DirectoryHandle directory, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, ref byte buffer, nuint size);
+
+        [DllImport("libc", EntryPoint = "unlinkat", SetLastError = true)]
+        public static extern int UnlinkAt(
+            DirectoryHandle directory, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags);
+
+        [DllImport("libc", EntryPoint = "close", SetLastError = true)]
+        public static extern int Close(int descriptor);
     }
 }
 
