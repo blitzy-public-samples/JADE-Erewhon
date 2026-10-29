@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Facade-only behaviour tests (per-operation routing, unreachable and timeout responses, listener
+    isolation) against the facade hosted on real loopback Kestrel sockets.
+
+    Target framework, runtime pin, nullable, implicit usings, central package management and lock
+    files are inherited from facade/Directory.Build.props, which imports Erewhon.Strangler.props;
+    package versions come only from the root Directory.Packages.props, so no reference here carries
+    a version.
+
+    xunit.v3 marks this executable as a Microsoft.Testing.Platform application, and facade/global.json
+    selects that runner for `dotnet test`. Microsoft.NET.Test.Sdk and xunit.runner.visualstudio are
+    deliberately absent: VSTest mode is not supported for xunit.v3 4.x on the .NET 10 SDK.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <AssemblyName>Erewhon.Facade.Tests</AssemblyName>
+    <RootNamespace>Erewhon.Facade.Tests</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" />
+    <PackageReference Include="xunit.v3" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Support/StubBackend.cs hosts its own minimal WebApplication. -->
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Erewhon.Contracts flows transitively from the facade project. -->
+    <ProjectReference Include="../../src/Erewhon.Facade/Erewhon.Facade.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+</Project>
