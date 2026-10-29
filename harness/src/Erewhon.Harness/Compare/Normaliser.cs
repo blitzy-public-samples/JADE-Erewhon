@@ -90,9 +90,9 @@ public sealed record NormalisationRule(string Id, string Name, string Descriptio
 /// decide pairwise equality at targeted positions.
 /// </summary>
 /// <remarks>
-/// Instances come only from <see cref="FromCatalogue"/>, <see cref="Parse"/> and <see cref="Load"/>, and
-/// always hold exactly two rules, <c>N1</c> then <c>N2</c>, with no position targeted twice. Instances
-/// are immutable.
+/// Instances come only from <see cref="FromCatalogue"/>, <see cref="Parse"/>, <see cref="Load"/> and
+/// <see cref="LoadAsync"/>, and always hold exactly two rules, <c>N1</c> then <c>N2</c>, with no position
+/// targeted twice. Instances are immutable.
 /// </remarks>
 public sealed class NormalisationRules
 {
@@ -233,6 +233,24 @@ public sealed class NormalisationRules
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         return Parse(File.ReadAllText(path, Encoding.UTF8));
+    }
+
+    /// <summary>
+    /// Reads and parses a normalisation rules file without blocking, as <see cref="Load"/> does: the text is
+    /// decoded as UTF-8 unless a byte-order mark names another encoding, the mark is dropped, and
+    /// <see cref="Parse"/> applies.
+    /// </summary>
+    /// <param name="path">The file path, normally <c>baseline/normalisation-rules.json</c>.</param>
+    /// <param name="cancellationToken">Cancels the read.</param>
+    /// <returns>The rules.</returns>
+    /// <exception cref="ArgumentException"><paramref name="path"/> is null or empty.</exception>
+    /// <exception cref="InvalidDataException">The file content is not a valid rules document.</exception>
+    /// <exception cref="IOException">The file cannot be read.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public static async Task<NormalisationRules> LoadAsync(string path, CancellationToken cancellationToken = default)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        return Parse(await File.ReadAllTextAsync(path, Encoding.UTF8, cancellationToken).ConfigureAwait(false));
     }
 
     /// <summary>
