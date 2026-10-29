@@ -9,7 +9,8 @@ namespace Erewhon.Harness.Tests;
 /// order, prefix choice, namespace declarations, comments and processing instructions, whitespace-only text in
 /// element-only containers, the order of differently named siblings) and which are significant (array item
 /// order, leaf text including whitespace, QName resolution, nil results, unnormalised SOAP values, missing and
-/// extra elements). Operation, element and namespace names come from the contracts catalogue, and every
+/// extra elements), and the N2 pairwise rule at timestamp positions reached through <c>xsi:type</c> or a
+/// synthetic declared type. Operation, element and namespace names come from the contracts catalogue, and every
 /// equivalence has a neighbouring case that must differ, so a comparer that never reports cannot pass.
 /// The response-level cases send SOAP bodies through <see cref="ResponseComparer"/>: XML dispatch, the
 /// media type, well-formedness as a SOAP 1.1 envelope, the byte-order mark and strict UTF-8 decoding.
@@ -66,6 +67,43 @@ public sealed class XmlSemanticComparerTests
 
     private static readonly string FacadeLocation =
         $"http://localhost:{SoapAddressing.Port}{SoapAddressing.EndpointPathAndQuery}";
+
+    // No public SOAP operation returns a class with a TimeStamp property, so the N2 positions are reached through
+    // real catalogue classes: a sale whose own property is targeted, and an item whose sale reference switches to
+    // the sale detail class that has one.
+    private static readonly DtoDefinition RetailSale = Catalogue.GetDto("DTORetailSale");
+    private static readonly DtoDefinition RetailItem = Catalogue.GetDto("DTORetailItem");
+    private static readonly DtoDefinition RetailSaleDetail = Catalogue.GetDto("DTORetailSaleDetail");
+
+    private static readonly string SaleTimestamp = TimestampProperty(RetailSale);
+    private static readonly string SoldDate = TimestampProperty(RetailSaleDetail);
+
+    // The item's reference that the sale detail class can occupy, declared with one of its ancestors.
+    private static readonly string ItemSale = RetailItem.SoapProperties
+        .Single(property => property.Kind == PropertyKind.Reference && Catalogue.IsKindOf(RetailSaleDetail.Name, property.JadeType))
+        .Name;
+
+    /// <summary>
+    /// A synthetic, test-only operation that is never in the catalogue: getAgent's message names with the sale
+    /// class as the declared return type, so N2 applies by declared type without any <c>xsi:type</c>.
+    /// </summary>
+    private static readonly OperationDescriptor SyntheticSaleOperation =
+        GetAgent with { Id = "Synthetic.getRetailSale", ReturnType = RetailSale.Name };
+
+    private static readonly XmlComparisonContext SyntheticSaleResponse = XmlComparisonContext.SoapResponse(SyntheticSaleOperation);
+
+    private static readonly string SaleTimestampPath = $"{AgentResultPath}/{SaleTimestamp}";
+
+    // How a test reaches the sale's timestamp: getAgent's result switched by xsi:type, or the synthetic declared type.
+    private const string ByXsiType = "xsi:type";
+    private const string ByDeclaredType = "declared type";
+
+    // Two different valid xsd:dateTime values, and texts N2 never accepts as one.
+    private const string StampA = "2026-01-01T12:00:00Z";
+    private const string StampB = "2025-06-30T08:15:30.125+02:00";
+    private const string SpacedStamp = "2026-01-01 12:00:00";
+    private const string MonthThirteen = "2026-13-01T12:00:00Z";
+    private const string NilLiteral = "xsi:nil=\"true\"";
 
     // Every SOAP outcome of getAgent shares one HTTP status; business errors travel in the result.
     private static readonly int SoapStatus = GetAgent.Statuses.Select(status => status.HttpStatus).Distinct().Single();
@@ -255,10 +293,82 @@ public sealed class XmlSemanticComparerTests
         Assert.Equal(expected, _comparer.Compare(baseline, swapped, AgentNamesResponse));
     }
 
+    // With an equal common prefix, one item fewer or more is a single length entry at the item group.
+    [Theory]
+    [InlineData("1", "Airi Hamada")]
+    [InlineData("3", "Airi Hamada", "Hank Williams", "Peter Smallsmith")]
+    public void RepeatedItems_CountDiffers_IsOneLengthDifference(string observedCount, params string[] observedNames)
+    {
+        var baseline = Envelope(GetAgentNames, Names(indent: true, "Airi Hamada", "Hank Williams"));
+        var observed = Envelope(GetAgentNames, Names(indent: true, observedNames));
+        var groupPath = $"{AgentNamesResultPath}/{NameItem}";
+
+        Assert.Equal(
+            new Discrepancy(groupPath, DiscrepancyKinds.Length, DiscrepancyValue.Literal("2"), DiscrepancyValue.Literal(observedCount)),
+            Assert.Single(_comparer.Compare(baseline, observed, AgentNamesResponse)));
+        Assert.Equal(
+            new Discrepancy(groupPath, DiscrepancyKinds.Length, DiscrepancyValue.Literal(observedCount), DiscrepancyValue.Literal("2")),
+            Assert.Single(_comparer.Compare(observed, baseline, AgentNamesResponse)));
+    }
+
+    [Fact]
+    public void RepeatedItems_CountAndPrefixDiffer_ReportLengthAndItemValue()
+    {
+        var two = Envelope(GetAgentNames, Names(indent: true, "Airi Hamada", "Hank Williams"));
+        var one = Envelope(GetAgentNames, Names(indent: true, "Hank Williams"));
+        var groupPath = $"{AgentNamesResultPath}/{NameItem}";
+
+        Discrepancy[] twoThenOne =
+        [
+            new(groupPath, DiscrepancyKinds.Length, DiscrepancyValue.Literal("2"), DiscrepancyValue.Literal("1")),
+            new($"{groupPath}[1]/{NameProperty}/text()", DiscrepancyKinds.Value, DiscrepancyValue.Literal("Airi Hamada"), DiscrepancyValue.Literal("Hank Williams")),
+        ];
+        Assert.Equal(twoThenOne, _comparer.Compare(two, one, AgentNamesResponse));
+
+        Discrepancy[] oneThenTwo =
+        [
+            new(groupPath, DiscrepancyKinds.Length, DiscrepancyValue.Literal("1"), DiscrepancyValue.Literal("2")),
+            new($"{groupPath}[1]/{NameProperty}/text()", DiscrepancyKinds.Value, DiscrepancyValue.Literal("Hank Williams"), DiscrepancyValue.Literal("Airi Hamada")),
+        ];
+        Assert.Equal(oneThenTwo, _comparer.Compare(one, two, AgentNamesResponse));
+    }
+
+    // Against a result with no items, each item is missing or extra on its own, at its index.
+    [Fact]
+    public void RepeatedItems_AgainstAnEmptyArray_AreEachMissingOrExtra()
+    {
+        var two = Envelope(GetAgentNames, Names(indent: true, "Airi Hamada", "Hank Williams"));
+        var none = Envelope(GetAgentNames, Names(indent: true));
+        string[] itemPaths = [$"{AgentNamesResultPath}/{NameItem}[1]", $"{AgentNamesResultPath}/{NameItem}[2]"];
+        string[] itemMarkup = [$"<{NameProperty}>Airi Hamada</{NameProperty}>", $"<{NameProperty}>Hank Williams</{NameProperty}>"];
+
+        // Indentation inside an empty array is ignored, as it is inside a populated one.
+        AssertEquivalent(none, Envelope(GetAgentNames, string.Empty), AgentNamesResponse);
+
+        var missing = _comparer.Compare(two, none, AgentNamesResponse);
+        Assert.Equal(itemPaths, missing.Select(discrepancy => discrepancy.Path));
+        for (var index = 0; index < missing.Count; index++)
+        {
+            Assert.Equal(DiscrepancyKinds.Missing, missing[index].Kind);
+            Assert.True(missing[index].Observed.IsAbsent);
+            Assert.Contains(itemMarkup[index], missing[index].Baseline.Text, StringComparison.Ordinal);
+        }
+
+        var extra = _comparer.Compare(none, two, AgentNamesResponse);
+        Assert.Equal(itemPaths, extra.Select(discrepancy => discrepancy.Path));
+        for (var index = 0; index < extra.Count; index++)
+        {
+            Assert.Equal(DiscrepancyKinds.Extra, extra[index].Kind);
+            Assert.True(extra[index].Baseline.IsAbsent);
+            Assert.Contains(itemMarkup[index], extra[index].Observed.Text, StringComparison.Ordinal);
+        }
+    }
+
     [Theory]
     [InlineData("<website> </website>", "<website/>", " ", null)]
     [InlineData("<website/>", "<website> </website>", null, " ")]
     [InlineData("<website> </website>", "<website></website>", " ", null)]
+    [InlineData("<website>&#160;</website>", "<website/>", "\u00A0", null)]
     public void WhitespaceOnlyLeaf_Differs(string baselineWebsite, string observedWebsite, string? baselineText, string? observedText)
     {
         var discrepancy = Assert.Single(
@@ -405,6 +515,328 @@ public sealed class XmlSemanticComparerTests
             discrepancy);
     }
 
+    // ---- N2 timestamps at targeted positions -----------------------------------------------------
+
+    [Theory]
+    [InlineData(ByXsiType)]
+    [InlineData(ByDeclaredType)]
+    public void TimestampSlot_DistinctValidValuesAreEqual_RuleNameLiteralDiffers(string route)
+    {
+        var context = SaleContext(route);
+
+        AssertEquivalent(SaleEnvelope(route, Stamp(StampA)), SaleEnvelope(route, Stamp(StampB)), context);
+
+        // The rule's report name is an ordinary invalid value, never a stand-in for a valid one.
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Value, DiscrepancyValue.Literal("{timestamp}"), DiscrepancyValue.Valid(NormalisationRuleIds.N2)),
+            Assert.Single(_comparer.Compare(SaleEnvelope(route, Stamp("{timestamp}")), SaleEnvelope(route, Stamp(StampA)), context)));
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Value, DiscrepancyValue.Valid(NormalisationRuleIds.N2), DiscrepancyValue.Literal("{timestamp}")),
+            Assert.Single(_comparer.Compare(SaleEnvelope(route, Stamp(StampA)), SaleEnvelope(route, Stamp("{timestamp}")), context)));
+    }
+
+    [Theory]
+    [InlineData(ByXsiType)]
+    [InlineData(ByDeclaredType)]
+    public void TimestampSlot_OnOneSideOnly_IsMissingOrExtraWithItsTypedValue(string route)
+    {
+        var context = SaleContext(route);
+        var withoutStamp = SaleEnvelope(route, null);
+
+        AssertEquivalent(withoutStamp, SaleEnvelope(route, null, indent: false), context);
+
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Missing, DiscrepancyValue.Valid(NormalisationRuleIds.N2), DiscrepancyValue.Absent),
+            Assert.Single(_comparer.Compare(SaleEnvelope(route, Stamp(StampA)), withoutStamp, context)));
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Valid(NormalisationRuleIds.N2)),
+            Assert.Single(_comparer.Compare(withoutStamp, SaleEnvelope(route, Stamp(StampB)), context)));
+
+        // An invalid one-sided value keeps its exact text.
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Missing, DiscrepancyValue.Literal("{timestamp}"), DiscrepancyValue.Absent),
+            Assert.Single(_comparer.Compare(SaleEnvelope(route, Stamp("{timestamp}")), withoutStamp, context)));
+    }
+
+    [Theory]
+    [InlineData(ByXsiType)]
+    [InlineData(ByDeclaredType)]
+    public void TimestampSlot_NilNeverEqualsValid(string route)
+    {
+        var context = SaleContext(route);
+        var nil = SaleEnvelope(route, $"<{SaleTimestamp} {NilLiteral}/>");
+        var valid = SaleEnvelope(route, Stamp(StampA));
+        var nilAttributePath = $"{SaleTimestampPath}/@{{{XsiNamespace}}}nil";
+
+        AssertEquivalent(nil, SaleEnvelope(route, $"<{SaleTimestamp} {NilLiteral}></{SaleTimestamp}>"), context);
+
+        Discrepancy[] nilThenValid =
+        [
+            new(SaleTimestampPath, DiscrepancyKinds.Type, DiscrepancyValue.Literal(NilLiteral), DiscrepancyValue.Valid(NormalisationRuleIds.N2)),
+            new(nilAttributePath, DiscrepancyKinds.Missing, DiscrepancyValue.Literal("true"), DiscrepancyValue.Absent),
+        ];
+        Assert.Equal(nilThenValid, _comparer.Compare(nil, valid, context));
+
+        Discrepancy[] validThenNil =
+        [
+            new(SaleTimestampPath, DiscrepancyKinds.Type, DiscrepancyValue.Valid(NormalisationRuleIds.N2), DiscrepancyValue.Literal(NilLiteral)),
+            new(nilAttributePath, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal("true")),
+        ];
+        Assert.Equal(validThenNil, _comparer.Compare(valid, nil, context));
+    }
+
+    [Theory]
+    [InlineData(ByXsiType)]
+    [InlineData(ByDeclaredType)]
+    public void TimestampSlot_EmptyNeverEqualsValid(string route)
+    {
+        var context = SaleContext(route);
+        var empty = SaleEnvelope(route, $"<{SaleTimestamp}/>");
+
+        AssertEquivalent(empty, SaleEnvelope(route, Stamp(string.Empty)), context);
+
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(string.Empty), DiscrepancyValue.Valid(NormalisationRuleIds.N2)),
+            Assert.Single(_comparer.Compare(empty, SaleEnvelope(route, Stamp(StampA)), context)));
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Value, DiscrepancyValue.Valid(NormalisationRuleIds.N2), DiscrepancyValue.Literal(string.Empty)),
+            Assert.Single(_comparer.Compare(SaleEnvelope(route, Stamp(StampA)), empty, context)));
+    }
+
+    [Theory]
+    [InlineData(ByXsiType)]
+    [InlineData(ByDeclaredType)]
+    public void TimestampSlot_InvalidValues_CompareExactly(string route)
+    {
+        var context = SaleContext(route);
+
+        AssertEquivalent(SaleEnvelope(route, Stamp(SpacedStamp)), SaleEnvelope(route, Stamp(SpacedStamp)), context);
+
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(SpacedStamp), DiscrepancyValue.Literal(MonthThirteen)),
+            Assert.Single(_comparer.Compare(SaleEnvelope(route, Stamp(SpacedStamp)), SaleEnvelope(route, Stamp(MonthThirteen)), context)));
+
+        // Padding makes a valid value invalid; nothing is trimmed.
+        Assert.Equal(
+            new Discrepancy(SaleTimestampPath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(" " + StampA), DiscrepancyValue.Valid(NormalisationRuleIds.N2)),
+            Assert.Single(_comparer.Compare(SaleEnvelope(route, Stamp(" " + StampA)), SaleEnvelope(route, Stamp(StampA)), context)));
+    }
+
+    // Element content is never a valid xsd:dateTime, so a targeted element with a child is compared exactly.
+    [Theory]
+    [InlineData(ByXsiType)]
+    [InlineData(ByDeclaredType)]
+    public void TimestampSlot_ComplexContent_IsComparedExactly(string route)
+    {
+        var context = SaleContext(route);
+        var wrappedA = SaleEnvelope(route, Stamp($"<value>{StampA}</value>"));
+
+        AssertEquivalent(wrappedA, SaleEnvelope(route, Stamp($"<value>{StampA}</value>"), indent: false), context);
+
+        // Two valid values inside the child are not normalised.
+        Assert.Equal(
+            new Discrepancy($"{SaleTimestampPath}/value/text()", DiscrepancyKinds.Value, DiscrepancyValue.Literal(StampA), DiscrepancyValue.Literal(StampB)),
+            Assert.Single(_comparer.Compare(wrappedA, SaleEnvelope(route, Stamp($"<value>{StampB}</value>")), context)));
+
+        var wrappedThenSimple = _comparer.Compare(wrappedA, SaleEnvelope(route, Stamp(StampA)), context);
+        Assert.Equal(2, wrappedThenSimple.Count);
+        Assert.Equal(
+            new Discrepancy($"{SaleTimestampPath}/text()[1]", DiscrepancyKinds.Value, DiscrepancyValue.Absent, DiscrepancyValue.Literal(StampA)),
+            wrappedThenSimple[0]);
+        Assert.Equal($"{SaleTimestampPath}/value", wrappedThenSimple[1].Path);
+        Assert.Equal(DiscrepancyKinds.Missing, wrappedThenSimple[1].Kind);
+        Assert.True(wrappedThenSimple[1].Observed.IsAbsent);
+        Assert.Contains(StampA, wrappedThenSimple[1].Baseline.Text, StringComparison.Ordinal);
+
+        var simpleThenWrapped = _comparer.Compare(SaleEnvelope(route, Stamp(StampA)), wrappedA, context);
+        Assert.Equal(2, simpleThenWrapped.Count);
+        Assert.Equal(
+            new Discrepancy($"{SaleTimestampPath}/text()[1]", DiscrepancyKinds.Value, DiscrepancyValue.Literal(StampA), DiscrepancyValue.Absent),
+            simpleThenWrapped[0]);
+        Assert.Equal($"{SaleTimestampPath}/value", simpleThenWrapped[1].Path);
+        Assert.Equal(DiscrepancyKinds.Extra, simpleThenWrapped[1].Kind);
+        Assert.True(simpleThenWrapped[1].Baseline.IsAbsent);
+        Assert.Contains(StampA, simpleThenWrapped[1].Observed.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void XsiTypeOfANestedReference_SwitchesItsClass()
+    {
+        var itemType = $" xsi:type=\"{RetailItem.Name}\"";
+        var soldDatePath = $"{AgentResultPath}/{ItemSale}/{SoldDate}";
+
+        string Item(string saleAttributes, string soldDate) =>
+            Envelope(GetAgent, Join([$"<{ItemSale}{saleAttributes}><{SoldDate}>{soldDate}</{SoldDate}></{ItemSale}>"]), resultAttributes: itemType);
+
+        var detailType = $" xsi:type=\"{RetailSaleDetail.Name}\"";
+        AssertEquivalent(Item(detailType, StampA), Item(detailType, StampB), AgentResponse);
+        Assert.Equal(
+            new Discrepancy(soldDatePath, DiscrepancyKinds.Value, DiscrepancyValue.Literal("{timestamp}"), DiscrepancyValue.Valid(NormalisationRuleIds.N2)),
+            Assert.Single(_comparer.Compare(Item(detailType, "{timestamp}"), Item(detailType, StampA), AgentResponse)));
+
+        // Without the nested xsi:type the reference keeps its declared class, which has no TimeStamp property.
+        Assert.Equal(
+            new Discrepancy($"{soldDatePath}/text()", DiscrepancyKinds.Value, DiscrepancyValue.Literal(StampA), DiscrepancyValue.Literal(StampB)),
+            Assert.Single(_comparer.Compare(Item(string.Empty, StampA), Item(string.Empty, StampB), AgentResponse)));
+    }
+
+    // The baseline's xsi:type decides the class both sides are walked as; an observed one that differs is reported.
+    [Fact]
+    public void ObservedXsiTypeThatDiffers_IsAnAttributeDifference()
+    {
+        var typePath = $"{AgentResultPath}/@{{{XsiNamespace}}}type";
+        var sale = Envelope(GetAgent, Join([Stamp(StampA)]), resultAttributes: $" xsi:type=\"{RetailSale.Name}\"");
+        var agent = Envelope(GetAgent, Join([Stamp(StampB)]), resultAttributes: $" xsi:type=\"{GetAgent.ReturnType}\"");
+        var untyped = Envelope(GetAgent, Join([Stamp(StampB)]));
+
+        Assert.Equal(
+            new Discrepancy(
+                typePath,
+                DiscrepancyKinds.Value,
+                DiscrepancyValue.Literal($"{{{TargetNamespace}}}{RetailSale.Name}"),
+                DiscrepancyValue.Literal($"{{{TargetNamespace}}}{GetAgent.ReturnType}")),
+            Assert.Single(_comparer.Compare(sale, agent, AgentResponse)));
+
+        Discrepancy[] agentThenSale =
+        [
+            new(
+                typePath,
+                DiscrepancyKinds.Value,
+                DiscrepancyValue.Literal($"{{{TargetNamespace}}}{GetAgent.ReturnType}"),
+                DiscrepancyValue.Literal($"{{{TargetNamespace}}}{RetailSale.Name}")),
+            new($"{SaleTimestampPath}/text()", DiscrepancyKinds.Value, DiscrepancyValue.Literal(StampB), DiscrepancyValue.Literal(StampA)),
+        ];
+        Assert.Equal(agentThenSale, _comparer.Compare(agent, sale, AgentResponse));
+
+        Assert.Equal(
+            new Discrepancy(typePath, DiscrepancyKinds.Missing, DiscrepancyValue.Literal($"{{{TargetNamespace}}}{RetailSale.Name}"), DiscrepancyValue.Absent),
+            Assert.Single(_comparer.Compare(sale, untyped, AgentResponse)));
+    }
+
+    // Under the declared DTOAgent, which has no TimeStamp property, timestamp-looking text is compared exactly.
+    [Theory]
+    [InlineData(StampA, StampB)]
+    [InlineData("{timestamp}", StampA)]
+    [InlineData(StampA, " " + StampA)]
+    public void TimestampElement_WithoutTypeSwitch_IsComparedExactly(string baselineStamp, string observedStamp)
+    {
+        AssertEquivalent(Envelope(GetAgent, Join([Stamp(baselineStamp)])), Envelope(GetAgent, Join([Stamp(baselineStamp)], indent: false)), AgentResponse);
+
+        Assert.Equal(
+            new Discrepancy($"{SaleTimestampPath}/text()", DiscrepancyKinds.Value, DiscrepancyValue.Literal(baselineStamp), DiscrepancyValue.Literal(observedStamp)),
+            Assert.Single(_comparer.Compare(Envelope(GetAgent, Join([Stamp(baselineStamp)])), Envelope(GetAgent, Join([Stamp(observedStamp)])), AgentResponse)));
+    }
+
+    // ---- Text, QName and container edges ---------------------------------------------------------
+
+    [Fact]
+    public void CdataSections_AreText()
+    {
+        AssertEquivalent(Envelope(GetAgent, Agent("<website><![CDATA[www.it.com]]></website>")), Envelope(GetAgent, Agent()), AgentResponse);
+
+        Assert.Equal(
+            new Discrepancy($"{AgentResultPath}/website/text()", DiscrepancyKinds.Value, DiscrepancyValue.Literal("www.it.com"), DiscrepancyValue.Literal("www.it.com/")),
+            Assert.Single(_comparer.Compare(
+                Envelope(GetAgent, Agent("<website><![CDATA[www.it.com]]></website>")),
+                Envelope(GetAgent, Agent("<website><![CDATA[www.it.com/]]></website>")),
+                AgentResponse)));
+
+        // An empty CDATA section holds no text, like <website/>; a CDATA space is text.
+        AssertEquivalent(Envelope(GetAgent, Agent("<website><![CDATA[]]></website>")), Envelope(GetAgent, Agent("<website/>")), AgentResponse);
+        Assert.Equal(
+            new Discrepancy($"{AgentResultPath}/website/text()", DiscrepancyKinds.Value, DiscrepancyValue.Literal(" "), DiscrepancyValue.Absent),
+            Assert.Single(_comparer.Compare(Envelope(GetAgent, Agent("<website><![CDATA[ ]]></website>")), Envelope(GetAgent, Agent("<website/>")), AgentResponse)));
+    }
+
+    [Theory]
+    [InlineData("Hank <!-- c -->Williams")]
+    [InlineData("Hank <?pi x?>Williams")]
+    [InlineData("Hank <![CDATA[Williams]]>")]
+    [InlineData("<![CDATA[Hank ]]><!-- c --><?pi x?>Williams")]
+    public void TextSplitByCommentInstructionOrCdata_IsOneRun(string nameContent)
+    {
+        var split = Envelope(GetAgent, AgentWith("name", $"<name>{nameContent}</name>"));
+
+        AssertEquivalent(split, Envelope(GetAgent, Agent()), AgentResponse);
+
+        Assert.Equal(
+            new Discrepancy($"{AgentResultPath}/name/text()", DiscrepancyKinds.Value, DiscrepancyValue.Literal("Hank Williams"), DiscrepancyValue.Literal("HankWilliams")),
+            Assert.Single(_comparer.Compare(split, Envelope(GetAgent, AgentWith("name", "<name>HankWilliams</name>")), AgentResponse)));
+    }
+
+    // A QName with an unbound prefix, or text that is not a QName, is raw text: it never switches the class and
+    // never equals a resolved name, even one that reads the same.
+    [Fact]
+    public void UnresolvedXsiType_IsRawText_AndKeepsTheDeclaredClass()
+    {
+        var typePath = $"{AgentResultPath}/@{{{XsiNamespace}}}type";
+        var unbound = $" xsi:type=\"u:{RetailSale.Name}\"";
+        var bound = $" xsi:type=\"u:{RetailSale.Name}\" xmlns:u=\"{TargetNamespace}\"";
+        var resolvedText = $"{{{TargetNamespace}}}{RetailSale.Name}";
+
+        string Sale(string resultAttributes, string stamp) => Envelope(GetAgent, Join([Stamp(stamp)]), resultAttributes: resultAttributes);
+
+        AssertEquivalent(Sale(unbound, StampA), Sale(unbound, StampA), AgentResponse);
+
+        // No switch: under DTOAgent two valid timestamps are compared exactly.
+        Assert.Equal(
+            new Discrepancy($"{SaleTimestampPath}/text()", DiscrepancyKinds.Value, DiscrepancyValue.Literal(StampA), DiscrepancyValue.Literal(StampB)),
+            Assert.Single(_comparer.Compare(Sale(unbound, StampA), Sale(unbound, StampB), AgentResponse)));
+
+        Assert.Equal(
+            new Discrepancy(typePath, DiscrepancyKinds.Value, DiscrepancyValue.Literal($"u:{RetailSale.Name}"), DiscrepancyValue.Literal(resolvedText)),
+            Assert.Single(_comparer.Compare(Sale(unbound, StampA), Sale(bound, StampA), AgentResponse)));
+        Assert.Equal(
+            new Discrepancy(typePath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(resolvedText), DiscrepancyValue.Literal($"u:{RetailSale.Name}")),
+            Assert.Single(_comparer.Compare(Sale(bound, StampA), Sale(unbound, StampA), AgentResponse)));
+
+        // Text in expanded-name form is not a QName: it differs from the resolved name although both read the same.
+        var expandedText = $" xsi:type=\"{resolvedText}\"";
+        AssertEquivalent(Sale(expandedText, StampA), Sale(expandedText, StampA), AgentResponse);
+        Assert.Equal(
+            new Discrepancy(typePath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(resolvedText), DiscrepancyValue.Literal(resolvedText)),
+            Assert.Single(_comparer.Compare(Sale(expandedText, StampA), Sale(bound, StampA), AgentResponse)));
+    }
+
+    // Only space, tab, carriage return and line feed are XML white space; a no-break space in a DTO element is text.
+    [Fact]
+    public void NoBreakSpaceInElementOnlyContainer_IsText()
+    {
+        var compact = Envelope(GetAgent, Agent(indent: false), indent: false);
+
+        AssertEquivalent(compact, InsertAfter(compact, "</name>", " \t\n"), AgentResponse);
+
+        Assert.Equal(
+            new Discrepancy($"{AgentResultPath}/text()[2]", DiscrepancyKinds.Value, DiscrepancyValue.Absent, DiscrepancyValue.Literal("\u00A0")),
+            Assert.Single(_comparer.Compare(compact, InsertAfter(compact, "</name>", "&#160;"), AgentResponse)));
+    }
+
+    [Fact]
+    public void SoapHeader_IndentationIgnored_TextKept()
+    {
+        const string Trace = "<t:trace xmlns:t=\"urn:test\">a1</t:trace>";
+        var compact = WithHeader(Envelope(GetAgent, Agent(indent: false), indent: false), Trace, indent: false);
+
+        AssertEquivalent(compact, WithHeader(Envelope(GetAgent, Agent()), Trace, indent: true), AgentResponse);
+
+        Assert.Equal(
+            new Discrepancy("/Envelope/Header/text()[1]", DiscrepancyKinds.Value, DiscrepancyValue.Absent, DiscrepancyValue.Literal("stray")),
+            Assert.Single(_comparer.Compare(
+                compact,
+                WithHeader(Envelope(GetAgent, Agent(indent: false), indent: false), "stray" + Trace, indent: false),
+                AgentResponse)));
+    }
+
+    [Fact]
+    public void SoapFault_IndentationIgnored_FaultStringCompared()
+    {
+        AssertEquivalent(FaultEnvelope("Backend unavailable", indent: false), FaultEnvelope("Backend unavailable"), AgentResponse);
+
+        Assert.Equal(
+            new Discrepancy("/Envelope/Body/Fault/faultstring/text()", DiscrepancyKinds.Value, DiscrepancyValue.Literal("Backend unavailable"), DiscrepancyValue.Literal("Backend timed out")),
+            Assert.Single(_comparer.Compare(FaultEnvelope("Backend unavailable"), FaultEnvelope("Backend timed out"), AgentResponse)));
+    }
+
     // ---- WSDL ------------------------------------------------------------------------------------
 
     [Fact]
@@ -485,6 +917,68 @@ public sealed class XmlSemanticComparerTests
         Assert.Equal(
             new Discrepancy("/definitions/documentation/text()", DiscrepancyKinds.Value, DiscrepancyValue.Literal(Documentation), DiscrepancyValue.Literal(Documentation + " ")),
             discrepancy);
+    }
+
+    // The excluded location must still be present on both sides. A location on one side only is covered by
+    // Wsdl_LocationMissing_IsReported.
+
+    // Where the fixture's port holds its soap:address.
+    private const string AddressPath = "/definitions/service/port/address";
+
+    [Theory]
+    [InlineData(true, LocationPath)]
+    [InlineData(false, AddressPath)]
+    public void Wsdl_LocationAbsentOnBothSides_IsReportedMissing(bool addressPresent, string path)
+    {
+        var document = addressPresent ? WsdlDocument(location: null) : WsdlDocumentWithoutAddress();
+
+        Assert.Equal(
+            new Discrepancy(path, DiscrepancyKinds.Missing, DiscrepancyValue.Absent, DiscrepancyValue.Absent),
+            Assert.Single(_comparer.Compare(document, document, XmlComparisonContext.Wsdl(excludeSoapAddressLocation: true))));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Wsdl_AddressOnOneSideOnly_IsReportedAsTheElement(bool withLocation)
+    {
+        var context = XmlComparisonContext.Wsdl(excludeSoapAddressLocation: true);
+        var withAddress = WsdlDocument(withLocation ? StandInLocation : null);
+        var locationMarkup = withLocation
+            ? $" location=\"{StandInLocation.Replace("&", "&amp;", StringComparison.Ordinal)}\""
+            : string.Empty;
+        var addressMarkup = DiscrepancyValue.Literal($"<soap:address{locationMarkup} xmlns:soap=\"{WsdlSoapNamespace}\" />");
+
+        // The element difference is the whole report: with an address on one side, the presence rule adds nothing.
+        Assert.Equal(
+            new Discrepancy(AddressPath, DiscrepancyKinds.Missing, addressMarkup, DiscrepancyValue.Absent),
+            Assert.Single(_comparer.Compare(withAddress, WsdlDocumentWithoutAddress(), context)));
+        Assert.Equal(
+            new Discrepancy(AddressPath, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, addressMarkup),
+            Assert.Single(_comparer.Compare(WsdlDocumentWithoutAddress(), withAddress, context)));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Wsdl_PresenceNotRequired_WhenLocationCompared(bool addressPresent)
+    {
+        // The presence requirement belongs to the exclusion: a location compared like any other attribute
+        // may be absent on both sides.
+        var document = addressPresent ? WsdlDocument(location: null) : WsdlDocumentWithoutAddress();
+
+        AssertEquivalent(document, document, XmlComparisonContext.Wsdl(excludeSoapAddressLocation: false));
+    }
+
+    /// <summary>The <see cref="WsdlDocument"/> fixture with no <c>soap:address</c> in its port.</summary>
+    private static string WsdlDocumentWithoutAddress()
+    {
+        const string Address = "<soap:address/>";
+        var document = WsdlDocument(location: null);
+        var index = document.IndexOf(Address, StringComparison.Ordinal);
+        Assert.True(index >= 0, "The fixture must hold the address element.");
+        Assert.True(document.IndexOf(Address, index + 1, StringComparison.Ordinal) < 0, "The fixture must hold only one address element.");
+        return document.Remove(index, Address.Length);
     }
 
     // ---- Response level --------------------------------------------------------------------------
@@ -678,6 +1172,55 @@ public sealed class XmlSemanticComparerTests
             names.Select(name =>
                 $"<{NameItem}>{Break(ResultChildDepth + 1, indent)}<{NameProperty}>{name}</{NameProperty}>{Break(ResultChildDepth, indent)}</{NameItem}>"),
             indent);
+
+    /// <summary>The one SOAP-exposed property of <paramref name="dto"/> that rule N2 targets.</summary>
+    private static string TimestampProperty(DtoDefinition dto) =>
+        dto.SoapProperties.Single(property => string.Equals(property.Normalisation, NormalisationClasses.N2, StringComparison.Ordinal)).Name;
+
+    /// <summary>The sale's timestamp element holding <paramref name="content"/>, which may be markup.</summary>
+    private static string Stamp(string content) => $"<{SaleTimestamp}>{content}</{SaleTimestamp}>";
+
+    /// <summary>The comparison context of a typing route: getAgent's for <see cref="ByXsiType"/>, the synthetic operation's otherwise.</summary>
+    private static XmlComparisonContext SaleContext(string route) => route switch
+    {
+        ByXsiType => AgentResponse,
+        ByDeclaredType => SyntheticSaleResponse,
+        _ => throw new ArgumentOutOfRangeException(nameof(route), route, "Unknown typing route."),
+    };
+
+    /// <summary>
+    /// A response whose result is typed as the sale class by <paramref name="route"/>: getAgent's result carrying
+    /// the sale class as <c>xsi:type</c>, or the synthetic operation's result with no <c>xsi:type</c>. The result
+    /// holds <paramref name="stampElement"/> as its only child, or nothing when it is null.
+    /// </summary>
+    private static string SaleEnvelope(string route, string? stampElement, bool indent = true)
+    {
+        string[] children = stampElement is null ? [] : [stampElement];
+        return route switch
+        {
+            ByXsiType => Envelope(GetAgent, Join(children, indent), indent: indent, resultAttributes: $" xsi:type=\"{RetailSale.Name}\""),
+            ByDeclaredType => Envelope(SyntheticSaleOperation, Join(children, indent), indent: indent),
+            _ => throw new ArgumentOutOfRangeException(nameof(route), route, "Unknown typing route."),
+        };
+    }
+
+    /// <summary>
+    /// Adds a <c>soap:Header</c> holding <paramref name="headerContent"/> before the <c>Body</c> of an envelope
+    /// built with no extra envelope attributes, each on its own indented line when <paramref name="indent"/> is true.
+    /// </summary>
+    private static string WithHeader(string envelope, string headerContent, bool indent) =>
+        InsertAfter(
+            envelope,
+            $" xmlns:xsd=\"{XsdNamespace}\">",
+            $"{Break(1, indent)}<soap:Header>{Break(2, indent)}{headerContent}{Break(1, indent)}</soap:Header>");
+
+    /// <summary>A SOAP 1.1 server Fault envelope whose <c>faultstring</c> is <paramref name="faultString"/>.</summary>
+    private static string FaultEnvelope(string faultString, bool indent = true) =>
+        SoapEnvelope(
+            $"<soap:Fault>{Break(3, indent)}<faultcode>soap:Server</faultcode>{Break(3, indent)}<faultstring>{faultString}</faultstring>{Break(2, indent)}</soap:Fault>",
+            "soap",
+            indent,
+            string.Empty);
 
     /// <summary>A SOAP 1.1 envelope whose <c>Body</c> holds <paramref name="bodyChild"/>.</summary>
     private static string SoapEnvelope(string bodyChild, string envPrefix, bool indent, string envelopeAttributes) =>

@@ -1,6 +1,8 @@
+using System.Collections.Immutable;
 using System.Collections.ObjectModel;
 using System.Globalization;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Xml;
 using System.Xml.Linq;
 using Erewhon.Contracts.Catalogue;
@@ -39,8 +41,14 @@ public abstract record XmlComparisonContext
 
     /// <summary>Returns the context of a WSDL 1.1 document.</summary>
     /// <param name="excludeSoapAddressLocation">
-    /// True to leave the value of <c>soap:address/@location</c> uncompared; the attribute must still be
-    /// present on both sides.
+    /// True to leave the value of <c>soap:address/@location</c> uncompared while requiring the attribute on
+    /// both sides. A location on one side only is a <c>missing</c> or <c>extra</c> attribute, and an address
+    /// element on one side only a <c>missing</c> or <c>extra</c> element, as for any other difference. A paired
+    /// <c>soap:address</c> that lacks the location on both sides gives one <c>missing</c> discrepancy at its
+    /// <c>@location</c> path, and documents with the same root and no <c>soap:address</c> anywhere give one
+    /// <c>missing</c> discrepancy at <c>/&lt;root&gt;/service/port/address</c>, both values absent in each
+    /// case. False to compare the location like any other attribute: the presence requirement belongs to the
+    /// exclusion, so two documents that both lack the location or the address then compare equal.
     /// </param>
     public static XmlComparisonContext Wsdl(bool excludeSoapAddressLocation) => new WsdlContext(excludeSoapAddressLocation);
 
@@ -85,12 +93,22 @@ public abstract record XmlComparisonContext
     /// <summary>
     /// A WSDL document: every element in the WSDL, WSDL SOAP binding or XML Schema namespace other than
     /// <c>documentation</c> is an element-only container, and the unqualified <c>type</c>,
-    /// <c>element</c>, <c>message</c>, <c>binding</c> and <c>base</c> attributes are compared as QNames.
+    /// <c>element</c>, <c>message</c>, <c>binding</c> and <c>base</c> attributes are compared as QNames. With
+    /// the location excluded, its presence on both sides is required as <see cref="Wsdl"/> describes.
     /// </summary>
-    /// <param name="ExcludeSoapAddressLocation">True to leave the value of <c>soap:address/@location</c> uncompared.</param>
+    /// <param name="ExcludeSoapAddressLocation">
+    /// True to leave the value of <c>soap:address/@location</c> uncompared and require the attribute on both sides.
+    /// </param>
     public sealed record WsdlContext(bool ExcludeSoapAddressLocation) : XmlComparisonContext
     {
-        /// <summary>True to leave the value of <c>soap:address/@location</c> uncompared; its presence is always compared.</summary>
+        /// <summary>
+        /// True to leave the value of <c>soap:address/@location</c> uncompared and require the attribute on both
+        /// sides: absent on one side it is reported missing or extra, absent on both sides of a paired address
+        /// it is reported missing with both values absent, and with no <c>soap:address</c> in either of two
+        /// documents of the same root the address is reported missing at
+        /// <c>/&lt;root&gt;/service/port/address</c>. False compares the location as any other attribute, with
+        /// no presence requirement.
+        /// </summary>
         public bool ExcludeSoapAddressLocation { get; } = ExcludeSoapAddressLocation;
     }
 
@@ -122,6 +140,13 @@ public abstract record XmlComparisonContext
 /// differently named siblings form an unordered set of name groups, and same-named siblings pair in
 /// document order. At a SOAP-exposed DTO property that a normalisation rule targets, the pairwise rule of
 /// <see cref="Normaliser"/> decides equality.
+/// </para>
+/// <para>
+/// In a WSDL compared with <c>soap:address/@location</c> excluded, the location's value is never compared
+/// but its presence on both sides is: a location or address on one side only is reported missing or extra
+/// as usual; a paired address that lacks the location on both sides is reported <c>missing</c> at its
+/// <c>@location</c>, and two documents with the same root and no <c>soap:address</c> at all are reported
+/// <c>missing</c> at <c>/&lt;root&gt;/service/port/address</c>, with both values absent.
 /// </para>
 /// <para>
 /// Paths start at <c>/</c> with the root's local name, for example
@@ -205,7 +230,7 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
         }
 
         var walk = new Walk(_catalogue, _normaliser, context);
-        walk.CompareElements(RootPath + baselineRoot.Name.LocalName, baselineRoot, observedRoot, walk.RootRole(baselineRoot));
+        walk.CompareRoots(baselineRoot, observedRoot);
         return walk.Result();
     }
 
@@ -288,7 +313,82 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
     /// </summary>
     private readonly record struct AttributeValue(bool IsResolvedQName, string Text);
 
-    /// <summary>The state of one comparison: the context's facts and the discrepancies found so far.</summary>
+    /// <summary>
+    /// The namespace declarations in scope at an element, which resolve prefixes exactly as
+    /// <see cref="XElement.GetNamespaceOfPrefix"/> and <see cref="XElement.GetDefaultNamespace"/> do, without
+    /// their walk through the element's ancestors.
+    /// </summary>
+    /// <remarks>
+    /// A binding is keyed by its declaration attribute's local name: the prefix of <c>xmlns:p</c>, and
+    /// <c>xmlns</c> for a default namespace declaration. A scope is immutable and is shared with its parent's
+    /// until an element declares a namespace, so entering an element costs a scan of its own attributes, and a
+    /// lookup is logarithmic in the number of bindings in scope rather than linear in the element's depth.
+    /// </remarks>
+    private sealed class NamespaceScope
+    {
+        // The local name of a default namespace declaration, xmlns="...", and so the key of its binding.
+        private const string DefaultKey = "xmlns";
+
+        private readonly ImmutableDictionary<string, string> _bindings;
+
+        private NamespaceScope(ImmutableDictionary<string, string> bindings) => _bindings = bindings;
+
+        /// <summary>The scope above a root element, where nothing is declared.</summary>
+        public static NamespaceScope Empty { get; } = new(ImmutableDictionary.Create<string, string>(StringComparer.Ordinal));
+
+        /// <summary>The default namespace: none when no default is declared or when <c>xmlns=""</c> undeclares it.</summary>
+        public XNamespace DefaultNamespace =>
+            _bindings.TryGetValue(DefaultKey, out var namespaceName) ? XNamespace.Get(namespaceName) : XNamespace.None;
+
+        /// <summary>
+        /// The scope inside <paramref name="element"/>: this scope with the element's own declarations added,
+        /// which apply to the element's attributes too; this instance when the element declares nothing new.
+        /// </summary>
+        public NamespaceScope Enter(XElement element)
+        {
+            var bindings = _bindings;
+            foreach (var attribute in element.Attributes())
+            {
+                if (attribute.IsNamespaceDeclaration)
+                {
+                    bindings = bindings.SetItem(attribute.Name.LocalName, attribute.Value);
+                }
+            }
+
+            return ReferenceEquals(bindings, _bindings) ? this : new NamespaceScope(bindings);
+        }
+
+        /// <summary>
+        /// The namespace bound to the non-empty <paramref name="prefix"/>: always the reserved namespace for
+        /// <c>xmlns</c>, whose key a default namespace declaration shares but never binds; otherwise the nearest
+        /// declaration, then the reserved namespace for <c>xml</c>; null when the prefix is unbound.
+        /// </summary>
+        public XNamespace? NamespaceOfPrefix(string prefix)
+        {
+            if (string.Equals(prefix, DefaultKey, StringComparison.Ordinal))
+            {
+                return XNamespace.Xmlns;
+            }
+
+            if (_bindings.TryGetValue(prefix, out var namespaceName))
+            {
+                return XNamespace.Get(namespaceName);
+            }
+
+            return string.Equals(prefix, "xml", StringComparison.Ordinal) ? XNamespace.Xml : null;
+        }
+    }
+
+    /// <summary>
+    /// The state of one comparison: the context's facts, the path of the element being compared and the
+    /// discrepancies found so far.
+    /// </summary>
+    /// <remarks>
+    /// The walk is depth-first. The path is one builder that each element extends by its segment on the way
+    /// down and cuts back on the way up, and it is rendered only when a discrepancy is added; each side's
+    /// namespace scope travels down with its element. Apart from rendering the path of a discrepancy, the
+    /// work done at an element therefore does not grow with its depth.
+    /// </remarks>
     private sealed class Walk
     {
         private static readonly XNamespace SoapEnvelopeNamespace = "http://schemas.xmlsoap.org/soap/envelope/";
@@ -308,6 +408,9 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
         // The one element of the WSDL and XML Schema vocabularies that holds prose rather than structure.
         private const string DocumentationElement = "documentation";
 
+        // Where WSDL 1.1 publishes a SOAP endpoint below the root: wsdl:service/wsdl:port/soap:address.
+        private const string SoapAddressPosition = "/service/port/address";
+
         private readonly OperationCatalogue _catalogue;
         private readonly Normaliser _normaliser;
         private readonly OperationDescriptor? _response;
@@ -315,6 +418,9 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
         private readonly bool _wsdl;
         private readonly bool _excludeSoapAddressLocation;
         private readonly List<Discrepancy> _discrepancies = [];
+
+        // The path of the element being compared; see the remarks.
+        private readonly StringBuilder _path = new();
 
         public Walk(OperationCatalogue catalogue, Normaliser normaliser, XmlComparisonContext context)
         {
@@ -348,23 +454,76 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
             return _discrepancies.AsReadOnly();
         }
 
-        /// <summary>The role of a root element, which only its name decides.</summary>
-        public Role RootRole(XElement root) => EnvelopeRole(root.Name) ?? GenericRole(root.Name);
+        /// <summary>
+        /// Compares two root elements of the same expanded name, whose path is <c>/</c> followed by the root's
+        /// local name; nothing is in scope above them. When the location is excluded and neither document has a
+        /// <c>soap:address</c>, the address is reported missing on both sides at its WSDL 1.1 position.
+        /// </summary>
+        public void CompareRoots(XElement baseline, XElement observed)
+        {
+            _path.Append(RootPath).Append(baseline.Name.LocalName);
+            var rootLength = _path.Length;
+            CompareElements(
+                baseline,
+                NamespaceScope.Empty.Enter(baseline),
+                observed,
+                NamespaceScope.Empty.Enter(observed),
+                RootRole(baseline));
 
-        /// <summary>Compares two elements of the same expanded name at <paramref name="path"/>: attributes, text, then children.</summary>
-        public void CompareElements(string path, XElement baseline, XElement observed, Role role)
+            // The location rule in CompareAttributes sees only addresses the two documents pair; with no
+            // address on either side there is no pair, and nothing else would report the absence.
+            if (_excludeSoapAddressLocation && !HasSoapAddress(baseline) && !HasSoapAddress(observed))
+            {
+                _path.Length = rootLength;
+                _path.Append(SoapAddressPosition);
+                Add(DiscrepancyKinds.Missing, DiscrepancyValue.Absent, DiscrepancyValue.Absent);
+                _path.Length = rootLength;
+            }
+        }
+
+        private static bool HasSoapAddress(XElement root) => root.DescendantsAndSelf(SoapAddress).Any();
+
+        /// <summary>The role of a root element, which only its name decides.</summary>
+        private Role RootRole(XElement root) => EnvelopeRole(root.Name) ?? GenericRole(root.Name);
+
+        /// <summary>
+        /// Compares two elements of the same expanded name at the current path, each with its own namespace
+        /// scope: attributes, text, then children.
+        /// </summary>
+        private void CompareElements(XElement baseline, NamespaceScope baselineScope, XElement observed, NamespaceScope observedScope, Role role)
         {
             // Turns a pathologically deep document into an exception the caller can report, instead of a
             // stack overflow that would end the process.
             RuntimeHelpers.EnsureSufficientExecutionStack();
 
-            CompareAttributes(path, baseline, observed);
-            CompareText(path, baseline, observed, role.IsElementOnly);
-            CompareChildren(path, baseline, observed, role);
+            CompareAttributes(baseline, baselineScope, observed, observedScope);
+            CompareText(baseline, observed, role.IsElementOnly);
+            CompareChildren(baseline, baselineScope, observed, observedScope, role);
         }
 
-        private void Add(string path, string kind, DiscrepancyValue baseline, DiscrepancyValue observed) =>
-            _discrepancies.Add(new Discrepancy(path, kind, baseline, observed));
+        /// <summary>Adds a discrepancy at the current path, the only place a path is rendered.</summary>
+        private void Add(string kind, DiscrepancyValue baseline, DiscrepancyValue observed) =>
+            _discrepancies.Add(new Discrepancy(_path.ToString(), kind, baseline, observed));
+
+        /// <summary>Appends <paramref name="name"/> as <see cref="XName.ToString"/> writes it: <c>{uri}local</c>, or the local name alone in no namespace.</summary>
+        private void AppendExpandedName(XName name)
+        {
+            if (name.Namespace != XNamespace.None)
+            {
+                _path.Append('{').Append(name.NamespaceName).Append('}');
+            }
+
+            _path.Append(name.LocalName);
+        }
+
+        /// <summary>Appends the 1-based position <c>[n]</c> of the item at <paramref name="index"/> when its group is indexed.</summary>
+        private void AppendItemIndex(int index, bool indexed)
+        {
+            if (indexed)
+            {
+                _path.Append(CultureInfo.InvariantCulture, $"[{index + 1}]");
+            }
+        }
 
         // Roles. A role comes from the context, the parent's role and the element's own name, never from
         // the element's content: a DTO element stays element-only even when it holds stray text.
@@ -391,8 +550,11 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
                 ? Role.Container
                 : Role.Leaf;
 
-        /// <summary>The role of <paramref name="child"/>, the BASELINE element of a pair, under a parent of role <paramref name="parent"/>.</summary>
-        private Role ChildRole(Role parent, XElement child)
+        /// <summary>
+        /// The role of <paramref name="child"/>, the BASELINE element of a pair, under a parent of role
+        /// <paramref name="parent"/>; <paramref name="childScope"/> is the child's own namespace scope.
+        /// </summary>
+        private Role ChildRole(Role parent, XElement child, NamespaceScope childScope)
         {
             if (EnvelopeRole(child.Name) is { } envelope)
             {
@@ -412,19 +574,19 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
 
                 case RoleKind.ResponseWrapper when _response is { Soap: { } binding } operation
                     && string.Equals(local, binding.ResultElement, StringComparison.Ordinal):
-                    return Typed(operation.ReturnType, child);
+                    return Typed(operation.ReturnType, child, childScope);
 
                 case RoleKind.RequestWrapper when ElementParameter(local) is { } parameter:
-                    return Typed(parameter.JadeType, child);
+                    return Typed(parameter.JadeType, child, childScope);
 
                 case RoleKind.Dto:
                     return parent.Dto!.TryGetProperty(local, out var property)
                         && (property.Kind is PropertyKind.Reference or PropertyKind.Collection)
-                            ? Typed(property.JadeType, child)
+                            ? Typed(property.JadeType, child, childScope)
                             : Role.Leaf;
 
                 case RoleKind.Array:
-                    return Typed(parent.Array!.ItemType, child);
+                    return Typed(parent.Array!.ItemType, child, childScope);
 
                 default:
                     return GenericRole(child.Name);
@@ -454,37 +616,41 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
         /// The role of an element declared with catalogue type <paramref name="type"/>. A DTO's runtime class
         /// is the BASELINE element's <c>xsi:type</c> when it resolves to a catalogue DTO, otherwise the
         /// declared class; an observed <c>xsi:type</c> that differs is reported as an attribute difference.
+        /// <paramref name="baselineScope"/> is the baseline element's own namespace scope.
         /// </summary>
-        private Role Typed(string type, XElement baselineElement)
+        private Role Typed(string type, XElement baselineElement, NamespaceScope baselineScope)
         {
             if (_catalogue.TryGetDto(type, out var declared))
             {
-                return Role.ForDto(RuntimeDto(baselineElement) ?? declared);
+                return Role.ForDto(RuntimeDto(baselineElement, baselineScope) ?? declared);
             }
 
             return _catalogue.TryGetArray(type, out var array) ? Role.ForArray(array) : Role.Leaf;
         }
 
-        private DtoDefinition? RuntimeDto(XElement element) =>
+        private DtoDefinition? RuntimeDto(XElement element, NamespaceScope scope) =>
             element.Attribute(XsiType) is { } typeAttribute
-            && TryResolveQName(typeAttribute, out _, out var local)
+            && TryResolveQName(typeAttribute.Value, scope, out _, out var local)
             && _catalogue.TryGetDto(local, out var runtime)
                 ? runtime
                 : null;
 
         // Attributes.
 
-        private void CompareAttributes(string path, XElement baseline, XElement observed)
+        /// <summary>
+        /// Compares the attributes of two elements as sets by expanded name, each side's QName values resolved
+        /// in that side's scope.
+        /// </summary>
+        private void CompareAttributes(XElement baseline, NamespaceScope baselineScope, XElement observed, NamespaceScope observedScope)
         {
             var baselineAttributes = AttributesOf(baseline);
             var observedAttributes = AttributesOf(observed);
 
             foreach (var (name, baselineAttribute) in baselineAttributes)
             {
-                var attributePath = AttributePath(path, name);
                 if (!observedAttributes.TryGetValue(name, out var observedAttribute))
                 {
-                    Add(attributePath, DiscrepancyKinds.Missing, DiscrepancyValue.Literal(ValueOf(baselineAttribute).Text), DiscrepancyValue.Absent);
+                    AddAttribute(name, DiscrepancyKinds.Missing, DiscrepancyValue.Literal(ValueOf(baselineAttribute, baselineScope).Text), DiscrepancyValue.Absent);
                     continue;
                 }
 
@@ -493,11 +659,11 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
                     continue;
                 }
 
-                var baselineValue = ValueOf(baselineAttribute);
-                var observedValue = ValueOf(observedAttribute);
+                var baselineValue = ValueOf(baselineAttribute, baselineScope);
+                var observedValue = ValueOf(observedAttribute, observedScope);
                 if (baselineValue != observedValue)
                 {
-                    Add(attributePath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(baselineValue.Text), DiscrepancyValue.Literal(observedValue.Text));
+                    AddAttribute(name, DiscrepancyKinds.Value, DiscrepancyValue.Literal(baselineValue.Text), DiscrepancyValue.Literal(observedValue.Text));
                 }
             }
 
@@ -505,8 +671,18 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
             {
                 if (!baselineAttributes.ContainsKey(name))
                 {
-                    Add(AttributePath(path, name), DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal(ValueOf(observedAttribute).Text));
+                    AddAttribute(name, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal(ValueOf(observedAttribute, observedScope).Text));
                 }
+            }
+
+            // An excluded location must still be present on both sides. Neither loop above sees an attribute
+            // that both sides lack, so that case is reported here.
+            if (_excludeSoapAddressLocation
+                && baseline.Name == SoapAddress
+                && !baselineAttributes.ContainsKey(LocationAttribute)
+                && !observedAttributes.ContainsKey(LocationAttribute))
+            {
+                AddAttribute(LocationAttribute, DiscrepancyKinds.Missing, DiscrepancyValue.Absent, DiscrepancyValue.Absent);
             }
         }
 
@@ -525,10 +701,18 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
             return attributes;
         }
 
-        private static string AttributePath(string path, XName name) =>
-            name.Namespace == XNamespace.None
-                ? $"{path}/@{name.LocalName}"
-                : $"{path}/@{{{name.NamespaceName}}}{name.LocalName}";
+        /// <summary>
+        /// Adds a discrepancy at the current element's attribute <paramref name="name"/>, whose path is
+        /// <c>/@local</c> or <c>/@{uri}local</c> below the element's.
+        /// </summary>
+        private void AddAttribute(XName name, string kind, DiscrepancyValue baseline, DiscrepancyValue observed)
+        {
+            var elementLength = _path.Length;
+            _path.Append("/@");
+            AppendExpandedName(name);
+            Add(kind, baseline, observed);
+            _path.Length = elementLength;
+        }
 
         private bool IsExcludedLocation(XName element, XName attribute) =>
             _excludeSoapAddressLocation && element == SoapAddress && attribute == LocationAttribute;
@@ -537,29 +721,30 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
             name == XsiType
             || (_wsdl && name.Namespace == XNamespace.None && Array.IndexOf(WsdlQNameAttributes, name.LocalName) >= 0);
 
-        private AttributeValue ValueOf(XAttribute attribute) =>
-            IsQNameAttribute(attribute.Name) && TryResolveQName(attribute, out var ns, out var local)
+        /// <summary>The value of <paramref name="attribute"/> as compared, a QName resolved in <paramref name="scope"/>, its element's scope.</summary>
+        private AttributeValue ValueOf(XAttribute attribute, NamespaceScope scope) =>
+            IsQNameAttribute(attribute.Name) && TryResolveQName(attribute.Value, scope, out var ns, out var local)
                 ? new AttributeValue(IsResolvedQName: true, ExpandedName(ns, local))
                 : new AttributeValue(IsResolvedQName: false, attribute.Value);
 
         /// <summary>
-        /// Resolves a QName-valued attribute: a prefix through the in-scope declarations of its element, no
-        /// prefix through the default namespace. False when the text is not a QName or its prefix is unbound.
+        /// Resolves the QName <paramref name="text"/> of an attribute in <paramref name="scope"/>, the scope of
+        /// the attribute's element: a prefix through its in-scope declarations, no prefix through the default
+        /// namespace. False when the text is not a QName or its prefix is unbound.
         /// </summary>
-        private static bool TryResolveQName(XAttribute attribute, out XNamespace ns, out string local)
+        private static bool TryResolveQName(string text, NamespaceScope scope, out XNamespace ns, out string local)
         {
-            var text = attribute.Value;
             var colon = text.IndexOf(':', StringComparison.Ordinal);
             var prefix = colon < 0 ? string.Empty : text[..colon];
             local = colon < 0 ? text : text[(colon + 1)..];
             ns = XNamespace.None;
 
-            if (!IsNcName(local) || (colon >= 0 && !IsNcName(prefix)) || attribute.Parent is not { } element)
+            if (!IsNcName(local) || (colon >= 0 && !IsNcName(prefix)))
             {
                 return false;
             }
 
-            var resolved = colon < 0 ? element.GetDefaultNamespace() : element.GetNamespaceOfPrefix(prefix);
+            var resolved = colon < 0 ? scope.DefaultNamespace : scope.NamespaceOfPrefix(prefix);
             if (resolved is null)
             {
                 return false;
@@ -594,14 +779,16 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
 
         /// <summary>
         /// Compares the direct text of two elements run by run, where run k is the text between element
-        /// children k-1 and k, ordinally and with no trimming or collapsing.
+        /// children k-1 and k, ordinally and with no trimming or collapsing. A difference is reported at
+        /// <c>/text()</c> below the element's path, or at <c>/text()[k]</c> when either element has children.
         /// </summary>
-        private void CompareText(string path, XElement baseline, XElement observed, bool elementOnly)
+        private void CompareText(XElement baseline, XElement observed, bool elementOnly)
         {
             var baselineRuns = TextRuns(baseline, elementOnly);
             var observedRuns = TextRuns(observed, elementOnly);
             var indexed = baseline.HasElements || observed.HasElements;
             var count = Math.Max(baselineRuns.Count, observedRuns.Count);
+            var elementLength = _path.Length;
 
             for (var index = 0; index < count; index++)
             {
@@ -609,11 +796,10 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
                 var observedText = index < observedRuns.Count ? observedRuns[index] : null;
                 if (!string.Equals(baselineText, observedText, StringComparison.Ordinal))
                 {
-                    Add(
-                        indexed ? $"{path}/text()[{(index + 1).ToString(CultureInfo.InvariantCulture)}]" : $"{path}/text()",
-                        DiscrepancyKinds.Value,
-                        DiscrepancyValue.Literal(baselineText),
-                        DiscrepancyValue.Literal(observedText));
+                    _path.Append("/text()");
+                    AppendItemIndex(index, indexed);
+                    Add(DiscrepancyKinds.Value, DiscrepancyValue.Literal(baselineText), DiscrepancyValue.Literal(observedText));
+                    _path.Length = elementLength;
                 }
             }
         }
@@ -624,27 +810,53 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
         /// joins into one run. An empty run is no text, as <c>&lt;a&gt;&lt;/a&gt;</c> holds no text node;
         /// in an element-only container a whitespace-only run is no text too.
         /// </summary>
+        /// <remarks>
+        /// A run's first fragment is kept as it is; only when a second fragment joins the run is it copied
+        /// into a builder, which takes every further fragment, and the run's text is materialised once when
+        /// the run closes. A run of many fragments therefore costs time linear in its length.
+        /// </remarks>
         private static List<string?> TextRuns(XElement element, bool elementOnly)
         {
             var runs = new List<string?>();
-            string? run = null;
+            string? first = null;
+            StringBuilder? joined = null;
+            var isJoined = false;
+
+            string? CloseRun()
+            {
+                var run = isJoined ? joined!.ToString() : first;
+                first = null;
+                isJoined = false;
+                return FinishRun(run, elementOnly);
+            }
+
             foreach (var node in element.Nodes())
             {
                 switch (node)
                 {
                     case XElement:
-                        runs.Add(FinishRun(run, elementOnly));
-                        run = null;
+                        runs.Add(CloseRun());
                         break;
 
                     // XCData derives from XText, so CDATA sections are text like any other.
+                    case XText text when first is null && !isJoined:
+                        first = text.Value;
+                        break;
+
                     case XText text:
-                        run = run is null ? text.Value : run + text.Value;
+                        if (!isJoined)
+                        {
+                            joined = (joined ?? new StringBuilder()).Clear().Append(first);
+                            first = null;
+                            isJoined = true;
+                        }
+
+                        joined!.Append(text.Value);
                         break;
                 }
             }
 
-            runs.Add(FinishRun(run, elementOnly));
+            runs.Add(CloseRun());
             return runs;
         }
 
@@ -670,9 +882,11 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
 
         /// <summary>
         /// Compares the child elements of two elements: name groups as an unordered set, and the elements of
-        /// one group pairwise in document order.
+        /// one group pairwise in document order. A group's path is the parent's with <c>/local</c>, or with
+        /// <c>/{uri}local</c> when another group shares the local name, and an item's adds <c>[n]</c> when
+        /// either side's group holds more than one element. Each child pair is compared in its own scopes.
         /// </summary>
-        private void CompareChildren(string path, XElement baseline, XElement observed, Role role)
+        private void CompareChildren(XElement baseline, NamespaceScope baselineScope, XElement observed, NamespaceScope observedScope, Role role)
         {
             var baselineGroups = GroupByName(baseline);
             var observedGroups = GroupByName(observed);
@@ -687,11 +901,23 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
             }
 
             var ambiguousLocalNames = AmbiguousLocalNames(names);
+            var parentLength = _path.Length;
             foreach (var name in names)
             {
                 // Two groups that share a local name in different namespaces need the namespace in their
                 // path, or their discrepancies would be indistinguishable.
-                var groupPath = $"{path}/{(ambiguousLocalNames.Contains(name.LocalName) ? name.ToString() : name.LocalName)}";
+                _path.Length = parentLength;
+                _path.Append('/');
+                if (ambiguousLocalNames.Contains(name.LocalName))
+                {
+                    AppendExpandedName(name);
+                }
+                else
+                {
+                    _path.Append(name.LocalName);
+                }
+
+                var groupLength = _path.Length;
                 var baselineElements = baselineGroups.GetValueOrDefault(name) ?? [];
                 var observedElements = observedGroups.GetValueOrDefault(name) ?? [];
                 var indexed = baselineElements.Count > 1 || observedElements.Count > 1;
@@ -701,7 +927,9 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
                 {
                     for (var index = 0; index < baselineElements.Count; index++)
                     {
-                        Add(ItemPath(groupPath, index, indexed), DiscrepancyKinds.Missing, OneSidedValue(baselineElements[index], rule), DiscrepancyValue.Absent);
+                        AppendItemIndex(index, indexed);
+                        Add(DiscrepancyKinds.Missing, OneSidedValue(baselineElements[index], rule), DiscrepancyValue.Absent);
+                        _path.Length = groupLength;
                     }
 
                     continue;
@@ -711,7 +939,9 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
                 {
                     for (var index = 0; index < observedElements.Count; index++)
                     {
-                        Add(ItemPath(groupPath, index, indexed), DiscrepancyKinds.Extra, DiscrepancyValue.Absent, OneSidedValue(observedElements[index], rule));
+                        AppendItemIndex(index, indexed);
+                        Add(DiscrepancyKinds.Extra, DiscrepancyValue.Absent, OneSidedValue(observedElements[index], rule));
+                        _path.Length = groupLength;
                     }
 
                     continue;
@@ -720,7 +950,6 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
                 if (baselineElements.Count != observedElements.Count)
                 {
                     Add(
-                        groupPath,
                         DiscrepancyKinds.Length,
                         DiscrepancyValue.Literal(baselineElements.Count.ToString(CultureInfo.InvariantCulture)),
                         DiscrepancyValue.Literal(observedElements.Count.ToString(CultureInfo.InvariantCulture)));
@@ -729,19 +958,30 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
                 var common = Math.Min(baselineElements.Count, observedElements.Count);
                 for (var index = 0; index < common; index++)
                 {
-                    var childPath = ItemPath(groupPath, index, indexed);
+                    AppendItemIndex(index, indexed);
                     var baselineChild = baselineElements[index];
                     var observedChild = observedElements[index];
+                    var baselineChildScope = baselineScope.Enter(baselineChild);
+                    var observedChildScope = observedScope.Enter(observedChild);
                     if (rule is not null && !baselineChild.HasElements && !observedChild.HasElements)
                     {
-                        CompareTargeted(childPath, baselineChild, observedChild, rule);
+                        CompareTargeted(baselineChild, baselineChildScope, observedChild, observedChildScope, rule);
                     }
                     else
                     {
-                        CompareElements(childPath, baselineChild, observedChild, ChildRole(role, baselineChild));
+                        CompareElements(
+                            baselineChild,
+                            baselineChildScope,
+                            observedChild,
+                            observedChildScope,
+                            ChildRole(role, baselineChild, baselineChildScope));
                     }
+
+                    _path.Length = groupLength;
                 }
             }
+
+            _path.Length = parentLength;
         }
 
         private static Dictionary<XName, List<XElement>> GroupByName(XElement parent)
@@ -776,9 +1016,6 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
             return ambiguous;
         }
 
-        private static string ItemPath(string groupPath, int index, bool indexed) =>
-            indexed ? $"{groupPath}[{(index + 1).ToString(CultureInfo.InvariantCulture)}]" : groupPath;
-
         // Normalisation.
 
         /// <summary>
@@ -797,12 +1034,13 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
 
         /// <summary>
         /// Compares a pair of targeted elements with simple content: their attributes as usual, and their
-        /// values under the pairwise rule, reported once at the element's path. A targeted element with
-        /// element children is compared exactly instead, because such content is never a valid value.
+        /// values under the pairwise rule, reported once at the element's path, the current one. A targeted
+        /// element with element children is compared exactly instead, because such content is never a valid
+        /// value. The scopes are the two elements' own, which their attributes resolve in.
         /// </summary>
-        private void CompareTargeted(string path, XElement baseline, XElement observed, string rule)
+        private void CompareTargeted(XElement baseline, NamespaceScope baselineScope, XElement observed, NamespaceScope observedScope, string rule)
         {
-            CompareAttributes(path, baseline, observed);
+            CompareAttributes(baseline, baselineScope, observed, observedScope);
 
             var baselineSlot = Slot(baseline);
             var observedSlot = Slot(observed);
@@ -812,7 +1050,6 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
             }
 
             Add(
-                path,
                 baselineSlot.IsNull != observedSlot.IsNull ? DiscrepancyKinds.Type : DiscrepancyKinds.Value,
                 _normaliser.ToValue(rule, baselineSlot, WireSyntax.Xml),
                 _normaliser.ToValue(rule, observedSlot, WireSyntax.Xml));
@@ -834,4 +1071,3 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
                 : NormalisedSlot.Of(element.Value);
     }
 }
-
