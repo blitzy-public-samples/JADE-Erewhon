@@ -1,0 +1,13 @@
+{
+  "Harness": {
+    "StartingCommit": "19a5189e9075349aca54de1fb5fdf2d8727403e7",
+    "ExpectedReferenceDate": "2026-01-01",
+    "SeedDirectory": "Erewhon/DataFiles",
+    "ReadinessTimeoutSeconds": 120,
+    "ReadinessPollIntervalSeconds": 1,
+    "RequestTimeoutSeconds": 60,
+    "ShutdownTimeoutSeconds": 15,
+    "ShutdownRequestTimeoutSeconds": 5,
+    "ExecutionMode": "docker"
+  }
+}

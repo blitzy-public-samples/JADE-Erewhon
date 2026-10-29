@@ -1,0 +1,30 @@
+# Build context for standin/, harness/ and facade/ Dockerfiles (context is the repository root).
+#
+# Deny everything, then allow only what the images copy: the root build props,
+# contracts/, the three component directories and the stand-in seed files.
+# Later lines override earlier ones, so build output and per-run data are
+# re-excluded after the allow lines; images always restore and build from a clean tree.
+#
+# baseline/, RESULTS.md, docker-compose.yml and .env reach the harness at run time
+# through the .:/repo bind mount and are never part of an image. Everything else
+# under Erewhon/ (schemas, .NET projects) stays out of the context.
+
+*
+
+!Directory.Packages.props
+!Erewhon.Strangler.props
+!contracts/
+!standin/
+!harness/
+!facade/
+!Erewhon/DataFiles/
+
+# .git and *.pdf are already excluded by '*'; they stay explicit so a future
+# relaxation of '*' cannot admit them. bin/, obj/ and artifacts/ must follow the
+# allow lines so local build output and per-run data inside them never enter.
+.git
+**/bin
+**/obj
+artifacts/
+**/artifacts
+*.pdf
