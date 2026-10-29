@@ -67,7 +67,8 @@ services:
     environment:
       Routing__Targets__backend__RestBaseUrl: ${BACKEND_REST_URL}
       Routing__Targets__backend__SoapBaseUrl: ${BACKEND_SOAP_URL}
-      Backend__TimeoutSeconds: ${BACKEND_TIMEOUT_SECONDS}
+      # `:-30` restores the documented 30 s default when BACKEND_TIMEOUT_SECONDS is unset or blank.
+      Backend__TimeoutSeconds: ${BACKEND_TIMEOUT_SECONDS:-30}
     networks:
       - edge
       - backend
@@ -103,11 +104,13 @@ services:
       Harness__Target__RestBaseUrl: http://facade:65000
       Harness__Target__SoapBaseUrl: http://facade:21001
       Harness__Target__AdminUrl: http://facade:9090
-      # No `:-` defaults: .env supplies them, and an explicitly empty BACKEND_ADMIN_URL must reach the
-      # harness empty, which is how it recognises an external backend with no reset path (KL-SUB-NORESET).
+      # The REST and SOAP URLs have no default: .env supplies them. The admin URL uses `-`, not `:-`: an
+      # unset BACKEND_ADMIN_URL falls back to the stand-in's admin URL, while an explicitly empty one
+      # reaches the harness empty, which is how it recognises an external backend with no reset path
+      # (KL-SUB-NORESET).
       Harness__Backend__RestBaseUrl: ${BACKEND_REST_URL}
       Harness__Backend__SoapBaseUrl: ${BACKEND_SOAP_URL}
-      Harness__Backend__AdminUrl: ${BACKEND_ADMIN_URL}
+      Harness__Backend__AdminUrl: ${BACKEND_ADMIN_URL-http://standin:9090}
     networks:
       - backend
       - edge
