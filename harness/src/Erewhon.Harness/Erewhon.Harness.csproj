@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Framework, runtime pin, central package versions and lock files are inherited from
+       harness/Directory.Build.props, which imports ../Erewhon.Strangler.props. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>Erewhon.Harness</AssemblyName>
+    <RootNamespace>Erewhon.Harness</RootNamespace>
+  </PropertyGroup>
+
+  <!-- The shared framework supplies Microsoft.Extensions.Configuration and matches the
+       aspnet runtime image, so the harness takes no NuGet package. -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <!-- The harness reaches the facade and the stand-in over HTTP only and never references
+       their projects; it must build before any facade file exists. -->
+  <ItemGroup>
+    <ProjectReference Include="../../../contracts/src/Erewhon.Contracts/Erewhon.Contracts.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Erewhon.Harness.Tests" />
+  </ItemGroup>
+
+</Project>
