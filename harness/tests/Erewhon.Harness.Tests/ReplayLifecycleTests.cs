@@ -664,6 +664,76 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         }
     }
 
+    // The committed conformance result, with the committed register documenting its 99 gaps, counts the
+    // members the report states, on the console and in the check. The same file claiming a pass for the
+    // unreachable DTOError.guid, its counts adjusted so it parses, contradicts the catalogue: it fails the
+    // run through a never-documentable CHK-EXCEPTION item and counts nothing. Replay never writes the file.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ConformanceResult_IsHeldToTheCatalogueAndCountedByMember(bool unreachablePassClaimed)
+    {
+        const string unreachableMember = "CONF:Rest:DTOError.guid";
+        var repoRoot = FindRepoRoot();
+        RepoRootDirectory.Write(CaseMatrixPath, File.ReadAllText(Path.Combine(repoRoot, CaseMatrixPath)));
+        var document = JsonNode.Parse(File.ReadAllText(Path.Combine(repoRoot, ConformanceFile)))!.AsObject();
+        var members = document["members"]!.AsArray();
+        var index = members.Select(member => member!["itemId"]!.GetValue<string>()).ToList().IndexOf(unreachableMember);
+        Assert.Equal(FailureItemIds.UnreachableInSource, members[index]!["result"]!.GetValue<string>());
+        if (unreachablePassClaimed)
+        {
+            members[index]!["result"] = "pass";
+            var counts = document["counts"]!;
+            counts["passed"] = counts["passed"]!.GetValue<int>() + 1;
+            counts["gapsByNature"]![FailureItemIds.UnreachableInSource] = counts["gapsByNature"]![FailureItemIds.UnreachableInSource]!.GetValue<int>() - 1;
+        }
+
+        var written = RepoRootDirectory.Write(ConformanceFile, document.ToJsonString());
+        var register = KnownLimitationsRegister.Load(Path.Combine(repoRoot, "harness", "config", "known-limitations.json"));
+        var state = new ReplayRunState();
+        var body = new ReplayBody(ClosedPortOptions(), OperationCatalogue.Default, register, _stdout);
+
+        using var limit = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        limit.CancelAfter(RunLimit);
+        await body.ExecuteAsync(state, limit.Token).WaitAsync(limit.Token);
+
+        var check = state.Checks[CheckNames.Conformance];
+        var exceptions = state.Failures.Where(item => item.ItemId == FailureItemIds.Exception).ToList();
+        if (unreachablePassClaimed)
+        {
+            var item = Assert.Single(exceptions);
+            Assert.Equal(typeof(InvalidDataException).FullName, item.Nature);
+            Assert.True(item.IsNeverDocumentable, "a conformance result the catalogue contradicts can never be documented");
+            Assert.Equal(
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"stand-in conformance check: baseline/conformance.json: $.members[{index}].result is 'pass', but the catalogue records '{unreachableMember}' as unreachable in source, so its result must be 'unreachable-in-source'."),
+                item.Detail);
+            Assert.Equal(CheckOutcomes.NotRun, check.Outcome);
+            Assert.Equal("the check did not complete", check.Detail);
+            Assert.Null(state.Conformance);
+            Assert.DoesNotContain(state.Failures, failure => failure.ItemId.StartsWith("CONF:", StringComparison.Ordinal));
+            Assert.DoesNotContain("check conformance:", StdoutText, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.Empty(exceptions);
+            Assert.Equal(CheckOutcomes.Pass, check.Outcome);
+            Assert.Equal(216, check.Cases);
+            Assert.Equal(117, check.Passed);
+            Assert.Equal("99 of 99 failing items documented by the register; 2 of 2 seed-token assertions hold", check.Detail);
+            Assert.NotNull(state.Conformance);
+            Assert.Equal((216, 117), (state.Conformance.MembersChecked, state.Conformance.Passed));
+            Assert.Contains(
+                "[jade-standin] check conformance: pass (117 of 216 members passed); 99 of 99 failing items documented by the register; 2 of 2 seed-token assertions hold",
+                StdoutText,
+                StringComparison.Ordinal);
+        }
+
+        // Replay reads the baseline and never writes it.
+        Assert.Equal(document.ToJsonString(), File.ReadAllText(written));
+    }
+
     private string StdoutText => _stdout.ToString();
 
     // The message is fixed: a path would differ between checkouts and runs.

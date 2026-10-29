@@ -91,8 +91,11 @@ public sealed record ConformanceCounts(int MembersChecked, int Passed, IReadOnly
 /// abstract <c>DTOObject</c> and every inherited <c>guid</c> are members), the REST constants, every SOAP
 /// property the SOAP surface emits, and the SOAP constants. The same records always give byte-identical
 /// <see cref="ConformanceResult.ToJsonNode"/> output.</para>
-/// <para>An instance is immutable once constructed and <see cref="Run"/> keeps its state local, so one
-/// instance may run concurrently.</para>
+/// <para><see cref="Verify"/> holds a result read back from <c>baseline/conformance.json</c> to the same
+/// inventory, reachability and seed-token assertions, so replay accepts no result the catalogue
+/// contradicts.</para>
+/// <para>An instance is immutable once constructed and <see cref="Run"/> and <see cref="Verify"/> keep
+/// their state local, so one instance may run concurrently.</para>
 /// </remarks>
 public sealed class ConformanceCheck
 {
@@ -338,6 +341,108 @@ public sealed class ConformanceCheck
 
         // A stored body keeps a byte-order mark as U+FEFF, which no JSON or XML parser accepts as content.
         return text.Length > 0 && text[0] == '\uFEFF' ? text[1..] : text;
+    }
+
+    /// <summary>
+    /// Holds a conformance result read back from <c>baseline/conformance.json</c> to this check's own
+    /// definitions, which <see cref="ConformanceResult.Parse"/> does not know. Its members must be exactly
+    /// the inventory, each with the surface, class and property or constant of its inventory entry. A
+    /// member's result must be <c>unreachable-in-source</c> exactly when the catalogue records the member as
+    /// unreachable in source, so a stored result can neither close an unreachable member nor declare a
+    /// reachable one unreachable. Its seed-token assertions must be exactly this check's assertions, each
+    /// with the item id and the expected value <see cref="Run"/> writes for it. Order is not checked, and
+    /// nothing is recomputed: a reachable member keeps the pass or gap the result states.
+    /// </summary>
+    /// <param name="result">The result <see cref="ConformanceResult.Parse"/> read.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="result"/> is null.</exception>
+    /// <exception cref="InvalidDataException">
+    /// The result disagrees with the inventory, with the catalogue's reachability or with the seed-token
+    /// assertions; the message names the offending path and item id.
+    /// </exception>
+    public void Verify(ConformanceResult result)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+
+        var inventory = _inventory.ToDictionary(entry => entry.ItemId, StringComparer.Ordinal);
+        var members = new HashSet<string>(StringComparer.Ordinal);
+        for (var index = 0; index < result.Members.Count; index++)
+        {
+            var member = result.Members[index];
+            var path = string.Create(CultureInfo.InvariantCulture, $"$.{ConformanceResult.MembersKey}[{index}]");
+            if (!inventory.TryGetValue(member.ItemId, out var entry))
+            {
+                throw ConformanceResult.Invalid(path, $"is '{member.ItemId}', which the catalogue inventory does not hold.");
+            }
+
+            if (!members.Add(member.ItemId))
+            {
+                throw ConformanceResult.Invalid(path, $"repeats member '{member.ItemId}'.");
+            }
+
+            RequireSame(path, ConformanceResult.SurfaceKey, member.ItemId, SurfaceToken(entry.Surface), member.Surface);
+            RequireSame(path, ConformanceResult.ClassKey, member.ItemId, entry.Class, member.Class);
+            RequireSame(path, ConformanceResult.PropertyKey, member.ItemId, entry.Property, member.Property);
+            RequireSame(path, ConformanceResult.ConstantKey, member.ItemId, entry.Constant?.Name, member.Constant);
+
+            // The rule Decide applies when it writes the result (AAP 0.7.8), checked in both directions.
+            var unreachable = string.Equals(entry.Reachability, ReachabilityValues.UnreachableInSource, StringComparison.Ordinal);
+            var statedUnreachable = string.Equals(member.Result, FailureItemIds.UnreachableInSource, StringComparison.Ordinal);
+            if (unreachable != statedUnreachable)
+            {
+                throw ConformanceResult.Invalid(
+                    $"{path}.{ConformanceResult.ResultKey}",
+                    unreachable
+                        ? $"is '{member.Result}', but the catalogue records '{member.ItemId}' as unreachable in source, so its result must be '{FailureItemIds.UnreachableInSource}'."
+                        : $"is '{member.Result}', but the catalogue records '{member.ItemId}' as '{entry.Reachability}'.");
+            }
+        }
+
+        foreach (var entry in _inventory)
+        {
+            if (!members.Contains(entry.ItemId))
+            {
+                throw ConformanceResult.Invalid($"$.{ConformanceResult.MembersKey}", $"lacks '{entry.ItemId}', a member of the catalogue inventory.");
+            }
+        }
+
+        var definitions = SeedAssertions.ToDictionary(assertion => assertion.Id, StringComparer.Ordinal);
+        var assertions = new HashSet<string>(StringComparer.Ordinal);
+        for (var index = 0; index < result.SeedAssertions.Count; index++)
+        {
+            var assertion = result.SeedAssertions[index];
+            var path = string.Create(CultureInfo.InvariantCulture, $"$.{ConformanceResult.SeedAssertionsKey}[{index}]");
+            if (!definitions.TryGetValue(assertion.AssertionId, out var definition))
+            {
+                throw ConformanceResult.Invalid(path, $"is seed-token assertion '{assertion.AssertionId}', which the check does not define.");
+            }
+
+            if (!assertions.Add(assertion.AssertionId))
+            {
+                throw ConformanceResult.Invalid(path, $"repeats seed-token assertion '{assertion.AssertionId}'.");
+            }
+
+            var itemId = FailureItemIds.Seed(definition.Id);
+            RequireSame(path, ConformanceResult.ItemIdKey, itemId, itemId, assertion.ItemId);
+            RequireSame(path, ConformanceResult.ExpectedKey, itemId, CompactJson(definition.ExpectedValue), assertion.Expected);
+        }
+
+        foreach (var definition in SeedAssertions)
+        {
+            if (!assertions.Contains(definition.Id))
+            {
+                throw ConformanceResult.Invalid($"$.{ConformanceResult.SeedAssertionsKey}", $"lacks seed-token assertion '{definition.Id}'.");
+            }
+        }
+
+        static void RequireSame(string path, string key, string itemId, string? expected, string? found)
+        {
+            if (!string.Equals(expected, found, StringComparison.Ordinal))
+            {
+                throw ConformanceResult.Invalid($"{path}.{key}", $"must be {Quoted(expected)} for '{itemId}', found {Quoted(found)}.");
+            }
+        }
+
+        static string Quoted(string? value) => value is null ? "absent" : $"'{value}'";
     }
 
     // Inventory.
@@ -1504,7 +1609,8 @@ public sealed class ConformanceCheck
 /// The result of the stand-in conformance check: one entry per inventoried member and per seed-token
 /// assertion, with the counts and failure items they give. <c>capture</c> writes
 /// <see cref="ToJsonNode"/> to <c>baseline/conformance.json</c> through <c>BaselineStore</c>, and
-/// <c>replay</c> reads it back with <see cref="Parse"/>.
+/// <c>replay</c> reads it back with <see cref="Parse"/> and holds it to the catalogue with
+/// <see cref="ConformanceCheck.Verify"/>.
 /// </summary>
 /// <remarks>Instances are immutable and safe for concurrent reads.</remarks>
 public sealed class ConformanceResult
@@ -1518,22 +1624,24 @@ public sealed class ConformanceResult
     private const string RestSurface = "Rest";
     private const string SoapSurface = "Soap";
 
+    // The keys ConformanceCheck.Verify names in its paths are internal, so its messages name the same
+    // paths as Parse's.
     private const string SourceKey = "source";
     private const string CountsKey = "counts";
-    private const string MembersKey = "members";
-    private const string SeedAssertionsKey = "seedAssertions";
+    internal const string MembersKey = "members";
+    internal const string SeedAssertionsKey = "seedAssertions";
     private const string MembersCheckedKey = "membersChecked";
     private const string PassedKey = "passed";
     private const string GapsByNatureKey = "gapsByNature";
-    private const string ItemIdKey = "itemId";
-    private const string SurfaceKey = "surface";
-    private const string ClassKey = "class";
-    private const string PropertyKey = "property";
-    private const string ConstantKey = "constant";
-    private const string ResultKey = "result";
+    internal const string ItemIdKey = "itemId";
+    internal const string SurfaceKey = "surface";
+    internal const string ClassKey = "class";
+    internal const string PropertyKey = "property";
+    internal const string ConstantKey = "constant";
+    internal const string ResultKey = "result";
     private const string ObservedTypeKey = "observedType";
     private const string AssertionIdKey = "assertionId";
-    private const string ExpectedKey = "expected";
+    internal const string ExpectedKey = "expected";
     private const string ObservedKey = "observed";
 
     /// <summary>The gap natures <see cref="ConformanceCounts.GapsByNature"/> always holds, in this order.</summary>
@@ -1590,9 +1698,10 @@ public sealed class ConformanceResult
     public ConformanceSummary Summary => new(Counts.MembersChecked, Counts.Passed, Counts.GapsByNature);
 
     /// <summary>
-    /// The <see cref="CheckNames.Conformance"/> check: every member and seed-token assertion is a case, and
-    /// the cases passed are the passing members and the seed-token assertions that hold. The outcome is
-    /// <see cref="CheckOutcomes.Pass"/> when <paramref name="register"/> documents every item of
+    /// The <see cref="CheckNames.Conformance"/> check: every member is a case, and the cases passed are the
+    /// passing members, the members checked and passed of <see cref="Summary"/>, so the console and the
+    /// results report give one count; the seed-token assertions are stated in the detail only. The
+    /// outcome is <see cref="CheckOutcomes.Pass"/> when <paramref name="register"/> documents every item of
     /// <see cref="Failures"/>, and so when nothing failed, because a gap or failed assertion that is
     /// registered is the accepted result for it: an unreachable member is always registered, and a
     /// reachable member or a seed-token assertion is registered once its correction attempts are spent.
@@ -1624,8 +1733,8 @@ public sealed class ConformanceResult
         return new CheckResult(
             CheckNames.Conformance,
             undocumented == 0 ? CheckOutcomes.Pass : CheckOutcomes.Fail,
-            Members.Count + SeedAssertions.Count,
-            Counts.Passed + passedAssertions,
+            Counts.MembersChecked,
+            Counts.Passed,
             detail);
     }
 
@@ -1931,5 +2040,6 @@ public sealed class ConformanceResult
             ? count
             : throw Invalid($"{path}.{key}", "must be a non-negative integer.");
 
-    private static InvalidDataException Invalid(string path, string message) => new($"{FileLabel}: {path} {message}");
+    /// <summary>The error for an invalid <c>baseline/conformance.json</c>: the file, the offending path and what is wrong there.</summary>
+    internal static InvalidDataException Invalid(string path, string message) => new($"{FileLabel}: {path} {message}");
 }

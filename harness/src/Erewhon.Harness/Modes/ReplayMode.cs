@@ -1417,7 +1417,11 @@ public sealed class ReplayBody(
                 or InvalidDataException;
 
         // Conformance is read from capture's result, never recomputed: the stand-in's conformance is a fact
-        // about the baseline, not about the facade.
+        // about the baseline, not about the facade. The result is still held to the catalogue before it
+        // counts: its members must be the catalogue's inventory, a member is unreachable-in-source exactly
+        // when the catalogue records it so, and its seed-token assertions must be the check's own. A result
+        // that disagrees is thrown, and the guard records the never-documentable CHK-EXCEPTION item, so no
+        // stored pass can close an unreachable member and no member or assertion can be dropped.
         //
         // Capture writes the conformance result beside the records it captured, so a captured baseline
         // without it has lost mandatory evidence. That absence is thrown, and the guard records it as the
@@ -1446,6 +1450,7 @@ public sealed class ReplayBody(
             }
 
             var result = ConformanceResult.Parse(node);
+            new ConformanceCheck(catalogue).Verify(result);
             var check = result.ToCheckResult(register);
             state.Conformance = result.Summary;
             state.SetCheck(check);
@@ -1453,8 +1458,13 @@ public sealed class ReplayBody(
 
             // The detail carries the verdict's reason: how many failing items the register documents and
             // how many seed-token assertions hold.
-            PrintBaseline(string.IsNullOrWhiteSpace(check.Detail) ? DescribeCheck(check) : $"{DescribeCheck(check)}; {check.Detail}");
+            PrintBaseline(string.IsNullOrWhiteSpace(check.Detail) ? DescribeConformance(check) : $"{DescribeConformance(check)}; {check.Detail}");
         }
+
+        // The conformance check counts members, the members checked and passed the report states, so the
+        // line names them; its seed-token assertions are in the detail.
+        private static string DescribeConformance(CheckResult check) =>
+            string.Create(CultureInfo.InvariantCulture, $"check {check.Name}: {check.Outcome} ({check.Passed} of {check.Cases} members passed)");
 
         private async Task OpenApiDriftAsync()
         {

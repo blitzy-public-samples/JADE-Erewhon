@@ -931,6 +931,9 @@ public sealed partial class NormaliserTests
     private const string SoapRetailSaleDetailPrice = "CONF:Soap:DTORetailSaleDetail.price";
     private const string SoapResultAllWarnings = "CONF:Soap:DTOResult.allWarnings";
 
+    // The conformance result capture committed, relative to the repository root.
+    private const string CommittedConformancePath = "baseline/conformance.json";
+
     // The SOAP message namespace the catalogue names, and a namespace no SOAP evidence may come from.
     private const string TargetNamespace = "urn:JadeWebServices/WebServiceHTTP/";
     private const string ForeignNamespace = "urn:example:foreign";
@@ -1244,8 +1247,10 @@ public sealed partial class NormaliserTests
 
         Assert.Equal(CheckNames.Conformance, check.Name);
         Assert.Equal(expectedOutcome, check.Outcome);
-        Assert.Equal(result.Members.Count + result.SeedAssertions.Count, check.Cases);
-        Assert.Equal(result.Counts.Passed + result.SeedAssertions.Count, check.Passed);
+        // Members only, the counts the results report states; the seed-token assertions are in the detail.
+        Assert.Equal(result.Members.Count, check.Cases);
+        Assert.Equal(result.Counts.Passed, check.Passed);
+        Assert.Equal((result.Summary.MembersChecked, result.Summary.Passed), (check.Cases, check.Passed));
         Assert.Equal(string.Format(System.Globalization.CultureInfo.InvariantCulture, expectedDetail, result.Failures.Count), check.Detail);
     }
 
@@ -1297,6 +1302,199 @@ public sealed partial class NormaliserTests
         };
 
         return KnownLimitationsRegister.Parse(document.ToJsonString());
+    }
+
+    // ---- Result read back, held to the catalogue ------------------------------------------------
+
+    /// <summary>
+    /// An edit of a written conformance result that <see cref="ConformanceResult.Parse"/> still accepts,
+    /// because the counts are recomputed from the edited members, and only
+    /// <see cref="ConformanceCheck.Verify"/> can reject.
+    /// </summary>
+    public enum ConformanceTamper
+    {
+        /// <summary>The unreachable <c>DTOError.guid</c> claims <c>pass</c>.</summary>
+        UnreachableMemberPasses,
+
+        /// <summary>The unreachable REST constant <c>HTTP_Conflict</c> claims <c>unobserved</c>.</summary>
+        UnreachableConstantUnobserved,
+
+        /// <summary>The reachable <c>DTOClient.name</c> claims <c>unreachable-in-source</c>.</summary>
+        ReachableMemberUnreachable,
+
+        /// <summary>The inventory member <c>DTOError.guid</c> is removed.</summary>
+        MemberMissing,
+
+        /// <summary>A member the inventory does not hold is added.</summary>
+        MemberUnknown,
+
+        /// <summary>The constant <c>HTTP_Success</c> names a DTO class instead of its service class.</summary>
+        ConstantClassChanged,
+
+        /// <summary>The <c>brian-olsen-email</c> assertion is removed.</summary>
+        SeedAssertionMissing,
+
+        /// <summary>The <c>pauline-wild-website</c> assertion expects, and observes, another value.</summary>
+        SeedAssertionExpectedChanged,
+
+        /// <summary>An assertion the check does not define is added.</summary>
+        SeedAssertionUnknown,
+    }
+
+    // {0} is the index of the edited or added member or assertion.
+    [Theory]
+    [InlineData(ConformanceTamper.UnreachableMemberPasses, "$.members[{0}].result is 'pass', but the catalogue records 'CONF:Rest:DTOError.guid' as unreachable in source, so its result must be 'unreachable-in-source'.")]
+    [InlineData(ConformanceTamper.UnreachableConstantUnobserved, "$.members[{0}].result is 'unobserved', but the catalogue records 'CONF:Rest:STATUS:HTTP_Conflict' as unreachable in source, so its result must be 'unreachable-in-source'.")]
+    [InlineData(ConformanceTamper.ReachableMemberUnreachable, "$.members[{0}].result is 'unreachable-in-source', but the catalogue records 'CONF:Rest:DTOClient.name' as 'reachable'.")]
+    [InlineData(ConformanceTamper.MemberMissing, "$.members lacks 'CONF:Rest:DTOError.guid', a member of the catalogue inventory.")]
+    [InlineData(ConformanceTamper.MemberUnknown, "$.members[{0}] is 'CONF:Rest:DTOAgent.nickname', which the catalogue inventory does not hold.")]
+    [InlineData(ConformanceTamper.ConstantClassChanged, "$.members[{0}].class must be 'ErewhonRestService' for 'CONF:Rest:STATUS:HTTP_Success', found 'DTOResult'.")]
+    [InlineData(ConformanceTamper.SeedAssertionMissing, "$.seedAssertions lacks seed-token assertion 'brian-olsen-email'.")]
+    [InlineData(ConformanceTamper.SeedAssertionExpectedChanged, "$.seedAssertions[{0}].expected must be '\"\"' for 'CONF:SEED:pauline-wild-website', found '\"www.wild.com\"'.")]
+    [InlineData(ConformanceTamper.SeedAssertionUnknown, "$.seedAssertions[{0}] is seed-token assertion 'carol-smith-email', which the check does not define.")]
+    public void Verify_RejectsAResultTheCatalogueContradicts(ConformanceTamper tamper, string expectedMessage)
+    {
+        var document = Run(ConformanceSeedRecord()).ToJsonNode().AsObject();
+        var index = Tamper(document, tamper);
+        var parsed = ConformanceResult.Parse(JsonNode.Parse(document.ToJsonString()));
+
+        var exception = Assert.Throws<InvalidDataException>(() => _check.Verify(parsed));
+
+        Assert.Equal(
+            "baseline/conformance.json: " + string.Format(System.Globalization.CultureInfo.InvariantCulture, expectedMessage, index),
+            exception.Message);
+    }
+
+    // The committed result, a fresh one and the fresh one read back as replay reads it all agree with the
+    // catalogue.
+    [Fact]
+    public void Verify_AcceptsTheCommittedResultAndAFreshRun()
+    {
+        var committed = ConformanceResult.Parse(JsonNode.Parse(File.ReadAllText(Path.Combine(FindRepoRoot(), CommittedConformancePath))));
+        var fresh = Run(ConformanceSeedRecord());
+        var readBack = ConformanceResult.Parse(JsonNode.Parse(fresh.ToJsonNode().ToJsonString()));
+
+        // Xunit.Record is named in full: this class's own Record builds a baseline record.
+        Assert.Null(Xunit.Record.Exception(() => _check.Verify(committed)));
+        Assert.Null(Xunit.Record.Exception(() => _check.Verify(fresh)));
+        Assert.Null(Xunit.Record.Exception(() => _check.Verify(readBack)));
+    }
+
+    [Fact]
+    public void Verify_RejectsANullResult() =>
+        Assert.Throws<ArgumentNullException>("result", () => _check.Verify(null!));
+
+    /// <summary>
+    /// Applies <paramref name="tamper"/> to a document written by <see cref="ConformanceResult.ToJsonNode"/>
+    /// and sets its counts to what the edited members give, so <see cref="ConformanceResult.Parse"/>
+    /// accepts it.
+    /// </summary>
+    /// <returns>The index of the member or assertion edited or added; -1 for a removal.</returns>
+    private static int Tamper(JsonObject document, ConformanceTamper tamper)
+    {
+        var members = document["members"]!.AsArray();
+        var assertions = document["seedAssertions"]!.AsArray();
+        var index = -1;
+        switch (tamper)
+        {
+            case ConformanceTamper.UnreachableMemberPasses:
+                index = Restate(members, "CONF:Rest:DTOError.guid", UnreachableInSource, Pass);
+                break;
+            case ConformanceTamper.UnreachableConstantUnobserved:
+                index = Restate(members, "CONF:Rest:STATUS:HTTP_Conflict", UnreachableInSource, Unobserved);
+                break;
+            case ConformanceTamper.ReachableMemberUnreachable:
+                index = Restate(members, RestClientName, Pass, UnreachableInSource);
+                break;
+            case ConformanceTamper.MemberMissing:
+                members.RemoveAt(IndexOf(members, "itemId", "CONF:Rest:DTOError.guid"));
+                break;
+            case ConformanceTamper.MemberUnknown:
+                members.Add(new JsonObject
+                {
+                    ["itemId"] = "CONF:Rest:DTOAgent.nickname",
+                    ["surface"] = "Rest",
+                    ["class"] = "DTOAgent",
+                    ["property"] = "nickname",
+                    ["result"] = Unobserved,
+                });
+                index = members.Count - 1;
+                break;
+            case ConformanceTamper.ConstantClassChanged:
+                index = IndexOf(members, "itemId", "CONF:Rest:STATUS:HTTP_Success");
+                members[index]!["class"] = "DTOResult";
+                break;
+            case ConformanceTamper.SeedAssertionMissing:
+                assertions.RemoveAt(IndexOf(assertions, "assertionId", "brian-olsen-email"));
+                break;
+            case ConformanceTamper.SeedAssertionExpectedChanged:
+                index = IndexOf(assertions, "assertionId", "pauline-wild-website");
+                assertions[index]!["expected"] = "\"www.wild.com\"";
+                assertions[index]!["observed"] = "\"www.wild.com\"";
+                break;
+            case ConformanceTamper.SeedAssertionUnknown:
+                assertions.Add(new JsonObject
+                {
+                    ["assertionId"] = "carol-smith-email",
+                    ["itemId"] = "CONF:SEED:carol-smith-email",
+                    ["expected"] = "\"cs@smith.com\"",
+                    ["observed"] = "\"cs@smith.com\"",
+                    ["result"] = Pass,
+                });
+                index = assertions.Count - 1;
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(tamper), tamper, "Not a defined tamper.");
+        }
+
+        var results = members.Select(member => member!["result"]!.GetValue<string>()).ToArray();
+        var counts = document["counts"]!.AsObject();
+        counts["membersChecked"] = results.Length;
+        counts["passed"] = results.Count(result => result == Pass);
+        var gaps = counts["gapsByNature"]!.AsObject();
+        foreach (var nature in new[] { UnreachableInSource, Unobserved, "null-only" })
+        {
+            gaps[nature] = results.Count(result => result == nature);
+        }
+
+        gaps["wrong-type"] = results.Count(result => result.StartsWith("wrong-type:", StringComparison.Ordinal));
+        return index;
+    }
+
+    // The fresh result must hold the stated result before the edit, so each row edits what it names.
+    private static int Restate(JsonArray members, string itemId, string before, string after)
+    {
+        var index = IndexOf(members, "itemId", itemId);
+        Assert.Equal(before, members[index]!["result"]!.GetValue<string>());
+        members[index]!["result"] = after;
+        return index;
+    }
+
+    private static int IndexOf(JsonArray entries, string key, string value)
+    {
+        for (var index = 0; index < entries.Count; index++)
+        {
+            if (entries[index]![key]!.GetValue<string>() == value)
+            {
+                return index;
+            }
+        }
+
+        throw new InvalidOperationException($"No entry has {key} '{value}'.");
+    }
+
+    // The message is fixed: a path would differ between checkouts and runs.
+    private static string FindRepoRoot()
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+        {
+            if (File.Exists(Path.Combine(directory.FullName, CommittedConformancePath)))
+            {
+                return directory.FullName;
+            }
+        }
+
+        throw new DirectoryNotFoundException("No ancestor of the test assembly holds baseline/conformance.json.");
     }
 
     // ---- Raw bodies -----------------------------------------------------------------------------
