@@ -14,6 +14,13 @@ public sealed class JadeUnchangedCheckTests : IDisposable
     private const string StartingCommit = "19a5189e9075349aca54de1fb5fdf2d8727403e7";
     private const string ModifiedBlob = "1111111111111111111111111111111111111111";
     private const string AddedBlob = "2222222222222222222222222222222222222222";
+    private const string Sha256Blob = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    // A symbolic link's text, and the ids real git stores for a link with that text (mode 120000, read
+    // back with ls-files --stage after staging it) in a SHA-1 and a SHA-256 repository.
+    private const string LinkText = "target.txt";
+    private const string LinkSha1Blob = "4cbb553f3f4ac2ee7b01ff6c951d6bf583c39c15";
+    private const string LinkSha256Blob = "8edaa00b6a3bb3f93168959cad1a6e971a6a448c06e146992be90e1259517afd";
 
     private readonly TempDirectory _temp = new();
 
@@ -143,24 +150,144 @@ public sealed class JadeUnchangedCheckTests : IDisposable
     }
 
     [Theory]
-    [InlineData(128, "")]
-    [InlineData(0, "")]
-    [InlineData(0, "1111111111111111111111111111111111111111\n2222222222222222222222222222222222222222\n")]
-    public async Task UnusableHashObjectAnswer_GivesUnknownBlob(int exitCode, string stdout)
+    [InlineData("modified", "unavailable", -1, "", "could not start")]
+    [InlineData("modified", "timed-out", -1, "", "timed out")]
+    [InlineData("modified", "exited", 128, "fatal: Unable to hash Erewhon/b.scm", "exited 128: fatal: Unable to hash Erewhon/b.scm")]
+    [InlineData("added", "unavailable", -1, "", "could not start")]
+    [InlineData("added", "timed-out", -1, "", "timed out")]
+    [InlineData("added", "exited", 128, "fatal: Unable to hash Erewhon/c.txt", "exited 128: fatal: Unable to hash Erewhon/c.txt")]
+    public async Task FailingHashObject_IsNotRun(string change, string failureKind, int exitCode, string stderr, string expectedReason)
     {
         Directory.CreateDirectory(_temp.PathOf(".git"));
-        var git = new ScriptedGit(args => args[0] switch
-        {
-            "diff" => ScriptedGit.Ok("M\0Erewhon/b.scm\0"),
-            "hash-object" => new GitResult(exitCode, stdout, string.Empty, TimedOut: false, Unavailable: false),
-            "ls-tree" => ScriptedGit.Ok("Erewhon/b.scm\0"),
-            _ => ScriptedGit.Ok(),
-        });
+        var git = OneChange(change, ScriptedGit.Failure(failureKind, exitCode, stderr));
 
         var result = await Check(git).RunAsync(TestContext.Current.CancellationToken);
 
-        var item = Assert.Single(result.Failures);
-        Assert.Equal(new FailureItem(FailureItemIds.JadeUnchangedPath("Erewhon/b.scm"), FailureItemIds.Modified("unknown")), item);
+        var path = ChangedPath(change);
+        var detail = AssertNotRun(result, $"git hash-object -- {path} ");
+        Assert.Contains(expectedReason, detail, StringComparison.Ordinal);
+        string[] hashArgs = ["hash-object", "--", path];
+        Assert.Equal(hashArgs, git.Calls[^1].Args);
+    }
+
+    [Theory]
+    [InlineData("modified", "", "")]
+    [InlineData("modified", "\n", "")]
+    [InlineData("modified", "1111111111111111111111111111111111111111\n2222222222222222222222222222222222222222\n", "1111111111111111111111111111111111111111 2222222222222222222222222222222222222222")]
+    [InlineData("modified", "ABCDEF0123456789ABCDEF0123456789ABCDEF01\n", "ABCDEF0123456789ABCDEF0123456789ABCDEF01")]
+    [InlineData("modified", "111111111111111111111111111111111111111\n", "111111111111111111111111111111111111111")]
+    [InlineData("modified", "11111111111111111111111111111111111111111\n", "11111111111111111111111111111111111111111")]
+    [InlineData("modified", "gggggggggggggggggggggggggggggggggggggggg\n", "gggggggggggggggggggggggggggggggggggggggg")]
+    [InlineData("added", "", "")]
+    [InlineData("added", "1111111111111111111111111111111111111111\n2222222222222222222222222222222222222222\n", "1111111111111111111111111111111111111111 2222222222222222222222222222222222222222")]
+    public async Task HashObjectOutputThatIsNoObjectId_IsNotRun(string change, string stdout, string printed)
+    {
+        Directory.CreateDirectory(_temp.PathOf(".git"));
+        var git = OneChange(change, ScriptedGit.Ok(stdout));
+
+        var result = await Check(git).RunAsync(TestContext.Current.CancellationToken);
+
+        var path = ChangedPath(change);
+        var detail = AssertNotRun(result, "which is not an object id");
+        Assert.Equal($"git hash-object -- {path} printed '{printed}', which is not an object id", detail);
+        string[] hashArgs = ["hash-object", "--", path];
+        Assert.Equal(hashArgs, git.Calls[^1].Args);
+    }
+
+    [Theory]
+    [InlineData("modified")]
+    [InlineData("added")]
+    public async Task Sha256HashObjectAnswer_GivesItsBlobId(string change)
+    {
+        Directory.CreateDirectory(_temp.PathOf(".git"));
+        var git = OneChange(change, ScriptedGit.Ok(Sha256Blob + "\n"));
+
+        var result = await Check(git).RunAsync(TestContext.Current.CancellationToken);
+
+        var nature = change == "added" ? FailureItemIds.Added(Sha256Blob) : FailureItemIds.Modified(Sha256Blob);
+        Assert.Equal(new FailureItem(FailureItemIds.JadeUnchangedPath(ChangedPath(change)), nature), Assert.Single(result.Failures));
+        Assert.Equal(CheckOutcomes.Fail, result.Result.Outcome);
+        Assert.Equal(new JadeUnchangedSummary(1, 1), result.Summary);
+    }
+
+    // ---- Symbolic links ------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("modified", "sha1\n", LinkSha1Blob)]
+    [InlineData("added", "sha1\n", LinkSha1Blob)]
+    [InlineData("modified", "sha256\n", LinkSha256Blob)]
+    [InlineData("added", "sha256\n", LinkSha256Blob)]
+    public async Task SymbolicLink_IsHashedFromItsLinkTextInTheRepositoryObjectFormat(string change, string objectFormat, string expectedBlob)
+    {
+        Directory.CreateDirectory(_temp.PathOf(".git"));
+        CreateSymbolicLink(ChangedPath(change), LinkText);
+        var git = OneChange(change, ScriptedGit.Exited(1, "hash-object would follow the link"), ScriptedGit.Ok(objectFormat));
+
+        var result = await Check(git).RunAsync(TestContext.Current.CancellationToken);
+
+        var nature = change == "added" ? FailureItemIds.Added(expectedBlob) : FailureItemIds.Modified(expectedBlob);
+        Assert.Equal(new FailureItem(FailureItemIds.JadeUnchangedPath(ChangedPath(change)), nature), Assert.Single(result.Failures));
+        Assert.Equal(CheckOutcomes.Fail, result.Result.Outcome);
+        Assert.Equal(new JadeUnchangedSummary(1, 1), result.Summary);
+
+        // diff, status and ls-tree, then the object format lookup; hash-object never runs for a link.
+        Assert.Equal(4, git.Calls.Count);
+        string[] formatArgs = ["rev-parse", "--show-object-format"];
+        Assert.Equal(formatArgs, git.Calls[^1].Args);
+        Assert.Equal(_temp.Root, git.Calls[^1].RepoRoot);
+        Assert.Equal(Git.DefaultTimeout, git.Calls[^1].Timeout);
+    }
+
+    [Theory]
+    [InlineData("unavailable", -1, "", "could not start")]
+    [InlineData("timed-out", -1, "", "timed out")]
+    [InlineData("exited", 128, "fatal: not a git repository: .git", "exited 128: fatal: not a git repository: .git")]
+    [InlineData("exited", 129, "", "exited 129")]
+    public async Task FailingObjectFormatLookup_IsNotRun(string failureKind, int exitCode, string stderr, string expectedReason)
+    {
+        Directory.CreateDirectory(_temp.PathOf(".git"));
+        CreateSymbolicLink(ChangedPath("added"), LinkText);
+        var git = OneChange("added", ScriptedGit.Ok(AddedBlob + "\n"), ScriptedGit.Failure(failureKind, exitCode, stderr));
+
+        var result = await Check(git).RunAsync(TestContext.Current.CancellationToken);
+
+        var detail = AssertNotRun(result, "git rev-parse --show-object-format ");
+        Assert.Contains(expectedReason, detail, StringComparison.Ordinal);
+        Assert.DoesNotContain(git.Calls, call => call.Args[0] == "hash-object");
+    }
+
+    [Theory]
+    [InlineData("", "")]
+    [InlineData("\n", "")]
+    [InlineData("SHA1\n", "SHA1")]
+    [InlineData("md5\n", "md5")]
+    [InlineData("sha1\nsha256\n", "sha1 sha256")]
+    public async Task ObjectFormatOutputThatIsNoKnownFormat_IsNotRun(string stdout, string printed)
+    {
+        Directory.CreateDirectory(_temp.PathOf(".git"));
+        CreateSymbolicLink(ChangedPath("added"), LinkText);
+        var git = OneChange("added", ScriptedGit.Ok(AddedBlob + "\n"), ScriptedGit.Ok(stdout));
+
+        var result = await Check(git).RunAsync(TestContext.Current.CancellationToken);
+
+        var detail = AssertNotRun(result, "which is not an object format");
+        Assert.Equal($"git rev-parse --show-object-format printed '{printed}', which is not an object format", detail);
+        Assert.DoesNotContain(git.Calls, call => call.Args[0] == "hash-object");
+    }
+
+    [Fact]
+    public async Task SymbolicLinkTextHoldingAReplacementCharacter_IsNotRunWithoutHashing()
+    {
+        // The runtime decodes link text bytes that are not valid UTF-8 as U+FFFD, so their bytes, and
+        // the blob git stores, can no longer be recovered from the text.
+        Directory.CreateDirectory(_temp.PathOf(".git"));
+        CreateSymbolicLink(ChangedPath("added"), "caf\uFFFD.scm");
+        var git = OneChange("added", ScriptedGit.Ok(AddedBlob + "\n"), ScriptedGit.Ok("sha1\n"));
+
+        var result = await Check(git).RunAsync(TestContext.Current.CancellationToken);
+
+        AssertNotRun(result, "symbolic link Erewhon/c.txt has link text 'caf\uFFFD.scm' that may not be valid UTF-8");
+        Assert.Equal(3, git.Calls.Count);
     }
 
     [Fact]
@@ -248,15 +375,102 @@ public sealed class JadeUnchangedCheckTests : IDisposable
         Assert.Contains("exited 128", detail, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task RealGit_UntrackedNestedRepository_IsNotRun()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var commit = await JadeRepositoryAsync(ct);
+
+        // git status lists a nested repository as one untracked directory, which hash-object cannot hash.
+        _temp.Write("Erewhon/nested/Inner.txt", "inner\n");
+        await TestGit.InitAsync(_temp.PathOf("Erewhon/nested"), ct);
+
+        var result = await new JadeUnchangedCheck(new HarnessOptions { RepoRoot = _temp.Root, StartingCommit = commit }).RunAsync(ct);
+
+        AssertNotRun(result, "git hash-object -- Erewhon/nested/ exited 128");
+    }
+
+    // committedTarget, when given, is the link text the path has at the starting commit; the path is
+    // then given currentTarget as its link text, replacing whatever was there (a link or a tracked file).
+    [Theory]
+    [InlineData("sha1", "Erewhon/Link.scm", null, "ErewhonModelSchema.scm", "added")]
+    [InlineData("sha1", "Erewhon/Dangling.scm", null, "Missing.scm", "added")]
+    [InlineData("sha1", "Erewhon/DataLink", null, "DataFiles", "added")]
+    [InlineData("sha1", "Erewhon/Link.scm", "ErewhonModelSchema.scm", "ErewhonDemoSystem.mul", "modified")]
+    [InlineData("sha1", "Erewhon/ErewhonDemoSystem.mul", null, "ErewhonModelSchema.scm", "modified")]
+    [InlineData("sha256", "Erewhon/Link.scm", null, "ErewhonModelSchema.scm", "added")]
+    [InlineData("sha256", "Erewhon/Link.scm", "ErewhonModelSchema.scm", "Missing.scm", "modified")]
+    public async Task RealGit_SymbolicLink_GivesTheBlobGitStoresForItsLinkText(
+        string objectFormat,
+        string linkPath,
+        string? committedTarget,
+        string currentTarget,
+        string change)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var commit = await JadeRepositoryAsync(ct, objectFormat);
+        if (committedTarget is not null)
+        {
+            CreateSymbolicLink(linkPath, committedTarget);
+            commit = await TestGit.CommitAllAsync(_temp.Root, "commit the link", ct);
+        }
+
+        File.Delete(_temp.PathOf(linkPath));
+        CreateSymbolicLink(linkPath, currentTarget);
+
+        var result = await new JadeUnchangedCheck(new HarnessOptions { RepoRoot = _temp.Root, StartingCommit = commit }).RunAsync(ct);
+
+        // The id git stores for the link once it is staged in this throwaway repository: a mode 120000
+        // blob of the link text, never the target's content.
+        await TestGit.RunAsync(_temp.Root, ct, "add", "--", linkPath);
+        var staged = (await TestGit.RunAsync(_temp.Root, ct, "ls-files", "--stage", "--", linkPath)).Split([' ', '\t']);
+        Assert.Equal("120000", staged[0]);
+        var nature = change == "added" ? FailureItemIds.Added(staged[1]) : FailureItemIds.Modified(staged[1]);
+        Assert.Equal(new FailureItem(FailureItemIds.JadeUnchangedPath(linkPath), nature), Assert.Single(result.Failures));
+        Assert.Equal(CheckOutcomes.Fail, result.Result.Outcome);
+    }
+
     // ---- Helpers -------------------------------------------------------------------------------
 
     private JadeUnchangedCheck Check(ScriptedGit git, string startingCommit = StartingCommit) =>
         new(new HarnessOptions { RepoRoot = _temp.Root, StartingCommit = startingCommit }, git.Runner);
 
-    // A repository whose one commit holds three files under Erewhon/ and one outside it.
-    private async Task<string> JadeRepositoryAsync(CancellationToken ct)
+    // The one path a theory's change touches: "added" is the untracked Erewhon/c.txt, anything else the
+    // modified Erewhon/b.scm.
+    private static string ChangedPath(string change) => change == "added" ? "Erewhon/c.txt" : "Erewhon/b.scm";
+
+    // git answers with that one change under Erewhon/, Erewhon/b.scm as the only tracked path,
+    // hashAnswer for every hash-object call and formatAnswer, when given, for the object format lookup.
+    private static ScriptedGit OneChange(string change, GitResult hashAnswer, GitResult? formatAnswer = null) => new(args => args[0] switch
     {
-        await TestGit.InitAsync(_temp.Root, ct);
+        "diff" => ScriptedGit.Ok(change == "added" ? string.Empty : "M\0Erewhon/b.scm\0"),
+        "status" => ScriptedGit.Ok(change == "added" ? "?? Erewhon/c.txt\0" : " M Erewhon/b.scm\0"),
+        "ls-tree" => ScriptedGit.Ok("Erewhon/b.scm\0"),
+        "hash-object" => hashAnswer,
+        "rev-parse" when formatAnswer is not null => formatAnswer,
+        _ => ScriptedGit.Exited(1, "unexpected git command"),
+    });
+
+    // Creates a symbolic link at relativePath with linkText as its text, or skips the test where the
+    // platform or file system cannot create one.
+    private void CreateSymbolicLink(string relativePath, string linkText)
+    {
+        var path = _temp.PathOf(relativePath);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        try
+        {
+            File.CreateSymbolicLink(path, linkText);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            Assert.Skip($"symbolic links cannot be created here: {ex.Message}");
+        }
+    }
+
+    // A repository in objectFormat whose one commit holds three files under Erewhon/ and one outside it.
+    private async Task<string> JadeRepositoryAsync(CancellationToken ct, string objectFormat = "sha1")
+    {
+        await TestGit.RunAsync(_temp.Root, ct, "init", "--quiet", "--initial-branch=main", $"--object-format={objectFormat}");
         _temp.Write("Erewhon/ErewhonModelSchema.scm", "schema\n");
         _temp.Write("Erewhon/ErewhonDemoSystem.mul", "load order\n");
         _temp.Write("Erewhon/DataFiles/Clients.txt", "Pauline Wild\n");

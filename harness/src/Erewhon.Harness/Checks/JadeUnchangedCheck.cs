@@ -1,6 +1,7 @@
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 using Erewhon.Harness.Report;
 
@@ -245,14 +246,25 @@ public sealed record JadeUnchangedResult(CheckResult Result, IReadOnlyList<Failu
 /// status reports, untracked files included.
 /// </summary>
 /// <remarks>
-/// <para>The check only reads. It runs <c>diff</c>, <c>status</c>, <c>ls-tree</c> and
-/// <c>hash-object</c> (without <c>-w</c>) through <see cref="Git.RunAsync"/> and never a command that
-/// writes the index, the object store or the working tree, and it never reads file content itself.</para>
+/// <para>The check only reads. It runs <c>diff</c>, <c>status</c>, <c>ls-tree</c>, <c>hash-object</c>
+/// (without <c>-w</c>) and <c>rev-parse --show-object-format</c> through <see cref="Git.RunAsync"/> and
+/// never a command that writes the index, the object store or the working tree. It never reads file
+/// content itself: the one thing it reads from the working tree is a symbolic link's own text, without
+/// following the link.</para>
 /// <para>Each changed path becomes a <c>CHK-JADE-UNCHANGED:&lt;path&gt;</c> item with nature
 /// <c>modified:&lt;blob&gt;</c>, <c>added:&lt;blob&gt;</c> or <c>deleted</c>, where the blob is the id
-/// git would store for the current content, so the same change yields the same item on every run. No
-/// metadata, a starting commit git cannot resolve (for example in a shallow clone), or git itself
-/// unavailable yields the single <c>CHK-JADE-UNCHANGED</c> <c>not-run</c> item instead.</para>
+/// git would store for the current content, so the same change yields the same item on every run and
+/// different content never shares one. For a regular file that is the id <c>hash-object</c> computes,
+/// filters applied. git stores a symbolic link as a blob of its link text, so for a link the blob is the
+/// id of that text in the repository's object format, whether the link points to a file, to a directory
+/// or to nothing; the target's content never enters it. No metadata, a starting commit git cannot
+/// resolve (for example in a shallow clone), git itself unavailable, a changed path whose content git
+/// cannot hash (for example a nested repository's directory), whose hash output is not an object id or
+/// which cannot be checked for a symbolic link, or a symbolic link whose blob cannot be computed (its
+/// text holds U+FFFD, which the runtime puts in place of bytes that are not valid UTF-8, or git does not
+/// report <c>sha1</c> or <c>sha256</c> as the object format) yields the single
+/// <c>CHK-JADE-UNCHANGED</c> <c>not-run</c> item instead, its detail stating the reason, including any
+/// failing git command and what it printed.</para>
 /// </remarks>
 /// <param name="options">The harness settings: <see cref="HarnessOptions.RepoRoot"/> and <see cref="HarnessOptions.StartingCommit"/>.</param>
 public sealed class JadeUnchangedCheck(HarnessOptions options)
@@ -260,7 +272,9 @@ public sealed class JadeUnchangedCheck(HarnessOptions options)
     // The pathspec of the JADE project; every schema, .ddx, .ddxx, .mul, data and test file lives under it.
     private const string JadePathspec = "Erewhon/";
 
-    private const string UnknownBlob = "unknown";
+    // SHA-1 and SHA-256 object ids, as hash-object prints them.
+    private const int Sha1HexLength = 40;
+    private const int Sha256HexLength = 64;
 
     private readonly HarnessOptions _options = options ?? throw new ArgumentNullException(nameof(options));
 
@@ -353,12 +367,19 @@ public sealed class JadeUnchangedCheck(HarnessOptions options)
         var failures = new List<FailureItem>(changes.Count);
         foreach (var (path, kind) in changes)
         {
-            var nature = kind switch
+            // A deleted path has no content to hash.
+            var nature = FailureItemIds.Deleted;
+            if (kind != ChangeKind.Deleted)
             {
-                ChangeKind.Deleted => FailureItemIds.Deleted,
-                ChangeKind.Added => FailureItemIds.Added(await BlobIdAsync(repoRoot, path, ct).ConfigureAwait(false)),
-                _ => FailureItemIds.Modified(await BlobIdAsync(repoRoot, path, ct).ConfigureAwait(false)),
-            };
+                var blob = await BlobIdAsync(repoRoot, path, ct).ConfigureAwait(false);
+                if (!blob.Hashed)
+                {
+                    return NotRun(blob.Value);
+                }
+
+                nature = kind == ChangeKind.Added ? FailureItemIds.Added(blob.Value) : FailureItemIds.Modified(blob.Value);
+            }
+
             failures.Add(new FailureItem(FailureItemIds.JadeUnchangedPath(path), nature, Operation: null));
         }
 
@@ -433,14 +454,87 @@ public sealed class JadeUnchangedCheck(HarnessOptions options)
         }
     }
 
-    // The blob id git would store for the path's current content (filters applied, nothing written),
-    // or "unknown" when git cannot hash it, for example for a nested repository's directory.
-    private async Task<string> BlobIdAsync(string repoRoot, string path, CancellationToken ct)
+    // The blob id git would store for the path's current content, nothing written. hash-object opens
+    // the path, so for a symbolic link it would hash the target's content, or fail when the link
+    // dangles or names a directory, while git stores the link as a blob of its link text. A path is
+    // therefore first checked for a symbolic link without following it: a link is hashed from its text
+    // (LinkBlobIdAsync), and every other path, a nested repository's directory included, by
+    // hash-object with the repository's filters applied. When git cannot hash the content (git is
+    // missing, times out, or exits non-zero, as it does for a nested repository's directory) or prints
+    // anything but one object id, the lookup carries the failing command and its output instead. No
+    // placeholder id is ever reported, because one would give different, unverified contents the same
+    // item.
+    private async Task<BlobLookup> BlobIdAsync(string repoRoot, string path, CancellationToken ct)
     {
-        var hash = await _git(repoRoot, ["hash-object", "--", path], Git.DefaultTimeout, ct).ConfigureAwait(false);
-        var blob = hash.Succeeded ? hash.StdOut.Trim() : string.Empty;
-        return blob.Length == 0 || blob.Contains('\n', StringComparison.Ordinal) ? UnknownBlob : blob;
+        string? linkText;
+        try
+        {
+            // LinkTarget reads the link itself and never follows it; it is null for anything that is
+            // not a symbolic link, a path that no longer exists included.
+            linkText = new FileInfo(Path.Combine(repoRoot, path.Replace('/', Path.DirectorySeparatorChar))).LinkTarget;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return new BlobLookup(Hashed: false, $"{path} could not be checked for a symbolic link: {OneLine(ex.Message)}");
+        }
+
+        if (linkText is not null)
+        {
+            return await LinkBlobIdAsync(repoRoot, path, linkText, ct).ConfigureAwait(false);
+        }
+
+        string[] hashArgs = ["hash-object", "--", path];
+        var hash = await _git(repoRoot, hashArgs, Git.DefaultTimeout, ct).ConfigureAwait(false);
+        if (!hash.Succeeded)
+        {
+            return new BlobLookup(Hashed: false, CommandFailure(hashArgs, hash));
+        }
+
+        var blob = hash.StdOut.Trim();
+        return IsObjectId(blob)
+            ? new BlobLookup(Hashed: true, blob)
+            : new BlobLookup(
+                Hashed: false,
+                $"git {string.Join(' ', hashArgs)} printed '{OneLine(hash.StdOut)}', which is not an object id");
     }
+
+    // The id git stores for a symbolic link (mode 120000): the hash of "blob <length>NUL" followed by
+    // the link text's bytes, in the object format git reports for the repository. The runtime decodes
+    // the link text as UTF-8 and replaces bytes that are not valid UTF-8 with U+FFFD, so a text holding
+    // that character may no longer give the bytes git hashes, and no id is computed for it.
+    private async Task<BlobLookup> LinkBlobIdAsync(string repoRoot, string path, string linkText, CancellationToken ct)
+    {
+        if (linkText.Contains('\uFFFD', StringComparison.Ordinal))
+        {
+            return new BlobLookup(
+                Hashed: false,
+                $"symbolic link {path} has link text '{OneLine(linkText)}' that may not be valid UTF-8, so the blob git stores for it cannot be computed");
+        }
+
+        string[] formatArgs = ["rev-parse", "--show-object-format"];
+        var format = await _git(repoRoot, formatArgs, Git.DefaultTimeout, ct).ConfigureAwait(false);
+        if (!format.Succeeded)
+        {
+            return new BlobLookup(Hashed: false, CommandFailure(formatArgs, format));
+        }
+
+        var text = Encoding.UTF8.GetBytes(linkText);
+        var blob = Encoding.UTF8.GetBytes(string.Create(CultureInfo.InvariantCulture, $"blob {text.Length}\0{linkText}"));
+        var digest = format.StdOut.Trim() switch
+        {
+            "sha1" => SHA1.HashData(blob),
+            "sha256" => SHA256.HashData(blob),
+            _ => null,
+        };
+        return digest is null
+            ? new BlobLookup(
+                Hashed: false,
+                $"git {string.Join(' ', formatArgs)} printed '{OneLine(format.StdOut)}', which is not an object format")
+            : new BlobLookup(Hashed: true, Convert.ToHexStringLower(digest));
+    }
+
+    private static bool IsObjectId(string value) =>
+        value.Length is Sha1HexLength or Sha256HexLength && value.All(char.IsAsciiHexDigitLower);
 
     private static List<string> SplitNul(string output) =>
         [.. output.Split('\0', StringSplitOptions.RemoveEmptyEntries)];
@@ -468,4 +562,8 @@ public sealed class JadeUnchangedCheck(HarnessOptions options)
     // Report details are single lines; NUL separators and line breaks become spaces.
     private static string OneLine(string text) =>
         string.Join(' ', text.Split(['\0', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+
+    // When Hashed, Value is the blob id git printed for the content, or computed for a symbolic link's
+    // text; otherwise Value is the not-run detail saying why there is none.
+    private readonly record struct BlobLookup(bool Hashed, string Value);
 }
