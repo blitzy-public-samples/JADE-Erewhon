@@ -1,0 +1,25 @@
+{
+  "order": 52,
+  "caseId": "SOAP-updateClient-01",
+  "operation": "Soap.updateClient",
+  "kind": "success",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/updateClient\""
+    },
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateClient xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>David Russel</pName><pStreet>101 Riccarton Road</pStreet><pCity>Christchurch</pCity><pCountry>New Zealand</pCountry><pPhone>64 3 392 9393</pPhone><pFax>64 3 828 2828</pFax><pEmail>russel@more.co.nz</pEmail><pWebsite>www.more/russel.co.nz</pWebsite></updateClient></soap:Body></soap:Envelope>"
+  },
+  "response": {
+    "status": 200,
+    "contentType": "text/xml; charset=utf-8",
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateClientResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><updateClientResult><allErrors /><allWarnings /><statusCode>200</statusCode></updateClientResult></updateClientResponse></soap:Body></soap:Envelope>",
+    "bodySha256": "8984f7fca5b3a5e6eaf8b23b5b1e6edccea63792c18fdb60c997a966dec96fec",
+    "bodyFile": null
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "order": 45,
+  "caseId": "REST-postCreateTender-03",
+  "operation": "Rest.postCreateTender",
+  "kind": "error",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/createTender/Brian%20Olsen/ANQU/1/100.00",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 400,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"guid\":\"\",\"allErrors\":[\"Item is not a Tender Item\"],\"allWarnings\":[],\"statusCode\":400}",
+    "bodySha256": "eaf14e90f6ba7b9b32b60dd637211d2aeab1c85ee3748a4fbc8ebda1b9ec00a5",
+    "bodyFile": null
+  }
+}

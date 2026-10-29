@@ -1,0 +1,25 @@
+{
+  "order": 49,
+  "caseId": "SOAP-updateAgent-03",
+  "operation": "Soap.updateAgent",
+  "kind": "error",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/updateAgent\""
+    },
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateAgent xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Hank Williams</pName><pStreet>9127 Bel Air Drive</pStreet><pCity>Los Angeles</pCity><pCountry>United States of America</pCountry><pPhone>1 8 2938 4756</pPhone><pFax>1 8 6354 7364</pFax><pEmail>hank.it.com</pEmail><pWebsite>www.it.com</pWebsite></updateAgent></soap:Body></soap:Envelope>"
+  },
+  "response": {
+    "status": 200,
+    "contentType": "text/xml; charset=utf-8",
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><updateAgentResult><allErrors><String>Email must be in a valid format e.g. user@domain.com</String></allErrors><allWarnings /><statusCode>400</statusCode></updateAgentResult></updateAgentResponse></soap:Body></soap:Envelope>",
+    "bodySha256": "b78e5e4c8fe5145839ea57b4d29550b1879ff38680ccbdef86187a57e6448db7",
+    "bodyFile": null
+  }
+}

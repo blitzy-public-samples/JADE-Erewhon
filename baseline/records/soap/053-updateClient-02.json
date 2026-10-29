@@ -1,0 +1,25 @@
+{
+  "order": 53,
+  "caseId": "SOAP-updateClient-02",
+  "operation": "Soap.updateClient",
+  "kind": "error",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/updateClient\""
+    },
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateClient xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Nobody Client</pName><pStreet>1 Nowhere Street</pStreet><pCity>Christchurch</pCity><pCountry>New Zealand</pCountry><pPhone>64 3 000 0001</pPhone><pFax>64 3 000 0002</pFax><pEmail>nobody@nowhere.co.nz</pEmail><pWebsite>www.nowhere.co.nz</pWebsite></updateClient></soap:Body></soap:Envelope>"
+  },
+  "response": {
+    "status": 200,
+    "contentType": "text/xml; charset=utf-8",
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateClientResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><updateClientResult><allErrors><String>Client Nobody Client not found</String></allErrors><allWarnings /><statusCode>404</statusCode></updateClientResult></updateClientResponse></soap:Body></soap:Envelope>",
+    "bodySha256": "6104b567892dffae4b7641e6b3a0c298e0e53ae98d7b0be570b04b915b4371ad",
+    "bodyFile": null
+  }
+}

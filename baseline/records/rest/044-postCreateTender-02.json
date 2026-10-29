@@ -1,0 +1,22 @@
+{
+  "order": 44,
+  "caseId": "REST-postCreateTender-02",
+  "operation": "Rest.postCreateTender",
+  "kind": "error",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/createTender/Brian%20Olsen/PROP/60/100.00",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 400,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"guid\":\"\",\"allErrors\":[\"The offer price cannot be less than the reserve price\"],\"allWarnings\":[],\"statusCode\":400}",
+    "bodySha256": "97393407e212028e1bb98f322d54f10703c2f892856e0622da692bc99464db05",
+    "bodyFile": null
+  }
+}
