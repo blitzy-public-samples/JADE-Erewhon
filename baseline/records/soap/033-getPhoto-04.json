@@ -1,0 +1,25 @@
+{
+  "order": 33,
+  "caseId": "SOAP-getPhoto-04",
+  "operation": "Soap.getPhoto",
+  "kind": "error",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getPhoto\""
+    },
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getPhoto xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Nobody Client</pName></getPhoto></soap:Body></soap:Envelope>"
+  },
+  "response": {
+    "status": 200,
+    "contentType": "text/xml; charset=utf-8",
+    "bodyText": null,
+    "bodySha256": "7d773708b19a3f4e98ad7d5738b1585b723c405a4b056da996369108ea78b9ee",
+    "bodyFile": "033-getPhoto-04.body.bin"
+  }
+}

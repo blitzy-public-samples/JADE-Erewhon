@@ -1,0 +1,25 @@
+{
+  "order": 31,
+  "caseId": "SOAP-getPhoto-02",
+  "operation": "Soap.getPhoto",
+  "kind": "success",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getPhoto\""
+    },
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getPhoto xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Elaine Lee</pName></getPhoto></soap:Body></soap:Envelope>"
+  },
+  "response": {
+    "status": 200,
+    "contentType": "text/xml; charset=utf-8",
+    "bodyText": null,
+    "bodySha256": "37cbd6dcdb38e1e728161501788de5f853f61c8c20b5436f61f29a66f28ac2f3",
+    "bodyFile": "031-getPhoto-02.body.bin"
+  }
+}

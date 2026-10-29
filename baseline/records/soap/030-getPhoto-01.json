@@ -1,0 +1,25 @@
+{
+  "order": 30,
+  "caseId": "SOAP-getPhoto-01",
+  "operation": "Soap.getPhoto",
+  "kind": "success",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getPhoto\""
+    },
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getPhoto xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Pauline Wild</pName></getPhoto></soap:Body></soap:Envelope>"
+  },
+  "response": {
+    "status": 200,
+    "contentType": "text/xml; charset=utf-8",
+    "bodyText": null,
+    "bodySha256": "b70815e427949e12a38f8bb1e0bc34a46e503c80361702c3b8fdd6079b1541de",
+    "bodyFile": "030-getPhoto-01.body.bin"
+  }
+}
