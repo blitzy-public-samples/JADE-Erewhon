@@ -118,8 +118,8 @@ public static class CheckOutcomes
 /// <param name="UtcDate">When the run took place.</param>
 /// <param name="ExecutionMode"><c>docker</c> or <c>local-processes</c>.</param>
 /// <param name="FacadeFrameworkDescription">
-/// The facade's <c>RuntimeInformation.FrameworkDescription</c> from its <c>/admin/info</c>; null when the
-/// facade was not reached.
+/// The facade's <c>RuntimeInformation.FrameworkDescription</c> from its <c>/admin/info</c>; null when it
+/// was not read, and <paramref name="FacadeFrameworkUnavailable"/> then says why.
 /// </param>
 /// <param name="SdkPin">
 /// The SDK version pinned in <c>harness/global.json</c>, baked into the harness assembly at build time
@@ -133,6 +133,11 @@ public static class CheckOutcomes
 /// <param name="StartingCommit">The starting commit the JADE-unchanged check compares against.</param>
 /// <param name="BaselineCommit">The commit that first added <c>baseline/manifest.json</c>; null when not found.</param>
 /// <param name="FacadeCommit">The commit that first added a <c>facade/</c> path; null when not found.</param>
+/// <param name="FacadeFrameworkUnavailable">
+/// Why <paramref name="FacadeFrameworkDescription"/> is unavailable, as the read observed it, for example
+/// <c>facade /admin/info answered HTTP 500</c>; it never quotes a URL or a response body. Null when the
+/// description was read, or when the run never attempted the read.
+/// </param>
 public sealed record RunFacts(
     DateTimeOffset UtcDate,
     string ExecutionMode,
@@ -145,7 +150,8 @@ public sealed record RunFacts(
     string? BackendAdminUrl,
     string StartingCommit,
     string? BaselineCommit,
-    string? FacadeCommit)
+    string? FacadeCommit,
+    string? FacadeFrameworkUnavailable = null)
 {
     /// <summary>
     /// The <see cref="AssemblyMetadataAttribute"/> key under which <c>Erewhon.Harness.csproj</c> bakes
@@ -1081,6 +1087,9 @@ public sealed class ResultsReportWriter : IResultsReportWriter
     private const string DiffNaturePrefix = "d:";
     private const string DiscrepancyArtifactDirectory = "artifacts/discrepancies/";
 
+    // Why the facade's .NET version is unavailable when the run states no reason: it never reached the read.
+    private const string FacadeFrameworkNotRead = "facade /admin/info not read";
+
     // Why a captured case is listed under "Captured cases not compared".
     private const string UnaccountedReason =
         "The case has a baseline record, but the replay did not compare it, so its operation is an undocumented difference.";
@@ -1226,11 +1235,7 @@ public sealed class ResultsReportWriter : IResultsReportWriter
         md.Header("Fact", "Value");
         md.Row("Date (UTC)", facts is null ? Dash : facts.UtcDate.UtcDateTime.ToString(DateFormat, CultureInfo.InvariantCulture));
         md.Row("Execution mode", Code(facts?.ExecutionMode));
-        md.Row(
-            ".NET (facade runtime)",
-            string.IsNullOrWhiteSpace(facts?.FacadeFrameworkDescription)
-                ? "unavailable (facade /admin/info not reached)"
-                : PlainText(facts.FacadeFrameworkDescription));
+        md.Row(".NET (facade runtime)", FacadeFramework(facts));
         md.Row("SDK pin (`harness/global.json`)", Code(facts?.SdkPin));
         md.Row("Harness version", Code(HarnessOptions.HarnessVersion));
         md.Row("Target REST URL", UrlCode(facts?.TargetRestUrl));
@@ -1614,6 +1619,20 @@ public sealed class ResultsReportWriter : IResultsReportWriter
     private static string Number(int value) => value.ToString(CultureInfo.InvariantCulture);
 
     private static string OrNotFound(string? value) => string.IsNullOrWhiteSpace(value) ? "not found" : Code(value);
+
+    // The facade's framework description as read, otherwise "unavailable" with the reason the read observed.
+    private static string FacadeFramework(RunFacts? facts)
+    {
+        if (!string.IsNullOrWhiteSpace(facts?.FacadeFrameworkDescription))
+        {
+            return PlainText(facts.FacadeFrameworkDescription);
+        }
+
+        var reason = string.IsNullOrWhiteSpace(facts?.FacadeFrameworkUnavailable)
+            ? FacadeFrameworkNotRead
+            : facts.FacadeFrameworkUnavailable;
+        return $"unavailable ({PlainText(reason)})";
+    }
 
     // A code span on one line whose content, under CommonMark's code-span rules, is the value exactly. The
     // fence is one backtick longer than the value's longest backtick run, so no run inside closes it early.

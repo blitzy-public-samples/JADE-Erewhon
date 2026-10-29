@@ -351,6 +351,7 @@ public sealed class StateReset : IDisposable
     internal const string ResetFailure = "reset";
     internal const string InvalidBodyFailure = "invalid";
     internal const string InvalidUrlFailure = "invalid-url";
+    internal const string BlankUrlFailure = "blank-url";
     internal const string InfoFailurePrefix = "info-";
     internal const string BeforeFailurePrefix = "before-";
     internal const string NullObserved = "null";
@@ -398,14 +399,34 @@ public sealed class StateReset : IDisposable
     /// object or holds a string that cannot be decoded.
     /// </returns>
     /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
-    public async Task<AdminInfo?> ReadInfoAsync(string? adminUrl, CancellationToken ct = default)
+    public async Task<AdminInfo?> ReadInfoAsync(string? adminUrl, CancellationToken ct = default) =>
+        (await ReadInfoOutcomeAsync(adminUrl, ct).ConfigureAwait(false)).Info;
+
+    /// <summary>
+    /// Reads a component's <c>GET /admin/info</c> like <see cref="ReadInfoAsync"/>, and also states why
+    /// no info was read, so a caller can report what it observed.
+    /// </summary>
+    /// <param name="adminUrl">The component's admin base URL, for example <c>http://facade:9090</c>.</param>
+    /// <param name="ct">Cancels the read; its cancellation is the only exception thrown.</param>
+    /// <returns>
+    /// The parsed info, or the failure token and a credential-free detail. A blank URL, or one that is not
+    /// an absolute <c>http</c>/<c>https</c> URL without user information, sends no request; its detail
+    /// never quotes the URL.
+    /// </returns>
+    /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
+    public async Task<AdminInfoRead> ReadInfoOutcomeAsync(string? adminUrl, CancellationToken ct = default)
     {
-        if (string.IsNullOrWhiteSpace(adminUrl) || !TryBuildUri(adminUrl, AdminRoutes.Info, out var infoUri, out _))
+        if (string.IsNullOrWhiteSpace(adminUrl))
         {
-            return null;
+            return new AdminInfoRead(null, BlankUrlFailure, "no admin URL is configured, so no request was sent");
         }
 
-        return (await ReadInfoCoreAsync(infoUri, ct).ConfigureAwait(false)).Info;
+        if (!TryBuildUri(adminUrl, AdminRoutes.Info, out var infoUri, out var urlProblem))
+        {
+            return new AdminInfoRead(null, InvalidUrlFailure, $"no request was sent; {urlProblem}");
+        }
+
+        return await ReadInfoCoreAsync(infoUri, ct).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -516,7 +537,7 @@ public sealed class StateReset : IDisposable
         string point,
         string state,
         ResetExpectations expected,
-        InfoRead before,
+        AdminInfoRead before,
         AdminInfo after)
     {
         var previousGeneration = before.Info?.Generation;
@@ -602,18 +623,18 @@ public sealed class StateReset : IDisposable
             $"{SourceLabels.ConsolePrefix} reset {state} at {point}: mismatch {field} observed {FailureItemDisplay.Observed(field, observed)}");
     }
 
-    private async Task<InfoRead> ReadInfoCoreAsync(Uri infoUri, CancellationToken ct)
+    private async Task<AdminInfoRead> ReadInfoCoreAsync(Uri infoUri, CancellationToken ct)
     {
         var call = await SendAsync(HttpMethod.Get, infoUri, ct).ConfigureAwait(false);
         if (call.Failure is not null)
         {
-            return new InfoRead(null, call.Failure, call.Detail);
+            return new AdminInfoRead(null, call.Failure, call.Detail);
         }
 
         var info = AdminInfo.Parse(call.Body ?? string.Empty);
         return info is null
-            ? new InfoRead(null, InvalidBodyFailure, $"GET {infoUri}: body is not a JSON object whose strings can be decoded")
-            : new InfoRead(info, null, null);
+            ? new AdminInfoRead(null, InvalidBodyFailure, $"GET {infoUri}: body is not a JSON object whose strings can be decoded")
+            : new AdminInfoRead(info, null, null);
     }
 
     /// <summary>
@@ -726,7 +747,18 @@ public sealed class StateReset : IDisposable
 
     /// <summary>One admin request's outcome: the body on a 2xx response, otherwise the failure token.</summary>
     private readonly record struct AdminCall(string? Body, string? Failure, string? Detail);
-
-    /// <summary>One <c>/admin/info</c> read: the parsed info, otherwise the failure token.</summary>
-    private readonly record struct InfoRead(AdminInfo? Info, string? Failure, string? Detail);
 }
+
+/// <summary>One <c>GET /admin/info</c> read: the parsed info, otherwise why none was read.</summary>
+/// <param name="Info">The parsed info; null when the read failed.</param>
+/// <param name="Failure">
+/// Null when <paramref name="Info"/> is set. Otherwise a deterministic token: <c>blank-url</c> or
+/// <c>invalid-url</c> when no request was sent; <c>connect</c>, <c>timeout</c> or <c>reset</c> when the
+/// request got no complete response; the status code of a response that is not 2xx; or <c>invalid</c> when
+/// the 2xx body is not a JSON object whose strings can be decoded.
+/// </param>
+/// <param name="Detail">
+/// Why the read failed, for the console: the method, the credential-free URL and what went wrong, never the
+/// response body; null when <paramref name="Info"/> is set.
+/// </param>
+public readonly record struct AdminInfoRead(AdminInfo? Info, string? Failure, string? Detail);

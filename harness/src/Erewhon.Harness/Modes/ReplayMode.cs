@@ -890,6 +890,10 @@ public sealed class ReplayBody(
 {
     private const string Unknown = "unknown";
 
+    // The setting the facade's /admin/info is read from, as reasons name it.
+    private const string TargetAdminUrlKey =
+        HarnessOptions.SectionName + ":" + nameof(HarnessOptions.Target) + ":" + nameof(HarnessEndpoints.AdminUrl);
+
     private readonly HarnessOptions _options = options ?? throw new ArgumentNullException(nameof(options));
     private readonly OperationCatalogue? _catalogue = catalogue;
     private readonly KnownLimitationsRegister _register = register ?? throw new ArgumentNullException(nameof(register));
@@ -919,6 +923,10 @@ public sealed class ReplayBody(
     /// <param name="frameworkDescription">The facade's framework description from its <c>/admin/info</c>; null when not read.</param>
     /// <param name="baselineCommit">The commit that first added <c>baseline/manifest.json</c>; null when not found.</param>
     /// <param name="facadeCommit">The commit that first added a <c>facade/</c> path; null when not found.</param>
+    /// <param name="frameworkUnavailable">
+    /// Why the framework description is unavailable, from <see cref="DescribeFacadeFramework"/>; null when it
+    /// was read or the read was not attempted.
+    /// </param>
     /// <returns>The facts; never throws for any settings value.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="options"/> is null.</exception>
     internal static RunFacts DescribeRun(
@@ -926,7 +934,8 @@ public sealed class ReplayBody(
         DateTimeOffset utcDate,
         string? frameworkDescription,
         string? baselineCommit,
-        string? facadeCommit)
+        string? facadeCommit,
+        string? frameworkUnavailable = null)
     {
         ArgumentNullException.ThrowIfNull(options);
         return new RunFacts(
@@ -941,7 +950,48 @@ public sealed class ReplayBody(
             options.Backend?.AdminUrl,
             string.IsNullOrWhiteSpace(options.StartingCommit) ? Unknown : options.StartingCommit,
             baselineCommit,
-            facadeCommit);
+            facadeCommit,
+            frameworkUnavailable);
+    }
+
+    /// <summary>
+    /// The facade's .NET version for the run facts, from one read of its <c>/admin/info</c>: the framework
+    /// description it gave, or why none is available, as the read observed it. The reason names the setting,
+    /// the outcome or the status code, and never quotes the URL or the response body.
+    /// </summary>
+    /// <param name="read">The outcome of <see cref="StateReset.ReadInfoOutcomeAsync"/> for <c>Harness:Target:AdminUrl</c>.</param>
+    /// <param name="requestLimit">The per-request limit the read was bounded by, which a timeout reason states.</param>
+    /// <returns>Exactly one non-null member: the description as given, or the reason it is unavailable.</returns>
+    internal static (string? Description, string? Unavailable) DescribeFacadeFramework(AdminInfoRead read, TimeSpan requestLimit)
+    {
+        const string info = "facade " + AdminRoutes.Info;
+        const string member = "frameworkDescription";
+
+        if (read.Info is { } answered)
+        {
+            return answered.FrameworkDescription switch
+            {
+                null => (null, $"{info} gave no {member}"),
+                var blank when string.IsNullOrWhiteSpace(blank) => (null, $"{info} gave a blank {member}"),
+                var description => (description, null),
+            };
+        }
+
+        var failure = read.Failure;
+        var reason = failure switch
+        {
+            StateReset.BlankUrlFailure => $"{TargetAdminUrlKey} is blank",
+            StateReset.InvalidUrlFailure => $"{TargetAdminUrlKey} is not an absolute http(s) URL without user information",
+            StateReset.ConnectFailure => $"{info} not reached",
+            StateReset.TimeoutFailure => string.Create(
+                CultureInfo.InvariantCulture, $"{info} gave no response within {requestLimit.TotalSeconds:0} s"),
+            StateReset.ResetFailure => $"{info} connection closed before a complete response",
+            StateReset.InvalidBodyFailure => $"{info} answer is not a JSON object whose strings can be decoded",
+            { Length: > 0 } status when status.All(char.IsAsciiDigit) => $"{info} answered HTTP {status}",
+            { Length: > 0 } other => $"{info} read failed ({other})",
+            _ => $"{info} read reported no outcome",
+        };
+        return (null, reason);
     }
 
     /// <summary>One run of the body: the per-run inputs, clients and findings, used by one thread at a time.</summary>
@@ -1020,8 +1070,9 @@ public sealed class ReplayBody(
             await Guard("JADE-unchanged check", JadeUnchangedAsync).ConfigureAwait(false);
             await Guard("ordering evidence", OrderingAsync).ConfigureAwait(false);
 
-            var frameworkDescription = await ReadFacadeFrameworkAsync().ConfigureAwait(false);
-            state.Facts = DescribeRun(options, _startedAt, frameworkDescription, _baselineCommit, _facadeCommit);
+            var framework = await ReadFacadeFrameworkAsync().ConfigureAwait(false);
+            state.Facts = DescribeRun(
+                options, _startedAt, framework.Description, _baselineCommit, _facadeCommit, framework.Unavailable);
         }
 
         // Only discrepancies/ and replay/ are this run's to clear; facade-tests/ was written before
@@ -1566,14 +1617,20 @@ public sealed class ReplayBody(
             Print(DescribeCheck(result.Result));
         }
 
-        // A reported fact only: a facade that does not answer leaves the .NET version unavailable, and no
-        // item is recorded for it.
-        private async Task<string?> ReadFacadeFrameworkAsync()
+        // A reported fact only: a read that yields no description leaves the .NET version unavailable, with
+        // the reason it observed and one console line, and no item is recorded for it. The read is bounded
+        // by the request limit.
+        private async Task<(string? Description, string? Unavailable)> ReadFacadeFrameworkAsync()
         {
+            const string unavailableLine = "facade .NET version unavailable: ";
+
+            (string? Description, string? Unavailable) framework;
+            string? detail;
             try
             {
-                var info = await reset.ReadInfoAsync(options.Target.AdminUrl, ct).ConfigureAwait(false);
-                return string.IsNullOrWhiteSpace(info?.FrameworkDescription) ? null : info.FrameworkDescription;
+                var read = await reset.ReadInfoOutcomeAsync(options.Target.AdminUrl, ct).ConfigureAwait(false);
+                framework = DescribeFacadeFramework(read, options.RequestTimeout);
+                detail = read.Detail;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -1581,9 +1638,16 @@ public sealed class ReplayBody(
             }
             catch (Exception ex)
             {
-                Print($"facade /admin/info not read: {ReplayMode.Describe(ex)}");
-                return null;
+                framework = (null, $"facade {AdminRoutes.Info} read failed ({FailureItemIds.ExceptionNature(ex)})");
+                detail = ReplayMode.SafeMessage(ex);
             }
+
+            if (framework.Unavailable is { } reason)
+            {
+                Print(string.IsNullOrWhiteSpace(detail) ? unavailableLine + reason : $"{unavailableLine}{reason} ({detail})");
+            }
+
+            return framework;
         }
 
         private static CheckResult NotRun(string name, string detail) => new(name, CheckOutcomes.NotRun, 0, 0, detail);

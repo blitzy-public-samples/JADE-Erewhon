@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
+using System.IO.Pipelines;
 using System.Net;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
@@ -128,6 +129,43 @@ public sealed partial class ReplayLifecycleTests : IDisposable
 
         /// <summary>A file in a new directory under a temporary directory beside the repository root.</summary>
         OutsideRoot,
+    }
+
+    /// <summary>How the facade's <c>/admin/info</c> read for the run facts ends.</summary>
+    public enum FacadeInfoAnswer
+    {
+        /// <summary>HTTP 200 with the facade's framework description.</summary>
+        Described,
+
+        /// <summary>HTTP 200 with a JSON object that has no <c>frameworkDescription</c>.</summary>
+        Fieldless,
+
+        /// <summary>HTTP 200 with a body that is not JSON.</summary>
+        NotJson,
+
+        /// <summary>HTTP 200 with a whitespace-only <c>frameworkDescription</c>.</summary>
+        BlankDescription,
+
+        /// <summary>HTTP 500.</summary>
+        ServerError,
+
+        /// <summary>The connection is refused.</summary>
+        ConnectionRefused,
+
+        /// <summary>The response ends prematurely.</summary>
+        ConnectionReset,
+
+        /// <summary>The response body never arrives, so the request limit ends the read.</summary>
+        NoResponse,
+
+        /// <summary><c>Harness:Target:AdminUrl</c> is blank, so no request is sent.</summary>
+        BlankUrl,
+
+        /// <summary><c>Harness:Target:AdminUrl</c> carries user information, so no request is sent.</summary>
+        CredentialUrl,
+
+        /// <summary>The run never reached the read, as when an earlier step ended the body.</summary>
+        NotRead,
     }
 
     /// <inheritdoc />
@@ -592,6 +630,14 @@ public sealed partial class ReplayLifecycleTests : IDisposable
             StdoutText.Contains($"not ready: {ShutdownTarget.FacadeComponent} (", StringComparison.Ordinal),
             "the console reports the facade as not ready");
 
+        // The .NET run fact states the blank setting, in one console line and no item.
+        Assert.Equal("Harness:Target:AdminUrl is blank", state.Facts.FacadeFrameworkUnavailable);
+        Assert.Null(state.Facts.FacadeFrameworkDescription);
+        Assert.Equal(
+            ["replay: facade .NET version unavailable: Harness:Target:AdminUrl is blank (no admin URL is configured, so no request was sent)"],
+            StdoutText.Split('\n').Select(line => line.TrimEnd('\r')).Where(line => line.Contains(".NET version", StringComparison.Ordinal)));
+        Assert.DoesNotContain(state.Failures, item => item.Detail?.Contains(AdminRoutes.Info, StringComparison.Ordinal) == true);
+
         // The case is compared as unanswered, and no connection reached the facade listeners.
         var result = Assert.Single(state.Cases);
         Assert.Equal(caseId, result.CaseId);
@@ -617,6 +663,92 @@ public sealed partial class ReplayLifecycleTests : IDisposable
 
         Assert.Equal(expected, facts.SdkPin);
     }
+
+    // The .NET run fact states what the facade's /admin/info read observed: the description it gave, or why
+    // none is available, without quoting the URL or the body. A blank or credential-bearing admin URL sends no
+    // request, and a run that never reached the read says so. The 1 s request limit bounds the unanswered read.
+    [Theory]
+    [InlineData(FacadeInfoAnswer.Described, ".NET 10.0.14")]
+    [InlineData(FacadeInfoAnswer.Fieldless, "unavailable (facade /admin/info gave no frameworkDescription)")]
+    [InlineData(FacadeInfoAnswer.NotJson, "unavailable (facade /admin/info answer is not a JSON object whose strings can be decoded)")]
+    [InlineData(FacadeInfoAnswer.BlankDescription, "unavailable (facade /admin/info gave a blank frameworkDescription)")]
+    [InlineData(FacadeInfoAnswer.ServerError, "unavailable (facade /admin/info answered HTTP 500)")]
+    [InlineData(FacadeInfoAnswer.ConnectionRefused, "unavailable (facade /admin/info not reached)")]
+    [InlineData(FacadeInfoAnswer.ConnectionReset, "unavailable (facade /admin/info connection closed before a complete response)")]
+    [InlineData(FacadeInfoAnswer.NoResponse, "unavailable (facade /admin/info gave no response within 1 s)")]
+    [InlineData(FacadeInfoAnswer.BlankUrl, "unavailable (Harness:Target:AdminUrl is blank)")]
+    [InlineData(FacadeInfoAnswer.CredentialUrl, "unavailable (Harness:Target:AdminUrl is not an absolute http(s) URL without user information)")]
+    [InlineData(FacadeInfoAnswer.NotRead, "unavailable (facade /admin/info not read)")]
+    public async Task FacadeFrameworkRunFact_StatesWhatTheInfoReadObserved(FacadeInfoAnswer answer, string expectedValue)
+    {
+        const string credential = "example-pass";
+        var options = Options();
+        options.RequestTimeoutSeconds = 1;
+        options.Target.AdminUrl = answer switch
+        {
+            FacadeInfoAnswer.BlankUrl => "   ",
+            FacadeInfoAnswer.CredentialUrl => "http://alice:" + credential + "@facade.invalid:9090",
+            _ => FacadeAdminUrl,
+        };
+
+        string? description = null;
+        string? unavailable = null;
+        if (answer != FacadeInfoAnswer.NotRead)
+        {
+            var sendsRequest = answer is not (FacadeInfoAnswer.BlankUrl or FacadeInfoAnswer.CredentialUrl);
+            var admin = new ScriptedAdmin();
+            if (sendsRequest)
+            {
+                admin.Then(InfoRequest, () => FacadeInfo(answer));
+            }
+
+            AdminInfoRead read;
+            using (var reset = new StateReset(options, admin, _console))
+            {
+                read = await reset.ReadInfoOutcomeAsync(options.Target.AdminUrl, TestContext.Current.CancellationToken);
+            }
+
+            Assert.Equal(sendsRequest ? [InfoRequest] : Array.Empty<string>(), admin.Requests);
+            (description, unavailable) = ReplayBody.DescribeFacadeFramework(read, options.RequestTimeout);
+            Assert.True(description is null != unavailable is null, "exactly one of the description and the reason is set");
+        }
+
+        var state = new ReplayRunState
+        {
+            Facts = ReplayBody.DescribeRun(
+                options, DateTimeOffset.UtcNow, description, baselineCommit: null, facadeCommit: null, frameworkUnavailable: unavailable),
+        };
+        var text = new ResultsReportWriter().Render(ResultsReport.Build(state, KnownLimitationsRegister.Empty, OperationCatalogue.Default));
+
+        Assert.Contains($"| .NET (facade runtime) | {expectedValue} |", text.Split('\n'));
+        Assert.DoesNotContain(credential, text, StringComparison.Ordinal);
+    }
+
+    // The facade's /admin/info answer for each scripted outcome; an exception stands for the failure the
+    // socket handler raises.
+    private static HttpResponseMessage FacadeInfo(FacadeInfoAnswer answer) => answer switch
+    {
+        FacadeInfoAnswer.Described => Json(new JsonObject { ["component"] = "facade", ["frameworkDescription"] = ".NET 10.0.14" }),
+        FacadeInfoAnswer.Fieldless => Json(new JsonObject { ["component"] = "stub" }),
+        FacadeInfoAnswer.NotJson => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent("<html>not json", Encoding.UTF8, "text/html"),
+        },
+        FacadeInfoAnswer.BlankDescription => Json(new JsonObject { ["component"] = "stub", ["frameworkDescription"] = "   " }),
+        FacadeInfoAnswer.ServerError => new HttpResponseMessage(HttpStatusCode.InternalServerError),
+        FacadeInfoAnswer.ConnectionRefused => throw new HttpRequestException(
+            HttpRequestError.ConnectionError, "Connection refused (facade.invalid:9090)", new SocketException((int)SocketError.ConnectionRefused)),
+        FacadeInfoAnswer.ConnectionReset => throw new HttpRequestException(
+            HttpRequestError.ResponseEnded, "The response ended prematurely."),
+
+        // Headers arrive, but the body is an empty pipe nothing ever writes to, so only the request limit
+        // ends the read.
+        FacadeInfoAnswer.NoResponse => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StreamContent(new Pipe().Reader.AsStream()),
+        },
+        _ => throw new ArgumentOutOfRangeException(nameof(answer), answer, "The answer sends no request."),
+    };
 
     // Without baseline/conformance.json, a captured baseline (its manifest names how capture ran) fails
     // the run through a never-documentable CHK-EXCEPTION item, while a baseline from which nothing was

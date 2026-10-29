@@ -172,10 +172,10 @@ public sealed class RoutingTests
         int bypassedCount = bypassed.Received.Count;
         Assert.True(
             received.Count == 1,
-            $"{label}: stub {reached.Id} received {received.Count} requests, expected exactly 1");
+            $"{label}: stub {reached.Id} did not receive exactly one request");
         Assert.True(
             bypassedCount == 0,
-            $"{label}: stub {bypassed.Id} received {bypassedCount} requests, expected none");
+            $"{label}: stub {bypassed.Id} received an unexpected request, expected none");
 
         StubRequest request = received[0];
         StubListener expectedListener = ListenerFor(prepared.Operation);
@@ -363,11 +363,11 @@ public sealed class RequestLinePassThroughTests
         foreach (StubBackend other in setup.All.Where(stub => !ReferenceEquals(stub, reached)))
         {
             int otherCount = other.Received.Count;
-            Assert.True(otherCount == 0, $"{label}: stub {other.Id} received {otherCount} requests, expected none");
+            Assert.True(otherCount == 0, $"{label}: stub {other.Id} received an unexpected request, expected none");
         }
 
         IReadOnlyList<StubRequest> received = reached.Received;
-        Assert.True(received.Count == 1, $"{label}: stub {reached.Id} received {received.Count} requests, expected exactly 1");
+        Assert.True(received.Count == 1, $"{label}: stub {reached.Id} did not receive exactly one request");
 
         StubRequest request = received[0];
         Assert.True(
@@ -484,6 +484,440 @@ public sealed class RequestLinePassThroughTests
         }
     }
 
+}
+
+// SOAP operation resolution (class SoapResolutionTests) sits here, beside the request-line
+// pass-through, as a class of its own: the results report counts test classes by the name suffixes
+// "RoutingTests", "FailureBehaviourTests" and "ListenerIsolationTests", and this name matches none, so
+// the per-operation routing check stays the two reroute cases alone.
+//
+// Which target a SOAP POST reaches, through the facade's real SOAP socket. The SOAPAction header,
+// quotes stripped, is matched first and decides whatever the body holds: another operation, an unknown
+// element, malformed XML or no body at all. Only an absent, empty or unmatched header lets the body
+// decide, through the first child element of the SOAP 1.1 Body read within the first 64 KiB. A request
+// that names neither goes unchanged to Routing:DefaultTarget: malformed XML, a document that is not a
+// SOAP 1.1 envelope, an empty Body, a first Body child in no or another namespace or of an unknown name,
+// and a Body whose first child starts beyond the bound. Three stubs tell the outcomes apart:
+// getAgentNames is routed to stub B, every other operation stays with the backend, stub A, and the
+// default target is stub C. The conflicting cases name one operation in the header and the other in
+// the body, in both directions, so a resolver that ignores the header, or reads the body first, sends
+// one of them to the wrong stub; and each non-empty unmatched header that leaves the body to decide is
+// one a lenient matcher (ignoring case, trimming quotes one by one, or matching a prefix or suffix)
+// would take for getClientNames, which the backend serves. Whichever stub is reached receives the
+// caller's method, raw target, Content-Type, SOAPAction or its absence and every body byte, bodies of
+// twice the inspection bound included, and the facade returns that stub's status, X-Stub-Id and body.
+//
+// Facade test failures are identified across runs by a signature over the exception type, the failing
+// line and the assertion message, so every message here is built from the case id, stub ids, listener
+// names, status codes and the byte count the case sends: no port, URL, elapsed time or GUID.
+/// <summary>
+/// Proves, on the facade hosted on real loopback Kestrel listeners, that a SOAP <c>POST</c> reaches the
+/// target of the operation its <c>SOAPAction</c> header names, else of the operation the first child of
+/// its SOAP 1.1 <c>Body</c> names within the 64 KiB inspection bound, else the default target, always
+/// with the caller's request and the target's response unchanged.
+/// </summary>
+public sealed class SoapResolutionTests
+{
+    // The stubs, rerouted target and headers of the per-operation routing cases.
+    private const string BackendStubId = RoutingTests.BackendStubId;
+    private const string RerouteStubId = RoutingTests.RerouteStubId;
+    private const string RerouteTargetName = RoutingTests.RerouteTargetName;
+    private const string StubIdHeader = RoutingTests.StubIdHeader;
+    private const string ForwardedHeaderPrefix = RoutingTests.ForwardedHeaderPrefix;
+    private const int RerouteStatus = RoutingTests.RerouteStatus;
+    private const int BackendStatus = 200;
+
+    // The default target, distinct from the backend and from the rerouted stub.
+    private const string DefaultStubId = "C";
+    private const string DefaultTargetName = "dflt";
+    private const int DefaultStatus = 202;
+
+    private const string SoapActionHeader = "SOAPAction";
+    private const string ContentTypeHeader = "Content-Type";
+
+    // getAgentNames is routed to stub B; getClientNames stays with the backend, stub A, as the shipped
+    // table lists it. Each conflicting case names one of the two in the header and the other in the body.
+    private const string ReroutedOperation = "getAgentNames";
+    private const string BackendOperation = "getClientNames";
+
+    // Facts neither the catalogue nor the frozen SOAP 1.1 interface defines: an element name no
+    // operation has, a namespace the catalogue does not use, and the SOAP 1.2 envelope namespace and
+    // content type.
+    private const string UnknownElement = "unknownOperation";
+    private const string OtherNamespace = "urn:example:other/";
+    private const string Soap12EnvelopeNamespace = "http://www.w3.org/2003/05/soap-envelope";
+    private const string Soap12ContentType = "application/soap+xml; charset=utf-8";
+
+    // A Header whose end tag does not match its start tag: the document is malformed before its Body.
+    private const string MismatchedHeader = "<soap:Header></soap:Head>";
+
+    private const string PaddingElement = "padding";
+
+    // Twice the inspection bound, so that a padded body puts the first Body child, or the end of the
+    // body after a child near its start, a whole bound away from the byte at which inspection stops.
+    private const int PaddingLength = 2 * Erewhon.Contracts.Matching.SoapOperationResolver.MaxInspectionBytes;
+
+    /// <summary>
+    /// With <c>getAgentNames</c> routed to stub B, the backend stub A and a default target C, posts the
+    /// request <paramref name="caseId"/> names to the SOAP endpoint on the SOAP socket and asserts that
+    /// only <paramref name="expectedStubId"/> receives it, with the method, raw target, <c>Content-Type</c>,
+    /// <c>SOAPAction</c> and body bytes unchanged, and that the facade returns that stub's response.
+    /// </summary>
+    /// <param name="caseId">The <c>SOAPAction</c> header and body the case sends, built by <see cref="BuildRequest"/>.</param>
+    /// <param name="expectedStubId">
+    /// A for an operation the backend serves, B for <c>getAgentNames</c>, C for a request that names no operation.
+    /// </param>
+    [Theory]
+    // The SOAPAction header decides, whatever the body holds.
+    [InlineData("action B, body A", RerouteStubId)]
+    [InlineData("action A, body B", BackendStubId)]
+    [InlineData("unquoted action B, body A", RerouteStubId)]
+    [InlineData("action B, unknown Body child", RerouteStubId)]
+    [InlineData("action B, malformed body naming A", RerouteStubId)]
+    [InlineData("action B, empty body", RerouteStubId)]
+    [InlineData("action A, Body child B beyond 64 KiB", BackendStubId)]
+    // An absent, empty or unmatched SOAPAction lets the first Body child decide.
+    [InlineData("empty action, body B", RerouteStubId)]
+    [InlineData("quoted empty action, body B", RerouteStubId)]
+    [InlineData("action A without its closing quote, body B", RerouteStubId)]
+    [InlineData("action A without its opening quote, body B", RerouteStubId)]
+    [InlineData("action A in upper case, body B", RerouteStubId)]
+    [InlineData("action A with a suffix, body B", RerouteStubId)]
+    [InlineData("bare operation name A, body B", RerouteStubId)]
+    [InlineData("no action, body A of twice 64 KiB", BackendStubId)]
+    // A request that names no operation goes to the default target.
+    [InlineData("no action, empty body", DefaultStubId)]
+    [InlineData("no action, text before the envelope", DefaultStubId)]
+    [InlineData("no action, mismatched tag before Body", DefaultStubId)]
+    [InlineData("unknown action, mismatched tag before Body", DefaultStubId)]
+    [InlineData("no action, SOAP 1.2 envelope", DefaultStubId)]
+    [InlineData("no action, no envelope", DefaultStubId)]
+    [InlineData("no action, empty-element Body", DefaultStubId)]
+    [InlineData("no action, Body without child", DefaultStubId)]
+    [InlineData("no action, Body child in no namespace", DefaultStubId)]
+    [InlineData("no action, Body child in another namespace", DefaultStubId)]
+    [InlineData("no action, unknown Body child", DefaultStubId)]
+    [InlineData("no action, Body child in upper case", DefaultStubId)]
+    [InlineData("no action, second Body child B", DefaultStubId)]
+    [InlineData("no action, Header child B", DefaultStubId)]
+    [InlineData("no action, Body child B beyond 64 KiB of Header", DefaultStubId)]
+    [InlineData("no action, Body child B beyond 64 KiB of comment", DefaultStubId)]
+    public async Task SoapPostReachesTheTargetItsActionOrBodyNames(string caseId, string expectedStubId)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+
+        // Built before any host starts, so an unknown case id fails without starting one.
+        PreparedRequest prepared = BuildRequest(caseId);
+        await using ResolutionSetup setup = await ResolutionSetup.StartAsync(ct);
+
+        using HttpClient client = setup.Facade.CreateRawClient();
+        RawResponse response = await FacadeFactory.SendAsync(client, prepared.ToMessage(setup.Facade.SoapBaseAddress), ct);
+
+        AssertReachedOnly(caseId, setup, expectedStubId, prepared, response);
+    }
+
+    // The request a case id names: POST to the catalogue's SOAP endpoint path and query with the
+    // catalogue's content type, unless the case says otherwise. Every catalogue fact (endpoint, content
+    // type, envelope and message namespaces, SOAP actions and request element names) comes from
+    // OperationCatalogue.Default. The operation recorded with each request is the one it calls, or for
+    // an unresolved one, the operation its body would name.
+    private static PreparedRequest BuildRequest(string caseId)
+    {
+        OperationCatalogue catalogue = OperationCatalogue.Default;
+        SoapAddress address = catalogue.Addresses.Soap;
+        OperationDescriptor rerouted = catalogue.Find(Surface.Soap, ReroutedOperation);
+        OperationDescriptor backend = catalogue.Find(Surface.Soap, BackendOperation);
+        SoapBinding reroutedBinding = BindingOf(rerouted);
+        SoapBinding backendBinding = BindingOf(backend);
+
+        string envelopeNamespace = address.EnvelopeNamespace;
+        string messageNamespace = address.TargetNamespace;
+        string reroutedAction = reroutedBinding.Action;
+        string backendAction = backendBinding.Action;
+        string bodyA = Element(backendBinding.RequestElement, messageNamespace);
+        string bodyB = Element(reroutedBinding.RequestElement, messageNamespace);
+        string unknownChild = Element(UnknownElement, messageNamespace);
+        string padding = new('x', PaddingLength);
+        string paddedHeader = Header(Element(PaddingElement, OtherNamespace, padding));
+
+        return caseId switch
+        {
+            "action B, body A" => Post(rerouted, Quoted(reroutedAction), Envelope(envelopeNamespace, null, bodyA)),
+            "action A, body B" => Post(backend, Quoted(backendAction), Envelope(envelopeNamespace, null, bodyB)),
+            "unquoted action B, body A" => Post(rerouted, reroutedAction, Envelope(envelopeNamespace, null, bodyA)),
+            "action B, unknown Body child" => Post(rerouted, Quoted(reroutedAction), Envelope(envelopeNamespace, null, unknownChild)),
+            "action B, malformed body naming A" => Post(rerouted, Quoted(reroutedAction), Envelope(envelopeNamespace, MismatchedHeader, bodyA)),
+            "action B, empty body" => Post(rerouted, Quoted(reroutedAction), string.Empty),
+            "action A, Body child B beyond 64 KiB" => Post(backend, Quoted(backendAction), Envelope(envelopeNamespace, paddedHeader, bodyB)),
+
+            "empty action, body B" => Post(rerouted, string.Empty, Envelope(envelopeNamespace, null, bodyB)),
+            "quoted empty action, body B" => Post(rerouted, Quoted(string.Empty), Envelope(envelopeNamespace, null, bodyB)),
+            "action A without its closing quote, body B" => Post(rerouted, "\"" + backendAction, Envelope(envelopeNamespace, null, bodyB)),
+            "action A without its opening quote, body B" => Post(rerouted, backendAction + "\"", Envelope(envelopeNamespace, null, bodyB)),
+            "action A in upper case, body B" => Post(rerouted, Quoted(backendAction.ToUpperInvariant()), Envelope(envelopeNamespace, null, bodyB)),
+            "action A with a suffix, body B" => Post(rerouted, Quoted(backendAction + "Suffix"), Envelope(envelopeNamespace, null, bodyB)),
+            "bare operation name A, body B" => Post(rerouted, Quoted(backend.JadeMethod), Envelope(envelopeNamespace, null, bodyB)),
+            "no action, body A of twice 64 KiB" => Post(
+                backend,
+                null,
+                Envelope(
+                    envelopeNamespace,
+                    null,
+                    Element(backendBinding.RequestElement, messageNamespace, Element(PaddingElement, null, padding)))),
+
+            "no action, empty body" => Post(rerouted, null, string.Empty),
+            "no action, text before the envelope" => Post(rerouted, null, "text" + Envelope(envelopeNamespace, null, bodyB)),
+            "no action, mismatched tag before Body" => Post(rerouted, null, Envelope(envelopeNamespace, MismatchedHeader, bodyB)),
+            "unknown action, mismatched tag before Body" => Post(
+                rerouted, Quoted(address.SoapActionPrefix + UnknownElement), Envelope(envelopeNamespace, MismatchedHeader, bodyB)),
+            "no action, SOAP 1.2 envelope" => Post(rerouted, null, Envelope(Soap12EnvelopeNamespace, null, bodyB), Soap12ContentType),
+            "no action, no envelope" => Post(rerouted, null, bodyB),
+            "no action, empty-element Body" => Post(rerouted, null, Envelope(envelopeNamespace, null, null)),
+            "no action, Body without child" => Post(rerouted, null, Envelope(envelopeNamespace, null, " ")),
+            "no action, Body child in no namespace" => Post(
+                rerouted, null, Envelope(envelopeNamespace, null, Element(reroutedBinding.RequestElement, null))),
+            "no action, Body child in another namespace" => Post(
+                rerouted, null, Envelope(envelopeNamespace, null, Element(reroutedBinding.RequestElement, OtherNamespace))),
+            "no action, unknown Body child" => Post(rerouted, null, Envelope(envelopeNamespace, null, unknownChild)),
+            "no action, Body child in upper case" => Post(
+                rerouted, null, Envelope(envelopeNamespace, null, Element(reroutedBinding.RequestElement.ToUpperInvariant(), messageNamespace))),
+            "no action, second Body child B" => Post(rerouted, null, Envelope(envelopeNamespace, null, unknownChild + bodyB)),
+            "no action, Header child B" => Post(rerouted, null, Envelope(envelopeNamespace, Header(bodyB), unknownChild)),
+            "no action, Body child B beyond 64 KiB of Header" => Post(rerouted, null, Envelope(envelopeNamespace, paddedHeader, bodyB)),
+            "no action, Body child B beyond 64 KiB of comment" => Post(
+                rerouted, null, Envelope(envelopeNamespace, "<!--" + padding + "-->", bodyB)),
+
+            _ => throw new ArgumentOutOfRangeException(nameof(caseId), "unknown SOAP resolution case"),
+        };
+    }
+
+    private static SoapBinding BindingOf(OperationDescriptor operation) =>
+        operation.Soap ?? throw new InvalidOperationException("SOAP operation has no SOAP binding");
+
+    // A POST of the UTF-8 'body', without a byte-order mark, to the catalogue's SOAP endpoint path and
+    // query; 'soapAction' is the exact header value, null for no SOAPAction header.
+    private static PreparedRequest Post(OperationDescriptor operation, string? soapAction, string body, string? contentType = null)
+    {
+        SoapAddress address = OperationCatalogue.Default.Addresses.Soap;
+        return new PreparedRequest(
+            operation,
+            HttpMethod.Post,
+            address.EndpointPathAndQuery,
+            Encoding.UTF8.GetBytes(body),
+            contentType ?? address.ContentType,
+            soapAction);
+    }
+
+    private static string Quoted(string value) => "\"" + value + "\"";
+
+    // An envelope in 'envelopeNamespace', bound to the prefix soap, holding 'beforeBody' (a Header, a
+    // comment or nothing) and then a Body holding 'bodyContent', or an empty-element Body when it is null.
+    private static string Envelope(string envelopeNamespace, string? beforeBody, string? bodyContent) =>
+        "<soap:Envelope xmlns:soap=\"" + AttributeValue(envelopeNamespace) + "\">"
+        + beforeBody
+        + (bodyContent is null ? "<soap:Body/>" : "<soap:Body>" + bodyContent + "</soap:Body>")
+        + "</soap:Envelope>";
+
+    private static string Header(string content) => "<soap:Header>" + content + "</soap:Header>";
+
+    // An element with 'content', declaring 'namespaceUri' as its default namespace; with a null
+    // namespace it declares none and keeps the namespace in scope where it is placed.
+    private static string Element(string localName, string? namespaceUri, string content = "") =>
+        "<" + localName
+        + (namespaceUri is null ? string.Empty : " xmlns=\"" + AttributeValue(namespaceUri) + "\"")
+        + ">" + content + "</" + localName + ">";
+
+    // A value escaped for a double-quoted XML attribute.
+    private static string AttributeValue(string value) =>
+        value
+            .Replace("&", "&amp;", StringComparison.Ordinal)
+            .Replace("<", "&lt;", StringComparison.Ordinal)
+            .Replace("\"", "&quot;", StringComparison.Ordinal);
+
+    // Asserts that the stub named 'expectedStubId' received the call once on its SOAP listener and the
+    // other two stubs none, with the method, raw target, Content-Type, SOAPAction (or its absence) and
+    // body bytes exactly as sent and no X-Forwarded-* header, and that the facade returned that stub's
+    // own status, X-Stub-Id and body bytes.
+    private static void AssertReachedOnly(
+        string caseId,
+        ResolutionSetup setup,
+        string expectedStubId,
+        PreparedRequest prepared,
+        RawResponse response)
+    {
+        StubBackend reached = setup.Stub(expectedStubId);
+        foreach (StubBackend other in setup.All.Where(stub => !ReferenceEquals(stub, reached)))
+        {
+            int otherCount = other.Received.Count;
+            Assert.True(otherCount == 0, $"{caseId}: stub {other.Id} received an unexpected request, expected none");
+        }
+
+        IReadOnlyList<StubRequest> received = reached.Received;
+        Assert.True(received.Count == 1, $"{caseId}: stub {reached.Id} did not receive exactly one request");
+
+        StubRequest request = received[0];
+        Assert.True(
+            request.Listener == StubListener.Soap,
+            $"{caseId}: stub {reached.Id} received the call on its {request.Listener} listener, expected {StubListener.Soap}");
+        Assert.True(
+            string.Equals(request.Method, prepared.Method.Method, StringComparison.Ordinal),
+            $"{caseId}: stub {reached.Id} received method {request.Method}, expected {prepared.Method.Method}");
+        Assert.True(
+            string.Equals(request.RawTarget, prepared.PathAndQuery, StringComparison.Ordinal),
+            $"{caseId}: stub {reached.Id} did not receive the request target {prepared.PathAndQuery} unchanged");
+
+        byte[] sentBody = prepared.Body ?? [];
+        Assert.True(
+            request.Body.AsSpan().SequenceEqual(sentBody),
+            $"{caseId}: stub {reached.Id} did not receive the {sentBody.Length} request body bytes unchanged");
+        Assert.True(
+            string.Equals(request.Header(ContentTypeHeader), prepared.ContentType, StringComparison.Ordinal),
+            $"{caseId}: stub {reached.Id} did not receive Content-Type {prepared.ContentType} unchanged");
+
+        if (prepared.SoapAction is null)
+        {
+            Assert.True(
+                request.Header(SoapActionHeader) is null,
+                $"{caseId}: stub {reached.Id} received a SOAPAction header the caller did not send");
+        }
+        else
+        {
+            Assert.True(
+                string.Equals(request.Header(SoapActionHeader), prepared.SoapAction, StringComparison.Ordinal),
+                $"{caseId}: stub {reached.Id} did not receive the SOAPAction header as sent, quotes included");
+        }
+
+        Assert.False(
+            request.Headers.Keys.Any(name => name.StartsWith(ForwardedHeaderPrefix, StringComparison.OrdinalIgnoreCase)),
+            $"{caseId}: stub {reached.Id} received an X-Forwarded-* header the caller did not send");
+
+        int expectedStatus = ResolutionSetup.StatusOf(expectedStubId);
+        Assert.True(
+            response.Status == expectedStatus,
+            $"{caseId}: facade answered status {response.Status}, expected stub {reached.Id}'s status {expectedStatus}");
+        string? stubId = response.Header(StubIdHeader);
+        Assert.True(
+            string.Equals(stubId, reached.Id, StringComparison.Ordinal),
+            $"{caseId}: facade response carried X-Stub-Id {stubId ?? "(absent)"}, expected {reached.Id}");
+        Assert.True(
+            response.Body.AsSpan().SequenceEqual(request.ResponseBody),
+            $"{caseId}: facade response body differs from the bytes stub {reached.Id} sent");
+    }
+
+    // Stub A as target "backend", stub B as target "stub" serving getAgentNames, and stub C as target
+    // "dflt", the Routing:DefaultTarget, behind one facade. Every other catalogue operation stays listed
+    // with "backend" in the shipped table, so only requests the resolver leaves unresolved reach C.
+    private sealed class ResolutionSetup : IAsyncDisposable
+    {
+        private ResolutionSetup(StubBackend backend, StubBackend rerouted, StubBackend fallback, FacadeFactory facade)
+        {
+            Backend = backend;
+            Rerouted = rerouted;
+            Fallback = fallback;
+            Facade = facade;
+        }
+
+        public StubBackend Backend { get; }
+
+        public StubBackend Rerouted { get; }
+
+        public StubBackend Fallback { get; }
+
+        public FacadeFactory Facade { get; }
+
+        public IEnumerable<StubBackend> All => [Backend, Rerouted, Fallback];
+
+        public static async Task<ResolutionSetup> StartAsync(CancellationToken ct)
+        {
+            OperationDescriptor reroutedOperation = OperationCatalogue.Default.Find(Surface.Soap, ReroutedOperation);
+
+            // The stubs start before the facade: the factory must not run while another host is built.
+            List<StubBackend> started = new(3);
+            try
+            {
+                StubBackend backend = await StubBackend.StartAsync(BackendStubId, new StubBackendOptions { Status = BackendStatus }, ct);
+                started.Add(backend);
+                StubBackend rerouted = await StubBackend.StartAsync(RerouteStubId, new StubBackendOptions { Status = RerouteStatus }, ct);
+                started.Add(rerouted);
+                StubBackend fallback = await StubBackend.StartAsync(DefaultStubId, new StubBackendOptions { Status = DefaultStatus }, ct);
+                started.Add(fallback);
+
+                FacadeFactory facade = await FacadeFactory.StartAsync(
+                    new FacadeTestSettings
+                    {
+                        BackendRestBaseUrl = backend.RestBaseUrl,
+                        BackendSoapBaseUrl = backend.SoapBaseUrl,
+                        StubRestBaseUrl = rerouted.RestBaseUrl,
+                        StubSoapBaseUrl = rerouted.SoapBaseUrl,
+                        Settings =
+                        {
+                            [$"Routing:Targets:{DefaultTargetName}:RestBaseUrl"] = fallback.RestBaseUrl,
+                            [$"Routing:Targets:{DefaultTargetName}:SoapBaseUrl"] = fallback.SoapBaseUrl,
+                            ["Routing:DefaultTarget"] = DefaultTargetName,
+                            [$"Routing:Operations:{reroutedOperation.Surface}:{reroutedOperation.RoutingKey}"] = RerouteTargetName,
+                        },
+                    },
+                    ct);
+
+                return new ResolutionSetup(backend, rerouted, fallback, facade);
+            }
+            catch
+            {
+                // StubBackend.DisposeAsync never throws, so every stub started so far is released.
+                for (int index = started.Count - 1; index >= 0; index--)
+                {
+                    await started[index].DisposeAsync();
+                }
+
+                throw;
+            }
+        }
+
+        public static int StatusOf(string id) => id switch
+        {
+            BackendStubId => BackendStatus,
+            RerouteStubId => RerouteStatus,
+            DefaultStubId => DefaultStatus,
+            _ => throw new ArgumentOutOfRangeException(nameof(id), "stub id is not A, B or C"),
+        };
+
+        public StubBackend Stub(string id) => id switch
+        {
+            BackendStubId => Backend,
+            RerouteStubId => Rerouted,
+            DefaultStubId => Fallback,
+            _ => throw new ArgumentOutOfRangeException(nameof(id), "stub id is not A, B or C"),
+        };
+
+        // The facade stops first, so no forwarded call is in flight when the stubs stop. Each disposal
+        // runs even when an earlier one throws, so no stub listener outlives the test; the first failure
+        // propagates, because a stub's own disposal never throws.
+        public async ValueTask DisposeAsync()
+        {
+            try
+            {
+                await Facade.DisposeAsync();
+            }
+            finally
+            {
+                try
+                {
+                    await Fallback.DisposeAsync();
+                }
+                finally
+                {
+                    try
+                    {
+                        await Rerouted.DisposeAsync();
+                    }
+                    finally
+                    {
+                        await Backend.DisposeAsync();
+                    }
+                }
+            }
+        }
+    }
 }
 
 // Header pass-through (class PassThroughTransformerTests) sits here, beside the request-line
@@ -1258,6 +1692,477 @@ public sealed class PassThroughTransformerTests
                 {
                     // The facade closed the connection, the request was not one this backend reads, or the
                     // backend is stopping; the connection is closed without an answer.
+                }
+            }
+        }
+    }
+}
+
+// WSDL dispatch (class WsdlDispatchTests) sits here, beside the request-line and header pass-through, as
+// a class of its own: the results report counts test classes by the name suffixes "RoutingTests",
+// "FailureBehaviourTests" and "ListenerIsolationTests", and this name matches none.
+//
+// GET dispatch on the facade's real SOAP socket, with stub A as target "backend" and a distinct stub C
+// as Routing:DefaultTarget. While a WSDL is loaded, a GET on the catalogue's SOAP endpoint path whose
+// query has a wsdl key is answered by the facade itself, and no target receives anything: the answer is
+// the loaded file byte for byte, except the value of its one soap:address/@location, which becomes the
+// request's scheme, its Host header as sent and the endpoint path and query, XML-escaped. Every other
+// GET, and every WSDL request while no WSDL is loaded, goes to the default target unchanged, and
+// /admin/info reports which of the two applies. "No WSDL" is the factory's default Facade:WsdlPath, a
+// file that does not exist.
+//
+// The WSDL is a small fixture written for each test into a directory of its own under the temporary
+// directory, never contracts/wsdl/ErewhonWebService.wsdl itself. Its CRLF line breaks, single-quoted
+// attributes and doubled space would not survive a facade that re-serialised the document, nor its
+// non-ASCII text one that re-encoded it. The expected address is built from the literal endpoint the
+// facade must publish, not from the catalogue or the facade's own escaping. Requests are written on a
+// raw socket, so the request target and the Host header reach the facade exactly as written.
+//
+// Facade test failures are identified across runs by a signature over the exception type, the failing
+// line and the assertion message, so every message here is built only from fixed values: case ids,
+// stub ids, listener names, methods, status codes and expected header values. No port, URL, Host value
+// or GUID ever reaches a message.
+/// <summary>
+/// Proves that a WSDL request on the SOAP socket publishes the loaded WSDL with only its
+/// <c>soap:address/@location</c> set to the caller's XML-escaped address and reaches no target, that
+/// every other GET, and a WSDL request while no WSDL is loaded, reaches the default target unchanged,
+/// and that <c>/admin/info</c> reports the WSDL as present or absent.
+/// </summary>
+public sealed class WsdlDispatchTests
+{
+    private const string BackendStubId = RoutingTests.BackendStubId;
+    private const string StubIdHeader = RoutingTests.StubIdHeader;
+    private const string ForwardedHeaderPrefix = RoutingTests.ForwardedHeaderPrefix;
+
+    // The default target, distinct from the backend A in its status and Content-Type, so a GET answered
+    // by any other target, or by the facade itself, cannot pass for a forwarded one.
+    private const string DefaultStubId = "C";
+    private const string DefaultTargetName = "dflt";
+    private const int DefaultStatus = 202;
+    private const string DefaultContentType = "text/x-erewhon-default; charset=us-ascii";
+
+    private const string HostHeader = "Host";
+    private const string ContentTypeHeader = "Content-Type";
+    private const string ContentLengthHeader = "Content-Length";
+
+    // The WSDL setting of a case, as /admin/info names it.
+    private const string Present = "present";
+    private const string Absent = "absent";
+
+    // The SOAP endpoint and its WSDL request, as the consumer and the published WSDL address them.
+    private const string EndpointTarget = "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP";
+    private const string WsdlTarget = EndpointTarget + "&wsdl";
+
+    // What the published soap:address/@location holds after its scheme and authority, XML-escaped.
+    private const string EscapedEndpoint = "/jade/jadehttp.dll?WebServiceHTTP&amp;serviceName=ErewhonWebService&amp;listName=WebServiceHTTP";
+
+    // A Host header naming neither the facade's socket nor any listener of this host.
+    private const string ForgedHost = "erewhon.example:21001";
+
+    private const int WsdlStatus = 200;
+    private const string WsdlContentType = "text/xml; charset=utf-8";
+
+    private const string SoapBindingNamespace = "http://schemas.xmlsoap.org/wsdl/soap/";
+    private const string AddressElement = "address";
+    private const string LocationAttribute = "location";
+
+    private const string AdminInfoWsdlMember = "wsdl";
+
+    /// <summary>
+    /// With a WSDL loaded, sends a WSDL request to the SOAP socket and asserts that the facade answers
+    /// it itself: status 200, <c>text/xml; charset=utf-8</c>, and exactly the fixture's bytes with only
+    /// the <c>soap:address/@location</c> value replaced by <c>http://</c>, the <c>Host</c> header as sent,
+    /// XML-escaped, and the escaped endpoint, with a matching <c>Content-Length</c>. Neither stub
+    /// receives anything. The address follows the <c>Host</c> header, whatever socket the request used.
+    /// </summary>
+    /// <param name="caseId">The fixed name of the case, used in every message.</param>
+    /// <param name="target">The origin-form request target; its query asks for the WSDL.</param>
+    /// <param name="host">The <c>Host</c> header as sent; null for the authority of the facade's SOAP socket.</param>
+    /// <param name="escapedHost">How the published address must carry <paramref name="host"/>; null when unchanged.</param>
+    [Theory]
+    [InlineData("socket-authority", WsdlTarget, null, null)]
+    [InlineData("forged-host-and-port", WsdlTarget, ForgedHost, null)]
+    [InlineData("host-without-port", WsdlTarget, "erewhon.example", null)]
+    [InlineData("host-with-ampersand", WsdlTarget, "a&b.example:21001", "a&amp;b.example:21001")]
+    [InlineData("bare-key", "/jade/jadehttp.dll?wsdl", ForgedHost, null)]
+    [InlineData("upper-case-key-with-value", "/jade/jadehttp.dll?WSDL=1", ForgedHost, null)]
+    [InlineData("percent-encoded-key", "/jade/jadehttp.dll?%77sdl", ForgedHost, null)]
+    public async Task WsdlRequestPublishesTheLoadedWsdlWithTheCallersAddress(string caseId, string target, string? host, string? escapedHost)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await using WsdlSetup setup = await WsdlSetup.StartAsync(withWsdl: true, ct);
+
+        string sentHost = host ?? setup.Facade.SoapBaseAddress.Authority;
+        RawResponse response = await FacadeFactory.SendRawAsync(setup.Facade.SoapPort, "GET " + target + " HTTP/1.1", sentHost, ct);
+
+        AssertNothingForwarded(caseId, setup);
+        Assert.True(response.Status == WsdlStatus, $"{caseId}: facade answered status {response.Status}, expected {WsdlStatus}");
+        Assert.True(
+            string.Equals(response.Header(ContentTypeHeader), WsdlContentType, StringComparison.Ordinal),
+            $"{caseId}: published WSDL does not carry Content-Type {WsdlContentType}");
+        Assert.True(response.Header(StubIdHeader) is null, $"{caseId}: published WSDL carries an X-Stub-Id header");
+
+        byte[] expected =
+        [
+            .. Encoding.UTF8.GetBytes(WsdlFixture.Prefix),
+            .. Encoding.UTF8.GetBytes("http://" + (escapedHost ?? sentHost) + EscapedEndpoint),
+            .. Encoding.UTF8.GetBytes(WsdlFixture.Suffix),
+        ];
+        Assert.True(
+            response.Body.AsSpan().SequenceEqual(expected),
+            $"{caseId}: published WSDL is not the fixture's bytes with only soap:address/@location replaced by the caller's escaped address");
+        Assert.True(
+            string.Equals(response.Header(ContentLengthHeader), expected.Length.ToString(CultureInfo.InvariantCulture), StringComparison.Ordinal),
+            $"{caseId}: published WSDL's Content-Length does not match its bytes");
+
+        string? location = ReadSingleAddressLocation(caseId, response.Body);
+        Assert.True(
+            string.Equals(location, "http://" + sentHost + EndpointTarget, StringComparison.Ordinal),
+            $"{caseId}: published soap:address/@location does not read back as the caller's address");
+    }
+
+    /// <summary>
+    /// Sends a GET to the SOAP socket with a forged <c>Host</c> and asserts that only the default target
+    /// C receives it, on its SOAP listener, as a <c>GET</c> with the exact raw request target, its own
+    /// authority as <c>Host</c>, no body and no <c>X-Forwarded-*</c> header, and that the facade returns
+    /// C's status, <c>X-Stub-Id</c>, <c>Content-Type</c> and body unchanged. Without a WSDL this holds for
+    /// WSDL requests too; with one, for every GET that is not a WSDL request on the endpoint path.
+    /// </summary>
+    /// <param name="wsdl"><c>present</c> to load the fixture WSDL, <c>absent</c> to load none.</param>
+    /// <param name="caseId">The fixed name of the case, used in every message.</param>
+    /// <param name="target">The origin-form request target.</param>
+    [Theory]
+    [InlineData(Absent, "wsdl-request", WsdlTarget)]
+    [InlineData(Absent, "wsdl-bare-key", "/jade/jadehttp.dll?wsdl")]
+    [InlineData(Absent, "wsdl-upper-case-key-with-value", "/jade/jadehttp.dll?WSDL=1")]
+    [InlineData(Absent, "wsdl-percent-encoded-key", "/jade/jadehttp.dll?%77sdl")]
+    [InlineData(Absent, "endpoint-without-wsdl-key", EndpointTarget)]
+    [InlineData(Absent, "other-path-with-wsdl-key", "/jade/other.dll?wsdl")]
+    [InlineData(Present, "endpoint-without-wsdl-key", EndpointTarget)]
+    [InlineData(Present, "endpoint-without-query", "/jade/jadehttp.dll")]
+    [InlineData(Present, "wsdl-as-value", "/jade/jadehttp.dll?x=wsdl")]
+    [InlineData(Present, "longer-key", "/jade/jadehttp.dll?wsdlx")]
+    [InlineData(Present, "double-encoded-key", "/jade/jadehttp.dll?%2577sdl")]
+    [InlineData(Present, "other-path-with-wsdl-key", "/jade/other.dll?wsdl")]
+    [InlineData(Present, "endpoint-sub-path-with-wsdl-key", "/jade/jadehttp.dll/x?wsdl")]
+    public async Task GetIsForwardedUnchangedToTheDefaultTarget(string wsdl, string caseId, string target)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await using WsdlSetup setup = await WsdlSetup.StartAsync(IsPresent(wsdl), ct);
+
+        RawResponse response = await FacadeFactory.SendRawAsync(setup.Facade.SoapPort, "GET " + target + " HTTP/1.1", ForgedHost, ct);
+
+        string label = $"{caseId} with the WSDL {wsdl}";
+        int backendCount = setup.Backend.Received.Count;
+        Assert.True(backendCount == 0, $"{label}: stub {BackendStubId} received an unexpected request, expected none");
+
+        IReadOnlyList<StubRequest> received = setup.Fallback.Received;
+        Assert.True(received.Count == 1, $"{label}: stub {DefaultStubId} did not receive exactly one request");
+
+        StubRequest request = received[0];
+        Assert.True(
+            request.Listener == StubListener.Soap,
+            $"{label}: stub {DefaultStubId} received the call on its {request.Listener} listener, expected {StubListener.Soap}");
+        Assert.True(
+            string.Equals(request.Method, HttpMethods.Get, StringComparison.Ordinal),
+            $"{label}: stub {DefaultStubId} received method {request.Method}, expected {HttpMethods.Get}");
+        Assert.True(
+            string.Equals(request.RawTarget, target, StringComparison.Ordinal),
+            $"{label}: stub {DefaultStubId} did not receive the request target unchanged");
+
+        string ownAuthority = new Uri(setup.Fallback.SoapBaseUrl).Authority;
+        Assert.True(
+            string.Equals(request.Header(HostHeader), ownAuthority, StringComparison.Ordinal),
+            $"{label}: stub {DefaultStubId} did not receive its own Soap listener authority as Host");
+        Assert.False(
+            request.Headers.Keys.Any(name => name.StartsWith(ForwardedHeaderPrefix, StringComparison.OrdinalIgnoreCase)),
+            $"{label}: stub {DefaultStubId} received an X-Forwarded-* header the caller did not send");
+        Assert.True(request.Body.Length == 0, $"{label}: stub {DefaultStubId} received a request body the caller did not send");
+
+        Assert.True(
+            response.Status == DefaultStatus,
+            $"{label}: facade answered status {response.Status}, expected stub {DefaultStubId}'s status {DefaultStatus}");
+        string? stubId = response.Header(StubIdHeader);
+        Assert.True(
+            string.Equals(stubId, DefaultStubId, StringComparison.Ordinal),
+            $"{label}: facade response carried X-Stub-Id {stubId ?? "(absent)"}, expected {DefaultStubId}");
+        Assert.True(
+            string.Equals(response.Header(ContentTypeHeader), DefaultContentType, StringComparison.Ordinal),
+            $"{label}: facade response does not carry stub {DefaultStubId}'s Content-Type unchanged");
+        Assert.True(
+            response.Body.AsSpan().SequenceEqual(request.ResponseBody),
+            $"{label}: facade response body differs from the bytes stub {DefaultStubId} sent");
+    }
+
+    /// <summary>
+    /// Asserts that <c>/admin/info</c>, on the admin socket, reports <c>"wsdl": "present"</c> while the
+    /// fixture WSDL is loaded and <c>"wsdl": "absent"</c> while none is, and forwards nothing.
+    /// </summary>
+    /// <param name="wsdl"><c>present</c> to load the fixture WSDL, <c>absent</c> to load none; the status expected.</param>
+    [Theory]
+    [InlineData(Present)]
+    [InlineData(Absent)]
+    public async Task AdminInfoReportsWhetherTheWsdlIsPublished(string wsdl)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await using WsdlSetup setup = await WsdlSetup.StartAsync(IsPresent(wsdl), ct);
+
+        RawResponse response = await FacadeFactory.SendRawAsync(
+            setup.Facade.AdminPort,
+            "GET " + Erewhon.Contracts.Admin.AdminRoutes.Info + " HTTP/1.1",
+            setup.Facade.AdminBaseAddress.Authority,
+            ct);
+
+        string label = $"admin info with the WSDL {wsdl}";
+        AssertNothingForwarded(label, setup);
+        Assert.True(response.Status == 200, $"{label}: facade answered status {response.Status}, expected 200");
+
+        string? reported = null;
+        try
+        {
+            using System.Text.Json.JsonDocument document = System.Text.Json.JsonDocument.Parse(response.Body);
+            if (document.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object
+                && document.RootElement.TryGetProperty(AdminInfoWsdlMember, out System.Text.Json.JsonElement status)
+                && status.ValueKind == System.Text.Json.JsonValueKind.String)
+            {
+                reported = status.GetString();
+            }
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            Assert.Fail($"{label}: body is not JSON");
+        }
+
+        Assert.True(
+            string.Equals(reported, wsdl, StringComparison.Ordinal),
+            $"{label}: the wsdl member is {reported ?? "(no string)"}, expected {wsdl}");
+    }
+
+    private static bool IsPresent(string wsdl) => wsdl switch
+    {
+        Present => true,
+        Absent => false,
+        _ => throw new ArgumentOutOfRangeException(nameof(wsdl), "WSDL setting is neither present nor absent"),
+    };
+
+    private static void AssertNothingForwarded(string label, WsdlSetup setup)
+    {
+        foreach (StubBackend stub in setup.All)
+        {
+            int count = stub.Received.Count;
+            Assert.True(count == 0, $"{label}: stub {stub.Id} received an unexpected request, expected none");
+        }
+    }
+
+    // Reads the published document as an XML parser does, which fails a document that is not
+    // well-formed, and returns the value of its one soap:address/@location with every escape resolved.
+    private static string? ReadSingleAddressLocation(string label, byte[] document)
+    {
+        System.Xml.XmlReaderSettings settings = new() { DtdProcessing = System.Xml.DtdProcessing.Prohibit };
+        int count = 0;
+        string? location = null;
+        try
+        {
+            using MemoryStream stream = new(document, writable: false);
+            using System.Xml.XmlReader reader = System.Xml.XmlReader.Create(stream, settings);
+            while (reader.Read())
+            {
+                if (reader.NodeType == System.Xml.XmlNodeType.Element
+                    && string.Equals(reader.LocalName, AddressElement, StringComparison.Ordinal)
+                    && string.Equals(reader.NamespaceURI, SoapBindingNamespace, StringComparison.Ordinal))
+                {
+                    count++;
+                    location = reader.GetAttribute(LocationAttribute);
+                }
+            }
+        }
+        catch (System.Xml.XmlException)
+        {
+            Assert.Fail($"{label}: published WSDL is not well-formed XML");
+        }
+
+        Assert.True(count == 1, $"{label}: published WSDL does not hold exactly one soap:address element");
+        return location;
+    }
+
+    // The fixture WSDL, split around the value of its one soap:address/@location. It is modelled on
+    // contracts/wsdl/ErewhonWebService.wsdl: the XML declaration, the stand-in label comment, the
+    // catalogue's WSDL, SOAP-binding and message namespaces and service name, and one catalogue
+    // operation. The CRLF line breaks, single-quoted attributes and doubled space are what a
+    // re-serialising facade would change, and the non-ASCII text what a re-encoding one would.
+    private static class WsdlFixture
+    {
+        private const string LineBreak = "\r\n";
+
+        // The address the file holds before any request rewrites it, XML-escaped as in the file.
+        private const string OriginalLocation = "http://fixture.invalid:15001" + EscapedEndpoint;
+
+        /// <summary>Every character of the file before the location value, up to its opening quote.</summary>
+        public static readonly string Prefix = BuildPrefix();
+
+        /// <summary>Every character of the file after the location value, from its closing quote.</summary>
+        public static readonly string Suffix = string.Join(
+            LineBreak,
+            "\" />",
+            "    </wsdl:port>",
+            "  </wsdl:service>",
+            "</wsdl:definitions>",
+            string.Empty);
+
+        /// <summary>The file's bytes: UTF-8 without a byte-order mark.</summary>
+        public static readonly byte[] Bytes = Encoding.UTF8.GetBytes(Prefix + OriginalLocation + Suffix);
+
+        private static string BuildPrefix()
+        {
+            OperationCatalogue catalogue = OperationCatalogue.Default;
+            SoapAddress address = catalogue.Addresses.Soap;
+            SoapBinding operation = catalogue.Find(Surface.Soap, "getAgentNames").Soap
+                ?? throw new InvalidOperationException("getAgentNames has no SOAP binding");
+            string wsdlNamespace = address.WsdlNamespaces["wsdl"];
+            string soapNamespace = address.WsdlNamespaces["soap"];
+            string messageNamespace = address.TargetNamespace;
+            string service = address.ServiceName;
+            string element = operation.RequestElement;
+
+            return string.Join(
+                LineBreak,
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>",
+                "<!-- " + Erewhon.Contracts.SourceLabels.WsdlHeaderComment + " -->",
+                $"<wsdl:definitions xmlns:wsdl=\"{wsdlNamespace}\"  xmlns:soap=\"{soapNamespace}\" xmlns:tns='{messageNamespace}' targetNamespace=\"{messageNamespace}\" name=\"{service}\">",
+                "  <wsdl:documentation>WSDL dispatch fixture \u2014 caf\u00E9 &amp; r\u00E9sum\u00E9</wsdl:documentation>",
+                $"  <wsdl:message name=\"{element}SoapIn\" />",
+                $"  <wsdl:portType name=\"{service}Soap\">",
+                $"    <wsdl:operation name=\"{element}\">",
+                $"      <wsdl:input message='tns:{element}SoapIn' />",
+                "    </wsdl:operation>",
+                "  </wsdl:portType>",
+                $"  <wsdl:binding name=\"{service}Soap\" type='tns:{service}Soap'>",
+                "    <soap:binding transport=\"http://schemas.xmlsoap.org/soap/http\" style=\"document\" />",
+                $"    <wsdl:operation name=\"{element}\">",
+                $"      <soap:operation soapAction=\"{operation.Action}\" style=\"document\" />",
+                "    </wsdl:operation>",
+                "  </wsdl:binding>",
+                $"  <wsdl:service name=\"{service}\">",
+                $"    <wsdl:port name=\"{service}Soap\" binding=\"tns:{service}Soap\">",
+                "      <soap:address location=\"");
+        }
+    }
+
+    // Stub A as target "backend" and stub C as target "dflt", the Routing:DefaultTarget, behind one
+    // facade. With a WSDL, Facade:WsdlPath names the fixture, written into a new directory under the
+    // temporary directory; without one, the factory's default path, which does not exist, applies.
+    private sealed class WsdlSetup : IAsyncDisposable
+    {
+        private const string FixtureFileName = "ErewhonWebService.wsdl";
+
+        private readonly string? _fixtureDirectory;
+
+        private WsdlSetup(StubBackend backend, StubBackend fallback, FacadeFactory facade, string? fixtureDirectory)
+        {
+            Backend = backend;
+            Fallback = fallback;
+            Facade = facade;
+            _fixtureDirectory = fixtureDirectory;
+        }
+
+        public StubBackend Backend { get; }
+
+        public StubBackend Fallback { get; }
+
+        public FacadeFactory Facade { get; }
+
+        public IEnumerable<StubBackend> All => [Backend, Fallback];
+
+        public static async Task<WsdlSetup> StartAsync(bool withWsdl, CancellationToken ct)
+        {
+            string? fixtureDirectory = null;
+            StubBackend? backend = null;
+            StubBackend? fallback = null;
+            try
+            {
+                string? wsdlPath = null;
+                if (withWsdl)
+                {
+                    fixtureDirectory = Path.Combine(Path.GetTempPath(), "erewhon-facade-wsdl-" + Guid.NewGuid().ToString("N"));
+                    Directory.CreateDirectory(fixtureDirectory);
+                    wsdlPath = Path.Combine(fixtureDirectory, FixtureFileName);
+                    await File.WriteAllBytesAsync(wsdlPath, WsdlFixture.Bytes, ct);
+                }
+
+                // The stubs start before the facade: the factory must not run while another host is built.
+                backend = await StubBackend.StartAsync(BackendStubId, null, ct);
+                fallback = await StubBackend.StartAsync(
+                    DefaultStubId,
+                    new StubBackendOptions
+                    {
+                        Status = DefaultStatus,
+                        ExtraHeaders = new Dictionary<string, string> { [ContentTypeHeader] = DefaultContentType },
+                    },
+                    ct);
+
+                FacadeFactory facade = await FacadeFactory.StartAsync(
+                    new FacadeTestSettings
+                    {
+                        BackendRestBaseUrl = backend.RestBaseUrl,
+                        BackendSoapBaseUrl = backend.SoapBaseUrl,
+                        WsdlPath = wsdlPath,
+                        Settings =
+                        {
+                            [$"Routing:Targets:{DefaultTargetName}:RestBaseUrl"] = fallback.RestBaseUrl,
+                            [$"Routing:Targets:{DefaultTargetName}:SoapBaseUrl"] = fallback.SoapBaseUrl,
+                            ["Routing:DefaultTarget"] = DefaultTargetName,
+                        },
+                    },
+                    ct);
+
+                return new WsdlSetup(backend, fallback, facade, fixtureDirectory);
+            }
+            catch
+            {
+                await ReleaseAsync(facade: null, fallback, backend, fixtureDirectory);
+                throw;
+            }
+        }
+
+        public ValueTask DisposeAsync() => ReleaseAsync(Facade, Fallback, Backend, _fixtureDirectory);
+
+        // The facade stops first, so no forwarded call is in flight when the stubs stop. Each later
+        // resource is still released when an earlier one's disposal throws.
+        private static async ValueTask ReleaseAsync(
+            FacadeFactory? facade, StubBackend? fallback, StubBackend? backend, string? fixtureDirectory)
+        {
+            try
+            {
+                if (facade is not null)
+                {
+                    await facade.DisposeAsync();
+                }
+            }
+            finally
+            {
+                try
+                {
+                    if (fallback is not null)
+                    {
+                        await fallback.DisposeAsync();
+                    }
+                }
+                finally
+                {
+                    try
+                    {
+                        if (backend is not null)
+                        {
+                            await backend.DisposeAsync();
+                        }
+                    }
+                    finally
+                    {
+                        if (fixtureDirectory is not null && Directory.Exists(fixtureDirectory))
+                        {
+                            Directory.Delete(fixtureDirectory, recursive: true);
+                        }
+                    }
                 }
             }
         }
