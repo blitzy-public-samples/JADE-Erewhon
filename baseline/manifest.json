@@ -1,0 +1,24 @@
+{
+  "source": "jade-standin",
+  "label": "Recorded from the JADE stand-in, not from live JADE",
+  "standIn": {
+    "seedSha256": "8051329b2d221dcc82530885bf3ec6afc9143cdd9e8c8ef98524dfdc3c0e10b0",
+    "referenceDate": "2026-01-01",
+    "generation": 2
+  },
+  "seedSha256": "8051329b2d221dcc82530885bf3ec6afc9143cdd9e8c8ef98524dfdc3c0e10b0",
+  "referenceDate": "2026-01-01",
+  "counts": {
+    "plannedOperations": 22,
+    "plannedCases": 56,
+    "capturedOperations": 22,
+    "capturedCases": 56
+  },
+  "notCaptured": [],
+  "wsdlCaptured": true,
+  "harnessVersion": "1.0.0",
+  "startingCommit": "19a5189e9075349aca54de1fb5fdf2d8727403e7",
+  "captureCommit": "b923b788adbc31fd2a34f33f171aefef4c7429ee",
+  "captureExecution": "local-processes",
+  "blockingError": null
+}
