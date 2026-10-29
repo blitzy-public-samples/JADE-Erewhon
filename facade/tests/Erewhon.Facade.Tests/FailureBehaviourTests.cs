@@ -8,6 +8,11 @@
 // The facade-tests container runs with network_mode none, so the unreachable targets are a closed
 // loopback port and a name under the reserved .invalid domain, which never resolves.
 //
+// The log level floors (class LogLevelFloorsTests), which bound what the framework logs for each failed
+// call and keep request data out of the framework logs, are tested here, without a socket, as a class
+// of their own: the results report counts every test class whose name ends in "FailureBehaviourTests"
+// as the unreachable and timeout check.
+//
 // Failures are identified across runs by a signature over the exception type, the failing line and the
 // assertion message, so every message and Assert.Equal operand here is run-invariant: no port, URL,
 // elapsed time or GUID. Timing bounds are Assert.True calls with fixed messages.
@@ -15,9 +20,13 @@
 using System.Text.Json;
 using System.Xml.Linq;
 using Erewhon.Contracts.Catalogue;
+using Erewhon.Contracts.Hosting;
 using Erewhon.Facade.Forwarding;
 using Erewhon.Facade.Soap;
 using Erewhon.Facade.Tests.Support;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace Erewhon.Facade.Tests;
@@ -254,5 +263,233 @@ public sealed class FailureBehaviourTests
         Assert.Equal(ServerFaultCode, faultCode);
         Assert.Equal(SoapFaultWriter.FaultCodeServer, faultCode);
         return fault.Element("faultstring")?.Value;
+    }
+}
+
+// The log level floors the facade applies in Program.cs to the framework categories whose lines print
+// what a caller sent: Microsoft.AspNetCore.Hosting.Diagnostics, Microsoft.AspNetCore.Routing and
+// Microsoft.AspNetCore.Server.Kestrel.BadRequests at Warning, and Yarp at Error. REST path segments
+// carry agent and client names, and YARP's forwarder writes a stack trace for every failed call. A floor
+// must hold whatever the Logging configuration says, a configured setting stricter than the floor must
+// stay as strict, and every category outside the floors must log exactly as configured.
+//
+// Each case builds only the logging services, from an in-memory Logging section, the console provider
+// and the facade's floors, and asks a logger of the category whether a level is enabled. No socket is
+// opened and nothing is written.
+//
+// Facade test failures are identified across runs by a signature over the exception type, the failing
+// line and the assertion message, so every message and Assert.Equal operand here is a fixed literal.
+/// <summary>
+/// Shows that the facade's log level floors keep every category under them at the floor's minimum level
+/// or above for any <c>Logging</c> configuration, a configuration reload included, while a stricter
+/// configured setting, a provider's own rule and a wildcard rule keep the levels they configure.
+/// </summary>
+public sealed class LogLevelFloorsTests
+{
+    private const string HostingDiagnostics = "Microsoft.AspNetCore.Hosting.Diagnostics";
+    private const string DfaMatcher = "Microsoft.AspNetCore.Routing.Matching.DfaMatcher";
+    private const string EndpointMiddleware = "Microsoft.AspNetCore.Routing.EndpointMiddleware";
+    private const string KestrelBadRequests = "Microsoft.AspNetCore.Server.Kestrel.BadRequests";
+    private const string KestrelConnections = "Microsoft.AspNetCore.Server.Kestrel.Connections";
+    private const string HttpForwarder = "Yarp.ReverseProxy.Forwarder.HttpForwarder";
+    private const string BackendForwarder = "Erewhon.Facade.Forwarding.BackendForwarder";
+    private const string HostingLifetime = "Microsoft.Hosting.Lifetime";
+    private const string OtherDfaMatcher = "Microsoft.Other.Matching.DfaMatcher";
+
+    // The QA reproduction: every framework category raised to Trace, also through the console provider's
+    // own rule and through a rule longer than the Yarp floor's prefix.
+    private const string RaisedToTrace = "raised-to-trace";
+
+    // A rule shorter than the Routing floor's prefix that matches only a category under it.
+    private const string ConsoleWildcardNone = "console-wildcard-none";
+    private const string ConsoleWildcardCritical = "console-wildcard-critical";
+    private const string ConsoleFullNameWildcardNone = "console-full-name-wildcard-none";
+    private const string WildcardNone = "wildcard-none";
+
+    // Settings stricter than the floors, next to an unrelated rule of the console provider's own.
+    private const string Stricter = "stricter";
+
+    // A wildcard rule longer than the Routing floor's prefix that also matches categories outside it.
+    private const string LongerWildcard = "longer-wildcard";
+
+    // A valid category prefix, for the floors rejected for their minimum level.
+    private const string RoutingPrefix = "Microsoft.AspNetCore.Routing";
+
+    private static readonly IReadOnlyDictionary<string, IReadOnlyDictionary<string, string?>> Configurations =
+        new Dictionary<string, IReadOnlyDictionary<string, string?>>(StringComparer.Ordinal)
+        {
+            [RaisedToTrace] = new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["Logging:LogLevel:Default"] = "Trace",
+                ["Logging:LogLevel:Microsoft.AspNetCore"] = "Trace",
+                ["Logging:LogLevel:Yarp"] = "Trace",
+                ["Logging:LogLevel:System"] = "Trace",
+                ["Logging:LogLevel:Yarp.ReverseProxy.Forwarder.HttpForwarder"] = "Trace",
+                ["Logging:Console:LogLevel:Microsoft.AspNetCore"] = "Trace",
+            },
+            [ConsoleWildcardNone] = new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["Logging:LogLevel:Default"] = "Information",
+                ["Logging:Console:LogLevel:*DfaMatcher"] = "None",
+            },
+            [ConsoleWildcardCritical] = new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["Logging:LogLevel:Default"] = "Information",
+                ["Logging:Console:LogLevel:*DfaMatcher"] = "Critical",
+            },
+            [ConsoleFullNameWildcardNone] = new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["Logging:LogLevel:Default"] = "Information",
+                ["Logging:Microsoft.Extensions.Logging.Console.ConsoleLoggerProvider:LogLevel:*DfaMatcher"] = "None",
+            },
+            [WildcardNone] = new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["Logging:LogLevel:Default"] = "Information",
+                ["Logging:LogLevel:*DfaMatcher"] = "None",
+            },
+            [Stricter] = new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["Logging:LogLevel:Default"] = "None",
+                ["Logging:LogLevel:Microsoft.AspNetCore"] = "Error",
+                ["Logging:LogLevel:Yarp.ReverseProxy.Forwarder"] = "None",
+                ["Logging:Console:LogLevel:Microsoft.Hosting.Lifetime"] = "Information",
+            },
+            [LongerWildcard] = new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["Logging:LogLevel:Default"] = "Information",
+                ["Logging:LogLevel:Microsoft.*.Matching.DfaMatcher"] = "Trace",
+            },
+        };
+
+    /// <summary>Configuration name, category, level and whether a logger of the category logs that level.</summary>
+    public static TheoryData<string, string, LogLevel, bool> Levels { get; } = new()
+    {
+        { RaisedToTrace, HostingDiagnostics, LogLevel.Information, false },
+        { RaisedToTrace, HostingDiagnostics, LogLevel.Warning, true },
+        { RaisedToTrace, DfaMatcher, LogLevel.Debug, false },
+        { RaisedToTrace, DfaMatcher, LogLevel.Warning, true },
+        { RaisedToTrace, KestrelBadRequests, LogLevel.Debug, false },
+        { RaisedToTrace, HttpForwarder, LogLevel.Warning, false },
+        { RaisedToTrace, HttpForwarder, LogLevel.Error, true },
+        { RaisedToTrace, KestrelConnections, LogLevel.Trace, true },
+        { RaisedToTrace, BackendForwarder, LogLevel.Trace, true },
+        { ConsoleWildcardNone, DfaMatcher, LogLevel.Warning, false },
+        { ConsoleWildcardNone, DfaMatcher, LogLevel.Error, false },
+        { ConsoleWildcardNone, DfaMatcher, LogLevel.Critical, false },
+        { ConsoleWildcardNone, EndpointMiddleware, LogLevel.Information, false },
+        { ConsoleWildcardNone, EndpointMiddleware, LogLevel.Warning, true },
+        { ConsoleWildcardCritical, DfaMatcher, LogLevel.Warning, false },
+        { ConsoleWildcardCritical, DfaMatcher, LogLevel.Error, false },
+        { ConsoleWildcardCritical, DfaMatcher, LogLevel.Critical, true },
+        { ConsoleFullNameWildcardNone, DfaMatcher, LogLevel.Error, false },
+        { ConsoleFullNameWildcardNone, DfaMatcher, LogLevel.Critical, false },
+        { WildcardNone, DfaMatcher, LogLevel.Warning, false },
+        { WildcardNone, DfaMatcher, LogLevel.Error, false },
+        { WildcardNone, DfaMatcher, LogLevel.Critical, false },
+        { Stricter, HostingDiagnostics, LogLevel.Warning, false },
+        { Stricter, HostingDiagnostics, LogLevel.Error, true },
+        { Stricter, DfaMatcher, LogLevel.Warning, false },
+        { Stricter, DfaMatcher, LogLevel.Error, true },
+        { Stricter, HttpForwarder, LogLevel.Critical, false },
+        { Stricter, BackendForwarder, LogLevel.Critical, false },
+        { Stricter, HostingLifetime, LogLevel.Information, true },
+        { Stricter, HostingLifetime, LogLevel.Debug, false },
+        { LongerWildcard, OtherDfaMatcher, LogLevel.Trace, true },
+        { LongerWildcard, DfaMatcher, LogLevel.Debug, false },
+        { LongerWildcard, DfaMatcher, LogLevel.Warning, true },
+    };
+
+    /// <summary>Category prefix, minimum level and the exception and parameter an invalid floor is rejected with.</summary>
+    public static TheoryData<string?, LogLevel, Type, string> InvalidFloors { get; } = new()
+    {
+        { null, LogLevel.Warning, typeof(ArgumentNullException), "categoryPrefix" },
+        { "", LogLevel.Warning, typeof(ArgumentException), "categoryPrefix" },
+        { "   ", LogLevel.Warning, typeof(ArgumentException), "categoryPrefix" },
+        { "*", LogLevel.Warning, typeof(ArgumentException), "categoryPrefix" },
+        { "Microsoft.AspNetCore.*", LogLevel.Warning, typeof(ArgumentException), "categoryPrefix" },
+        { RoutingPrefix, (LogLevel)7, typeof(ArgumentOutOfRangeException), "minimum" },
+        { RoutingPrefix, (LogLevel)(-1), typeof(ArgumentOutOfRangeException), "minimum" },
+    };
+
+    [Theory]
+    [MemberData(nameof(Levels))]
+    public void FloorsHoldAndStricterSettingsStayStrict(string configurationName, string category, LogLevel level, bool expected)
+    {
+        IConfigurationRoot configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(Configurations[configurationName])
+            .Build();
+        using ServiceProvider services = BuildLogging(configuration);
+
+        ILogger logger = services.GetRequiredService<ILoggerFactory>().CreateLogger(category);
+
+        Assert.Equal(expected, logger.IsEnabled(level));
+    }
+
+    [Fact]
+    public void ReloadThatRaisesFlooredCategoriesKeepsThemAtTheirFloors()
+    {
+        IConfigurationRoot configuration = new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>(StringComparer.Ordinal)
+            {
+                ["Logging:LogLevel:Default"] = "Information",
+            })
+            .Build();
+        using ServiceProvider services = BuildLogging(configuration);
+        ILoggerFactory factory = services.GetRequiredService<ILoggerFactory>();
+        ILogger hosting = factory.CreateLogger(HostingDiagnostics);
+        ILogger forwarder = factory.CreateLogger(HttpForwarder);
+        ILogger backendForwarder = factory.CreateLogger(BackendForwarder);
+        Assert.False(backendForwarder.IsEnabled(LogLevel.Debug), "unfloored category logged Debug before the reload");
+
+        configuration["Logging:LogLevel:Default"] = "Trace";
+        configuration["Logging:LogLevel:Microsoft.AspNetCore.Hosting.Diagnostics"] = "Trace";
+        configuration["Logging:Console:LogLevel:Yarp"] = "Trace";
+        configuration.Reload();
+
+        Assert.True(backendForwarder.IsEnabled(LogLevel.Debug), "reload did not reach the logger filter options");
+        Assert.False(hosting.IsEnabled(LogLevel.Information), "Hosting.Diagnostics logged below its floor after the reload");
+        Assert.True(hosting.IsEnabled(LogLevel.Warning), "Hosting.Diagnostics did not log its floor level after the reload");
+        Assert.False(forwarder.IsEnabled(LogLevel.Warning), "HttpForwarder logged below its floor after the reload");
+        Assert.True(forwarder.IsEnabled(LogLevel.Error), "HttpForwarder did not log its floor level after the reload");
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidFloors))]
+    public void InvalidFloorIsRejected(string? categoryPrefix, LogLevel minimum, Type exceptionType, string parameterName)
+    {
+        ILoggingBuilder? captured = null;
+        new ServiceCollection().AddLogging(builder => captured = builder);
+        ILoggingBuilder logging = captured ?? throw new InvalidOperationException("AddLogging did not pass its builder");
+
+        Exception exception = Assert.Throws(exceptionType, () => logging.AddLogLevelFloor(categoryPrefix!, minimum));
+
+        Assert.Equal(parameterName, Assert.IsAssignableFrom<ArgumentException>(exception).ParamName);
+    }
+
+    [Fact]
+    public void NullLoggingBuilderIsRejected()
+    {
+        ArgumentNullException exception = Assert.Throws<ArgumentNullException>(
+            () => LogLevelFloors.AddLogLevelFloor(null!, RoutingPrefix, LogLevel.Warning));
+
+        Assert.Equal("logging", exception.ParamName);
+    }
+
+    // The logging services of the facade (Program.cs): the Logging section, the console provider and the
+    // floors, in the order the facade registers them.
+    private static ServiceProvider BuildLogging(IConfiguration configuration)
+    {
+        var services = new ServiceCollection();
+        services.AddLogging(logging =>
+        {
+            logging.AddConfiguration(configuration.GetSection("Logging"));
+            logging.AddConsole();
+            logging
+                .AddLogLevelFloor("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.Warning)
+                .AddLogLevelFloor("Microsoft.AspNetCore.Routing", LogLevel.Warning)
+                .AddLogLevelFloor("Microsoft.AspNetCore.Server.Kestrel.BadRequests", LogLevel.Warning)
+                .AddLogLevelFloor("Yarp", LogLevel.Error);
+        });
+        return services.BuildServiceProvider();
     }
 }

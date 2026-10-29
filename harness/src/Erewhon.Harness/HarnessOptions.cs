@@ -184,13 +184,13 @@ public sealed class HarnessOptions
     /// <summary><c>harness/config/harness.json</c>.</summary>
     public string HarnessConfigPath => ResolvePath(Path.Combine("harness", "config", "harness.json"));
 
-    /// <summary><c>harness/global.json</c>, which holds the SDK pin the report states.</summary>
-    public string HarnessGlobalJsonPath => ResolvePath(Path.Combine("harness", "global.json"));
-
     /// <summary><c>artifacts</c>, the per-run output tree.</summary>
     public string ArtifactsDirectory => ResolvePath("artifacts");
 
-    /// <summary><c>artifacts/facade-tests</c>, where the facade tests write their TRX and exit code.</summary>
+    /// <summary>
+    /// <c>artifacts/facade-tests</c>, where the facade tests write their TRX, their xunit XML (which records
+    /// each failure's exception type) and their exit code.
+    /// </summary>
     public string FacadeTestsDirectory => ResolvePath(Path.Combine("artifacts", "facade-tests"));
 
     /// <summary><see cref="ReadinessTimeoutSeconds"/> as a duration.</summary>

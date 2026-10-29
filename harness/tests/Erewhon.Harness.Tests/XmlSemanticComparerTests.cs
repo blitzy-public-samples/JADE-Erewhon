@@ -1,7 +1,23 @@
+using System.Collections.Concurrent;
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
+using System.Security;
 using System.Text;
 using Erewhon.Contracts.Catalogue;
+using Erewhon.Harness.Checks;
 using Erewhon.Harness.Compare;
+using Erewhon.Harness.Http;
+using Erewhon.Harness.Report;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace Erewhon.Harness.Tests;
 
@@ -16,8 +32,11 @@ namespace Erewhon.Harness.Tests;
 /// The response-level cases send SOAP bodies through <see cref="ResponseComparer"/>: XML dispatch, the
 /// media type, well-formedness as a SOAP 1.1 envelope, the byte-order mark, the encoding XML detection reads
 /// and lossless decoding.
+/// It also covers the WSDL contract check, which compares the facade WSDL with the backend WSDL under this
+/// XML semantic comparison with the <c>soap:address/@location</c> value excluded, against two in-process
+/// loopback stubs in a temporary repository root of its own.
 /// </summary>
-public sealed class XmlSemanticComparerTests
+public sealed partial class XmlSemanticComparerTests : IDisposable
 {
     private const string XsiNamespace = "http://www.w3.org/2001/XMLSchema-instance";
     private const string XsdNamespace = "http://www.w3.org/2001/XMLSchema";
@@ -1598,5 +1617,789 @@ public sealed class XmlSemanticComparerTests
             + $"{Break(2, indent)}</wsdl:port>"
             + $"{Break(1, indent)}</wsdl:service>"
             + $"{Break(0, indent)}</wsdl:definitions>";
+    }
+}
+
+// ---- The WSDL contract check --------------------------------------------------------------------
+// The WSDL contract check against two in-process loopback stubs standing in for the backend and the facade,
+// in a temporary repository root of its own: an absent contracts WSDL or an unusable SOAP base URL is not-run
+// with no request sent; documents that differ only in the soap:address/@location value, comments, indentation
+// or a byte order mark pass; a location or address that is absent on either side or on both, a changed
+// operation, an unreachable side, a status other than 200 and an undecodable or non-XML body each fail with
+// exactly the discrepancies the signature is computed over, an undecodable body at $body and a non-XML one at
+// /, and undecodable bodies that differ in an invalid byte, in their decodable peer or in which side decodes,
+// or from non-XML texts that spell their hexadecimal, give different natures; and the check writes only the
+// two artifacts/wsdl/** files, removing stale ones and reporting a failed save in its detail, never the
+// contract.
+// These members live in this class because the harness test project keeps its fixed set of test classes,
+// and the check compares the facade WSDL with the backend WSDL under the XML semantic comparison this class
+// covers.
+public sealed partial class XmlSemanticComparerTests
+{
+    // Catalogue, SoapAddressing, WsdlNamespace, WsdlSoapNamespace, GetAgent, GetAgentNames, BindingName,
+    // StandInHeaderComment, StandInLocation, FacadeLocation, LocationPath, AddressPath, Break and _comparer are
+    // the class's own members above, which hold the values the check tests use.
+
+    private const string BackendSide = "backend";
+    private const string FacadeSide = "facade";
+
+    private const string SoapHttpTransport = "http://schemas.xmlsoap.org/soap/http";
+
+    private const string PortTypeOperationNamePath = "/definitions/portType/operation/@name";
+    private const string BindingOperationNamePath = "/definitions/binding/operation/@name";
+    private const string XmlRootPath = "/";
+
+    // The body as a whole, where the check reports a body that is not UTF-8.
+    private const string BodyPath = "$body";
+
+    // The token a test's base URL holds in place of the authority of that side's running stub.
+    private const string AuthorityToken = "{authority}";
+    private const string UserInfoPassword = "user-info-password";
+
+    // Request limit and connect limit: generous for a loaded host, never reached by a passing test.
+    private const int RequestLimitSeconds = 10;
+
+    // How the backend and facade documents of a presence test differ.
+    private const string FacadeLocationAbsent = "facade location absent";
+    private const string BackendLocationAbsent = "backend location absent";
+    private const string BothLocationsAbsent = "both locations absent";
+    private const string FacadeAddressAbsent = "facade address absent";
+    private const string BackendAddressAbsent = "backend address absent";
+    private const string BothAddressesAbsent = "both addresses absent";
+
+    // How a facade document that must pass differs from the backend's beyond the location.
+    private const string LocationOnly = "location only";
+    private const string Unindented = "unindented";
+    private const string HeaderComment = "declaration and header comment";
+    private const string ByteOrderMark = "byte order mark";
+
+    // A malformed body on both sides, and how a malformed body is malformed.
+    private const string BothSides = "both";
+    private const string InvalidUtf8 = "invalid UTF-8";
+    private const string NotXml = "not XML";
+
+    // How the second of two failing runs with an undecodable body differs from the first.
+    private const string ChangedInvalidByte = "changed invalid byte";
+    private const string ChangedValidPeer = "changed valid peer";
+    private const string SwappedTextAndBytes = "swapped text and bytes";
+    private const string HexLookalikeText = "hex lookalike text";
+
+    private const string NotFoundBody = "Not Found";
+    private const string NotXmlBody = "Service Unavailable";
+
+    // A property, so it reads SoapAddressing from the other part of the class whatever order the parts'
+    // static fields are initialised in.
+    private static string WsdlPathAndQuery => SoapAddressing.WsdlPathAndQuery;
+
+    private static readonly string NoResponseConnect = DiscrepancyKinds.NoResponse(NoResponseReasons.Connect);
+
+    private static readonly byte[] StaleArtifact = Encoding.UTF8.GetBytes("stale artifact of an earlier run");
+
+    // Created on first use, so only the WSDL contract check tests touch the file system or hold a runner;
+    // removed in Dispose.
+    private string? _root;
+    private HarnessOptions? _options;
+    private CaseRunner? _http;
+
+    /// <summary>The test's own repository root, which every contract and artifact path resolves inside.</summary>
+    private string Root => _root ??=
+        Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), $"erewhon-wsdl-check-{Guid.NewGuid():N}")).FullName;
+
+    /// <summary>The check's settings, rooted at <see cref="Root"/>.</summary>
+    private HarnessOptions Options => _options ??= new HarnessOptions { RepoRoot = Root, RequestTimeoutSeconds = RequestLimitSeconds };
+
+    /// <summary>The runner the check fetches both WSDL documents with.</summary>
+    private CaseRunner Http => _http ??= new(TimeSpan.FromSeconds(RequestLimitSeconds));
+
+    /// <summary>Disposes the runner and deletes the repository root, where a WSDL contract check test created them.</summary>
+    public void Dispose()
+    {
+        _http?.Dispose();
+        if (_root is not null && Directory.Exists(_root))
+        {
+            Directory.Delete(_root, recursive: true);
+        }
+    }
+
+    // ---- Not run -----------------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AbsentContract_IsNotRun_WithNoRequest_AndRemovesStaleArtifacts(bool directoryAtContractPath)
+    {
+        await using var backend = await ServeAsync(WsdlCheckDocument(StandInLocation));
+        await using var facade = await ServeAsync(WsdlCheckDocument(FacadeLocation));
+        if (directoryAtContractPath)
+        {
+            Directory.CreateDirectory(Options.ContractsWsdlPath);
+        }
+
+        WriteStaleArtifacts();
+
+        var result = await RunAsync(backend.BaseUrl, facade.BaseUrl);
+
+        AssertNotRun(result);
+        Assert.Empty(backend.Requests);
+        Assert.Empty(facade.Requests);
+        Assert.False(File.Exists(ArtifactPath(BackendSide)), "A stale backend artifact must be removed.");
+        Assert.False(File.Exists(ArtifactPath(FacadeSide)), "A stale facade artifact must be removed.");
+        Assert.False(File.Exists(Options.ContractsWsdlPath), "The check must never create the contracts WSDL.");
+        Assert.Equal(directoryAtContractPath, Directory.Exists(Options.ContractsWsdlPath));
+    }
+
+    [Theory]
+    [InlineData(BackendSide, "")]
+    [InlineData(FacadeSide, " ")]
+    [InlineData(BackendSide, "not a url")]
+    [InlineData(FacadeSide, "/relative/path")]
+    [InlineData(BackendSide, "ftp://" + AuthorityToken + "/")]
+    [InlineData(BackendSide, "http://harness:" + UserInfoPassword + "@" + AuthorityToken)]
+    [InlineData(FacadeSide, "http://harness:" + UserInfoPassword + "@" + AuthorityToken)]
+    public async Task UnusableSoapBaseUrl_IsNotRun_WithNoRequest(string side, string baseUrl)
+    {
+        await using var backend = await ServeAsync(WsdlCheckDocument(StandInLocation));
+        await using var facade = await ServeAsync(WsdlCheckDocument(FacadeLocation));
+        var contract = WriteContract();
+        WriteStaleArtifacts();
+
+        // A URL that names a running stub proves that no request is sent even where one could be answered.
+        var unusable = baseUrl.Replace(AuthorityToken, (side == BackendSide ? backend : facade).Authority, StringComparison.Ordinal);
+        var result = await RunAsync(
+            side == BackendSide ? unusable : backend.BaseUrl,
+            side == FacadeSide ? unusable : facade.BaseUrl);
+
+        AssertNotRun(result);
+        Assert.Contains(SettingName(side), result.Result.Detail, StringComparison.Ordinal);
+        Assert.DoesNotContain(UserInfoPassword, result.Result.Detail, StringComparison.Ordinal);
+        Assert.Empty(backend.Requests);
+        Assert.Empty(facade.Requests);
+        Assert.False(File.Exists(ArtifactPath(BackendSide)), "A stale backend artifact must be removed.");
+        Assert.False(File.Exists(ArtifactPath(FacadeSide)), "A stale facade artifact must be removed.");
+        AssertOnlyArtifactsWritten(contract);
+    }
+
+    // ---- Pass ----------------------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(LocationOnly)]
+    [InlineData(Unindented)]
+    [InlineData(HeaderComment)]
+    [InlineData(ByteOrderMark)]
+    public async Task EqualExceptLocation_Passes_AndKeepsBothDocumentsByteForByte(string variant)
+    {
+        var backendBody = Encoding.UTF8.GetBytes(WsdlCheckDocument(StandInLocation));
+        byte[] facadeBody = variant switch
+        {
+            LocationOnly => Encoding.UTF8.GetBytes(WsdlCheckDocument(FacadeLocation)),
+            Unindented => Encoding.UTF8.GetBytes(WsdlCheckDocument(FacadeLocation, indent: false)),
+            HeaderComment => Encoding.UTF8.GetBytes(WithHeaderComment(WsdlCheckDocument(FacadeLocation))),
+            ByteOrderMark => [.. Encoding.UTF8.Preamble, .. Encoding.UTF8.GetBytes(WithHeaderComment(WsdlCheckDocument(FacadeLocation)))],
+            _ => throw new ArgumentOutOfRangeException(nameof(variant), variant, "Unknown facade document variant."),
+        };
+
+        await using var backend = await LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, backendBody, TestContext.Current.CancellationToken);
+        await using var facade = await LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, facadeBody, TestContext.Current.CancellationToken);
+        var contract = WriteContract();
+        WriteStaleArtifacts();
+
+        var result = await RunAsync(backend.BaseUrl, facade.BaseUrl);
+
+        Assert.Equal(new CheckResult(CheckNames.WsdlContract, CheckOutcomes.Pass, Cases: 1, Passed: 1, Detail: null), result.Result);
+        Assert.Null(result.Failure);
+        Assert.Empty(result.Discrepancies);
+        Assert.Equal(WsdlPathAndQuery, Assert.Single(backend.Requests));
+        Assert.Equal(WsdlPathAndQuery, Assert.Single(facade.Requests));
+        Assert.Equal(backendBody, File.ReadAllBytes(ArtifactPath(BackendSide)));
+        Assert.Equal(facadeBody, File.ReadAllBytes(ArtifactPath(FacadeSide)));
+        AssertOnlyArtifactsWritten(contract, BackendSide, FacadeSide);
+    }
+
+    [Fact]
+    public async Task UnsavableArtifact_IsReportedInTheDetail_AndNeverThrown()
+    {
+        var backendBody = Encoding.UTF8.GetBytes(WsdlCheckDocument(StandInLocation));
+        await using var backend = await LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, backendBody, TestContext.Current.CancellationToken);
+        await using var facade = await ServeAsync(WsdlCheckDocument(FacadeLocation));
+        var contract = WriteContract();
+
+        // A directory where the facade artifact belongs makes its save fail; the comparison is unaffected.
+        Directory.CreateDirectory(ArtifactPath(FacadeSide));
+
+        var result = await RunAsync(backend.BaseUrl, facade.BaseUrl);
+
+        Assert.Equal(CheckNames.WsdlContract, result.Result.Name);
+        Assert.Equal(CheckOutcomes.Pass, result.Result.Outcome);
+        Assert.Equal(1, result.Result.Cases);
+        Assert.Equal(1, result.Result.Passed);
+        Assert.Contains(ArtifactPath(FacadeSide), result.Result.Detail, StringComparison.Ordinal);
+        Assert.Null(result.Failure);
+        Assert.Empty(result.Discrepancies);
+        Assert.True(Directory.Exists(ArtifactPath(FacadeSide)), "The check must leave a directory in an artifact's place untouched.");
+        Assert.Equal(backendBody, File.ReadAllBytes(ArtifactPath(BackendSide)));
+        AssertOnlyArtifactsWritten(contract, BackendSide);
+    }
+
+    // ---- Location presence ---------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(FacadeLocationAbsent)]
+    [InlineData(BackendLocationAbsent)]
+    [InlineData(BothLocationsAbsent)]
+    [InlineData(FacadeAddressAbsent)]
+    [InlineData(BackendAddressAbsent)]
+    [InlineData(BothAddressesAbsent)]
+    public async Task AbsentLocationOrAddress_Fails_WithThePresenceDiscrepancy(string absence)
+    {
+        var (backendDocument, facadeDocument, expected) = absence switch
+        {
+            FacadeLocationAbsent => (
+                WsdlCheckDocument(StandInLocation),
+                WsdlCheckDocument(location: null),
+                new Discrepancy(LocationPath, DiscrepancyKinds.Missing, DiscrepancyValue.Literal(StandInLocation), DiscrepancyValue.Absent)),
+            BackendLocationAbsent => (
+                WsdlCheckDocument(location: null),
+                WsdlCheckDocument(FacadeLocation),
+                new Discrepancy(LocationPath, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal(FacadeLocation))),
+            BothLocationsAbsent => (
+                WsdlCheckDocument(location: null),
+                WsdlCheckDocument(location: null),
+                new Discrepancy(LocationPath, DiscrepancyKinds.Missing, DiscrepancyValue.Absent, DiscrepancyValue.Absent)),
+            FacadeAddressAbsent => (
+                WsdlCheckDocument(StandInLocation),
+                WsdlCheckDocument(FacadeLocation, address: false),
+                new Discrepancy(AddressPath, DiscrepancyKinds.Missing, AddressMarkup(StandInLocation), DiscrepancyValue.Absent)),
+            BackendAddressAbsent => (
+                WsdlCheckDocument(StandInLocation, address: false),
+                WsdlCheckDocument(FacadeLocation),
+                new Discrepancy(AddressPath, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, AddressMarkup(FacadeLocation))),
+            BothAddressesAbsent => (
+                WsdlCheckDocument(StandInLocation, address: false),
+                WsdlCheckDocument(FacadeLocation, address: false),
+                new Discrepancy(AddressPath, DiscrepancyKinds.Missing, DiscrepancyValue.Absent, DiscrepancyValue.Absent)),
+            _ => throw new ArgumentOutOfRangeException(nameof(absence), absence, "Unknown absence."),
+        };
+
+        await using var backend = await ServeAsync(backendDocument);
+        await using var facade = await ServeAsync(facadeDocument);
+        var contract = WriteContract();
+
+        var result = await RunAsync(backend.BaseUrl, facade.BaseUrl);
+
+        AssertDifference(result, [expected]);
+        AssertOnlyArtifactsWritten(contract, BackendSide, FacadeSide);
+    }
+
+    // ---- Document difference ---------------------------------------------------------------------------
+
+    [Fact]
+    public async Task ChangedOperation_Fails_WithTheSameSignatureOnEveryRun()
+    {
+        Discrepancy[] expected =
+        [
+            new(BindingOperationNamePath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(GetAgent.JadeMethod), DiscrepancyValue.Literal(GetAgentNames.JadeMethod)),
+            new(PortTypeOperationNamePath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(GetAgent.JadeMethod), DiscrepancyValue.Literal(GetAgentNames.JadeMethod)),
+        ];
+        var contract = WriteContract();
+
+        // Each run fetches from stubs on other ports, which must not reach the signature.
+        var natures = new List<string>();
+        for (var run = 0; run < 2; run++)
+        {
+            await using var backend = await ServeAsync(WsdlCheckDocument(StandInLocation));
+            await using var facade = await ServeAsync(WsdlCheckDocument(FacadeLocation, operationName: GetAgentNames.JadeMethod));
+
+            var result = await RunAsync(backend.BaseUrl, facade.BaseUrl);
+
+            AssertDifference(result, expected);
+            natures.Add(result.Failure!.Nature);
+        }
+
+        Assert.Equal(natures[0], natures[1]);
+        AssertOnlyArtifactsWritten(contract, BackendSide, FacadeSide);
+    }
+
+    // ---- Fetch failures --------------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(BackendSide)]
+    [InlineData(FacadeSide)]
+    public async Task UnreachableSide_Fails_WithTheFixedNoResponseDiscrepancy(string side)
+    {
+        var otherSide = side == BackendSide ? FacadeSide : BackendSide;
+        var otherBody = Encoding.UTF8.GetBytes(WsdlCheckDocument(side == BackendSide ? FacadeLocation : StandInLocation));
+        await using var other = await LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, otherBody, TestContext.Current.CancellationToken);
+        var contract = WriteContract();
+        Discrepancy[] expected =
+        [
+            new($"$response.{side}", NoResponseConnect, DiscrepancyValue.Literal("response"), DiscrepancyValue.Literal(NoResponseConnect)),
+        ];
+
+        // Two different closed ports: the port appears in the detail only, never in the signature.
+        var natures = new List<string>();
+        foreach (var port in ClosedPorts.Take(2))
+        {
+            WriteStaleArtifacts();
+            var unreachable = $"http://{IPAddress.Loopback}:{port}";
+
+            var result = await RunAsync(
+                side == BackendSide ? unreachable : other.BaseUrl,
+                side == FacadeSide ? unreachable : other.BaseUrl);
+
+            AssertDifference(result, expected);
+            natures.Add(result.Failure!.Nature);
+            Assert.False(File.Exists(ArtifactPath(side)), "The stale artifact of the unanswered side must be removed.");
+            Assert.Equal(otherBody, File.ReadAllBytes(ArtifactPath(otherSide)));
+        }
+
+        Assert.Equal(natures[0], natures[1]);
+        Assert.Equal(new[] { WsdlPathAndQuery, WsdlPathAndQuery }, other.Requests);
+        AssertOnlyArtifactsWritten(contract, otherSide);
+    }
+
+    [Theory]
+    [InlineData(BackendSide)]
+    [InlineData(FacadeSide)]
+    public async Task NotFoundSide_Fails_WithTheStatusDiscrepancy_AndKeepsItsBody(string side)
+    {
+        // The 404 body is not XML, so any comparison of the documents would add a malformed discrepancy.
+        var notFoundBody = Encoding.UTF8.GetBytes(NotFoundBody);
+        var otherBody = Encoding.UTF8.GetBytes(WsdlCheckDocument(side == BackendSide ? FacadeLocation : StandInLocation));
+        await using var backend = await LoopbackStub.StartAsync(
+            WsdlPathAndQuery,
+            side == BackendSide ? StatusCodes.Status404NotFound : StatusCodes.Status200OK,
+            side == BackendSide ? notFoundBody : otherBody,
+            TestContext.Current.CancellationToken);
+        await using var facade = await LoopbackStub.StartAsync(
+            WsdlPathAndQuery,
+            side == FacadeSide ? StatusCodes.Status404NotFound : StatusCodes.Status200OK,
+            side == FacadeSide ? notFoundBody : otherBody,
+            TestContext.Current.CancellationToken);
+        var contract = WriteContract();
+
+        var result = await RunAsync(backend.BaseUrl, facade.BaseUrl);
+
+        AssertDifference(result, [new($"$status.{side}", DiscrepancyKinds.Value, DiscrepancyValue.Literal("200"), DiscrepancyValue.Literal("404"))]);
+        Assert.Equal(side == BackendSide ? notFoundBody : otherBody, File.ReadAllBytes(ArtifactPath(BackendSide)));
+        Assert.Equal(side == FacadeSide ? notFoundBody : otherBody, File.ReadAllBytes(ArtifactPath(FacadeSide)));
+        AssertOnlyArtifactsWritten(contract, BackendSide, FacadeSide);
+    }
+
+    // ---- Malformed bodies ------------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(BackendSide, InvalidUtf8)]
+    [InlineData(FacadeSide, InvalidUtf8)]
+    [InlineData(BothSides, InvalidUtf8)]
+    [InlineData(BackendSide, NotXml)]
+    [InlineData(FacadeSide, NotXml)]
+    public async Task MalformedSide_Fails_WithTheExactDiscrepancies(string side, string defect)
+    {
+        var backendText = WsdlCheckDocument(StandInLocation);
+        var facadeText = WsdlCheckDocument(FacadeLocation);
+
+        // An invalid byte inside the portType name. An undecodable body is the hex of its bytes after the byte order
+        // mark, which the facade side carries when both are undecodable, reported at the body as a whole; the bytes
+        // are kept as served. A decodable body that is not XML is the comparer's entry at the root.
+        var undecodableBackend = WithInvalidByte(backendText, 0xFF);
+        var undecodableFacade = WithInvalidByte(facadeText, 0xFF);
+        byte[] markedUndecodableFacade = [.. Encoding.UTF8.Preamble, .. undecodableFacade];
+        var (backendBody, facadeBody) = (side, defect) switch
+        {
+            (BackendSide, InvalidUtf8) => (undecodableBackend, Encoding.UTF8.GetBytes(facadeText)),
+            (FacadeSide, InvalidUtf8) => (Encoding.UTF8.GetBytes(backendText), undecodableFacade),
+            (BothSides, InvalidUtf8) => (undecodableBackend, markedUndecodableFacade),
+            (BackendSide, NotXml) => (Encoding.UTF8.GetBytes(NotXmlBody), Encoding.UTF8.GetBytes(facadeText)),
+            (FacadeSide, NotXml) => (Encoding.UTF8.GetBytes(backendText), Encoding.UTF8.GetBytes(NotXmlBody)),
+            _ => throw new ArgumentOutOfRangeException(nameof(side), $"{side}, {defect}", "Unknown malformed side or defect."),
+        };
+        Discrepancy[] expected = (side, defect) switch
+        {
+            (BackendSide, InvalidUtf8) =>
+            [
+                new(BodyPath, DiscrepancyKinds.Malformed, Hex(undecodableBackend), DiscrepancyValue.Absent),
+                new(BodyPath, DiscrepancyKinds.Type, Hex(undecodableBackend), DiscrepancyValue.Literal(facadeText)),
+            ],
+            (FacadeSide, InvalidUtf8) =>
+            [
+                new(BodyPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, Hex(undecodableFacade)),
+                new(BodyPath, DiscrepancyKinds.Type, DiscrepancyValue.Literal(backendText), Hex(undecodableFacade)),
+            ],
+            (BothSides, InvalidUtf8) =>
+            [
+                new(BodyPath, DiscrepancyKinds.Malformed, Hex(undecodableBackend), Hex(undecodableFacade)),
+            ],
+            (BackendSide, NotXml) =>
+            [
+                new(XmlRootPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Literal(NotXmlBody), DiscrepancyValue.Absent),
+            ],
+            (FacadeSide, NotXml) =>
+            [
+                new(XmlRootPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, DiscrepancyValue.Literal(NotXmlBody)),
+            ],
+            _ => throw new ArgumentOutOfRangeException(nameof(side), $"{side}, {defect}", "Unknown malformed side or defect."),
+        };
+
+        await using var backend = await LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, backendBody, TestContext.Current.CancellationToken);
+        await using var facade = await LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, facadeBody, TestContext.Current.CancellationToken);
+        var contract = WriteContract();
+
+        var result = await RunAsync(backend.BaseUrl, facade.BaseUrl);
+
+        AssertDifference(result, expected);
+        Assert.Equal(backendBody, File.ReadAllBytes(ArtifactPath(BackendSide)));
+        Assert.Equal(facadeBody, File.ReadAllBytes(ArtifactPath(FacadeSide)));
+        AssertOnlyArtifactsWritten(contract, BackendSide, FacadeSide);
+    }
+
+    [Theory]
+    [InlineData(ChangedInvalidByte)]
+    [InlineData(ChangedValidPeer)]
+    [InlineData(SwappedTextAndBytes)]
+    [InlineData(HexLookalikeText)]
+    public async Task DifferentUndecodableDocuments_GiveDifferentNatures(string change)
+    {
+        var backendText = WsdlCheckDocument(StandInLocation);
+        var facadeText = WsdlCheckDocument(FacadeLocation);
+        var changedFacadeText = WsdlCheckDocument(FacadeLocation, operationName: GetAgentNames.JadeMethod);
+        var undecodableBackend = WithInvalidByte(backendText, 0xFF);
+        var facadeWithFf = WithInvalidByte(facadeText, 0xFF);
+        var facadeWithFe = WithInvalidByte(facadeText, 0xFE);
+        byte[] textFf = "ff"u8.ToArray();
+        byte[] textFe = "fe"u8.ToArray();
+        byte[] text80 = "80"u8.ToArray();
+        byte[] bytesFf = [0xFF];
+        byte[] bytesFe = [0xFE];
+        byte[] bytes80 = [0x80];
+
+        // Two runs per row, each with its own stubs and contract; the type entries of the swapped pair are equal,
+        // so only the malformed entry, which names the undecodable side, tells the two apart. The hex lookalike
+        // pair has equal kinds and values, so only the path, the body as a whole against the comparer's root,
+        // tells two undecodable bodies from two decodable non-XML texts that spell their hexadecimal.
+        (byte[] Backend, byte[] Facade, Discrepancy[] Expected)[] runs = change switch
+        {
+            ChangedInvalidByte =>
+            [
+                (Encoding.UTF8.GetBytes(backendText), facadeWithFf,
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, Hex(facadeWithFf)),
+                    new(BodyPath, DiscrepancyKinds.Type, DiscrepancyValue.Literal(backendText), Hex(facadeWithFf)),
+                ]),
+                (Encoding.UTF8.GetBytes(backendText), facadeWithFe,
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, Hex(facadeWithFe)),
+                    new(BodyPath, DiscrepancyKinds.Type, DiscrepancyValue.Literal(backendText), Hex(facadeWithFe)),
+                ]),
+            ],
+            ChangedValidPeer =>
+            [
+                (undecodableBackend, Encoding.UTF8.GetBytes(facadeText),
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, Hex(undecodableBackend), DiscrepancyValue.Absent),
+                    new(BodyPath, DiscrepancyKinds.Type, Hex(undecodableBackend), DiscrepancyValue.Literal(facadeText)),
+                ]),
+                (undecodableBackend, Encoding.UTF8.GetBytes(changedFacadeText),
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, Hex(undecodableBackend), DiscrepancyValue.Absent),
+                    new(BodyPath, DiscrepancyKinds.Type, Hex(undecodableBackend), DiscrepancyValue.Literal(changedFacadeText)),
+                ]),
+            ],
+            SwappedTextAndBytes =>
+            [
+                (textFf, bytes80,
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, Hex(bytes80)),
+                    new(BodyPath, DiscrepancyKinds.Type, DiscrepancyValue.Literal("ff"), Hex(bytes80)),
+                ]),
+                (bytesFf, text80,
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, Hex(bytesFf), DiscrepancyValue.Absent),
+                    new(BodyPath, DiscrepancyKinds.Type, Hex(bytesFf), DiscrepancyValue.Literal("80")),
+                ]),
+            ],
+            HexLookalikeText =>
+            [
+                (bytesFf, bytesFe,
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, Hex(bytesFf), Hex(bytesFe)),
+                ]),
+                (textFf, textFe,
+                [
+                    new(XmlRootPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Literal("ff"), DiscrepancyValue.Literal("fe")),
+                ]),
+            ],
+            _ => throw new ArgumentOutOfRangeException(nameof(change), change, "Unknown change."),
+        };
+
+        var natures = new List<string>();
+        foreach (var (backendBody, facadeBody, expected) in runs)
+        {
+            await using var backend = await LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, backendBody, TestContext.Current.CancellationToken);
+            await using var facade = await LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, facadeBody, TestContext.Current.CancellationToken);
+            var contract = WriteContract();
+
+            var result = await RunAsync(backend.BaseUrl, facade.BaseUrl);
+
+            AssertDifference(result, expected);
+            Assert.Equal(backendBody, File.ReadAllBytes(ArtifactPath(BackendSide)));
+            Assert.Equal(facadeBody, File.ReadAllBytes(ArtifactPath(FacadeSide)));
+            AssertOnlyArtifactsWritten(contract, BackendSide, FacadeSide);
+            natures.Add(result.Failure!.Nature);
+        }
+
+        Assert.NotEqual(natures[0], natures[1]);
+    }
+
+    // ---- Helpers ---------------------------------------------------------------------------------------
+
+    private Task<ContractCheckResult> RunAsync(string backendSoapBaseUrl, string facadeSoapBaseUrl)
+    {
+        Options.Backend.SoapBaseUrl = backendSoapBaseUrl;
+        Options.Target.SoapBaseUrl = facadeSoapBaseUrl;
+        return new WsdlContractCheck(Options, Catalogue, _comparer, Http).RunAsync(TestContext.Current.CancellationToken);
+    }
+
+    /// <summary>Starts a stub that answers the catalogue's WSDL request with 200 and <paramref name="document"/> as UTF-8.</summary>
+    private static Task<LoopbackStub> ServeAsync(string document) =>
+        LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, Encoding.UTF8.GetBytes(document), TestContext.Current.CancellationToken);
+
+    /// <summary>Writes the contracts WSDL, which only has to exist, and returns its bytes.</summary>
+    private byte[] WriteContract()
+    {
+        var bytes = Encoding.UTF8.GetBytes(WithHeaderComment(WsdlCheckDocument(FacadeLocation)));
+        Directory.CreateDirectory(Path.GetDirectoryName(Options.ContractsWsdlPath)!);
+        File.WriteAllBytes(Options.ContractsWsdlPath, bytes);
+        return bytes;
+    }
+
+    /// <summary>Leaves both artifacts of an earlier run in place.</summary>
+    private void WriteStaleArtifacts()
+    {
+        Directory.CreateDirectory(Path.GetDirectoryName(ArtifactPath(BackendSide))!);
+        File.WriteAllBytes(ArtifactPath(BackendSide), StaleArtifact);
+        File.WriteAllBytes(ArtifactPath(FacadeSide), StaleArtifact);
+    }
+
+    private string ArtifactPath(string side) => Path.Combine(Options.ArtifactsDirectory, "wsdl", $"{side}.wsdl");
+
+    /// <summary>The configuration key of a side's SOAP base URL, for example <c>Harness:Backend:SoapBaseUrl</c>.</summary>
+    private static string SettingName(string side) =>
+        $"{HarnessOptions.SectionName}:{(side == BackendSide ? nameof(HarnessOptions.Backend) : nameof(HarnessOptions.Target))}:{nameof(HarnessEndpoints.SoapBaseUrl)}";
+
+    /// <summary>
+    /// Asserts that the repository root holds exactly the contracts WSDL, with its bytes unchanged, and the
+    /// artifacts of <paramref name="artifactSides"/>: the check creates and rewrites nothing else.
+    /// </summary>
+    private void AssertOnlyArtifactsWritten(byte[] contract, params string[] artifactSides)
+    {
+        var expected = artifactSides
+            .Select(ArtifactPath)
+            .Append(Options.ContractsWsdlPath)
+            .Order(StringComparer.Ordinal);
+        Assert.Equal(expected, Directory.EnumerateFiles(Root, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal));
+        Assert.Equal(contract, File.ReadAllBytes(Options.ContractsWsdlPath));
+    }
+
+    private static void AssertNotRun(ContractCheckResult result)
+    {
+        Assert.Equal(CheckNames.WsdlContract, result.Result.Name);
+        Assert.Equal(CheckOutcomes.NotRun, result.Result.Outcome);
+        Assert.Equal(0, result.Result.Cases);
+        Assert.Equal(0, result.Result.Passed);
+        Assert.False(string.IsNullOrWhiteSpace(result.Result.Detail), "A not-run check must state its reason.");
+        var failure = Assert.IsType<FailureItem>(result.Failure);
+        Assert.Equal(FailureItemIds.WsdlContract, failure.ItemId);
+        Assert.Equal(FailureItemIds.NotRun, failure.Nature);
+        Assert.Null(failure.Operation);
+        Assert.Equal(result.Result.Detail, failure.Detail);
+        Assert.Empty(result.Discrepancies);
+    }
+
+    /// <summary>
+    /// Asserts a failed check whose nature is <c>d:&lt;signature&gt;</c> over exactly <paramref name="expected"/>,
+    /// which is given in canonical order.
+    /// </summary>
+    private static void AssertDifference(ContractCheckResult result, IReadOnlyList<Discrepancy> expected)
+    {
+        Assert.Equal(CheckNames.WsdlContract, result.Result.Name);
+        Assert.Equal(CheckOutcomes.Fail, result.Result.Outcome);
+        Assert.Equal(1, result.Result.Cases);
+        Assert.Equal(0, result.Result.Passed);
+        Assert.Equal(expected, result.Discrepancies);
+        var failure = Assert.IsType<FailureItem>(result.Failure);
+        Assert.Equal(FailureItemIds.WsdlContract, failure.ItemId);
+        Assert.Equal(FailureItemIds.Diff(DiscrepancySignature.Compute(expected)), failure.Nature);
+        Assert.Null(failure.Operation);
+        Assert.Equal(result.Result.Detail, failure.Detail);
+    }
+
+    /// <summary>The XML declaration and the stand-in's label comment above <paramref name="document"/>, as the contracts WSDL carries them.</summary>
+    private static string WithHeaderComment(string document) =>
+        $"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n{StandInHeaderComment}\n{document}";
+
+    /// <summary>The UTF-8 bytes of <paramref name="document"/> with <paramref name="invalid"/>, a byte UTF-8 never uses, inside the portType name.</summary>
+    private static byte[] WithInvalidByte(string document, byte invalid)
+    {
+        var marker = $"<wsdl:portType name=\"{BindingName}";
+        var split = document.IndexOf(marker, StringComparison.Ordinal) + marker.Length;
+        return [.. Encoding.UTF8.GetBytes(document[..split]), invalid, .. Encoding.UTF8.GetBytes(document[split..])];
+    }
+
+    /// <summary>The literal of an undecodable body: the lowercase hexadecimal of <paramref name="bytes"/>.</summary>
+    private static DiscrepancyValue Hex(byte[] bytes) => DiscrepancyValue.Literal(Convert.ToHexStringLower(bytes));
+
+    /// <summary>The literal of a <c>soap:address</c> reported on one side only: the element as written on its own, namespace declared.</summary>
+    private static DiscrepancyValue AddressMarkup(string location) =>
+        DiscrepancyValue.Literal($"<soap:address location=\"{SecurityElement.Escape(location)}\" xmlns:soap=\"{WsdlSoapNamespace}\" />");
+
+    /// <summary>
+    /// A WSDL 1.1 document in the stand-in's shape: one portType operation, its document/literal binding and the
+    /// service port whose <c>soap:address</c> carries <paramref name="location"/>, XML-escaped. The address has no
+    /// <c>location</c> attribute when <paramref name="location"/> is null, and the port has no address when
+    /// <paramref name="address"/> is false.
+    /// </summary>
+    private static string WsdlCheckDocument(string? location, bool address = true, string? operationName = null, bool indent = true)
+    {
+        var operation = operationName ?? GetAgent.JadeMethod;
+        var addressElement = !address
+            ? string.Empty
+            : location is null
+                ? $"{Break(3, indent)}<soap:address/>"
+                : $"{Break(3, indent)}<soap:address location=\"{SecurityElement.Escape(location)}\"/>";
+
+        return $"<wsdl:definitions xmlns:wsdl=\"{WsdlNamespace}\" xmlns:soap=\"{WsdlSoapNamespace}\" xmlns:tns=\"{SoapAddressing.TargetNamespace}\" targetNamespace=\"{SoapAddressing.TargetNamespace}\">"
+            + $"{Break(1, indent)}<wsdl:portType name=\"{BindingName}\">"
+            + $"{Break(2, indent)}<wsdl:operation name=\"{operation}\"/>"
+            + $"{Break(1, indent)}</wsdl:portType>"
+            + $"{Break(1, indent)}<wsdl:binding name=\"{BindingName}\" type=\"tns:{BindingName}\">"
+            + $"{Break(2, indent)}<soap:binding style=\"{SoapAddressing.Style}\" transport=\"{SoapHttpTransport}\"/>"
+            + $"{Break(2, indent)}<wsdl:operation name=\"{operation}\">"
+            + $"{Break(3, indent)}<soap:operation soapAction=\"{GetAgent.Soap!.Action}\" style=\"{SoapAddressing.Style}\"/>"
+            + $"{Break(2, indent)}</wsdl:operation>"
+            + $"{Break(1, indent)}</wsdl:binding>"
+            + $"{Break(1, indent)}<wsdl:service name=\"{SoapAddressing.ServiceName}\">"
+            + $"{Break(2, indent)}<wsdl:port name=\"{BindingName}\" binding=\"tns:{BindingName}\">"
+            + addressElement
+            + $"{Break(2, indent)}</wsdl:port>"
+            + $"{Break(1, indent)}</wsdl:service>"
+            + $"{Break(0, indent)}</wsdl:definitions>";
+    }
+}
+
+// ---- Support types of the contract check tests --------------------------------------------------
+// The loopback stub and the closed ports serve the WSDL contract check tests above and the OpenAPI drift
+// check tests in JsonSemanticComparerTests; they are internal support types, not test classes.
+
+/// <summary>
+/// An in-process HTTP/1.1 server on 127.0.0.1 and an ephemeral port that answers one exact request target with a
+/// chosen status and exact body bytes, and any other target with 404 and no body. It records every request
+/// target it receives, before answering, so a caller that has its response also sees its request recorded.
+/// Shared by the WSDL contract check tests of <see cref="XmlSemanticComparerTests"/> and the OpenAPI drift check
+/// tests of <see cref="JsonSemanticComparerTests"/>.
+/// </summary>
+internal sealed class LoopbackStub : IAsyncDisposable
+{
+    // Bounds the graceful stop; idle keep-alive connections close at once, so it is never reached.
+    private static readonly TimeSpan ShutdownLimit = TimeSpan.FromSeconds(5);
+
+    private readonly WebApplication _app;
+    private readonly ConcurrentQueue<string> _requests;
+
+    private LoopbackStub(WebApplication app, ConcurrentQueue<string> requests, Uri baseUrl)
+    {
+        _app = app;
+        _requests = requests;
+        BaseUrl = baseUrl.GetLeftPart(UriPartial.Authority);
+        Authority = baseUrl.Authority;
+    }
+
+    /// <summary>The stub's base URL, <c>http://127.0.0.1:&lt;port&gt;</c>.</summary>
+    public string BaseUrl { get; }
+
+    /// <summary>The stub's authority, <c>127.0.0.1:&lt;port&gt;</c>.</summary>
+    public string Authority { get; }
+
+    /// <summary>Every request target received so far, raw and in arrival order.</summary>
+    public IReadOnlyList<string> Requests => [.. _requests];
+
+    /// <summary>Starts a stub that answers <paramref name="pathAndQuery"/> with <paramref name="status"/> and <paramref name="body"/>.</summary>
+    /// <param name="pathAndQuery">The exact raw request target answered.</param>
+    /// <param name="status">The status code of that answer.</param>
+    /// <param name="body">The exact body bytes of that answer.</param>
+    /// <param name="ct">Cancels the start.</param>
+    /// <returns>The running stub, which the caller disposes.</returns>
+    public static async Task<LoopbackStub> StartAsync(string pathAndQuery, int status, byte[] body, CancellationToken ct)
+    {
+        var builder = WebApplication.CreateSlimBuilder();
+        builder.Logging.ClearProviders();
+        builder.Services.Configure<HostOptions>(options => options.ShutdownTimeout = ShutdownLimit);
+        builder.WebHost.ConfigureKestrel(kestrel => kestrel.Listen(IPAddress.Loopback, 0));
+
+        var app = builder.Build();
+        var requests = new ConcurrentQueue<string>();
+        app.Run(async context =>
+        {
+            var target = context.Features.GetRequiredFeature<IHttpRequestFeature>().RawTarget;
+            requests.Enqueue(target);
+            if (!string.Equals(target, pathAndQuery, StringComparison.Ordinal))
+            {
+                context.Response.StatusCode = StatusCodes.Status404NotFound;
+                return;
+            }
+
+            context.Response.StatusCode = status;
+            context.Response.ContentLength = body.Length;
+            await context.Response.Body.WriteAsync(body, context.RequestAborted);
+        });
+
+        try
+        {
+            await app.StartAsync(ct);
+            var address = app.Services.GetRequiredService<IServer>().Features.GetRequiredFeature<IServerAddressesFeature>().Addresses.Single();
+            return new LoopbackStub(app, requests, new Uri(address));
+        }
+        catch
+        {
+            await app.DisposeAsync();
+            throw;
+        }
+    }
+
+    /// <summary>Stops the server and releases its port.</summary>
+    public async ValueTask DisposeAsync()
+    {
+        await _app.StopAsync(CancellationToken.None);
+        await _app.DisposeAsync();
+    }
+}
+
+/// <summary>Loopback ports that were just bound and released, so a connection to them is refused.</summary>
+internal static class ClosedPorts
+{
+    /// <summary>
+    /// Returns <paramref name="count"/> distinct closed ports: each is bound on 127.0.0.1 with port 0 while the
+    /// others are still held, so the system assigns different ones, and all are released before returning.
+    /// </summary>
+    public static int[] Take(int count)
+    {
+        var listeners = new List<TcpListener>(count);
+        try
+        {
+            for (var index = 0; index < count; index++)
+            {
+                var listener = new TcpListener(IPAddress.Loopback, 0);
+                listeners.Add(listener);
+                listener.Start();
+            }
+
+            return [.. listeners.Select(listener => ((IPEndPoint)listener.LocalEndpoint).Port)];
+        }
+        finally
+        {
+            foreach (var listener in listeners)
+            {
+                listener.Dispose();
+            }
+        }
     }
 }

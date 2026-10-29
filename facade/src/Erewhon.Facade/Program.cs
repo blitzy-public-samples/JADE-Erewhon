@@ -69,6 +69,17 @@ try
         console.TimestampFormat = "yyyy-MM-dd'T'HH:mm:ss.fff'Z'";
     });
 
+    // Framework request logging prints the raw request path, request line and header text, and REST path
+    // segments carry agent and client names. YARP's forwarder logs each destination URL and, for every
+    // failed call, a warning with the full exception stack that repeats what the call's one line records.
+    // These floors hold whatever the Logging configuration says. Hosting stays at Warning rather than off,
+    // so its start-up exception is still logged.
+    builder.Logging
+        .AddLogLevelFloor("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.Warning)
+        .AddLogLevelFloor("Microsoft.AspNetCore.Routing", LogLevel.Warning)
+        .AddLogLevelFloor("Microsoft.AspNetCore.Server.Kestrel.BadRequests", LogLevel.Warning)
+        .AddLogLevelFloor("Yarp", LogLevel.Error);
+
     // POST /admin/shutdown must end the process well inside the harness's 15 s shutdown limit.
     builder.Services.Configure<HostOptions>(host => host.ShutdownTimeout = TimeSpan.FromSeconds(5));
 

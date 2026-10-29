@@ -40,6 +40,14 @@ x-harness-build: &harness-build
   context: .
   dockerfile: harness/Dockerfile
 
+# The json-file driver keeps `docker logs` and `compose up` output. Rotation caps each long-running
+# service's log on the host disk, however long it runs under load.
+x-bounded-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
 services:
   # The backend of this run. No ports are published: REST 65000, SOAP 21001 and admin 9090 are reached
   # only over the internal network.
@@ -53,6 +61,7 @@ services:
       StandIn__SeedDirectory: /app/seed
     networks:
       - backend
+    logging: *bounded-logging
     restart: "no"
 
   # Owns the caller-facing REST and SOAP addresses and forwards every operation to its routed target.
@@ -77,11 +86,13 @@ services:
       standin:
         condition: service_started
         required: false
+    logging: *bounded-logging
     restart: "no"
 
   # Routing, failure-behaviour and listener-isolation tests on loopback. tests/run-tests.sh writes
-  # /repo/artifacts/facade-tests/facade-tests.trx and exit-code and always exits 0, so the harness's
-  # dependency on it always holds and the outcome travels in those files.
+  # /repo/artifacts/facade-tests/facade-tests.trx, facade-tests.xunit.xml (failures' exception types)
+  # and exit-code and always exits 0, so the harness's dependency on it always holds and the outcome
+  # travels in those files.
   facade-tests:
     build:
       context: .

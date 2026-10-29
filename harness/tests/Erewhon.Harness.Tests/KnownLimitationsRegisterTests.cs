@@ -1,11 +1,14 @@
+using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
+using System.Xml.Linq;
 using Erewhon.Contracts.Catalogue;
 using Erewhon.Harness.Cases;
+using Erewhon.Harness.Checks;
 using Erewhon.Harness.Compare;
 using Erewhon.Harness.Report;
 
@@ -22,10 +25,14 @@ namespace Erewhon.Harness.Tests;
 /// rejected with a message that starts <c>case-matrix: </c> and names the offending case by id, or by
 /// JSON path where the text does not parse. The results report built on the register's decisions is
 /// covered from inline sources and registers, and its rendered text is checked in memory; the report is
-/// written only into a temporary directory. The committed <c>harness/config/known-limitations.json</c> and
-/// <c>harness/config/case-matrix.json</c> are only ever read here.
+/// written only into a temporary directory. It also covers the checks whose failure items the register
+/// matches: reading the facade tests' TRX file and <c>exit-code</c>, the JADE-unchanged check and the
+/// ordering-evidence check, driven by scripted git runners and confirmed against throwaway repositories in
+/// a temporary directory of the test's own, so git never runs in the harness's own repository. The
+/// committed <c>harness/config/known-limitations.json</c> and <c>harness/config/case-matrix.json</c> are
+/// only ever read here.
 /// </summary>
-public sealed partial class KnownLimitationsRegisterTests
+public sealed partial class KnownLimitationsRegisterTests : IDisposable
 {
     private const string CaseId = "REST-getAgent-01";
     private const string CaseItemId = "CASE:" + CaseId;
@@ -87,6 +94,16 @@ public sealed partial class KnownLimitationsRegisterTests
     // \z, unlike $, also rejects a trailing newline.
     [GeneratedRegex(@"\A[0-9a-f]{16}\z", RegexOptions.CultureInvariant)]
     private static partial Regex SignatureForm();
+
+    // The temporary directory of the facade TRX, JADE-unchanged and ordering-evidence tests. Created on
+    // first use, so the class's other tests never create it; removed, with any repository in it, in Dispose.
+    private TempDirectory? _temp;
+
+    /// <summary>This test's own temporary directory, created on first use.</summary>
+    private TempDirectory Temp => _temp ??= new TempDirectory();
+
+    /// <summary>Deletes the temporary directory and any repository in it, if this test created one.</summary>
+    public void Dispose() => _temp?.Dispose();
 
     // ---- Matching -------------------------------------------------------------------------------
 
@@ -1299,6 +1316,74 @@ public sealed partial class KnownLimitationsRegisterTests
     }
 
     [Theory]
+    [InlineData(0)]
+    [InlineData(2)]
+    public void Build_CapturedCaseTheReplayDidNotCompare_LeavesItsOperationAnUndocumentedDifference(int comparedCases)
+    {
+        // Rest.getSale has three records. The replay compared the first comparedCases of them, each
+        // equivalent, and reported nothing for the rest (no comparer, a cancellation or a failed case
+        // step), so no failing item names them. Every other operation is captured and equivalent.
+        string[] saleCases = ["REST-getSale-01", "REST-getSale-02", "REST-getSale-03"];
+        var source = CatalogueRun([]);
+        source.Cases =
+        [
+            .. source.Cases.Where(result => !string.Equals(result.Operation, "Rest.getSale", StringComparison.Ordinal)),
+            .. saleCases.Take(comparedCases).Select(caseId => EquivalentCase(caseId, "Rest.getSale")),
+        ];
+        source.PlannedCasesByOperation = new Dictionary<string, IReadOnlyList<string>>(source.PlannedCasesByOperation, StringComparer.Ordinal)
+        {
+            ["Rest.getSale"] = saleCases,
+        };
+        source.CapturedCasesByOperation = CapturedFrom(source.Cases, [.. saleCases.Skip(comparedCases).Select(caseId => ("Rest.getSale", caseId))]);
+
+        var report = BuildReport(source);
+
+        var row = OperationRowOf(report, "Rest.getSale");
+        Assert.Equal(OperationResults.UndocumentedDifference, row.Result);
+        Assert.Equal((3, 3, comparedCases, comparedCases), (row.Planned, row.Captured, row.Compared, row.EquivalentCases));
+        Assert.Equal(saleCases[comparedCases..], row.UnaccountedCases);
+        Assert.Equal(saleCases[comparedCases..], report.UnaccountedCases);
+        Assert.All(report.Operations.Where(other => other != row), other => Assert.Empty(other.UnaccountedCases));
+
+        // An uncompared case is no failing item, so nothing a register entry could match exists for it,
+        // and its operation counts towards neither N nor M.
+        Assert.Empty(row.FailingItems);
+        Assert.Empty(report.Failures);
+        Assert.True(report.AllFailuresDocumented);
+        Assert.Equal(
+            (21, 0, 1, 0),
+            (report.EquivalentCount, report.DocumentedDifferenceCount, report.UndocumentedDifferenceCount, report.NotComparedCount));
+        Assert.Equal("21 of 22 operations equivalent, 0 documented differences", report.FinalLine);
+    }
+
+    [Fact]
+    public void Build_CaptureEvidenceThatMatchesTheResults_ChangesNoResult()
+    {
+        // The records hold every case the replay compared; Rest.getAllAgents has no record (its only case
+        // was not captured) and an empty capture entry.
+        var source = CatalogueRun(["Rest.getAllAgents"]);
+        var withoutEvidence = BuildReport(source, Entry(NotCapturedPair(CaseIdOf("Rest.getAllAgents"))));
+        source.CapturedCasesByOperation = new Dictionary<string, IReadOnlyList<string>>(CapturedFrom(source.Cases), StringComparer.Ordinal)
+        {
+            ["Rest.getAllAgents"] = [],
+        };
+
+        var report = BuildReport(source, Entry(NotCapturedPair(CaseIdOf("Rest.getAllAgents"))));
+
+        var row = OperationRowOf(report, "Rest.getAllAgents");
+        Assert.Equal(OperationResults.NotCompared, row.Result);
+        Assert.Equal((1, 0, 0), (row.Planned, row.Captured, row.Compared));
+        var agent = OperationRowOf(report, "Rest.getAgent");
+        Assert.Equal((OperationResults.Equivalent, 1, 1, 1), (agent.Result, agent.Planned, agent.Captured, agent.Compared));
+        Assert.Empty(report.UnaccountedCases);
+        Assert.Equal(
+            withoutEvidence.Operations.Select(other => (other.OperationId, other.Result, other.Planned, other.Captured, other.Compared)),
+            report.Operations.Select(other => (other.OperationId, other.Result, other.Planned, other.Captured, other.Compared)));
+        Assert.Equal((21, 0, 0, 1), (report.EquivalentCount, report.DocumentedDifferenceCount, report.UndocumentedDifferenceCount, report.NotComparedCount));
+        Assert.Equal(RenderReport(withoutEvidence), RenderReport(report));
+    }
+
+    [Theory]
     [InlineData(0, 0, "0 of 22 operations equivalent, 0 documented differences")]
     [InlineData(20, 2, "20 of 22 operations equivalent, 2 documented differences")]
     [InlineData(22, 0, "22 of 22 operations equivalent, 0 documented differences")]
@@ -1376,6 +1461,41 @@ public sealed partial class KnownLimitationsRegisterTests
             report.DemoAcceptanceShortfall);
     }
 
+    [Fact]
+    public void DemoAcceptance_EveryPlannedOrCapturedCaseNeedsAComparedResponse()
+    {
+        // 20 operations are equivalent. The other two return the baseline status with a well-formed payload
+        // in every case that was compared, but Rest.getCompany's second planned case was not captured, and of
+        // Rest.getSale's three planned cases the second has a record the replay never compared and the third
+        // was not captured. Neither missing response is evidence of the baseline status.
+        var company = DifferingCase(CaseIdOf("Rest.getCompany"), "Rest.getCompany", Website);
+        var source = CatalogueRun([], company);
+        source.PlannedCasesByOperation = new Dictionary<string, IReadOnlyList<string>>(source.PlannedCasesByOperation, StringComparer.Ordinal)
+        {
+            ["Rest.getCompany"] = ["REST-getCompany-01", "REST-getCompany-02"],
+            ["Rest.getSale"] = ["REST-getSale-01", "REST-getSale-02", "REST-getSale-03"],
+        };
+        source.CapturedCasesByOperation = CapturedFrom(source.Cases, ("Rest.getSale", "REST-getSale-02"));
+        source.Baseline = source.Baseline with { NotCaptured = ["REST-getCompany-02", "REST-getSale-03"] };
+
+        var report = BuildReport(
+            source,
+            Entry(CasePair(company), NotCapturedPair("REST-getCompany-02"), NotCapturedPair("REST-getSale-03")));
+
+        Assert.Equal(OperationResults.DocumentedDifference, OperationRowOf(report, "Rest.getCompany").Result);
+        Assert.Equal(OperationResults.UndocumentedDifference, OperationRowOf(report, "Rest.getSale").Result);
+        Assert.Equal(20, report.EquivalentCount);
+        Assert.False(report.DemoAcceptanceMet);
+        Assert.Equal(
+            new[]
+            {
+                "Rest.getCompany: no compared response for REST-getCompany-02 (not captured)",
+                "Rest.getSale: no compared response for REST-getSale-02 (captured, not compared)",
+                "Rest.getSale: no compared response for REST-getSale-03 (not captured)",
+            },
+            report.DemoAcceptanceShortfall);
+    }
+
     /// <summary>Each change <see cref="MutableReportRun.Change"/> makes to the source after a build.</summary>
     public static TheoryData<string> SourceChangesAfterBuild { get; } = new()
     {
@@ -1389,6 +1509,7 @@ public sealed partial class KnownLimitationsRegisterTests
         MutableReportRun.NotCapturedCaseAppended,
         MutableReportRun.PlannedOperationAdded,
         MutableReportRun.PlannedCaseAppended,
+        MutableReportRun.CapturedCaseAppended,
         MutableReportRun.ChecksCleared,
     };
 
@@ -1397,9 +1518,11 @@ public sealed partial class KnownLimitationsRegisterTests
     {
         "Failures",
         "UndocumentedFailures",
+        "UnaccountedCases",
         "DemoAcceptanceShortfall",
         "Operations",
         "Operations[].FailingItems",
+        "Operations[].UnaccountedCases",
         "Cases",
         "Cases[].Discrepancies",
         "NotCaptured",
@@ -1454,7 +1577,8 @@ public sealed partial class KnownLimitationsRegisterTests
 
     /// <summary>
     /// The report's decisions as text: N, M, whether every failure is documented, the final line, every
-    /// failure with its documentation, the undocumented failures, the demo shortfall and each operation row.
+    /// failure with its documentation, the undocumented failures, the captured cases not compared, the
+    /// demo shortfall and each operation row.
     /// </summary>
     private static string[] DecisionsOf(ResultsReport report) =>
     [
@@ -1465,9 +1589,10 @@ public sealed partial class KnownLimitationsRegisterTests
         .. report.Failures.Select(failure =>
             $"failure {failure.Item.ItemId} {failure.Item.Nature} {failure.Item.Operation} documented: {failure.Documented} by {failure.Entry?.Id}"),
         .. report.UndocumentedFailures.Select(item => $"undocumented {item.ItemId} {item.Nature}"),
+        .. report.UnaccountedCases.Select(caseId => "not compared: " + caseId),
         .. report.DemoAcceptanceShortfall.Select(line => "shortfall: " + line),
         .. report.Operations.Select(row =>
-            $"{row.OperationId}: {row.Result}, planned {Number(row.Planned)}, failing {string.Join(" ", row.FailingItems.Select(item => item.ItemId))}"),
+            $"{row.OperationId}: {row.Result}, planned {Number(row.Planned)}, captured {Number(row.Captured)}, failing {string.Join(" ", row.FailingItems.Select(item => item.ItemId))}, not compared {string.Join(" ", row.UnaccountedCases)}"),
     ];
 
     /// <summary>
@@ -1491,9 +1616,11 @@ public sealed partial class KnownLimitationsRegisterTests
     {
         "Failures" => ListChangeAttempts(report.Failures),
         "UndocumentedFailures" => ListChangeAttempts(report.UndocumentedFailures),
+        "UnaccountedCases" => ListChangeAttempts(report.UnaccountedCases),
         "DemoAcceptanceShortfall" => ListChangeAttempts(report.DemoAcceptanceShortfall),
         "Operations" => ListChangeAttempts(report.Operations),
         "Operations[].FailingItems" => ListChangeAttempts(OperationRowOf(report, "Rest.getCompany").FailingItems),
+        "Operations[].UnaccountedCases" => ListChangeAttempts(OperationRowOf(report, "Rest.getCompany").UnaccountedCases),
         "Cases" => ListChangeAttempts(report.Cases),
         "Cases[].Discrepancies" => ListChangeAttempts(
             Assert.Single(report.Cases, result => string.Equals(result.CaseId, FourResultsRun.CompanyCaseId, StringComparison.Ordinal)).Discrepancies),
@@ -1538,9 +1665,10 @@ public sealed partial class KnownLimitationsRegisterTests
     }
 
     /// <summary>
-    /// <see cref="FourResultsRun"/> with two checks and two conformance gap natures, where every list and
-    /// dictionary of the source, nested ones included, is a mutable instance this run keeps and
-    /// <see cref="Change"/> can alter after a build.
+    /// <see cref="FourResultsRun"/> with two checks, two conformance gap natures and capture evidence for
+    /// every case result plus <see cref="CompanyUncomparedCaseId"/>, a record the replay reported no result
+    /// for. Every list and dictionary of the source, nested ones included, is a mutable instance this run
+    /// keeps and <see cref="Change"/> can alter after a build.
     /// </summary>
     private sealed class MutableReportRun
     {
@@ -1554,15 +1682,21 @@ public sealed partial class KnownLimitationsRegisterTests
         public const string NotCapturedCaseAppended = "not-captured case appended";
         public const string PlannedOperationAdded = "planned operation added";
         public const string PlannedCaseAppended = "planned case appended";
+        public const string CapturedCaseAppended = "captured case appended";
         public const string ChecksCleared = "checks cleared";
 
+        /// <summary>The <c>Rest.getCompany</c> case that has a record but no case result.</summary>
+        public const string CompanyUncomparedCaseId = "REST-getCompany-03";
+
         private const string CompanyOperation = "Rest.getCompany";
+        private const string AgentOperation = "Rest.getAgent";
 
         private readonly List<FailureItem> failures;
         private readonly List<CaseResult> cases;
         private readonly List<Discrepancy> companyDiscrepancies;
         private readonly Dictionary<string, IReadOnlyList<string>> planned;
         private readonly List<string> companyPlan;
+        private readonly List<string> agentCaptured;
         private readonly Dictionary<string, CheckResult> checks;
         private readonly List<string> notCaptured;
         private readonly Dictionary<string, int> gaps;
@@ -1581,6 +1715,11 @@ public sealed partial class KnownLimitationsRegisterTests
                 operation => (IReadOnlyList<string>)operation.Value.ToList(),
                 StringComparer.Ordinal);
             companyPlan = (List<string>)planned[CompanyOperation];
+            var captured = CapturedFrom(cases, (CompanyOperation, CompanyUncomparedCaseId)).ToDictionary(
+                operation => operation.Key,
+                operation => (IReadOnlyList<string>)operation.Value.ToList(),
+                StringComparer.Ordinal);
+            agentCaptured = (List<string>)captured[AgentOperation];
             checks = new Dictionary<string, CheckResult>(StringComparer.Ordinal)
             {
                 [CheckNames.Routing] = new(CheckNames.Routing, CheckOutcomes.Pass, 2, 2, null),
@@ -1596,6 +1735,7 @@ public sealed partial class KnownLimitationsRegisterTests
             source.Failures = failures;
             source.Cases = cases;
             source.PlannedCasesByOperation = planned;
+            source.CapturedCasesByOperation = captured;
             source.Checks = checks;
             source.Baseline = source.Baseline with { NotCaptured = notCaptured };
             source.Conformance = new ConformanceSummary(40, 30, gaps);
@@ -1641,6 +1781,9 @@ public sealed partial class KnownLimitationsRegisterTests
                     break;
                 case PlannedCaseAppended:
                     companyPlan.Add("REST-getCompany-02");
+                    break;
+                case CapturedCaseAppended:
+                    agentCaptured.Add("REST-getAgent-03");
                     break;
                 case ChecksCleared:
                     checks.Clear();
@@ -1828,6 +1971,49 @@ public sealed partial class KnownLimitationsRegisterTests
         Assert.Equal(
             TableRow("`CHK-ORDERING`", NoValue, "`not-run`", "yes", InlineCode(FourResultsRun.OrderingEntryId), "0", NoValue, FourResultsRun.OrderingDetail),
             Assert.Single(TableBody(SectionLines(text, "### Other failing items"))));
+    }
+
+    [Fact]
+    public void Render_CapturedCasesNotCompared_ListsEachUnderDifferences()
+    {
+        // Two records the replay reported no result for: a second Rest.getSale case and a second
+        // Soap.getPhoto case. Every compared case is equivalent, so no failing item exists.
+        var source = CatalogueRun([]);
+        source.CapturedCasesByOperation = CapturedFrom(
+            source.Cases,
+            ("Soap.getPhoto", "SOAP-getPhoto-02"),
+            ("Rest.getSale", "REST-getSale-02"));
+
+        var text = RenderReport(BuildReport(source));
+
+        Assert.Equal(
+            new[] { "## Differences", "### Equivalence cases", "### Captured cases not compared", "### Other failing items", "## Known limitations" },
+            Lines(text).SkipWhile(line => line != "## Differences").Where(line => line.StartsWith('#')).Take(5));
+        Assert.Equal("None.", Assert.Single(NonBlank(SectionLines(text, "### Equivalence cases"))));
+        Assert.Equal(
+            new[]
+            {
+                TableRow("`REST-getSale-02`", "`Rest.getSale`", UnaccountedReason),
+                TableRow("`SOAP-getPhoto-02`", "`Soap.getPhoto`", UnaccountedReason),
+            },
+            TableBody(SectionLines(text, "### Captured cases not compared")));
+        Assert.Contains(
+            TableRow("`getSale`", "REST", "`Rest.getSale`", "1", "2", "1", "undocumented difference"),
+            TableBody(SectionLines(text, "## Per-operation results")));
+        Assert.Equal("None.", Assert.Single(NonBlank(SectionLines(text, "### Other failing items"))));
+    }
+
+    [Fact]
+    public void Render_EveryCapturedCaseCompared_OmitsTheCapturedCasesNotComparedSection()
+    {
+        var source = CatalogueRun([]);
+        var withoutEvidence = RenderReport(BuildReport(source));
+        source.CapturedCasesByOperation = CapturedFrom(source.Cases);
+
+        var text = RenderReport(BuildReport(source));
+
+        Assert.DoesNotContain("### Captured cases not compared", Lines(text));
+        Assert.Equal(withoutEvidence, text);
     }
 
     [Theory]
@@ -2138,7 +2324,12 @@ public sealed partial class KnownLimitationsRegisterTests
     {
         // Each kind of free text the report writes outside a code span holds every escaped character:
         // the facade runtime, a check's outcome and detail, a failing item's detail and a shortfall line.
+        // The plan names the case, so its status line is the operation's only shortfall.
         var source = CatalogueRun([], StatusMismatchCase("REST-getAgent-" + MarkupFreeText, "Rest.getAgent", 200, 502));
+        source.PlannedCasesByOperation = new Dictionary<string, IReadOnlyList<string>>(source.PlannedCasesByOperation, StringComparer.Ordinal)
+        {
+            ["Rest.getAgent"] = ["REST-getAgent-" + MarkupFreeText],
+        };
         source.Facts = FixtureFacts with { FacadeFrameworkDescription = MarkupFreeText };
         source.Failures = [new FailureItem(FailureItemIds.Ordering, FailureItemIds.NotRun, Detail: MarkupFreeText)];
         source.Checks = new Dictionary<string, CheckResult>(StringComparer.Ordinal)
@@ -2561,6 +2752,10 @@ public sealed partial class KnownLimitationsRegisterTests
     private const string CatalogueUnavailableNote =
         "The operation catalogue could not be loaded, so rows are derived from the planned and replayed cases and an operation with neither is not listed.";
 
+    // The "Why" cell of each row under "### Captured cases not compared".
+    private const string UnaccountedReason =
+        "The case has a baseline record, but the replay did not compare it, so its operation is an undocumented difference.";
+
     // Held by every user name and password a test configures; the report must never contain it.
     private const string CredentialMark = "Zq7";
     private const string UrlUser = "user" + CredentialMark;
@@ -2639,6 +2834,23 @@ public sealed partial class KnownLimitationsRegisterTests
     /// <param name="operations">Each operation id with its planned case ids, in matrix order.</param>
     private static Dictionary<string, IReadOnlyList<string>> Plan(params (string Operation, string[] CaseIds)[] operations) =>
         operations.ToDictionary(operation => operation.Operation, operation => (IReadOnlyList<string>)operation.CaseIds, StringComparer.Ordinal);
+
+    /// <summary>
+    /// The captured case ids by operation id, as <see cref="IReportSource.CapturedCasesByOperation"/> holds
+    /// them: the case of every result in <paramref name="results"/>, in their order, then each of
+    /// <paramref name="recordedWithoutResult"/>, a record the replay reported no result for.
+    /// </summary>
+    private static Dictionary<string, IReadOnlyList<string>> CapturedFrom(
+        IEnumerable<CaseResult> results,
+        params (string Operation, string CaseId)[] recordedWithoutResult) =>
+        results
+            .Select(result => (result.Operation, result.CaseId))
+            .Concat(recordedWithoutResult)
+            .GroupBy(record => record.Operation, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => (IReadOnlyList<string>)group.Select(record => record.CaseId).ToArray(),
+                StringComparer.Ordinal);
 
     /// <summary>A captured case that was compared and found equivalent: status 200 on both sides, well formed.</summary>
     private static CaseResult EquivalentCase(string caseId, string operation) =>
@@ -2855,8 +3067,9 @@ public sealed partial class KnownLimitationsRegisterTests
 
     /// <summary>
     /// An inline <see cref="IReportSource"/>. Every member is settable and defaults to an empty but valid
-    /// run: no failures, cases, plans or checks, <see cref="FixtureFacts"/>, <see cref="FixtureBaseline"/>,
-    /// no conformance or JADE-unchanged counts, and the stand-in as the backend.
+    /// run: no failures, cases, plans, captured cases or checks, <see cref="FixtureFacts"/>,
+    /// <see cref="FixtureBaseline"/>, no conformance or JADE-unchanged counts, and the stand-in as the
+    /// backend.
     /// </summary>
     private sealed class ReportSourceFixture : IReportSource
     {
@@ -2865,6 +3078,8 @@ public sealed partial class KnownLimitationsRegisterTests
         public IReadOnlyList<CaseResult> Cases { get; set; } = [];
 
         public IReadOnlyDictionary<string, IReadOnlyList<string>> PlannedCasesByOperation { get; set; } = Plan();
+
+        public IReadOnlyDictionary<string, IReadOnlyList<string>> CapturedCasesByOperation { get; set; } = Plan();
 
         public IReadOnlyDictionary<string, CheckResult> Checks { get; set; } = new Dictionary<string, CheckResult>(StringComparer.Ordinal);
 
@@ -4090,4 +4305,1800 @@ public sealed partial class KnownLimitationsRegisterTests
     }
 
     private static string CommittedMatrixPath() => Path.Combine(FindRepoRoot(), "harness", "config", "case-matrix.json");
+}
+
+// ---- Facade test results (TRX) ------------------------------------------------------------------
+// Reading the facade tests' TRX file, xunit XML file and exit-code: the routing, failure and
+// listener-isolation counts exactly as the TRX states them, one TEST item per failed or not-run
+// invocation whose signature carries the exception type the xunit XML (or xunit's message prefix)
+// records, and a single CHK-FACADE-TRX missing item whenever the TRX or the run's completion evidence
+// is absent, unusable or inconsistent, or a failed result's exception type is not recorded, so an
+// all-passed TRX never certifies an unverified run and an empty type slot is never silent. Files are
+// written only to a temporary directory of the test's own. These members live in this class because the
+// harness test project keeps its fixed set of test classes, and the TEST:<className>/<testName> and
+// CHK-FACADE-TRX items the reading produces are failure identities this class covers.
+public sealed partial class KnownLimitationsRegisterTests
+{
+    // RoutingClass, the routing tests' class name, is the one the register tests above declare.
+    private const string FailureClass = "Erewhon.Facade.Tests.FailureBehaviourTests";
+    private const string ListenerClass = "Erewhon.Facade.Tests.ListenerIsolationTests";
+    private const string OtherClass = "Erewhon.Facade.Tests.CatalogueTests";
+
+    private const string RerouteMethod = "RerouteOneOperation";
+    private const string RestArguments = "(operationId: \"Rest.getCompany\")";
+    private const string SoapArguments = "(operationId: \"Soap.getAgentNames\")";
+
+    private const string FacadeTrxAssertionMessage = "Assert.Equal() Failure: Values differ\nExpected: 502\nActual:   200";
+    private const int FacadeTrxAssertionLine = 42;
+    private const string FacadeTestsRelativePath = "Erewhon.Facade.Tests/RoutingTests.cs";
+
+    // The exception types xunit.v3 records in its XML for a failed Assert.Equal and Assert.True.
+    private const string EqualExceptionType = "Xunit.Sdk.EqualException";
+    private const string TrueExceptionType = "Xunit.Sdk.TrueException";
+
+    private const string UntypedPrefix = "exception type not recorded for 1 failed result(s): ";
+    private const string NoMatchingFailure = "xunit XML results hold no unambiguous matching failure";
+
+    // 60 digits: no int holds it, and the quoted excerpt is cut at 40 characters.
+    private const string OverlongExitCode = "777777777777777777777777777777777777777777777777777777777777";
+    private const string OverlongExcerpt = "'7777777777777777777777777777777777777777…'";
+
+    private static readonly XNamespace TrxNamespace = "http://microsoft.com/schemas/VisualStudio/TeamTest/2010";
+
+    // ---- Positive control ----------------------------------------------------------------------
+
+    [Fact]
+    public void AllPassed_WithExitZero_GivesThreePassingChecksAndNoFailure()
+    {
+        var summary = FacadeTestResults.Parse(AllPassedTrx(), 0);
+
+        Assert.Equal(new CheckResult(CheckNames.Routing, CheckOutcomes.Pass, 2, 2, null), summary.Routing);
+        Assert.Equal(
+            new CheckResult(CheckNames.Failure, CheckOutcomes.Pass, 2, 2, "unreachable 1/1 passed; timeout 1/1 passed"),
+            summary.Failure);
+        Assert.Equal(new CheckResult(CheckNames.ListenerIsolation, CheckOutcomes.Pass, 1, 1, null), summary.ListenerIsolation);
+        Assert.Empty(summary.Failures);
+        Assert.Equal(0, summary.ExitCode);
+    }
+
+    // ---- Completion evidence -------------------------------------------------------------------
+
+    [Fact]
+    public void AllPassed_WithoutExitStatus_GivesOneMissingItem()
+    {
+        var summary = FacadeTestResults.Parse(AllPassedTrx(), exitCode: null);
+
+        AssertAllPassedCounts(summary);
+        var item = AssertSingleTrxItem(summary);
+        Assert.Contains("no valid dotnet test exit status", item.Detail, StringComparison.Ordinal);
+        Assert.Null(summary.ExitCode);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(8)]
+    [InlineData(127)]
+    [InlineData(-1)]
+    public void AllPassed_WithNonzeroExit_GivesMissingItemNamingTheCode(int exitCode)
+    {
+        var summary = FacadeTestResults.Parse(AllPassedTrx(), exitCode);
+
+        AssertAllPassedCounts(summary);
+        var item = AssertSingleTrxItem(summary);
+        Assert.Contains($"dotnet test exited {exitCode}", item.Detail, StringComparison.Ordinal);
+        Assert.Equal(exitCode, summary.ExitCode);
+    }
+
+    [Theory]
+    [InlineData(0, "dotnet test exited 0, but the TRX records 1 failed result(s)")]
+    [InlineData(1, "dotnet test exited 1, so it did not complete normally")]
+    [InlineData(3, "dotnet test exited 3, so it did not complete normally")]
+    public void FailedResult_WithExitOtherThanTwo_GivesTestItemAndMissingItem(int exitCode, string expectedReason)
+    {
+        var summary = FacadeTestResults.Parse(OneFailedTrx(), OneFailedXunitXml(), exitCode);
+
+        Assert.Equal(new CheckResult(CheckNames.Routing, CheckOutcomes.Fail, 2, 1, null), summary.Routing);
+        Assert.Equal(2, summary.Failures.Count);
+        var test = Assert.Single(summary.Failures, item => item.ItemId.StartsWith("TEST:", StringComparison.Ordinal));
+        Assert.Equal(FailureItemIds.Test(RoutingClass, RoutingTestName(RestArguments)), test.ItemId);
+        Assert.StartsWith("failed:", test.Nature, StringComparison.Ordinal);
+        var trx = Assert.Single(summary.Failures, item => item.ItemId == FailureItemIds.FacadeTrx);
+        Assert.Equal(FailureItemIds.Missing, trx.Nature);
+        Assert.Contains(expectedReason, trx.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void FailedResult_WithExitTwo_GivesOnlyTheTestItem()
+    {
+        var summary = FacadeTestResults.Parse(OneFailedTrx(), OneFailedXunitXml(), 2);
+
+        var item = Assert.Single(summary.Failures);
+        Assert.Equal(FailureItemIds.Test(RoutingClass, RoutingTestName(RestArguments)), item.ItemId);
+        Assert.Equal(ExpectedNature(EqualExceptionType, "RoutingTests.cs", FacadeTrxAssertionLine, FacadeTrxAssertionMessage), item.Nature);
+        Assert.Equal("Assert.Equal() Failure: Values differ", item.Detail);
+        Assert.Equal(2, summary.ExitCode);
+    }
+
+    [Theory]
+    [InlineData(0, true)]
+    [InlineData(2, false)]
+    public void FailedResultOfUncountedClass_CountsTowardsCompletion(int exitCode, bool expectMissing)
+    {
+        TrxResult[] results = [.. AllPassedResults(), new TrxResult(OtherClass, "LoadsCatalogue", "Failed", Message: "boom", ExceptionType: TrueExceptionType)];
+
+        var summary = FacadeTestResults.Parse(Trx(results), XunitXml(results), exitCode);
+
+        AssertAllPassedCounts(summary);
+        Assert.Single(summary.Failures, item => item.ItemId == FailureItemIds.Test(OtherClass, $"{OtherClass}.LoadsCatalogue"));
+        Assert.Equal(expectMissing, summary.Failures.Any(item => item.ItemId == FailureItemIds.FacadeTrx));
+    }
+
+    [Fact]
+    public void NotRunResultOnly_WithExitTwo_GivesMissingItem()
+    {
+        var trx = Trx([.. AllPassedResults(), new TrxResult(RoutingClass, "Skipped", "NotExecuted")]);
+
+        var summary = FacadeTestResults.Parse(trx, 2);
+
+        var item = Assert.Single(summary.Failures, failure => failure.ItemId == FailureItemIds.FacadeTrx);
+        Assert.Contains("dotnet test exited 2 (at least one test failed), but the TRX records no failed result", item.Detail, StringComparison.Ordinal);
+        Assert.Single(summary.Failures, failure => failure.Nature == FailureItemIds.NotRun);
+    }
+
+    // ---- exit-code file ------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(null, "exit-code file absent: ")]
+    [InlineData("", "does not hold an integer: ''")]
+    [InlineData("  \n", "does not hold an integer: ''")]
+    [InlineData("abc", "does not hold an integer: 'abc'")]
+    [InlineData("0 1", "does not hold an integer: '0 1'")]
+    [InlineData("0\n1\n", "does not hold an integer: '0 1'")]
+    [InlineData(OverlongExitCode, OverlongExcerpt)]
+    public void Read_UnusableExitCodeFile_GivesMissingItemNamingTheProblem(string? exitCode, string expectedReason)
+    {
+        WriteTrx(AllPassedTrx());
+        if (exitCode is not null)
+        {
+            WriteExitCode(exitCode);
+        }
+
+        var summary = Read();
+
+        AssertAllPassedCounts(summary);
+        var item = AssertSingleTrxItem(summary);
+        Assert.Contains(expectedReason, item.Detail, StringComparison.Ordinal);
+        Assert.Contains(FacadeTestResults.ExitCodeFileName, item.Detail, StringComparison.Ordinal);
+        Assert.DoesNotContain("\n", item.Detail, StringComparison.Ordinal);
+        Assert.Null(summary.ExitCode);
+    }
+
+    [Fact]
+    public void Read_ExitCodeDirectory_GivesMissingItemNamingTheProblem()
+    {
+        WriteTrx(AllPassedTrx());
+        Directory.CreateDirectory(Temp.PathOf($"artifacts/facade-tests/{FacadeTestResults.ExitCodeFileName}"));
+
+        var summary = Read();
+
+        AssertAllPassedCounts(summary);
+        var item = AssertSingleTrxItem(summary);
+        Assert.Contains("exit-code file unreadable: ", item.Detail, StringComparison.Ordinal);
+        Assert.EndsWith("is a directory", item.Detail, StringComparison.Ordinal);
+        Assert.Null(summary.ExitCode);
+    }
+
+    [Theory]
+    [InlineData("0\n", false, 0)]
+    [InlineData(" 0 ", false, 0)]
+    [InlineData("2\r\n", true, 2)]
+    public void Read_ConsistentExitCodeFile_AddsNoTrxItem(string exitCode, bool withFailedResult, int expectedCode)
+    {
+        WriteTrx(withFailedResult ? OneFailedTrx() : AllPassedTrx());
+        if (withFailedResult)
+        {
+            WriteXunitXml(OneFailedXunitXml());
+        }
+
+        WriteExitCode(exitCode);
+
+        var summary = Read();
+
+        Assert.DoesNotContain(summary.Failures, item => item.ItemId == FailureItemIds.FacadeTrx);
+        Assert.Equal(withFailedResult ? 1 : 0, summary.Failures.Count);
+        Assert.Equal(expectedCode, summary.ExitCode);
+    }
+
+    // ---- Unusable TRX --------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("0", null)]
+    [InlineData("2", null)]
+    [InlineData("3", "dotnet test exited 3, so it did not complete normally")]
+    [InlineData(null, "exit-code file absent: ")]
+    public void Read_TrxAbsent_GivesOneMissingItemAndThreeNotRunChecks(string? exitCode, string? expectedCompletionReason)
+    {
+        if (exitCode is not null)
+        {
+            WriteExitCode(exitCode);
+        }
+
+        var summary = Read();
+
+        AssertThreeNotRunChecks(summary);
+        var item = AssertSingleTrxItem(summary);
+        var trxReason = $"TRX file absent: {Temp.PathOf($"artifacts/facade-tests/{FacadeTestResults.TrxFileName}")}";
+        if (expectedCompletionReason is null)
+        {
+            Assert.Equal(trxReason, item.Detail);
+        }
+        else
+        {
+            Assert.StartsWith(trxReason + "; ", item.Detail, StringComparison.Ordinal);
+            Assert.Contains(expectedCompletionReason, item.Detail, StringComparison.Ordinal);
+        }
+    }
+
+    [Theory]
+    [InlineData("<TestRun")]
+    [InlineData("")]
+    [InlineData("""<?xml version="1.0"?><!DOCTYPE TestRun [<!ENTITY x "y">]><TestRun xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010"><Results/></TestRun>""")]
+    [InlineData("""<TestResults xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010"><Results><UnitTestResult testName="Erewhon.Facade.Tests.RoutingTests.R" outcome="Passed"/></Results></TestResults>""")]
+    [InlineData("""<TestRun xmlns="urn:not-trx"><Results><UnitTestResult testName="Erewhon.Facade.Tests.RoutingTests.R" outcome="Passed"/></Results></TestRun>""")]
+    [InlineData("""<TestRun><Results><UnitTestResult testName="Erewhon.Facade.Tests.RoutingTests.R" outcome="Passed"/></Results></TestRun>""")]
+    public void UnusableTrx_GivesMissingItemAndThreeNotRunChecks(string trxXml)
+    {
+        var summary = FacadeTestResults.Parse(trxXml, 0);
+
+        AssertThreeNotRunChecks(summary);
+        var item = AssertSingleTrxItem(summary);
+        Assert.StartsWith("TRX file ", item.Detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Parse_NullTrx_Throws()
+    {
+        Assert.Throws<ArgumentNullException>("trxXml", () => FacadeTestResults.Parse(null!, 0));
+    }
+
+    // ---- Absent classes ------------------------------------------------------------------------
+
+    [Fact]
+    public void OneClassAbsent_GivesSingleMissingItemNamingTheClass()
+    {
+        var trx = Trx([.. AllPassedResults().Where(result => result.ClassName != ListenerClass)]);
+
+        var summary = FacadeTestResults.Parse(trx, 0);
+
+        Assert.Equal(CheckOutcomes.Pass, summary.Routing.Outcome);
+        Assert.Equal(CheckOutcomes.Pass, summary.Failure.Outcome);
+        Assert.Equal(new CheckResult(CheckNames.ListenerIsolation, CheckOutcomes.NotRun, 0, 0, null), summary.ListenerIsolation);
+        var item = AssertSingleTrxItem(summary);
+        Assert.Equal("TRX file holds no results for ListenerIsolationTests", item.Detail);
+    }
+
+    [Theory]
+    [InlineData(null, "no valid dotnet test exit status")]
+    [InlineData(3, "dotnet test exited 3")]
+    public void OneClassAbsent_WithBadExitStatus_GivesOneItemNamingBoth(int? exitCode, string expectedCompletionReason)
+    {
+        var trx = Trx([.. AllPassedResults().Where(result => result.ClassName != ListenerClass)]);
+
+        var summary = FacadeTestResults.Parse(trx, exitCode);
+
+        var item = AssertSingleTrxItem(summary);
+        Assert.StartsWith("TRX file holds no results for ListenerIsolationTests; ", item.Detail, StringComparison.Ordinal);
+        Assert.Contains(expectedCompletionReason, item.Detail, StringComparison.Ordinal);
+    }
+
+    // ---- Test items ----------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("NotExecuted")]
+    [InlineData("Inconclusive")]
+    [InlineData("Pending")]
+    public void NotRunOutcome_GivesNotRunTestItem(string outcome)
+    {
+        var trx = Trx([.. AllPassedResults(), new TrxResult(RoutingClass, "Skipped", outcome)]);
+
+        var summary = FacadeTestResults.Parse(trx, 0);
+
+        var item = Assert.Single(summary.Failures);
+        Assert.Equal(FailureItemIds.Test(RoutingClass, $"{RoutingClass}.Skipped"), item.ItemId);
+        Assert.Equal(FailureItemIds.NotRun, item.Nature);
+        Assert.Equal(new CheckResult(CheckNames.Routing, CheckOutcomes.Fail, 3, 2, null), summary.Routing);
+    }
+
+    [Theory]
+    [InlineData("Assert.Equal() Failure: Values differ", EqualExceptionType)]
+    [InlineData("Rest.getCompany: stub B received 0 requests, expected exactly 1", TrueExceptionType)]
+    [InlineData("System.Net.Http.HttpRequestException : Connection refused (127.0.0.1:1)", "System.Net.Http.HttpRequestException")]
+    public void FailedResult_NatureHashesExceptionTypeFileLineAndMessage(string message, string exceptionType)
+    {
+        TrxResult[] results =
+        [
+            .. AllPassedResults(),
+            new TrxResult(RoutingClass, "Fails", "Failed", null, message, StackTrace("/src/facade/tests", FacadeTrxAssertionLine), exceptionType),
+        ];
+
+        var item = Assert.Single(FacadeTestResults.Parse(Trx(results), XunitXml(results), 2).Failures);
+
+        Assert.Equal(ExpectedNature(exceptionType, "RoutingTests.cs", FacadeTrxAssertionLine, message), item.Nature);
+    }
+
+    [Theory]
+    [InlineData("/src/facade/tests")]
+    [InlineData("/home/u/repo/facade/tests")]
+    [InlineData(@"C:\r\facade\tests")]
+    public void FailureSignature_IgnoresThePathPrefix(string prefix)
+    {
+        var results = FailedResults(FacadeTrxAssertionMessage, StackTrace(prefix, FacadeTrxAssertionLine), EqualExceptionType);
+
+        var summary = FacadeTestResults.Parse(Trx(results), XunitXml(results), 2);
+
+        var item = Assert.Single(summary.Failures);
+        Assert.Equal(ExpectedNature(EqualExceptionType, "RoutingTests.cs", FacadeTrxAssertionLine, FacadeTrxAssertionMessage), item.Nature);
+    }
+
+    [Theory]
+    [InlineData(EqualExceptionType, FacadeTrxAssertionMessage, FacadeTrxAssertionLine + 1)]
+    [InlineData(EqualExceptionType, "Assert.Equal() Failure: Values differ\nExpected: 502\nActual:   504", FacadeTrxAssertionLine)]
+    [InlineData("System.InvalidOperationException", "System.InvalidOperationException : boom", FacadeTrxAssertionLine)]
+    [InlineData(TrueExceptionType, FacadeTrxAssertionMessage, FacadeTrxAssertionLine)]
+    public void FailureSignature_DiffersForAnotherExceptionTypeLineOrMessage(string exceptionType, string message, int line)
+    {
+        var referenceResults = FailedResults(FacadeTrxAssertionMessage, StackTrace("/src/facade/tests", FacadeTrxAssertionLine), EqualExceptionType);
+        var reference = Assert.Single(FacadeTestResults.Parse(Trx(referenceResults), XunitXml(referenceResults), 2).Failures);
+
+        var otherResults = FailedResults(message, StackTrace("/src/facade/tests", line), exceptionType);
+        var other = Assert.Single(FacadeTestResults.Parse(Trx(otherResults), XunitXml(otherResults), 2).Failures);
+
+        Assert.Equal(reference.ItemId, other.ItemId);
+        Assert.NotEqual(reference.Nature, other.Nature);
+    }
+
+    [Fact]
+    public void TwoTheoryInvocations_GiveTwoDistinctTestItems()
+    {
+        var stack = StackTrace("/src/facade/tests", FacadeTrxAssertionLine);
+        TrxResult[] results =
+        [
+            new(RoutingClass, RerouteMethod, "Failed", RestArguments, FacadeTrxAssertionMessage, stack, EqualExceptionType),
+            new(RoutingClass, RerouteMethod, "Failed", SoapArguments, FacadeTrxAssertionMessage, stack, EqualExceptionType),
+            new(FailureClass, "RestCallToUnreachableBackend_Returns502", "Passed"),
+            new(ListenerClass, "AdminPathsOnPublicListeners_ReachCatchAll", "Passed"),
+        ];
+
+        var summary = FacadeTestResults.Parse(Trx(results), XunitXml(results), 2);
+
+        string[] expectedIds =
+        [
+            FailureItemIds.Test(RoutingClass, RoutingTestName(RestArguments)),
+            FailureItemIds.Test(RoutingClass, RoutingTestName(SoapArguments)),
+        ];
+        Assert.Equal(expectedIds, summary.Failures.Select(item => item.ItemId));
+        Assert.Equal(summary.Failures[0].Nature, summary.Failures[1].Nature);
+        Assert.Equal(new CheckResult(CheckNames.Routing, CheckOutcomes.Fail, 2, 0, null), summary.Routing);
+    }
+
+    // ---- Exception types -----------------------------------------------------------------------
+
+    [Fact]
+    public void Read_TakesTheExceptionTypeFromTheXunitXmlFile()
+    {
+        WriteTrx(OneFailedTrx());
+        WriteXunitXml(OneFailedXunitXml());
+        WriteExitCode("2");
+
+        var summary = Read();
+
+        var item = Assert.Single(summary.Failures);
+        Assert.Equal(FailureItemIds.Test(RoutingClass, RoutingTestName(RestArguments)), item.ItemId);
+        Assert.Equal(ExpectedNature(EqualExceptionType, "RoutingTests.cs", FacadeTrxAssertionLine, FacadeTrxAssertionMessage), item.Nature);
+    }
+
+    [Theory]
+    [InlineData("absent", "xunit XML results absent: ")]
+    [InlineData("directory", "xunit XML results unreadable: ")]
+    [InlineData("unparseable", "xunit XML results unparseable: ")]
+    public void Read_UnusableXunitXmlFile_KeepsTestItemAndNamesTheProblem(string state, string expectedReason)
+    {
+        WriteTrx(OneFailedTrx());
+        WriteExitCode("2");
+        var xmlPath = Temp.PathOf($"artifacts/facade-tests/{FacadeTestResults.XunitXmlFileName}");
+        switch (state)
+        {
+            case "directory":
+                Directory.CreateDirectory(xmlPath);
+                break;
+            case "unparseable":
+                WriteXunitXml("<assemblies><assembly>");
+                break;
+        }
+
+        var summary = Read();
+
+        AssertUntypedFailure(summary, UntypedPrefix + expectedReason);
+        var trx = Assert.Single(summary.Failures, item => item.ItemId == FailureItemIds.FacadeTrx);
+        if (state != "unparseable")
+        {
+            Assert.Contains(xmlPath, trx.Detail, StringComparison.Ordinal);
+        }
+    }
+
+    [Theory]
+    [InlineData("none", "no xunit XML results were supplied")]
+    [InlineData("empty", "xunit XML results unparseable: ")]
+    [InlineData("truncated", "xunit XML results unparseable: ")]
+    [InlineData("dtd", "xunit XML results unparseable: ")]
+    [InlineData("other-root", NoMatchingFailure)]
+    [InlineData("other-test", NoMatchingFailure)]
+    [InlineData("other-class", NoMatchingFailure)]
+    [InlineData("no-exception-type", NoMatchingFailure)]
+    [InlineData("conflicting-types", NoMatchingFailure)]
+    public void FailedResult_WithoutRecordedExceptionType_KeepsTestItemAndNamesTheProblem(string xunitXml, string expectedReason)
+    {
+        var stack = StackTrace("/src/facade/tests", FacadeTrxAssertionLine);
+        var failed = FailedResults(FacadeTrxAssertionMessage, stack, EqualExceptionType)[0];
+        var xml = xunitXml switch
+        {
+            "none" => null,
+            "empty" => string.Empty,
+            "truncated" => "<assemblies",
+            "dtd" => """<?xml version="1.0"?><!DOCTYPE assemblies [<!ENTITY x "y">]><assemblies/>""",
+            "other-root" => XunitXml(failed).Replace("assemblies", "testsuites", StringComparison.Ordinal),
+            "other-test" => XunitXml(failed with { Arguments = SoapArguments }),
+            "other-class" => XunitXml(failed with { ClassName = FailureClass }),
+            "no-exception-type" => XunitXml(failed with { ExceptionType = null }),
+            "conflicting-types" => XunitXml(
+                failed with { Message = "Assert.Equal() Failure: Values differ\nExpected: 502\nActual:   503" },
+                failed with { ExceptionType = TrueExceptionType, Message = "Assert.True() Failure" }),
+            _ => throw new ArgumentOutOfRangeException(nameof(xunitXml), xunitXml, "unknown xunit XML case"),
+        };
+
+        var summary = FacadeTestResults.Parse(FailedTrx(FacadeTrxAssertionMessage, stack), xml, 2);
+
+        AssertUntypedFailure(summary, UntypedPrefix + expectedReason);
+        Assert.Equal(new CheckResult(CheckNames.Routing, CheckOutcomes.Fail, 2, 1, null), summary.Routing);
+    }
+
+    [Fact]
+    public void XunitXml_TwoFailuresForOneDisplayName_AreNarrowedByMessage()
+    {
+        var stack = StackTrace("/src/facade/tests", FacadeTrxAssertionLine);
+        var failed = FailedResults(FacadeTrxAssertionMessage, stack, EqualExceptionType)[0];
+        var xml = XunitXml(
+            failed with { ExceptionType = TrueExceptionType, Message = "Assert.True() Failure" },
+            failed with { Message = FacadeTrxAssertionMessage.Replace("\n", "\r\n", StringComparison.Ordinal) + "  " });
+
+        var item = Assert.Single(FacadeTestResults.Parse(FailedTrx(FacadeTrxAssertionMessage, stack), xml, 2).Failures);
+
+        Assert.Equal(ExpectedNature(EqualExceptionType, "RoutingTests.cs", FacadeTrxAssertionLine, FacadeTrxAssertionMessage), item.Nature);
+    }
+
+    // Each xunit form is what Xunit.Runner.Common.XmlUtility.Escape in xunit.v3 4.0.2 returns for the TRX
+    // form: escapeNewlines true for display names, false for messages. Two failures share the display
+    // name with different types, so the type resolves only when both the name and the message match.
+    [Theory]
+    [InlineData("(operationId: \"Rest.getCompany\")", "(operationId: \\\"Rest.getCompany\\\")", FacadeTrxAssertionMessage, FacadeTrxAssertionMessage)]
+    [InlineData(@"(path: ""C:\\dir"")", @"(path: \""C:\\\\dir\"")", "Expected: \"B\"\tActual: \"A\"", "Expected: \\\"B\\\"\\tActual: \\\"A\\\"")]
+    [InlineData(@"(value: ""tab\there"")", @"(value: \""tab\\there\"")", "line 1\r\nline 2 C:\\dir\t\"x\"", "line 1\r\nline 2 C:\\\\dir\\t\\\"x\\\"")]
+    public void XunitXml_EscapedNameAndMessage_MatchTheirTrxResult(string arguments, string xunitArguments, string message, string xunitMessage)
+    {
+        var stack = StackTrace("/src/facade/tests", FacadeTrxAssertionLine);
+        var failed = new TrxResult(RoutingClass, RerouteMethod, "Failed", arguments, message, stack, EqualExceptionType);
+        var xunitName = $"{RoutingClass}.{RerouteMethod}{xunitArguments}";
+        var xml = XunitXmlOf(
+        [
+            new XunitTest(failed with { ExceptionType = TrueExceptionType }, xunitName, "Assert.True() Failure"),
+            new XunitTest(failed, xunitName, xunitMessage),
+        ]);
+
+        var summary = FacadeTestResults.Parse(Trx([failed, .. AllPassedResults().Skip(2)]), xml, 2);
+
+        var item = Assert.Single(summary.Failures);
+        Assert.Equal(FailureItemIds.Test(RoutingClass, $"{RoutingClass}.{RerouteMethod}{arguments}"), item.ItemId);
+        Assert.Equal(
+            ExpectedNature(EqualExceptionType, "RoutingTests.cs", FacadeTrxAssertionLine, message.Replace("\r\n", "\n", StringComparison.Ordinal)),
+            item.Nature);
+    }
+
+    // Without xunit XML the type is the one xunit writes ahead of a non-assertion exception's message,
+    // as "Type : message"; an assertion message that merely starts with a dotted name and a colon names none.
+    [Theory]
+    [InlineData("System.InvalidOperationException : boom", "System.InvalidOperationException")]
+    [InlineData("System.Net.Http.HttpRequestException : Connection refused (127.0.0.1:1)", "System.Net.Http.HttpRequestException")]
+    [InlineData("Erewhon.Facade.Tests.Support.StubBackend+StubFailure : stopped", "Erewhon.Facade.Tests.Support.StubBackend+StubFailure")]
+    [InlineData("System.OperationCanceledException :", "System.OperationCanceledException")]
+    [InlineData("Rest.getCompany: stub B received 0 requests, expected exactly 1", "")]
+    [InlineData("Assert.Equal() Failure: Values differ", "")]
+    public void FailedResult_WithoutXunitXml_TakesTheTypeXunitPrefixedToTheMessage(string message, string expectedExceptionType)
+    {
+        var summary = FacadeTestResults.Parse(FailedTrx(message, StackTrace("/src/facade/tests", FacadeTrxAssertionLine)), xunitXml: null, 2);
+
+        var test = Assert.Single(summary.Failures, item => item.ItemId.StartsWith("TEST:", StringComparison.Ordinal));
+        Assert.Equal(ExpectedNature(expectedExceptionType, "RoutingTests.cs", FacadeTrxAssertionLine, message), test.Nature);
+        Assert.Equal(expectedExceptionType.Length == 0, summary.Failures.Any(item => item.ItemId == FailureItemIds.FacadeTrx));
+    }
+
+    // No failed result needs a type, so unusable xunit XML is no problem; the null case is the positive control.
+    [Theory]
+    [InlineData("")]
+    [InlineData("<assemblies")]
+    [InlineData("<assemblies/>")]
+    public void AllPassed_WithUnusableXunitXml_AddsNoItem(string xunitXml)
+    {
+        var summary = FacadeTestResults.Parse(AllPassedTrx(), xunitXml, 0);
+
+        AssertAllPassedCounts(summary);
+        Assert.Empty(summary.Failures);
+    }
+
+    [Fact]
+    public void EveryTrxProblem_IsListedInItsFixedOrder()
+    {
+        var results = FailedResults(FacadeTrxAssertionMessage, StackTrace("/src/facade/tests", FacadeTrxAssertionLine), EqualExceptionType)
+            .Where(result => result.ClassName != ListenerClass)
+            .ToArray();
+
+        var summary = FacadeTestResults.Parse(Trx(results), xunitXml: null, 3);
+
+        var item = Assert.Single(summary.Failures, failure => failure.ItemId == FailureItemIds.FacadeTrx);
+        Assert.Equal(
+            "TRX file holds no results for ListenerIsolationTests; "
+                + UntypedPrefix + "no xunit XML results were supplied; "
+                + "dotnet test exited 3, so it did not complete normally and its results are unverified",
+            item.Detail);
+    }
+
+
+    // ---- Helpers -------------------------------------------------------------------------------
+
+    private FacadeTestSummary Read() => new FacadeTestResults(new HarnessOptions { RepoRoot = Temp.Root }).Read();
+
+    private void WriteTrx(string trxXml) =>
+        Temp.Write($"artifacts/facade-tests/{FacadeTestResults.TrxFileName}", trxXml);
+
+    private void WriteExitCode(string content) =>
+        Temp.Write($"artifacts/facade-tests/{FacadeTestResults.ExitCodeFileName}", content);
+
+    private void WriteXunitXml(string xunitXml) =>
+        Temp.Write($"artifacts/facade-tests/{FacadeTestResults.XunitXmlFileName}", xunitXml);
+
+    private static void AssertAllPassedCounts(FacadeTestSummary summary)
+    {
+        Assert.Equal(new CheckResult(CheckNames.Routing, CheckOutcomes.Pass, 2, 2, null), summary.Routing);
+        Assert.Equal(CheckOutcomes.Pass, summary.Failure.Outcome);
+        Assert.Equal(2, summary.Failure.Passed);
+        Assert.Equal(new CheckResult(CheckNames.ListenerIsolation, CheckOutcomes.Pass, 1, 1, null), summary.ListenerIsolation);
+    }
+
+    private static void AssertThreeNotRunChecks(FacadeTestSummary summary)
+    {
+        Assert.Equal(new CheckResult(CheckNames.Routing, CheckOutcomes.NotRun, 0, 0, null), summary.Routing);
+        Assert.Equal(new CheckResult(CheckNames.Failure, CheckOutcomes.NotRun, 0, 0, null), summary.Failure);
+        Assert.Equal(new CheckResult(CheckNames.ListenerIsolation, CheckOutcomes.NotRun, 0, 0, null), summary.ListenerIsolation);
+    }
+
+    private static FailureItem AssertSingleTrxItem(FacadeTestSummary summary)
+    {
+        var item = Assert.Single(summary.Failures);
+        Assert.Equal(FailureItemIds.FacadeTrx, item.ItemId);
+        Assert.Equal(FailureItemIds.Missing, item.Nature);
+        Assert.False(string.IsNullOrWhiteSpace(item.Detail));
+        return item;
+    }
+
+    // The failed REST routing invocation keeps its TEST item, with an empty exception-type slot, and the
+    // CHK-FACADE-TRX item, the only other item, says why the type is not recorded.
+    private static void AssertUntypedFailure(FacadeTestSummary summary, string expectedDetailStart)
+    {
+        Assert.Equal(2, summary.Failures.Count);
+        var test = Assert.Single(summary.Failures, item => item.ItemId == FailureItemIds.Test(RoutingClass, RoutingTestName(RestArguments)));
+        Assert.Equal(ExpectedNature(string.Empty, "RoutingTests.cs", FacadeTrxAssertionLine, FacadeTrxAssertionMessage), test.Nature);
+        var trx = Assert.Single(summary.Failures, item => item.ItemId == FailureItemIds.FacadeTrx);
+        Assert.Equal(FailureItemIds.Missing, trx.Nature);
+        Assert.StartsWith(expectedDetailStart, trx.Detail, StringComparison.Ordinal);
+    }
+
+    // The signature as the identity table defines it, computed independently of the parser.
+    private static string ExpectedNature(string exceptionType, string file, int line, string message) =>
+        FailureItemIds.Failed(DiscrepancySignature.Hash16($"{exceptionType}\n{file}:{line}\n{message}"));
+
+    private static string RoutingTestName(string arguments) => $"{RoutingClass}.{RerouteMethod}{arguments}";
+
+    private static string StackTrace(string prefix, int line)
+    {
+        var separator = prefix.Contains('\\', StringComparison.Ordinal) ? '\\' : '/';
+        var file = prefix + separator + FacadeTestsRelativePath.Replace('/', separator);
+        return $"   at {RoutingClass}.{RerouteMethod}(String operationId) in {file}:line {line}\n"
+            + "   at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)";
+    }
+
+    private static TrxResult[] AllPassedResults() =>
+    [
+        new(RoutingClass, RerouteMethod, "Passed", RestArguments),
+        new(RoutingClass, RerouteMethod, "Passed", SoapArguments),
+        new(FailureClass, "RestCallToUnreachableBackend_Returns502", "Passed"),
+        new(FailureClass, "SoapCallToSlowBackend_FaultsAfterDeadline", "Passed"),
+        new(ListenerClass, "AdminPathsOnPublicListeners_ReachCatchAll", "Passed"),
+    ];
+
+    private static string AllPassedTrx() => Trx(AllPassedResults());
+
+    // The REST routing invocation fails an Assert.Equal; everything else passes.
+    private static string OneFailedTrx() => FailedTrx(FacadeTrxAssertionMessage, StackTrace("/src/facade/tests", FacadeTrxAssertionLine));
+
+    private static string OneFailedXunitXml() =>
+        XunitXml(FailedResults(FacadeTrxAssertionMessage, StackTrace("/src/facade/tests", FacadeTrxAssertionLine), EqualExceptionType));
+
+    private static string FailedTrx(string message, string stackTrace) =>
+        Trx(FailedResults(message, stackTrace, exceptionType: null));
+
+    // The REST routing invocation fails with the given message, stack trace and exception type, the
+    // last recorded only in the xunit XML; everything else passes.
+    private static TrxResult[] FailedResults(string message, string stackTrace, string? exceptionType)
+    {
+        var results = AllPassedResults();
+        results[0] = results[0] with { Outcome = "Failed", Message = message, StackTrace = stackTrace, ExceptionType = exceptionType };
+        return results;
+    }
+
+    // The shape xunit.v3 4.0.2 writes with --report-xunit-trx: results carry the fully qualified display
+    // name and a test id, and the definitions carry the class and method names.
+    private static string Trx(params TrxResult[] results)
+    {
+        var resultElements = new List<XElement>(results.Length);
+        var definitions = new List<XElement>(results.Length);
+        for (var i = 0; i < results.Length; i++)
+        {
+            var test = results[i];
+            var id = $"00000000-0000-0000-0000-{i + 1:D12}";
+            var testName = $"{test.ClassName}.{test.MethodName}{test.Arguments}";
+
+            var result = new XElement(
+                TrxNamespace + "UnitTestResult",
+                new XAttribute("testName", testName),
+                new XAttribute("outcome", test.Outcome),
+                new XAttribute("testId", id),
+                new XAttribute("executionId", id),
+                new XAttribute("testListId", "8c84fa94-04c1-424b-9868-57a2d4851a1d"));
+            if (test.Message is not null || test.StackTrace is not null)
+            {
+                result.Add(new XElement(
+                    TrxNamespace + "Output",
+                    new XElement(
+                        TrxNamespace + "ErrorInfo",
+                        new XElement(TrxNamespace + "Message", test.Message ?? string.Empty),
+                        new XElement(TrxNamespace + "StackTrace", test.StackTrace ?? string.Empty))));
+            }
+
+            resultElements.Add(result);
+            definitions.Add(new XElement(
+                TrxNamespace + "UnitTest",
+                new XAttribute("name", testName),
+                new XAttribute("id", id),
+                new XElement(TrxNamespace + "Execution", new XAttribute("id", id)),
+                new XElement(
+                    TrxNamespace + "TestMethod",
+                    new XAttribute("className", test.ClassName),
+                    new XAttribute("name", test.MethodName),
+                    new XAttribute("adapterTypeName", "executor://xunit.v3/4.0.2"))));
+        }
+
+        var run = new XElement(
+            TrxNamespace + "TestRun",
+            new XAttribute("id", "c28ea7a4-9a87-491f-b0ea-7e7fa6538bd3"),
+            new XAttribute("name", "harness-tests"),
+            new XElement(TrxNamespace + "Results", resultElements),
+            new XElement(TrxNamespace + "TestDefinitions", definitions),
+            new XElement(
+                TrxNamespace + "ResultSummary",
+                new XAttribute("outcome", results.Any(test => test.Outcome == "Failed") ? "Failed" : "Completed")));
+        return new XDocument(new XDeclaration("1.0", "utf-8", null), run).ToString();
+    }
+
+    // The xunit XML of the same run as Trx(results). xunit escapes the display name and message it writes
+    // there; the fixtures' names and messages hold no control character, so only its backslash and
+    // double-quote escapes apply. The full escaping is covered by literal values in its own theory.
+    private static string XunitXml(params TrxResult[] results) =>
+        XunitXmlOf([.. results.Select(result => new XunitTest(
+            result,
+            EscapeQuotes($"{result.ClassName}.{result.MethodName}{result.Arguments}"),
+            result.Message is null ? null : EscapeQuotes(result.Message)))]);
+
+    private static string EscapeQuotes(string value) =>
+        value.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal);
+
+    // The shape xunit.v3 4.0.2 writes with --report-xunit-xml in the same run: an assemblies root, one
+    // collection per test class, and test elements carrying the class name and the escaped display name
+    // but ids of their own; a failed test holds a failure with its exception type, escaped message and
+    // stack trace.
+    private static string XunitXmlOf(IReadOnlyList<XunitTest> tests)
+    {
+        var collections = new List<XElement>();
+        var testNumber = 0;
+        foreach (var group in tests.GroupBy(test => test.Result.ClassName, StringComparer.Ordinal))
+        {
+            var elements = new List<XElement>();
+            foreach (var (test, name, message) in group)
+            {
+                testNumber++;
+                var element = new XElement(
+                    "test",
+                    new XAttribute("id", $"10000000-0000-0000-0000-{testNumber:D12}"),
+                    new XAttribute("name", name),
+                    new XAttribute("result", XunitResult(test.Outcome)),
+                    new XAttribute("time", "0"),
+                    new XAttribute("type", test.ClassName),
+                    new XAttribute("method", test.MethodName));
+                if (test.Outcome == "Failed")
+                {
+                    var failure = new XElement("failure");
+                    if (test.ExceptionType is not null)
+                    {
+                        failure.Add(new XAttribute("exception-type", test.ExceptionType));
+                    }
+
+                    failure.Add(
+                        new XElement("message", message ?? string.Empty),
+                        new XElement("stack-trace", test.StackTrace ?? string.Empty));
+                    element.Add(failure);
+                }
+
+                elements.Add(element);
+            }
+
+            collections.Add(new XElement(
+                "collection",
+                new XAttribute("name", $"Test collection for {group.Key}"),
+                new XAttribute("id", $"20000000-0000-0000-0000-{collections.Count + 1:D12}"),
+                new XAttribute("total", elements.Count),
+                new XAttribute("failed", group.Count(test => test.Result.Outcome == "Failed")),
+                elements));
+        }
+
+        var assemblies = new XElement(
+            "assemblies",
+            new XAttribute("schema-version", "3"),
+            new XElement(
+                "assembly",
+                new XAttribute("name", "/src/facade/tests/Erewhon.Facade.Tests/bin/Release/net10.0/Erewhon.Facade.Tests.dll"),
+                new XAttribute("test-framework", "xUnit.net v3 4.0.2"),
+                new XAttribute("total", tests.Count),
+                new XAttribute("failed", tests.Count(test => test.Result.Outcome == "Failed")),
+                collections));
+        return assemblies.ToString(SaveOptions.DisableFormatting);
+    }
+
+    private static string XunitResult(string outcome) => outcome switch
+    {
+        "Passed" => "Pass",
+        "Failed" => "Fail",
+        _ => "NotRun",
+    };
+
+    // One xunit XML test element: the result it records, and its display name and message as written.
+    private sealed record XunitTest(TrxResult Result, string Name, string? Message);
+
+    // ExceptionType is written only to the xunit XML, as xunit.v3 records it; the TRX carries none.
+    private sealed record TrxResult(
+        string ClassName,
+        string MethodName,
+        string Outcome,
+        string? Arguments = null,
+        string? Message = null,
+        string? StackTrace = null,
+        string? ExceptionType = null);
+}
+
+// ---- The JADE-unchanged check -------------------------------------------------------------------
+// The JADE-unchanged check: no difference and no working-tree change under Erewhon/ since the
+// starting commit. Scripted git runners drive every git outcome, so missing, failing and
+// unattributable git evidence is shown to give not-run rather than a pass; throwaway repositories in
+// a temporary directory confirm the same verdicts against real git. The harness's own repository is
+// never touched. These members live in this class because the harness test project keeps its fixed
+// set of test classes, and the CHK-JADE-UNCHANGED items the check produces are failure identities
+// this class covers.
+public sealed partial class KnownLimitationsRegisterTests
+{
+    // StartingCommit is the starting commit the results report fixtures above declare.
+    private const string ModifiedBlob = "1111111111111111111111111111111111111111";
+    private const string AddedBlob = "2222222222222222222222222222222222222222";
+    private const string Sha256Blob = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    // A symbolic link's text, and the ids real git stores for a link with that text (mode 120000, read
+    // back with ls-files --stage after staging it) in a SHA-1 and a SHA-256 repository.
+    private const string LinkText = "target.txt";
+    private const string LinkSha1Blob = "4cbb553f3f4ac2ee7b01ff6c951d6bf583c39c15";
+    private const string LinkSha256Blob = "8edaa00b6a3bb3f93168959cad1a6e971a6a448c06e146992be90e1259517afd";
+
+    // ---- Inputs that stop the check before git runs ---------------------------------------------
+
+    [Fact]
+    public async Task JadeUnchanged_NoGitMetadata_IsNotRunWithoutCallingGit()
+    {
+        var git = new ScriptedGit(_ => ScriptedGit.Ok());
+
+        var result = await ScriptedJadeUnchangedCheck(git).RunAsync(TestContext.Current.CancellationToken);
+
+        AssertJadeUnchangedNotRun(result, "no .git metadata at ");
+        Assert.Empty(git.Calls);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("-x")]
+    [InlineData("--output=x")]
+    public async Task UnusableStartingCommit_IsNotRunWithoutCallingGit(string startingCommit)
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var git = new ScriptedGit(_ => ScriptedGit.Ok());
+
+        var result = await ScriptedJadeUnchangedCheck(git, startingCommit).RunAsync(TestContext.Current.CancellationToken);
+
+        AssertJadeUnchangedNotRun(result, "is not a commit id");
+        Assert.Empty(git.Calls);
+    }
+
+    // ---- git failures --------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("diff", "exited", 128, "fatal: bad revision '19a5189e'", "exited 128: fatal: bad revision '19a5189e'")]
+    [InlineData("diff", "unavailable", -1, "", "could not start")]
+    [InlineData("status", "timed-out", -1, "", "timed out")]
+    [InlineData("status", "exited", 129, "", "exited 129")]
+    [InlineData("ls-tree", "exited", 128, "fatal: not a tree object", "exited 128: fatal: not a tree object")]
+    public async Task JadeUnchanged_FailingGitCommand_IsNotRun(string command, string failureKind, int exitCode, string stderr, string expectedReason)
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var git = new ScriptedGit(args => args[0] == command
+            ? ScriptedGit.Failure(failureKind, exitCode, stderr)
+            : ScriptedGit.Ok());
+
+        var result = await ScriptedJadeUnchangedCheck(git).RunAsync(TestContext.Current.CancellationToken);
+
+        var detail = AssertJadeUnchangedNotRun(result, $"git {command} ");
+        Assert.Contains(expectedReason, detail, StringComparison.Ordinal);
+        Assert.Equal(command, git.Calls[^1].Args[0]);
+    }
+
+    [Theory]
+    [InlineData("M\0", "")]
+    [InlineData("\0\0", "")]
+    [InlineData("", "??\0")]
+    [InlineData("", "garbage")]
+    public async Task OutputNamingNoPath_IsNotRun(string diffOutput, string statusOutput)
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var git = new ScriptedGit(args => args[0] switch
+        {
+            "diff" => ScriptedGit.Ok(diffOutput),
+            "status" => ScriptedGit.Ok(statusOutput),
+            _ => ScriptedGit.Ok("Erewhon/a.scm\0"),
+        });
+
+        var result = await ScriptedJadeUnchangedCheck(git).RunAsync(TestContext.Current.CancellationToken);
+
+        AssertJadeUnchangedNotRun(result, "that name no path");
+    }
+
+    // ---- Verdicts from git output --------------------------------------------------------------
+
+    [Fact]
+    public async Task EmptyOutputs_PassWithTrackedPathCounts()
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var git = new ScriptedGit(args => args[0] == "ls-tree"
+            ? ScriptedGit.Ok("Erewhon/a.scm\0Erewhon/DataFiles/b.txt\0")
+            : ScriptedGit.Ok());
+
+        var result = await ScriptedJadeUnchangedCheck(git).RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(
+            new CheckResult(CheckNames.JadeUnchanged, CheckOutcomes.Pass, 2, 2, $"no change under Erewhon/ since starting commit {StartingCommit}"),
+            result.Result);
+        Assert.Empty(result.Failures);
+        Assert.Equal(new JadeUnchangedSummary(2, 0), result.Summary);
+    }
+
+    [Fact]
+    public async Task Changes_GiveOneSortedItemPerPathWithBlobIds()
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var git = new ScriptedGit(args => args[0] switch
+        {
+            "diff" => ScriptedGit.Ok("M\0Erewhon/b.scm\0D\0Erewhon/a.ddx\0"),
+            "status" => ScriptedGit.Ok(" M Erewhon/b.scm\0 D Erewhon/a.ddx\0?? Erewhon/c.txt\0"),
+            "ls-tree" => ScriptedGit.Ok("Erewhon/a.ddx\0Erewhon/b.scm\0Erewhon/z.mul\0"),
+            "hash-object" => ScriptedGit.Ok((args[^1] == "Erewhon/b.scm" ? ModifiedBlob : AddedBlob) + "\n"),
+            _ => ScriptedGit.Exited(1, "unexpected git command"),
+        });
+
+        var result = await ScriptedJadeUnchangedCheck(git).RunAsync(TestContext.Current.CancellationToken);
+
+        FailureItem[] expected =
+        [
+            new(FailureItemIds.JadeUnchangedPath("Erewhon/a.ddx"), FailureItemIds.Deleted),
+            new(FailureItemIds.JadeUnchangedPath("Erewhon/b.scm"), FailureItemIds.Modified(ModifiedBlob)),
+            new(FailureItemIds.JadeUnchangedPath("Erewhon/c.txt"), FailureItemIds.Added(AddedBlob)),
+        ];
+        Assert.Equal(expected, result.Failures);
+        Assert.Equal(
+            new CheckResult(CheckNames.JadeUnchanged, CheckOutcomes.Fail, 3, 1, $"3 path(s) under Erewhon/ changed since starting commit {StartingCommit}"),
+            result.Result);
+        Assert.Equal(new JadeUnchangedSummary(3, 3), result.Summary);
+
+        // A deleted path has no content to hash; the other two are hashed once each.
+        string[] hashedPaths = ["Erewhon/b.scm", "Erewhon/c.txt"];
+        Assert.Equal(hashedPaths, git.Calls.Where(call => call.Args[0] == "hash-object").Select(call => call.Args[^1]));
+    }
+
+    [Theory]
+    [InlineData("modified", "unavailable", -1, "", "could not start")]
+    [InlineData("modified", "timed-out", -1, "", "timed out")]
+    [InlineData("modified", "exited", 128, "fatal: Unable to hash Erewhon/b.scm", "exited 128: fatal: Unable to hash Erewhon/b.scm")]
+    [InlineData("added", "unavailable", -1, "", "could not start")]
+    [InlineData("added", "timed-out", -1, "", "timed out")]
+    [InlineData("added", "exited", 128, "fatal: Unable to hash Erewhon/c.txt", "exited 128: fatal: Unable to hash Erewhon/c.txt")]
+    public async Task FailingHashObject_IsNotRun(string change, string failureKind, int exitCode, string stderr, string expectedReason)
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var git = OneChange(change, ScriptedGit.Failure(failureKind, exitCode, stderr));
+
+        var result = await ScriptedJadeUnchangedCheck(git).RunAsync(TestContext.Current.CancellationToken);
+
+        var path = ChangedPath(change);
+        var detail = AssertJadeUnchangedNotRun(result, $"git hash-object -- {path} ");
+        Assert.Contains(expectedReason, detail, StringComparison.Ordinal);
+        string[] hashArgs = ["hash-object", "--", path];
+        Assert.Equal(hashArgs, git.Calls[^1].Args);
+    }
+
+    [Theory]
+    [InlineData("modified", "", "")]
+    [InlineData("modified", "\n", "")]
+    [InlineData("modified", "1111111111111111111111111111111111111111\n2222222222222222222222222222222222222222\n", "1111111111111111111111111111111111111111 2222222222222222222222222222222222222222")]
+    [InlineData("modified", "ABCDEF0123456789ABCDEF0123456789ABCDEF01\n", "ABCDEF0123456789ABCDEF0123456789ABCDEF01")]
+    [InlineData("modified", "111111111111111111111111111111111111111\n", "111111111111111111111111111111111111111")]
+    [InlineData("modified", "11111111111111111111111111111111111111111\n", "11111111111111111111111111111111111111111")]
+    [InlineData("modified", "gggggggggggggggggggggggggggggggggggggggg\n", "gggggggggggggggggggggggggggggggggggggggg")]
+    [InlineData("added", "", "")]
+    [InlineData("added", "1111111111111111111111111111111111111111\n2222222222222222222222222222222222222222\n", "1111111111111111111111111111111111111111 2222222222222222222222222222222222222222")]
+    public async Task HashObjectOutputThatIsNoObjectId_IsNotRun(string change, string stdout, string printed)
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var git = OneChange(change, ScriptedGit.Ok(stdout));
+
+        var result = await ScriptedJadeUnchangedCheck(git).RunAsync(TestContext.Current.CancellationToken);
+
+        var path = ChangedPath(change);
+        var detail = AssertJadeUnchangedNotRun(result, "which is not an object id");
+        Assert.Equal($"git hash-object -- {path} printed '{printed}', which is not an object id", detail);
+        string[] hashArgs = ["hash-object", "--", path];
+        Assert.Equal(hashArgs, git.Calls[^1].Args);
+    }
+
+    [Theory]
+    [InlineData("modified")]
+    [InlineData("added")]
+    public async Task Sha256HashObjectAnswer_GivesItsBlobId(string change)
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var git = OneChange(change, ScriptedGit.Ok(Sha256Blob + "\n"));
+
+        var result = await ScriptedJadeUnchangedCheck(git).RunAsync(TestContext.Current.CancellationToken);
+
+        var nature = change == "added" ? FailureItemIds.Added(Sha256Blob) : FailureItemIds.Modified(Sha256Blob);
+        Assert.Equal(new FailureItem(FailureItemIds.JadeUnchangedPath(ChangedPath(change)), nature), Assert.Single(result.Failures));
+        Assert.Equal(CheckOutcomes.Fail, result.Result.Outcome);
+        Assert.Equal(new JadeUnchangedSummary(1, 1), result.Summary);
+    }
+
+    // ---- Symbolic links ------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("modified", "sha1\n", LinkSha1Blob)]
+    [InlineData("added", "sha1\n", LinkSha1Blob)]
+    [InlineData("modified", "sha256\n", LinkSha256Blob)]
+    [InlineData("added", "sha256\n", LinkSha256Blob)]
+    public async Task SymbolicLink_IsHashedFromItsLinkTextInTheRepositoryObjectFormat(string change, string objectFormat, string expectedBlob)
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        CreateSymbolicLink(ChangedPath(change), LinkText);
+        var git = OneChange(change, ScriptedGit.Exited(1, "hash-object would follow the link"), ScriptedGit.Ok(objectFormat));
+
+        var result = await ScriptedJadeUnchangedCheck(git).RunAsync(TestContext.Current.CancellationToken);
+
+        var nature = change == "added" ? FailureItemIds.Added(expectedBlob) : FailureItemIds.Modified(expectedBlob);
+        Assert.Equal(new FailureItem(FailureItemIds.JadeUnchangedPath(ChangedPath(change)), nature), Assert.Single(result.Failures));
+        Assert.Equal(CheckOutcomes.Fail, result.Result.Outcome);
+        Assert.Equal(new JadeUnchangedSummary(1, 1), result.Summary);
+
+        // diff, status and ls-tree, then the object format lookup; hash-object never runs for a link.
+        Assert.Equal(4, git.Calls.Count);
+        string[] formatArgs = ["rev-parse", "--show-object-format"];
+        Assert.Equal(formatArgs, git.Calls[^1].Args);
+        Assert.Equal(Temp.Root, git.Calls[^1].RepoRoot);
+        Assert.Equal(Git.DefaultTimeout, git.Calls[^1].Timeout);
+    }
+
+    [Theory]
+    [InlineData("unavailable", -1, "", "could not start")]
+    [InlineData("timed-out", -1, "", "timed out")]
+    [InlineData("exited", 128, "fatal: not a git repository: .git", "exited 128: fatal: not a git repository: .git")]
+    [InlineData("exited", 129, "", "exited 129")]
+    public async Task FailingObjectFormatLookup_IsNotRun(string failureKind, int exitCode, string stderr, string expectedReason)
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        CreateSymbolicLink(ChangedPath("added"), LinkText);
+        var git = OneChange("added", ScriptedGit.Ok(AddedBlob + "\n"), ScriptedGit.Failure(failureKind, exitCode, stderr));
+
+        var result = await ScriptedJadeUnchangedCheck(git).RunAsync(TestContext.Current.CancellationToken);
+
+        var detail = AssertJadeUnchangedNotRun(result, "git rev-parse --show-object-format ");
+        Assert.Contains(expectedReason, detail, StringComparison.Ordinal);
+        Assert.DoesNotContain(git.Calls, call => call.Args[0] == "hash-object");
+    }
+
+    [Theory]
+    [InlineData("", "")]
+    [InlineData("\n", "")]
+    [InlineData("SHA1\n", "SHA1")]
+    [InlineData("md5\n", "md5")]
+    [InlineData("sha1\nsha256\n", "sha1 sha256")]
+    public async Task ObjectFormatOutputThatIsNoKnownFormat_IsNotRun(string stdout, string printed)
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        CreateSymbolicLink(ChangedPath("added"), LinkText);
+        var git = OneChange("added", ScriptedGit.Ok(AddedBlob + "\n"), ScriptedGit.Ok(stdout));
+
+        var result = await ScriptedJadeUnchangedCheck(git).RunAsync(TestContext.Current.CancellationToken);
+
+        var detail = AssertJadeUnchangedNotRun(result, "which is not an object format");
+        Assert.Equal($"git rev-parse --show-object-format printed '{printed}', which is not an object format", detail);
+        Assert.DoesNotContain(git.Calls, call => call.Args[0] == "hash-object");
+    }
+
+    [Fact]
+    public async Task SymbolicLinkTextHoldingAReplacementCharacter_IsNotRunWithoutHashing()
+    {
+        // The runtime decodes link text bytes that are not valid UTF-8 as U+FFFD, so their bytes, and
+        // the blob git stores, can no longer be recovered from the text.
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        CreateSymbolicLink(ChangedPath("added"), "caf\uFFFD.scm");
+        var git = OneChange("added", ScriptedGit.Ok(AddedBlob + "\n"), ScriptedGit.Ok("sha1\n"));
+
+        var result = await ScriptedJadeUnchangedCheck(git).RunAsync(TestContext.Current.CancellationToken);
+
+        AssertJadeUnchangedNotRun(result, "symbolic link Erewhon/c.txt has link text 'caf\uFFFD.scm' that may not be valid UTF-8");
+        Assert.Equal(3, git.Calls.Count);
+    }
+
+    [Fact]
+    public async Task GitArguments_CarryTheStartingCommitAndTheJadePathspec()
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var git = new ScriptedGit(_ => ScriptedGit.Ok());
+
+        await ScriptedJadeUnchangedCheck(git, $"  {StartingCommit} ").RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(3, git.Calls.Count);
+        Assert.All(git.Calls, call => Assert.Equal(Temp.Root, call.RepoRoot));
+        Assert.All(git.Calls, call => Assert.Equal(Git.DefaultTimeout, call.Timeout));
+        string[] diffArgs = ["diff", "--name-status", "--no-renames", "-z", StartingCommit, "--", "Erewhon/"];
+        string[] statusArgs = ["status", "--porcelain", "--no-renames", "--untracked-files=all", "-z", "--", "Erewhon/"];
+        string[] treeArgs = ["ls-tree", "-r", "--name-only", "-z", StartingCommit, "--", "Erewhon/"];
+        Assert.Equal(diffArgs, git.Calls[0].Args);
+        Assert.Equal(statusArgs, git.Calls[1].Args);
+        Assert.Equal(treeArgs, git.Calls[2].Args);
+    }
+
+    [Fact]
+    public void JadeUnchanged_NullGitRunner_Throws()
+    {
+        Assert.Throws<ArgumentNullException>("git", () => new JadeUnchangedCheck(new HarnessOptions { RepoRoot = Temp.Root }, null!));
+    }
+
+    // ---- Real git ------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task RealGit_UnchangedTree_Passes()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var commit = await JadeRepositoryAsync(ct);
+
+        // A change outside Erewhon/ is not the check's concern.
+        Temp.Write("facade/Program.cs", "class Program {}\n");
+        Temp.Write("README.md", "changed\n");
+
+        var result = await new JadeUnchangedCheck(new HarnessOptions { RepoRoot = Temp.Root, StartingCommit = commit }).RunAsync(ct);
+
+        Assert.Equal(CheckOutcomes.Pass, result.Result.Outcome);
+        Assert.Equal(3, result.Result.Cases);
+        Assert.Equal(3, result.Result.Passed);
+        Assert.Empty(result.Failures);
+        Assert.Equal(new JadeUnchangedSummary(3, 0), result.Summary);
+    }
+
+    [Fact]
+    public async Task RealGit_ModifiedDeletedAndUntrackedPaths_GiveTheirNatures()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var commit = await JadeRepositoryAsync(ct);
+        Temp.Write("Erewhon/ErewhonModelSchema.scm", "schema changed\n");
+        File.Delete(Temp.PathOf("Erewhon/ErewhonDemoSystem.mul"));
+        Temp.Write("Erewhon/DataFiles/New.txt", "added\n");
+        var modifiedBlob = await TestGit.HashObjectAsync(Temp.Root, "Erewhon/ErewhonModelSchema.scm", ct);
+        var addedBlob = await TestGit.HashObjectAsync(Temp.Root, "Erewhon/DataFiles/New.txt", ct);
+
+        var result = await new JadeUnchangedCheck(new HarnessOptions { RepoRoot = Temp.Root, StartingCommit = commit }).RunAsync(ct);
+
+        FailureItem[] expected =
+        [
+            new(FailureItemIds.JadeUnchangedPath("Erewhon/DataFiles/New.txt"), FailureItemIds.Added(addedBlob)),
+            new(FailureItemIds.JadeUnchangedPath("Erewhon/ErewhonDemoSystem.mul"), FailureItemIds.Deleted),
+            new(FailureItemIds.JadeUnchangedPath("Erewhon/ErewhonModelSchema.scm"), FailureItemIds.Modified(modifiedBlob)),
+        ];
+        Assert.Equal(expected, result.Failures);
+        Assert.Equal(CheckOutcomes.Fail, result.Result.Outcome);
+        Assert.Equal(3, result.Result.Cases);
+        Assert.Equal(1, result.Result.Passed);
+        Assert.Equal(new JadeUnchangedSummary(3, 3), result.Summary);
+    }
+
+    [Fact]
+    public async Task RealGit_UnresolvableStartingCommit_IsNotRun()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await JadeRepositoryAsync(ct);
+
+        var result = await new JadeUnchangedCheck(
+            new HarnessOptions { RepoRoot = Temp.Root, StartingCommit = "0123456789abcdef0123456789abcdef01234567" }).RunAsync(ct);
+
+        var detail = AssertJadeUnchangedNotRun(result, "git diff ");
+        Assert.Contains("exited 128", detail, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RealGit_UntrackedNestedRepository_IsNotRun()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var commit = await JadeRepositoryAsync(ct);
+
+        // git status lists a nested repository as one untracked directory, which hash-object cannot hash.
+        Temp.Write("Erewhon/nested/Inner.txt", "inner\n");
+        await TestGit.InitAsync(Temp.PathOf("Erewhon/nested"), ct);
+
+        var result = await new JadeUnchangedCheck(new HarnessOptions { RepoRoot = Temp.Root, StartingCommit = commit }).RunAsync(ct);
+
+        AssertJadeUnchangedNotRun(result, "git hash-object -- Erewhon/nested/ exited 128");
+    }
+
+    // committedTarget, when given, is the link text the path has at the starting commit; the path is
+    // then given currentTarget as its link text, replacing whatever was there (a link or a tracked file).
+    [Theory]
+    [InlineData("sha1", "Erewhon/Link.scm", null, "ErewhonModelSchema.scm", "added")]
+    [InlineData("sha1", "Erewhon/Dangling.scm", null, "Missing.scm", "added")]
+    [InlineData("sha1", "Erewhon/DataLink", null, "DataFiles", "added")]
+    [InlineData("sha1", "Erewhon/Link.scm", "ErewhonModelSchema.scm", "ErewhonDemoSystem.mul", "modified")]
+    [InlineData("sha1", "Erewhon/ErewhonDemoSystem.mul", null, "ErewhonModelSchema.scm", "modified")]
+    [InlineData("sha256", "Erewhon/Link.scm", null, "ErewhonModelSchema.scm", "added")]
+    [InlineData("sha256", "Erewhon/Link.scm", "ErewhonModelSchema.scm", "Missing.scm", "modified")]
+    public async Task RealGit_SymbolicLink_GivesTheBlobGitStoresForItsLinkText(
+        string objectFormat,
+        string linkPath,
+        string? committedTarget,
+        string currentTarget,
+        string change)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var commit = await JadeRepositoryAsync(ct, objectFormat);
+        if (committedTarget is not null)
+        {
+            CreateSymbolicLink(linkPath, committedTarget);
+            commit = await TestGit.CommitAllAsync(Temp.Root, "commit the link", ct);
+        }
+
+        File.Delete(Temp.PathOf(linkPath));
+        CreateSymbolicLink(linkPath, currentTarget);
+
+        var result = await new JadeUnchangedCheck(new HarnessOptions { RepoRoot = Temp.Root, StartingCommit = commit }).RunAsync(ct);
+
+        // The id git stores for the link once it is staged in this throwaway repository: a mode 120000
+        // blob of the link text, never the target's content.
+        await TestGit.RunAsync(Temp.Root, ct, "add", "--", linkPath);
+        var staged = (await TestGit.RunAsync(Temp.Root, ct, "ls-files", "--stage", "--", linkPath)).Split([' ', '\t']);
+        Assert.Equal("120000", staged[0]);
+        var nature = change == "added" ? FailureItemIds.Added(staged[1]) : FailureItemIds.Modified(staged[1]);
+        Assert.Equal(new FailureItem(FailureItemIds.JadeUnchangedPath(linkPath), nature), Assert.Single(result.Failures));
+        Assert.Equal(CheckOutcomes.Fail, result.Result.Outcome);
+    }
+
+    // ---- Helpers -------------------------------------------------------------------------------
+
+    private JadeUnchangedCheck ScriptedJadeUnchangedCheck(ScriptedGit git, string startingCommit = StartingCommit) =>
+        new(new HarnessOptions { RepoRoot = Temp.Root, StartingCommit = startingCommit }, git.Runner);
+
+    // The one path a theory's change touches: "added" is the untracked Erewhon/c.txt, anything else the
+    // modified Erewhon/b.scm.
+    private static string ChangedPath(string change) => change == "added" ? "Erewhon/c.txt" : "Erewhon/b.scm";
+
+    // git answers with that one change under Erewhon/, Erewhon/b.scm as the only tracked path,
+    // hashAnswer for every hash-object call and formatAnswer, when given, for the object format lookup.
+    private static ScriptedGit OneChange(string change, GitResult hashAnswer, GitResult? formatAnswer = null) => new(args => args[0] switch
+    {
+        "diff" => ScriptedGit.Ok(change == "added" ? string.Empty : "M\0Erewhon/b.scm\0"),
+        "status" => ScriptedGit.Ok(change == "added" ? "?? Erewhon/c.txt\0" : " M Erewhon/b.scm\0"),
+        "ls-tree" => ScriptedGit.Ok("Erewhon/b.scm\0"),
+        "hash-object" => hashAnswer,
+        "rev-parse" when formatAnswer is not null => formatAnswer,
+        _ => ScriptedGit.Exited(1, "unexpected git command"),
+    });
+
+    // Creates a symbolic link at relativePath with linkText as its text, or skips the test where the
+    // platform or file system cannot create one.
+    private void CreateSymbolicLink(string relativePath, string linkText)
+    {
+        var path = Temp.PathOf(relativePath);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        try
+        {
+            File.CreateSymbolicLink(path, linkText);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            Assert.Skip($"symbolic links cannot be created here: {ex.Message}");
+        }
+    }
+
+    // A repository in objectFormat whose one commit holds three files under Erewhon/ and one outside it.
+    private async Task<string> JadeRepositoryAsync(CancellationToken ct, string objectFormat = "sha1")
+    {
+        await TestGit.RunAsync(Temp.Root, ct, "init", "--quiet", "--initial-branch=main", $"--object-format={objectFormat}");
+        Temp.Write("Erewhon/ErewhonModelSchema.scm", "schema\n");
+        Temp.Write("Erewhon/ErewhonDemoSystem.mul", "load order\n");
+        Temp.Write("Erewhon/DataFiles/Clients.txt", "Pauline Wild\n");
+        Temp.Write("README.md", "readme\n");
+        return await TestGit.CommitAllAsync(Temp.Root, "starting commit", ct);
+    }
+
+    private static string AssertJadeUnchangedNotRun(JadeUnchangedResult result, string expectedDetail)
+    {
+        Assert.Equal(CheckNames.JadeUnchanged, result.Result.Name);
+        Assert.Equal(CheckOutcomes.NotRun, result.Result.Outcome);
+        Assert.Equal(0, result.Result.Cases);
+        Assert.Null(result.Summary);
+        var item = Assert.Single(result.Failures);
+        Assert.Equal(FailureItemIds.JadeUnchanged, item.ItemId);
+        Assert.Equal(FailureItemIds.NotRun, item.Nature);
+        Assert.Equal(result.Result.Detail, item.Detail);
+        Assert.Contains(expectedDetail, item.Detail, StringComparison.Ordinal);
+        return item.Detail!;
+    }
+}
+
+// ---- The ordering-evidence check ----------------------------------------------------------------
+// The ordering-evidence check: the commit that first added baseline/manifest.json must be an
+// ancestor of the commit that first added a facade/ path. Scripted git runners show that missing
+// metadata, shallow history, failing or malformed git answers and inconclusive ancestry give
+// not-run, and that absent or equal commits never pass; throwaway repositories in a temporary
+// directory confirm the verdicts against real git. The harness's own repository is never touched.
+// These members live in this class because the harness test project keeps its fixed set of test
+// classes, and the CHK-ORDERING items the check produces are failure identities this class covers.
+public sealed partial class KnownLimitationsRegisterTests
+{
+    private const string BaselinePathspec = "baseline/manifest.json";
+    private const string FacadePathspec = "facade/";
+
+    private const string BaselineCommit = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    private const string FacadeCommit = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    private const string LaterBaselineCommit = "cccccccccccccccccccccccccccccccccccccccc";
+    private const string LaterFacadeCommit = "dddddddddddddddddddddddddddddddddddddddd";
+
+    // ---- Evidence git cannot give --------------------------------------------------------------
+
+    [Fact]
+    public async Task Ordering_NoGitMetadata_IsNotRunWithoutCallingGit()
+    {
+        var git = Script();
+
+        var result = await ScriptedOrderingEvidence(git).RunAsync(TestContext.Current.CancellationToken);
+
+        AssertOrderingNotRun(result, "no .git metadata at ");
+        Assert.Null(result.BaselineCommit);
+        Assert.Null(result.FacadeCommit);
+        Assert.Empty(git.Calls);
+    }
+
+    [Theory]
+    [InlineData("rev-parse", "exited", 128, "fatal: not a git repository", "exited 128: fatal: not a git repository")]
+    [InlineData("rev-parse", "unavailable", -1, "", "could not start")]
+    [InlineData(BaselinePathspec, "exited", 128, "fatal: bad default revision 'HEAD'", "exited 128: fatal: bad default revision 'HEAD'")]
+    [InlineData(BaselinePathspec, "timed-out", -1, "", "timed out")]
+    [InlineData(FacadePathspec, "exited", 129, "", "exited 129")]
+    public async Task Ordering_FailingGitCommand_IsNotRun(string step, string failureKind, int exitCode, string stderr, string expectedReason)
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var failure = ScriptedGit.Failure(failureKind, exitCode, stderr);
+        var git = Script(
+            shallow: step == "rev-parse" ? failure : null,
+            baselineLog: step == BaselinePathspec ? failure : null,
+            facadeLog: step == FacadePathspec ? failure : null);
+
+        var result = await ScriptedOrderingEvidence(git).RunAsync(TestContext.Current.CancellationToken);
+
+        var detail = AssertOrderingNotRun(result, "git ");
+        Assert.Contains(expectedReason, detail, StringComparison.Ordinal);
+        Assert.Equal(step == FacadePathspec ? BaselineCommit : null, result.BaselineCommit);
+        Assert.Null(result.FacadeCommit);
+        Assert.DoesNotContain(git.Calls, call => call.Args[0] == "merge-base");
+    }
+
+    [Fact]
+    public async Task ShallowClone_IsNotRun()
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var git = Script(shallow: ScriptedGit.Ok("true\n"));
+
+        var result = await ScriptedOrderingEvidence(git).RunAsync(TestContext.Current.CancellationToken);
+
+        AssertOrderingNotRun(result, "is a shallow clone");
+        var call = Assert.Single(git.Calls);
+        string[] shallowArgs = ["rev-parse", "--is-shallow-repository"];
+        Assert.Equal(shallowArgs, call.Args);
+    }
+
+    [Theory]
+    [InlineData(BaselinePathspec, "not-a-hash")]
+    [InlineData(BaselinePathspec, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")]
+    [InlineData(BaselinePathspec, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")]
+    [InlineData(BaselinePathspec, "-x")]
+    [InlineData(FacadePathspec, "not-a-hash")]
+    [InlineData(FacadePathspec, "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")]
+    [InlineData(FacadePathspec, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")]
+    [InlineData(FacadePathspec, "-x")]
+    public async Task LogLineThatIsNoObjectId_IsNotRun(string pathspec, string firstLine)
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var answer = ScriptedGit.Ok($"{firstLine}\n{LaterFacadeCommit}\n");
+        var git = Script(
+            baselineLog: pathspec == BaselinePathspec ? answer : null,
+            facadeLog: pathspec == FacadePathspec ? answer : null);
+
+        var result = await ScriptedOrderingEvidence(git).RunAsync(TestContext.Current.CancellationToken);
+
+        var detail = AssertOrderingNotRun(result, $"printed '{firstLine}', which is not a commit id");
+        Assert.Contains(pathspec, detail, StringComparison.Ordinal);
+        Assert.DoesNotContain(git.Calls, call => call.Args[0] == "merge-base");
+    }
+
+    // ---- Absent or equal commits ---------------------------------------------------------------
+
+    [Theory]
+    [InlineData(BaselineCommit + "\n", "no commit adds a path under facade/; baseline commit aaaaaaaaaaaa")]
+    [InlineData("", "no commit adds a path under facade/ or adds baseline/manifest.json")]
+    public async Task NoFacadeCommit_FailsWithNoFacadeCommit(string baselineLog, string expectedDetail)
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var git = Script(baselineLog: ScriptedGit.Ok(baselineLog), facadeLog: ScriptedGit.Ok());
+
+        var result = await ScriptedOrderingEvidence(git).RunAsync(TestContext.Current.CancellationToken);
+
+        AssertFail(result, FailureItemIds.NoFacadeCommit, expectedDetail);
+        Assert.Null(result.FacadeCommit);
+        Assert.DoesNotContain(git.Calls, call => call.Args[0] == "merge-base");
+    }
+
+    [Fact]
+    public async Task FacadeCommitWithoutBaselineCommit_IsNotAncestor()
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var git = Script(baselineLog: ScriptedGit.Ok());
+
+        var result = await ScriptedOrderingEvidence(git).RunAsync(TestContext.Current.CancellationToken);
+
+        AssertFail(result, FailureItemIds.NotAncestor, "no commit adds baseline/manifest.json; first facade commit bbbbbbbbbbbb");
+        Assert.Null(result.BaselineCommit);
+        Assert.Equal(FacadeCommit, result.FacadeCommit);
+        Assert.DoesNotContain(git.Calls, call => call.Args[0] == "merge-base");
+    }
+
+    [Fact]
+    public async Task SameCommitAddingBoth_IsNotAncestor()
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var git = Script(facadeLog: ScriptedGit.Ok(BaselineCommit + "\n"));
+
+        var result = await ScriptedOrderingEvidence(git).RunAsync(TestContext.Current.CancellationToken);
+
+        AssertFail(result, FailureItemIds.NotAncestor, "baseline commit aaaaaaaaaaaa also adds the first path under facade/; the baseline commit must contain no facade/ path");
+        Assert.Equal(BaselineCommit, result.BaselineCommit);
+        Assert.Equal(BaselineCommit, result.FacadeCommit);
+        Assert.DoesNotContain(git.Calls, call => call.Args[0] == "merge-base");
+    }
+
+    // ---- Ancestry ------------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("exited", 0, CheckOutcomes.Pass, null)]
+    [InlineData("exited", 1, CheckOutcomes.Fail, FailureItemIds.NotAncestor)]
+    [InlineData("exited", 128, CheckOutcomes.NotRun, FailureItemIds.NotRun)]
+    [InlineData("timed-out", -1, CheckOutcomes.NotRun, FailureItemIds.NotRun)]
+    [InlineData("unavailable", -1, CheckOutcomes.NotRun, FailureItemIds.NotRun)]
+    public async Task MergeBaseAnswer_DecidesTheVerdict(string answerKind, int exitCode, string expectedOutcome, string? expectedNature)
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var git = Script(mergeBase: answerKind == "exited" && exitCode == 0
+            ? ScriptedGit.Ok()
+            : ScriptedGit.Failure(answerKind, exitCode, string.Empty));
+
+        var result = await ScriptedOrderingEvidence(git).RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(CheckNames.Ordering, result.Result.Name);
+        Assert.Equal(expectedOutcome, result.Result.Outcome);
+        Assert.Equal(expectedNature, result.Failure?.Nature);
+        if (expectedNature is not null)
+        {
+            Assert.Equal(FailureItemIds.Ordering, result.Failure!.ItemId);
+            Assert.Equal(result.Result.Detail, result.Failure.Detail);
+        }
+        else
+        {
+            Assert.Equal(new CheckResult(CheckNames.Ordering, CheckOutcomes.Pass, 1, 1, "baseline commit aaaaaaaaaaaa is an ancestor of the first facade commit bbbbbbbbbbbb"), result.Result);
+        }
+
+        Assert.Equal(BaselineCommit, result.BaselineCommit);
+        Assert.Equal(FacadeCommit, result.FacadeCommit);
+    }
+
+    [Fact]
+    public async Task OldestAddingCommits_AreCompared()
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var git = Script(
+            baselineLog: ScriptedGit.Ok($"{BaselineCommit}\n{LaterBaselineCommit}\n"),
+            facadeLog: ScriptedGit.Ok($"{FacadeCommit}\n{LaterFacadeCommit}\n"));
+
+        var result = await ScriptedOrderingEvidence(git).RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(CheckOutcomes.Pass, result.Result.Outcome);
+        Assert.Equal(BaselineCommit, result.BaselineCommit);
+        Assert.Equal(FacadeCommit, result.FacadeCommit);
+        string[] mergeBaseArgs = ["merge-base", "--is-ancestor", BaselineCommit, FacadeCommit];
+        Assert.Equal(mergeBaseArgs, git.Calls[^1].Args);
+    }
+
+    [Fact]
+    public async Task GitArguments_AskForTheFirstAddingCommitOfEachPathspec()
+    {
+        Directory.CreateDirectory(Temp.PathOf(".git"));
+        var git = Script();
+
+        await ScriptedOrderingEvidence(git).RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(4, git.Calls.Count);
+        Assert.All(git.Calls, call => Assert.Equal(Temp.Root, call.RepoRoot));
+        Assert.All(git.Calls, call => Assert.Equal(Git.DefaultTimeout, call.Timeout));
+        Assert.Equal(LogArgs(BaselinePathspec), git.Calls[1].Args);
+        Assert.Equal(LogArgs(FacadePathspec), git.Calls[2].Args);
+    }
+
+    [Fact]
+    public void Ordering_NullGitRunner_Throws()
+    {
+        Assert.Throws<ArgumentNullException>("git", () => new OrderingEvidence(new HarnessOptions { RepoRoot = Temp.Root }, null!));
+    }
+
+    // ---- Real git ------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task RealGit_BaselineCommittedBeforeFacade_Passes()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await TestGit.InitAsync(Temp.Root, ct);
+        Temp.Write("README.md", "start\n");
+        await TestGit.CommitAllAsync(Temp.Root, "starting commit", ct);
+        Temp.Write(BaselinePathspec, "{}\n");
+        var baseline = await TestGit.CommitAllAsync(Temp.Root, "baseline", ct);
+        Temp.Write("facade/src/Program.cs", "class Program {}\n");
+        var facade = await TestGit.CommitAllAsync(Temp.Root, "facade", ct);
+        Temp.Write("facade/src/Later.cs", "class Later {}\n");
+        await TestGit.CommitAllAsync(Temp.Root, "more facade", ct);
+
+        var result = await new OrderingEvidence(new HarnessOptions { RepoRoot = Temp.Root }).RunAsync(ct);
+
+        Assert.Equal(CheckOutcomes.Pass, result.Result.Outcome);
+        Assert.Null(result.Failure);
+        Assert.Equal(baseline, result.BaselineCommit);
+        Assert.Equal(facade, result.FacadeCommit);
+    }
+
+    [Fact]
+    public async Task RealGit_FacadeCommittedBeforeBaseline_IsNotAncestor()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        await TestGit.InitAsync(Temp.Root, ct);
+        Temp.Write("README.md", "start\n");
+        await TestGit.CommitAllAsync(Temp.Root, "starting commit", ct);
+        Temp.Write("facade/src/Program.cs", "class Program {}\n");
+        var facade = await TestGit.CommitAllAsync(Temp.Root, "facade", ct);
+        Temp.Write(BaselinePathspec, "{}\n");
+        var baseline = await TestGit.CommitAllAsync(Temp.Root, "baseline", ct);
+
+        var result = await new OrderingEvidence(new HarnessOptions { RepoRoot = Temp.Root }).RunAsync(ct);
+
+        Assert.Equal(CheckOutcomes.Fail, result.Result.Outcome);
+        Assert.Equal(FailureItemIds.NotAncestor, result.Failure?.Nature);
+        Assert.Contains("is not an ancestor of the first facade commit", result.Failure?.Detail, StringComparison.Ordinal);
+        Assert.Equal(baseline, result.BaselineCommit);
+        Assert.Equal(facade, result.FacadeCommit);
+    }
+
+    [Fact]
+    public async Task RealGit_ShallowClone_IsNotRun()
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var source = Temp.PathOf("source");
+        var clone = Temp.PathOf("clone");
+        Directory.CreateDirectory(source);
+        await TestGit.InitAsync(source, ct);
+        Temp.Write("source/" + BaselinePathspec, "{}\n");
+        await TestGit.CommitAllAsync(source, "baseline", ct);
+        Temp.Write("source/facade/src/Program.cs", "class Program {}\n");
+        await TestGit.CommitAllAsync(source, "facade", ct);
+        await TestGit.RunAsync(Temp.Root, ct, "clone", "--quiet", "--depth", "1", new Uri(source).AbsoluteUri, clone);
+
+        var result = await new OrderingEvidence(new HarnessOptions { RepoRoot = clone }).RunAsync(ct);
+
+        AssertOrderingNotRun(result, "is a shallow clone");
+    }
+
+    // ---- Helpers -------------------------------------------------------------------------------
+
+    private OrderingEvidence ScriptedOrderingEvidence(ScriptedGit git) => new(new HarnessOptions { RepoRoot = Temp.Root }, git.Runner);
+
+    // A history that passes unless a step's answer is replaced: not shallow, one baseline commit, one
+    // later facade commit, and an ancestor relation between them.
+    private static ScriptedGit Script(
+        GitResult? shallow = null,
+        GitResult? baselineLog = null,
+        GitResult? facadeLog = null,
+        GitResult? mergeBase = null) =>
+        new(args => args[0] switch
+        {
+            "rev-parse" => shallow ?? ScriptedGit.Ok("false\n"),
+            "log" when args[^1] == BaselinePathspec => baselineLog ?? ScriptedGit.Ok(BaselineCommit + "\n"),
+            "log" when args[^1] == FacadePathspec => facadeLog ?? ScriptedGit.Ok(FacadeCommit + "\n"),
+            "merge-base" => mergeBase ?? ScriptedGit.Ok(),
+            _ => ScriptedGit.Exited(1, $"unexpected git {string.Join(' ', args)}"),
+        });
+
+    private static string[] LogArgs(string pathspec) =>
+    [
+        "log", "--full-history", "--date-order", "--root", "--no-follow",
+        "--diff-filter=A", "--no-renames", "--reverse", "--format=%H", "--", pathspec,
+    ];
+
+    private static void AssertFail(OrderingResult result, string expectedNature, string expectedDetail)
+    {
+        Assert.Equal(new CheckResult(CheckNames.Ordering, CheckOutcomes.Fail, 1, 0, expectedDetail), result.Result);
+        Assert.Equal(new FailureItem(FailureItemIds.Ordering, expectedNature, Operation: null, Detail: expectedDetail), result.Failure);
+    }
+
+    private static string AssertOrderingNotRun(OrderingResult result, string expectedDetail)
+    {
+        Assert.Equal(CheckNames.Ordering, result.Result.Name);
+        Assert.Equal(CheckOutcomes.NotRun, result.Result.Outcome);
+        Assert.Equal(0, result.Result.Cases);
+        var item = result.Failure;
+        Assert.NotNull(item);
+        Assert.Equal(FailureItemIds.Ordering, item.ItemId);
+        Assert.Equal(FailureItemIds.NotRun, item.Nature);
+        Assert.Equal(result.Result.Detail, item.Detail);
+        Assert.Contains(expectedDetail, item.Detail, StringComparison.Ordinal);
+        return item.Detail!;
+    }
+}
+
+// ---- Support types of the facade TRX, JADE-unchanged and ordering-evidence tests ----------------
+// Top-level support types rather than test classes: a scripted git runner, a temporary directory
+// and the git command line for throwaway repositories. TempDirectory also serves the replay
+// lifecycle tests. They live in this file because the harness test project keeps its fixed set of
+// test source files.
+
+/// <summary>One invocation a <see cref="ScriptedGit"/> received.</summary>
+/// <param name="RepoRoot">The repository root the check passed.</param>
+/// <param name="Args">The git arguments, copied when the call was made.</param>
+/// <param name="Timeout">The limit the check passed.</param>
+internal sealed record GitCall(string RepoRoot, IReadOnlyList<string> Args, TimeSpan Timeout);
+
+/// <summary>
+/// A git runner that answers from a script instead of running git and records every invocation, so the
+/// JADE-unchanged and ordering checks can be driven through each git outcome without a repository.
+/// </summary>
+internal sealed class ScriptedGit(Func<IReadOnlyList<string>, GitResult> answer)
+{
+    private readonly List<GitCall> _calls = [];
+
+    /// <summary>Every invocation so far, in call order.</summary>
+    public IReadOnlyList<GitCall> Calls => _calls;
+
+    /// <summary>The runner to pass to a check.</summary>
+    public GitRunner Runner => RunAsync;
+
+    /// <summary>git ran and exited 0 with <paramref name="stdout"/>.</summary>
+    public static GitResult Ok(string stdout = "") =>
+        new(0, stdout, string.Empty, TimedOut: false, Unavailable: false);
+
+    /// <summary>git ran and exited <paramref name="exitCode"/>, writing <paramref name="stderr"/>.</summary>
+    public static GitResult Exited(int exitCode, string stderr = "") =>
+        new(exitCode, string.Empty, stderr, TimedOut: false, Unavailable: false);
+
+    /// <summary>git was killed at its deadline, as <see cref="Git.RunAsync"/> reports it.</summary>
+    public static GitResult TimedOut() =>
+        new(-1, string.Empty, "git did not finish within 30 s; its process tree was killed.", TimedOut: true, Unavailable: false);
+
+    /// <summary>git could not be started, as <see cref="Git.RunAsync"/> reports it.</summary>
+    public static GitResult Unavailable() =>
+        new(-1, string.Empty, "git could not be started: No such file or directory", TimedOut: false, Unavailable: true);
+
+    /// <summary>
+    /// The failure a theory names: <c>timed-out</c>, <c>unavailable</c>, or otherwise an exit with
+    /// <paramref name="exitCode"/> and <paramref name="stderr"/>.
+    /// </summary>
+    public static GitResult Failure(string kind, int exitCode, string stderr) => kind switch
+    {
+        "timed-out" => TimedOut(),
+        "unavailable" => Unavailable(),
+        _ => Exited(exitCode, stderr),
+    };
+
+    private Task<GitResult> RunAsync(string repoRoot, IReadOnlyList<string> args, TimeSpan timeout, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        _calls.Add(new GitCall(repoRoot, [.. args], timeout));
+        return Task.FromResult(answer(args));
+    }
+}
+
+/// <summary>A directory of its own under the system temp path, deleted with its contents on dispose.</summary>
+internal sealed class TempDirectory : IDisposable
+{
+    /// <summary>Creates the directory.</summary>
+    public TempDirectory() => Root = Directory.CreateTempSubdirectory("erewhon-harness-tests-").FullName;
+
+    /// <summary>The directory's full path.</summary>
+    public string Root { get; }
+
+    /// <summary>Returns <paramref name="relativePath"/> under <see cref="Root"/>, with '/' as separator.</summary>
+    public string PathOf(string relativePath) =>
+        Path.Combine(Root, relativePath.Replace('/', Path.DirectorySeparatorChar));
+
+    /// <summary>Writes <paramref name="content"/> to <paramref name="relativePath"/>, creating its directories.</summary>
+    public string Write(string relativePath, string content)
+    {
+        var path = PathOf(relativePath);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllText(path, content);
+        return path;
+    }
+
+    /// <summary>Deletes the directory; read-only files, such as git's object files, are made writable first.</summary>
+    public void Dispose()
+    {
+        if (!Directory.Exists(Root))
+        {
+            return;
+        }
+
+        foreach (var file in Directory.EnumerateFiles(Root, "*", SearchOption.AllDirectories))
+        {
+            File.SetAttributes(file, FileAttributes.Normal);
+        }
+
+        Directory.Delete(Root, recursive: true);
+    }
+}
+
+/// <summary>
+/// The git command line, for building throwaway repositories in a <see cref="TempDirectory"/>. System
+/// and global configuration are ignored and the author, committer and dates are fixed, so the tests
+/// depend on the git binary alone and never on the machine's or the user's settings.
+/// </summary>
+internal static class TestGit
+{
+    private static readonly TimeSpan Limit = TimeSpan.FromSeconds(60);
+
+    private static readonly string[] InheritedRepositoryVariables =
+    [
+        "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+    ];
+
+    /// <summary>Creates a repository at <paramref name="root"/> on branch <c>main</c>.</summary>
+    public static Task InitAsync(string root, CancellationToken ct) =>
+        RunAsync(root, ct, "init", "--quiet", "--initial-branch=main");
+
+    /// <summary>Stages every change and commits it.</summary>
+    /// <returns>The new commit's full id.</returns>
+    public static async Task<string> CommitAllAsync(string root, string message, CancellationToken ct)
+    {
+        await RunAsync(root, ct, "add", "--all");
+        await RunAsync(root, ct, "commit", "--quiet", "--no-gpg-sign", "--allow-empty", "-m", message);
+        return (await RunAsync(root, ct, "rev-parse", "HEAD")).Trim();
+    }
+
+    /// <summary>The blob id git computes for the file's current content, without writing it.</summary>
+    public static async Task<string> HashObjectAsync(string root, string path, CancellationToken ct) =>
+        (await RunAsync(root, ct, "hash-object", "--", path)).Trim();
+
+    /// <summary>Runs git in <paramref name="workingDirectory"/> and returns its standard output.</summary>
+    /// <exception cref="InvalidOperationException">git exited non-zero or did not finish within the limit.</exception>
+    public static async Task<string> RunAsync(string workingDirectory, CancellationToken ct, params string[] args)
+    {
+        var startInfo = new ProcessStartInfo("git")
+        {
+            WorkingDirectory = workingDirectory,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
+        };
+        foreach (var arg in args)
+        {
+            startInfo.ArgumentList.Add(arg);
+        }
+
+        foreach (var variable in InheritedRepositoryVariables)
+        {
+            startInfo.Environment.Remove(variable);
+        }
+
+        startInfo.Environment["GIT_CONFIG_GLOBAL"] = OperatingSystem.IsWindows() ? "NUL" : "/dev/null";
+        startInfo.Environment["GIT_CONFIG_NOSYSTEM"] = "1";
+        startInfo.Environment["GIT_AUTHOR_NAME"] = "Erewhon Harness Tests";
+        startInfo.Environment["GIT_AUTHOR_EMAIL"] = "harness-tests@example.invalid";
+        startInfo.Environment["GIT_AUTHOR_DATE"] = "2026-01-01T00:00:00Z";
+        startInfo.Environment["GIT_COMMITTER_NAME"] = "Erewhon Harness Tests";
+        startInfo.Environment["GIT_COMMITTER_EMAIL"] = "harness-tests@example.invalid";
+        startInfo.Environment["GIT_COMMITTER_DATE"] = "2026-01-01T00:00:00Z";
+        startInfo.Environment["GIT_TERMINAL_PROMPT"] = "0";
+        startInfo.Environment["LC_ALL"] = "C";
+
+        using var process = Process.Start(startInfo)
+            ?? throw new InvalidOperationException($"git {string.Join(' ', args)} could not be started");
+        process.StandardInput.Close();
+        var stdout = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
+        var stderr = process.StandardError.ReadToEndAsync(CancellationToken.None);
+
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        deadline.CancelAfter(Limit);
+        try
+        {
+            await process.WaitForExitAsync(deadline.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            if (!process.HasExited)
+            {
+                process.Kill(entireProcessTree: true);
+            }
+
+            ct.ThrowIfCancellationRequested();
+            throw new InvalidOperationException($"git {string.Join(' ', args)} did not finish within {Limit.TotalSeconds} s");
+        }
+
+        var output = await stdout;
+        var error = await stderr;
+        return process.ExitCode == 0
+            ? output
+            : throw new InvalidOperationException($"git {string.Join(' ', args)} exited {process.ExitCode}: {error.Trim()}");
+    }
 }

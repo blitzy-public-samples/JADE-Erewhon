@@ -374,13 +374,17 @@ run_facade_tests() {
     # `-- ... --results-directory <dir>` when <dir> exists, and writes no TRX.
     (cd "$REPO_ROOT/facade" && dotnet test --project tests/Erewhon.Facade.Tests/Erewhon.Facade.Tests.csproj \
         -c "$CONFIGURATION" --no-restore \
-        --report-xunit-trx --report-xunit-trx-filename facade-tests.trx --results-directory "$results") 2>&1 |
+        --report-xunit-trx --report-xunit-trx-filename facade-tests.trx \
+        --report-xunit-xml --report-xunit-xml-filename facade-tests.xunit.xml --results-directory "$results") 2>&1 |
         tee "$log"
     status=${PIPESTATUS[0]}
     printf '%s\n' "$status" >"$results/exit-code"
     echo "run-local.sh: facade tests exited $status"
     if [ ! -f "$results/facade-tests.trx" ]; then
         echo "run-local.sh: warning: $(rel "$results")/facade-tests.trx was not written" >&2
+    fi
+    if [ ! -f "$results/facade-tests.xunit.xml" ]; then
+        echo "run-local.sh: warning: $(rel "$results")/facade-tests.xunit.xml was not written" >&2
     fi
 }
 

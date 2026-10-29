@@ -28,7 +28,7 @@ public interface IReplayBody
 
 /// <summary>
 /// Everything one replay run observed, as the results report reads it (AAP 0.8.2): failing items, case
-/// results, the planned cases, the separate checks and the run and baseline facts.
+/// results, the planned and captured cases, the separate checks and the run and baseline facts.
 /// </summary>
 /// <remarks>
 /// <para>A fresh instance already renders a valid report: every collection is empty, the facts say
@@ -47,6 +47,7 @@ public sealed class ReplayRunState : IReportSource
     private readonly List<CaseResult> _cases = [];
     private readonly Dictionary<string, CheckResult> _checks = new(StringComparer.Ordinal);
     private Dictionary<string, IReadOnlyList<string>> _planned = new(StringComparer.Ordinal);
+    private Dictionary<string, IReadOnlyList<string>> _captured = new(StringComparer.Ordinal);
 
     private RunFacts _facts = new(
         DateTimeOffset.UtcNow,
@@ -101,6 +102,19 @@ public sealed class ReplayRunState : IReportSource
             lock (_gate)
             {
                 return new Dictionary<string, IReadOnlyList<string>>(_planned, StringComparer.Ordinal).AsReadOnly();
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>A snapshot; a later <see cref="SetCaptured"/> does not change it.</remarks>
+    public IReadOnlyDictionary<string, IReadOnlyList<string>> CapturedCasesByOperation
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return new Dictionary<string, IReadOnlyList<string>>(_captured, StringComparer.Ordinal).AsReadOnly();
             }
         }
     }
@@ -322,6 +336,32 @@ public sealed class ReplayRunState : IReportSource
             _planned = copy;
         }
     }
+
+    /// <summary>
+    /// Replaces the capture evidence: catalogue operation id to the case ids that have a baseline record,
+    /// in record order. The lists are copied, so later changes to the caller's collections do not reach
+    /// the report.
+    /// </summary>
+    /// <param name="capturedCaseIdsByOperation">The captured cases; blank keys are skipped and a null list reads as empty.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="capturedCaseIdsByOperation"/> is null.</exception>
+    public void SetCaptured(IReadOnlyDictionary<string, IReadOnlyList<string>> capturedCaseIdsByOperation)
+    {
+        ArgumentNullException.ThrowIfNull(capturedCaseIdsByOperation);
+
+        var copy = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
+        foreach (var (operation, ids) in capturedCaseIdsByOperation)
+        {
+            if (!string.IsNullOrWhiteSpace(operation))
+            {
+                copy[operation] = Array.AsReadOnly((ids ?? []).ToArray());
+            }
+        }
+
+        lock (_gate)
+        {
+            _captured = copy;
+        }
+    }
 }
 
 /// <summary>
@@ -335,8 +375,9 @@ public sealed class ReplayRunState : IReportSource
 /// the cleanup and the report rewrite, each inside its own <c>try</c>/<c>catch</c>, so a failure in one never
 /// skips the next. Cleanup uses <see cref="CancellationToken.None"/>, so a cancelled run (SIGTERM) still shuts
 /// its components down; every wait is bounded by the shutdown client's own limits.</para>
-/// <para>The exit code is 0 only when the last report write succeeded and the register documents every
-/// failing item, both those recorded here and those the report derives. <c>CHK-REPORT</c>,
+/// <para>The exit code is 0 only when the last report write succeeded, the register documents every
+/// failing item, both those recorded here and those the report derives, and the report holds no captured
+/// case the replay left uncompared (<see cref="ResultsReport.UnaccountedCases"/>). <c>CHK-REPORT</c>,
 /// <c>CHK-SHUTDOWN</c> and <c>CHK-EXCEPTION</c> are never documentable, so any of them gives 1
 /// (AAP 0.7.7). No other value is returned, and <see cref="RunAsync"/> never throws.</para>
 /// <para>The mode writes only the report, through <see cref="IResultsReportWriter"/>; the body writes
@@ -403,7 +444,10 @@ public sealed class ReplayMode
 
     /// <summary>Runs the replay and its exit path. Call once per instance.</summary>
     /// <param name="ct">Cancels the body only; the report and cleanup always run.</param>
-    /// <returns>0 when the report was written and every failing item is documented; otherwise 1.</returns>
+    /// <returns>
+    /// 0 when the report was written, every failing item is documented and every captured case was
+    /// compared; otherwise 1.
+    /// </returns>
     public async Task<int> RunAsync(CancellationToken ct)
     {
         try
@@ -597,8 +641,11 @@ public sealed class ReplayMode
 
             // Both the recorded items and the report's own verdict must hold: the report also derives items
             // (a compared, non-equivalent case without a recorded nature), so its AllFailuresDocumented can be
-            // false where the recorded items alone look documented.
-            var allDocumented = undocumented.Count == 0 && _lastReport is { AllFailuresDocumented: true };
+            // false where the recorded items alone look documented. A captured case the replay never compared
+            // is no failing item, yet it leaves its operation an undocumented difference, so it fails the run
+            // as well.
+            var unaccounted = _lastReport?.UnaccountedCases ?? [];
+            var allDocumented = undocumented.Count == 0 && unaccounted.Count == 0 && _lastReport is { AllFailuresDocumented: true };
             exitCode = _lastWriteSucceeded && allDocumented ? 0 : 1;
 
             Print(string.Create(
@@ -607,6 +654,13 @@ public sealed class ReplayMode
             foreach (var item in undocumented)
             {
                 Print($"  {item.ItemId} {item.Nature}");
+            }
+
+            if (unaccounted.Count > 0)
+            {
+                Print(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{unaccounted.Count} captured case(s) not compared, so their operations are undocumented differences: {string.Join(", ", unaccounted)}"));
             }
         }
         catch (Exception ex)
@@ -764,7 +818,10 @@ public sealed class ReplayBody(
         await execution.RunAsync().ConfigureAwait(false);
     }
 
-    /// <summary>The run facts the report states, from the settings and what the run found.</summary>
+    /// <summary>
+    /// The run facts the report states, from the settings, what the run found and the SDK pin baked into
+    /// the harness at build time (<see cref="RunFacts.TryReadSdkPin"/>), so no repository file is read.
+    /// </summary>
     /// <param name="options">The harness settings.</param>
     /// <param name="utcDate">When the run started.</param>
     /// <param name="frameworkDescription">The facade's framework description from its <c>/admin/info</c>; null when not read.</param>
@@ -784,7 +841,7 @@ public sealed class ReplayBody(
             utcDate,
             string.IsNullOrWhiteSpace(options.ExecutionMode) ? Unknown : options.ExecutionMode,
             frameworkDescription,
-            TryReadSdkPin(options),
+            RunFacts.TryReadSdkPin(),
             options.Target?.RestBaseUrl ?? "",
             options.Target?.SoapBaseUrl ?? "",
             options.Backend?.RestBaseUrl ?? "",
@@ -793,22 +850,6 @@ public sealed class ReplayBody(
             string.IsNullOrWhiteSpace(options.StartingCommit) ? Unknown : options.StartingCommit,
             baselineCommit,
             facadeCommit);
-    }
-
-    // The SDK pin is a reported fact only; a repository root that cannot form a path reports it unknown.
-    private static string? TryReadSdkPin(HarnessOptions options)
-    {
-        string path;
-        try
-        {
-            path = options.HarnessGlobalJsonPath;
-        }
-        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
-        {
-            return null;
-        }
-
-        return RunFacts.TryReadSdkPin(path);
     }
 
     /// <summary>One run of the body: the per-run inputs, clients and findings, used by one thread at a time.</summary>
@@ -993,6 +1034,16 @@ public sealed class ReplayBody(
         {
             _entries = await _store.ReadEntriesAsync(ct).ConfigureAwait(false);
             _recordsRead = true;
+
+            // The capture evidence, recorded before any case is replayed, so a case that is never compared
+            // (no comparer, cancellation, a failed case step) is still reported as captured.
+            state.SetCaptured(_entries
+                .Where(entry => !string.IsNullOrWhiteSpace(entry.Record.Operation))
+                .GroupBy(entry => entry.Record.Operation, StringComparer.Ordinal)
+                .ToDictionary(
+                    group => group.Key,
+                    group => (IReadOnlyList<string>)group.Select(entry => entry.Record.CaseId).ToArray(),
+                    StringComparer.Ordinal));
             PrintBaseline(string.Create(CultureInfo.InvariantCulture, $"{_entries.Count} baseline record(s) read and verified"));
         }
 

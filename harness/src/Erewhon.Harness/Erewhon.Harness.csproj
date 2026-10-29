@@ -24,4 +24,23 @@
     <InternalsVisibleTo Include="Erewhon.Harness.Tests" />
   </ItemGroup>
 
+  <!-- The SDK pin the results report states is baked in here, from harness/global.json, because the
+       harness must not read harness/global.json at run time: it reads only its configuration, the
+       baseline, the contracts and the facade test results from the repository. Evaluation re-reads the
+       file on every build, so a changed pin reaches the assembly on the next build. The harness
+       Dockerfile copies harness/ before it publishes and run-local.sh builds in the working tree, so
+       the file is present in both builds. The pattern takes "version" from inside the "sdk" object
+       only. A file that is absent, or whose "sdk" object names no version, bakes nothing, and the
+       report then shows the pin as unknown. The key must equal RunFacts.SdkPinMetadataKey. -->
+  <PropertyGroup>
+    <_HarnessGlobalJsonPath>$(MSBuildProjectDirectory)/../../global.json</_HarnessGlobalJsonPath>
+    <_HarnessSdkPinPattern>"sdk"\s*:\s*\{[^{}]*?"version"\s*:\s*"([^"]*)"</_HarnessSdkPinPattern>
+    <_HarnessGlobalJson Condition="Exists('$(_HarnessGlobalJsonPath)')">$([System.IO.File]::ReadAllText('$(_HarnessGlobalJsonPath)'))</_HarnessGlobalJson>
+    <_HarnessSdkPin Condition="'$(_HarnessGlobalJson)' != '' and $([System.Text.RegularExpressions.Regex]::IsMatch($(_HarnessGlobalJson), $(_HarnessSdkPinPattern)))">$([System.Text.RegularExpressions.Regex]::Match($(_HarnessGlobalJson), $(_HarnessSdkPinPattern)).Result('$1').Trim())</_HarnessSdkPin>
+  </PropertyGroup>
+
+  <ItemGroup Condition="'$(_HarnessSdkPin)' != ''">
+    <AssemblyMetadata Include="Erewhon.Harness.SdkPin" Value="$(_HarnessSdkPin)" />
+  </ItemGroup>
+
 </Project>

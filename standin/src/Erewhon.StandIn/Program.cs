@@ -52,6 +52,12 @@ try
     });
     configuration = builder.Configuration;
 
+    // Framework request logs print raw paths, which carry names; held at Warning whatever Logging says.
+    builder.Logging
+        .AddLogLevelFloor("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.Warning)
+        .AddLogLevelFloor("Microsoft.AspNetCore.Routing", LogLevel.Warning)
+        .AddLogLevelFloor("Microsoft.AspNetCore.Server.Kestrel.BadRequests", LogLevel.Warning);
+
     // Read from the context's configuration, so --StandIn:* switches and StandIn__* variables apply. The
     // explicit Listen calls replace ASPNETCORE_HTTP_PORTS from the aspnet image (Kestrel warns that it
     // overrides them).
@@ -264,8 +270,8 @@ namespace Erewhon.StandIn
     /// a SOAP handler recorded. REST and SOAP lines are Information up to 4xx, Warning for the stand-in's
     /// own 5xx answers (REST 500 with null, SOAP Faults, 501) and Error for an unexpected exception. Admin
     /// lines are Debug, so health polling does not flood the default log, which keeps the reset and
-    /// shutdown lines of the admin endpoints. Framework request logging stays filtered, because its lines
-    /// print the raw path, and REST path segments carry names.
+    /// shutdown lines of the admin endpoints. Framework request logging is held at Warning whatever the
+    /// Logging configuration says, because its lines print the raw path, and REST path segments carry names.
     /// </para>
     /// <para>
     /// The line is operational logging, not an audit record: it commits and stores nothing. It changes no

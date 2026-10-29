@@ -1,11 +1,14 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
+using System.Reflection;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.AspNetCore.Routing.Matching;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 
 namespace Erewhon.Contracts.Hosting;
@@ -307,5 +310,259 @@ public sealed class ListenerPortMatcherPolicy : MatcherPolicy, IEndpointSelector
         }
 
         return Task.CompletedTask;
+    }
+}
+
+// ---- Log level floors ---------------------------------------------------------------------------
+// A hosting helper shared by the facade's and the stand-in's Program.cs, which both floor the framework
+// categories whose lines print what a caller sent. It sits with the listener policy, the other hosting
+// helper the two hosts share.
+/// <summary>
+/// Minimum log levels that hold for a group of logging categories whatever the <c>Logging</c>
+/// configuration says. The facade and the stand-in use them for the framework categories whose lines
+/// print what a caller sent, such as the request path, because REST path segments carry agent and
+/// client names.
+/// </summary>
+/// <remarks>
+/// <para>
+/// A floor amends the bound <see cref="LoggerFilterOptions"/> after every configuration source has
+/// been applied, and again each time the configuration reloads. From then on a provider logs a level of
+/// a category under the floor only when the level is at least the floor's minimum and the rules and
+/// global minimum level, as configured, allow that provider to log it. No setting can lower a category
+/// under the floor: not a <c>Logging:LogLevel</c> entry for the same or a longer category, not a
+/// provider's own <c>Logging:&lt;provider&gt;:LogLevel</c> entry, not a wildcard rule and not an
+/// <c>AddFilter</c> call. A setting stricter than the floor keeps the category as strict as it was, and
+/// every category outside the floor logs exactly as configured.
+/// </para>
+/// <para>
+/// A category is under a floor when its name starts with the floor's prefix, ignoring case, which is
+/// how Microsoft.Extensions.Logging matches a rule to a category. The configured rules are evaluated as
+/// that library selects them: a provider's own rule, named by its full type name or by its
+/// <see cref="ProviderAliasAttribute"/> alias, beats every rule without a provider, a longer category
+/// beats a shorter one, and on a tie the later rule wins.
+/// </para>
+/// </remarks>
+public static class LogLevelFloors
+{
+    private const char Wildcard = '*';
+
+    // Provider aliases by provider full type name, resolved once per provider; null when it has none.
+    private static readonly ConcurrentDictionary<string, string?> ProviderAliases = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Keeps every category whose name starts with <paramref name="categoryPrefix"/> at
+    /// <paramref name="minimum"/> or above, for every logging provider, whatever the <c>Logging</c>
+    /// configuration says.
+    /// </summary>
+    /// <param name="logging">The host's logging builder.</param>
+    /// <param name="categoryPrefix">
+    /// The category name, or the start of the category names, the floor covers, for example
+    /// <c>Microsoft.AspNetCore.Routing</c>. It is matched ignoring case and cannot contain a wildcard.
+    /// </param>
+    /// <param name="minimum">
+    /// The lowest level a category under the floor logs; <see cref="LogLevel.None"/> turns the
+    /// categories off.
+    /// </param>
+    /// <returns><paramref name="logging"/>, so further calls can be chained.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="logging"/> or <paramref name="categoryPrefix"/> is null.</exception>
+    /// <exception cref="ArgumentException"><paramref name="categoryPrefix"/> is empty, white space or contains <c>*</c>.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="minimum"/> is not a defined <see cref="LogLevel"/>.</exception>
+    public static ILoggingBuilder AddLogLevelFloor(this ILoggingBuilder logging, string categoryPrefix, LogLevel minimum)
+    {
+        ArgumentNullException.ThrowIfNull(logging);
+        ArgumentException.ThrowIfNullOrWhiteSpace(categoryPrefix);
+        if (categoryPrefix.Contains(Wildcard))
+        {
+            throw new ArgumentException("A log level floor's category prefix cannot contain the wildcard '*'.", nameof(categoryPrefix));
+        }
+
+        if (!Enum.IsDefined(minimum))
+        {
+            throw new ArgumentOutOfRangeException(nameof(minimum), minimum, "Unknown log level.");
+        }
+
+        // Post-configuration runs after every Configure step, the binding of the Logging section
+        // included, and is repeated whenever the options are rebuilt after a configuration reload.
+        logging.Services.PostConfigure<LoggerFilterOptions>(options => Apply(options, categoryPrefix, minimum));
+        return logging;
+    }
+
+    // Amends the rules so that, for every provider and every category under the prefix, whichever rule
+    // Microsoft.Extensions.Logging selects allows a level only when it is at least the minimum and the
+    // rules and global minimum level as they stood before this call allowed it.
+    private static void Apply(LoggerFilterOptions options, string categoryPrefix, LogLevel minimum)
+    {
+        IList<LoggerFilterRule> rules = options.Rules;
+        LoggerFilterRule[] configured = [.. rules];
+        LogLevel configuredMinLevel = options.MinLevel;
+
+        // A rule longer than the prefix that can match a category under it beats the floor rules on the
+        // prefix itself. It keeps its level, which still decides every category outside the prefix, and
+        // its filter also requires the minimum for the categories under the prefix.
+        for (int i = 0; i < rules.Count; i++)
+        {
+            LoggerFilterRule rule = rules[i];
+            if (IsLongerThan(rule, categoryPrefix) && CanMatchUnder(rule, categoryPrefix))
+            {
+                rules[i] = new LoggerFilterRule(
+                    rule.ProviderName, rule.CategoryName, rule.LogLevel, WithFloor(rule.Filter, categoryPrefix, minimum));
+            }
+        }
+
+        // Every other rule that matches a category under the prefix loses to a floor rule of the same
+        // provider on the prefix, appended last so that it also wins every tie, and so does the global
+        // minimum level when no rule matches. Each floor rule passes a level only when the configured
+        // selection for the actual provider and category allows it, so appending one for every provider
+        // name the rules use, and one for the rules without a provider, changes nothing else.
+        Func<string?, string?, LogLevel, bool> floor = (provider, category, level) =>
+            level >= minimum && ConfiguredAllows(configured, configuredMinLevel, provider, category, level);
+        rules.Add(new LoggerFilterRule(null, categoryPrefix, minimum, floor));
+        var flooredProviders = new HashSet<string>(StringComparer.Ordinal);
+        foreach (LoggerFilterRule rule in configured)
+        {
+            if (rule.ProviderName is { } provider && flooredProviders.Add(provider))
+            {
+                rules.Add(new LoggerFilterRule(provider, categoryPrefix, minimum, floor));
+            }
+        }
+    }
+
+    // A longer rule's filter, which in addition lets a category under the prefix log no level below the
+    // minimum. The rule's own level is checked before the filter runs.
+    private static Func<string?, string?, LogLevel, bool> WithFloor(
+        Func<string?, string?, LogLevel, bool>? filter, string categoryPrefix, LogLevel minimum) =>
+        (provider, category, level) =>
+            (category is null || !category.StartsWith(categoryPrefix, StringComparison.OrdinalIgnoreCase) || level >= minimum)
+            && (filter is null || filter(provider, category, level));
+
+    // Whether the configured rules and global minimum level let the provider with this full type name
+    // log the level of the category, decided as Microsoft.Extensions.Logging decides it: the selected
+    // rule's level (none: every level) or, without a matching rule, the global minimum level, where a
+    // level above Critical turns the provider off for the category, and then the selected rule's filter.
+    // Filters are invoked on every call and their results are never cached, since they may hold state.
+    private static bool ConfiguredAllows(
+        LoggerFilterRule[] configured, LogLevel configuredMinLevel, string? provider, string? category, LogLevel level)
+    {
+        string? alias = provider is null ? null : ProviderAliases.GetOrAdd(provider, ResolveAlias);
+        LoggerFilterRule? selected = Select(configured, provider, alias, category ?? string.Empty);
+        LogLevel? allowed = selected is null ? configuredMinLevel : selected.LogLevel;
+        if (allowed is { } lowest && (lowest > LogLevel.Critical || level < lowest))
+        {
+            return false;
+        }
+
+        return selected?.Filter is not { } filter || filter(provider, category, level);
+    }
+
+    // The rule Microsoft.Extensions.Logging selects for a provider and a category. A rule applies to the
+    // provider when it names the provider's full type name or its alias.
+    private static LoggerFilterRule? Select(LoggerFilterRule[] rules, string? provider, string? alias, string category)
+    {
+        LoggerFilterRule? selected = null;
+        foreach (LoggerFilterRule rule in rules)
+        {
+            if (IsBetter(rule, selected, provider, category)
+                || (alias is not null && IsBetter(rule, selected, alias, category)))
+            {
+                selected = rule;
+            }
+        }
+
+        return selected;
+    }
+
+    // The alias a provider type declares with ProviderAliasAttribute (not inherited), which rules may use
+    // instead of its full type name. The type is looked up by that name in the loaded assemblies, which
+    // hold every provider a logger was created from. A type found nowhere, or declaring no alias or an
+    // empty one, has none.
+    private static string? ResolveAlias(string providerFullName)
+    {
+        foreach (Assembly assembly in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            Type? type;
+            try
+            {
+                type = assembly.GetType(providerFullName, throwOnError: false);
+            }
+            catch (Exception exception) when (exception is ArgumentException or IOException or BadImageFormatException)
+            {
+                // A name the assembly cannot parse, or whose type arguments it cannot load, is not its type.
+                continue;
+            }
+
+            if (type is not null)
+            {
+                string? alias = type.GetCustomAttribute<ProviderAliasAttribute>(inherit: false)?.Alias;
+                return string.IsNullOrEmpty(alias) ? null : alias;
+            }
+        }
+
+        return null;
+    }
+
+    private static bool IsBetter(LoggerFilterRule rule, LoggerFilterRule? current, string? provider, string category)
+    {
+        if (rule.ProviderName != null && !string.Equals(rule.ProviderName, provider, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        if (rule.CategoryName is { } name && !Matches(name, category))
+        {
+            return false;
+        }
+
+        // A provider's own rule beats every rule without a provider, whatever their categories.
+        if (current?.ProviderName != null)
+        {
+            if (rule.ProviderName == null)
+            {
+                return false;
+            }
+        }
+        else if (rule.ProviderName != null)
+        {
+            return true;
+        }
+
+        // Between rules of the same kind a longer category wins, and on a tie the later rule.
+        return current?.CategoryName is not { } currentName
+            || (rule.CategoryName is { } ruleName && ruleName.Length >= currentName.Length);
+    }
+
+    // A rule's category matches when the category starts with the part before the single wildcard (the
+    // whole name without one) and ends with the part after it, ignoring case. Microsoft.Extensions.Logging
+    // rejects a name with more than one wildcard itself when it selects rules for a logger, so such a
+    // rule never matches here.
+    private static bool Matches(string name, string category)
+    {
+        int wildcard = name.IndexOf(Wildcard);
+        if (wildcard < 0)
+        {
+            return category.StartsWith(name, StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (name.IndexOf(Wildcard, wildcard + 1) >= 0)
+        {
+            return false;
+        }
+
+        return category.AsSpan().StartsWith(name.AsSpan(0, wildcard), StringComparison.OrdinalIgnoreCase)
+            && category.AsSpan().EndsWith(name.AsSpan(wildcard + 1), StringComparison.OrdinalIgnoreCase);
+    }
+
+    // Selection prefers the longer category name, wildcard included; a rule without a category is shortest.
+    private static bool IsLongerThan(LoggerFilterRule rule, string categoryPrefix) =>
+        rule.CategoryName is { } name && name.Length > categoryPrefix.Length;
+
+    // Whether some category under the prefix can match the rule: the part of its name before the wildcard
+    // (all of it without one, nothing without a category) and the prefix must be prefixes of one name.
+    private static bool CanMatchUnder(LoggerFilterRule rule, string categoryPrefix)
+    {
+        string name = rule.CategoryName ?? string.Empty;
+        int wildcard = name.IndexOf(Wildcard);
+        string head = wildcard < 0 ? name : name[..wildcard];
+        return head.StartsWith(categoryPrefix, StringComparison.OrdinalIgnoreCase)
+            || categoryPrefix.StartsWith(head, StringComparison.OrdinalIgnoreCase);
     }
 }

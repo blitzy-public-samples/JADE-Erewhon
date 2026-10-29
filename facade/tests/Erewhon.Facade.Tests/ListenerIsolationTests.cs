@@ -12,7 +12,10 @@
 //
 // Facade test failures are identified across runs by a signature over the exception type, the failing
 // line and the assertion message. Forged Host values carry run-time ports, so they are built per test
-// and never asserted on or printed; every assertion compares fixed values only.
+// and never asserted on or printed, and every message is built only from fixed values: stub ids,
+// sockets, listener names, methods, paths, Host variants and counts. That is also why no Assert.Single,
+// Assert.Empty or Assert.Equal is applied to recorded StubRequest data, its fields included: the dump
+// would print observed values, among them the Host header and with it a port.
 
 using System.Globalization;
 using System.Net;
@@ -170,20 +173,21 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
     public async Task AdminPathOnPublicSocketWithForgedHostReachesCatchAll(string socket, string method, string path)
     {
         (Uri baseAddress, StubListener listener) = PublicSocket(socket);
+        string label = $"{socket} socket {method} {path} with forged admin Host";
 
         RawResponse response = await SendAsync(baseAddress, new HttpMethod(method), path, HostFor("admin-port"));
 
         // The socket's catch-all forwarded the request unchanged to the default target on the same surface.
-        StubRequest forwarded = Assert.Single(Backend.Received);
-        Assert.Equal(listener, forwarded.Listener);
-        Assert.Equal(method, forwarded.Method);
-        Assert.Equal(path, forwarded.RawTarget);
-        Assert.Empty(Reroute.Received);
+        StubRequest forwarded = SingleRequest(Backend, label);
+        AssertRequest(forwarded, Backend, listener, method, path, label);
+        AssertNoRequests(Reroute, label);
 
         // The answer is stub A's, not the shutdown endpoint's 202 nor an OpenAPI document.
         Assert.Equal(200, response.Status);
         Assert.Equal(BackendStubId, response.Header(StubIdHeader));
-        Assert.Equal(forwarded.ResponseBody, response.Body);
+        Assert.True(
+            response.Body.AsSpan().SequenceEqual(forwarded.ResponseBody),
+            $"{label}: facade response body differs from the bytes stub {Backend.Id} sent");
 
         // The facade is still serving on both the admin and the REST sockets.
         Backend.ClearLog();
@@ -192,12 +196,13 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
         RawResponse health = await SendAsync(Facade.AdminBaseAddress, HttpMethod.Get, AdminRoutes.Health, host: null);
         Assert.Equal(200, health.Status);
 
+        string followUp = $"{label}, then REST socket {GetCompanyRequest.Method.Method} {GetCompanyRequest.PathAndQuery}";
         RawResponse company = await SendAsync(GetCompanyRequest, Facade.RestBaseAddress, host: null);
         Assert.Equal(200, company.Status);
         Assert.Equal(RerouteStubId, company.Header(StubIdHeader));
-        StubRequest dispatched = Assert.Single(Reroute.ReceivedOn(StubListener.Rest));
-        Assert.Equal(GetCompanyRequest.PathAndQuery, dispatched.RawTarget);
-        Assert.Empty(Backend.Received);
+        StubRequest dispatched = SingleRequest(Reroute, followUp, StubListener.Rest);
+        AssertRequest(dispatched, Reroute, StubListener.Rest, GetCompanyRequest.Method.Method, GetCompanyRequest.PathAndQuery, followUp);
+        AssertNoRequests(Backend, followUp);
 
         IHostApplicationLifetime lifetime = Facade.Services.GetRequiredService<IHostApplicationLifetime>();
         Assert.False(
@@ -213,14 +218,14 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
     [InlineData("rest-port")]
     public async Task RestOperationOnRestSocketIsDispatchedWhateverTheHost(string hostVariant)
     {
+        string label = $"REST socket {GetCompanyRequest.Method.Method} {GetCompanyRequest.PathAndQuery} with Host variant {hostVariant}";
+
         RawResponse response = await SendAsync(GetCompanyRequest, Facade.RestBaseAddress, HostFor(hostVariant));
 
         // Only the getCompany endpoint routes to stub B; any catch-all would have forwarded to stub A.
-        StubRequest dispatched = Assert.Single(Reroute.Received);
-        Assert.Equal(StubListener.Rest, dispatched.Listener);
-        Assert.Equal(GetCompanyRequest.Method.Method, dispatched.Method);
-        Assert.Equal(GetCompanyRequest.PathAndQuery, dispatched.RawTarget);
-        Assert.Empty(Backend.Received);
+        StubRequest dispatched = SingleRequest(Reroute, label);
+        AssertRequest(dispatched, Reroute, StubListener.Rest, GetCompanyRequest.Method.Method, GetCompanyRequest.PathAndQuery, label);
+        AssertNoRequests(Backend, label);
 
         Assert.Equal(200, response.Status);
         Assert.Equal(RerouteStubId, response.Header(StubIdHeader));
@@ -229,15 +234,15 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
     [Fact]
     public async Task RestPathOnSoapSocketIsHandledBySoapCatchAll()
     {
+        string label = $"SOAP socket {GetCompanyRequest.Method.Method} {GetCompanyRequest.PathAndQuery}";
+
         RawResponse response = await SendAsync(GetCompanyRequest, Facade.SoapBaseAddress, host: null);
 
         // The REST getCompany endpoint would have routed to stub B; the SOAP catch-all forwards to the
         // default target's SOAP base URL.
-        StubRequest forwarded = Assert.Single(Backend.Received);
-        Assert.Equal(StubListener.Soap, forwarded.Listener);
-        Assert.Equal(GetCompanyRequest.Method.Method, forwarded.Method);
-        Assert.Equal(GetCompanyRequest.PathAndQuery, forwarded.RawTarget);
-        Assert.Empty(Reroute.Received);
+        StubRequest forwarded = SingleRequest(Backend, label);
+        AssertRequest(forwarded, Backend, StubListener.Soap, GetCompanyRequest.Method.Method, GetCompanyRequest.PathAndQuery, label);
+        AssertNoRequests(Reroute, label);
 
         Assert.Equal(200, response.Status);
         Assert.Equal(BackendStubId, response.Header(StubIdHeader));
@@ -250,7 +255,7 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
 
         Assert.Equal(200, response.Status);
         Assert.Equal(HealthyBody, response.BodyText);
-        AssertNothingForwarded();
+        AssertNothingForwarded($"admin socket GET {AdminRoutes.Health}");
     }
 
     [Fact]
@@ -269,7 +274,7 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
                 "OpenAPI document has no top-level openapi string member");
         }
 
-        AssertNothingForwarded();
+        AssertNothingForwarded($"admin socket GET {AdminRoutes.OpenApiDocument}");
     }
 
     [Fact]
@@ -289,7 +294,7 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
                 "admin info has no non-empty frameworkDescription string member");
         }
 
-        AssertNothingForwarded();
+        AssertNothingForwarded($"admin socket GET {AdminRoutes.Info}");
     }
 
     // "/company" is a catalogue REST path: on the admin socket it is not an operation.
@@ -298,17 +303,60 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
     [InlineData("/company")]
     public async Task UnknownAdminPathReturns404AndForwardsNothing(string path)
     {
+        string label = $"admin socket GET {path}";
+
         RawResponse response = await SendAsync(Facade.AdminBaseAddress, HttpMethod.Get, path, host: null);
 
         Assert.Equal(404, response.Status);
-        Assert.Empty(response.Body);
-        AssertNothingForwarded();
+        Assert.True(
+            response.Body.Length == 0,
+            $"{label}: facade answered 404 with a {response.Body.Length}-byte body, expected an empty body");
+        AssertNothingForwarded(label);
     }
 
-    private void AssertNothingForwarded()
+    private void AssertNothingForwarded(string label)
     {
-        Assert.Empty(Backend.Received);
-        Assert.Empty(Reroute.Received);
+        AssertNoRequests(Backend, label);
+        AssertNoRequests(Reroute, label);
+    }
+
+    // Asserts that the stub recorded exactly one request, on any listener or only on the one given, and
+    // returns it. The snapshot is read once, so the count in the message is the count that was checked.
+    private static StubRequest SingleRequest(StubBackend stub, string label, StubListener? listener = null)
+    {
+        IReadOnlyList<StubRequest> received = listener is { } only ? stub.ReceivedOn(only) : stub.Received;
+        string where = listener is { } on ? $" on its {on} listener" : string.Empty;
+        Assert.True(
+            received.Count == 1,
+            $"{label}: stub {stub.Id} received {received.Count} requests{where}, expected exactly 1");
+        return received[0];
+    }
+
+    private static void AssertNoRequests(StubBackend stub, string label)
+    {
+        int count = stub.Received.Count;
+        Assert.True(count == 0, $"{label}: stub {stub.Id} received {count} requests, expected none");
+    }
+
+    // Asserts that a recorded request arrived on the expected listener with the caller's method and raw
+    // target unchanged; each message names only the expected value.
+    private static void AssertRequest(
+        StubRequest request,
+        StubBackend stub,
+        StubListener listener,
+        string method,
+        string rawTarget,
+        string label)
+    {
+        Assert.True(
+            request.Listener == listener,
+            $"{label}: stub {stub.Id} did not receive the request on its {listener} listener");
+        Assert.True(
+            string.Equals(request.Method, method, StringComparison.Ordinal),
+            $"{label}: stub {stub.Id} did not receive method {method}");
+        Assert.True(
+            string.Equals(request.RawTarget, rawTarget, StringComparison.Ordinal),
+            $"{label}: stub {stub.Id} did not receive the request target {rawTarget} unchanged");
     }
 
     private (Uri BaseAddress, StubListener Listener) PublicSocket(string socket) => socket switch

@@ -1,7 +1,7 @@
 using System.Collections.ObjectModel;
 using System.Globalization;
+using System.Reflection;
 using System.Text;
-using System.Text.Json;
 using Erewhon.Contracts;
 using Erewhon.Contracts.Catalogue;
 using Erewhon.Harness.Compare;
@@ -121,7 +121,10 @@ public static class CheckOutcomes
 /// The facade's <c>RuntimeInformation.FrameworkDescription</c> from its <c>/admin/info</c>; null when the
 /// facade was not reached.
 /// </param>
-/// <param name="SdkPin">The SDK version pinned in <c>harness/global.json</c>; null when unreadable.</param>
+/// <param name="SdkPin">
+/// The SDK version pinned in <c>harness/global.json</c>, baked into the harness assembly at build time
+/// (<see cref="TryReadSdkPin"/>); null when the build baked none.
+/// </param>
 /// <param name="TargetRestUrl">The facade REST base URL cases were sent to.</param>
 /// <param name="TargetSoapUrl">The facade SOAP base URL cases were sent to.</param>
 /// <param name="BackendRestUrl">The backend REST base URL.</param>
@@ -144,46 +147,30 @@ public sealed record RunFacts(
     string? BaselineCommit,
     string? FacadeCommit)
 {
-    // dotnet itself accepts comments and trailing commas in global.json.
-    private static readonly JsonDocumentOptions GlobalJsonOptions = new()
-    {
-        CommentHandling = JsonCommentHandling.Skip,
-        AllowTrailingCommas = true,
-    };
+    /// <summary>
+    /// The <see cref="AssemblyMetadataAttribute"/> key under which <c>Erewhon.Harness.csproj</c> bakes
+    /// <c>sdk.version</c> from <c>harness/global.json</c> into the harness assembly.
+    /// </summary>
+    public const string SdkPinMetadataKey = "Erewhon.Harness.SdkPin";
 
     /// <summary>
-    /// Reads <c>sdk.version</c> from a <c>global.json</c>, normally <c>harness/global.json</c>
-    /// (<c>HarnessOptions.HarnessGlobalJsonPath</c>). Never throws.
+    /// Returns the SDK version pinned in <c>harness/global.json</c>, as the build baked it into the
+    /// harness assembly under <see cref="SdkPinMetadataKey"/>. Reads no file and never throws.
     /// </summary>
-    /// <param name="globalJsonPath">The file path.</param>
-    /// <returns>The pinned SDK version; null when the file is absent, unreadable or has no such value.</returns>
-    public static string? TryReadSdkPin(string globalJsonPath)
+    /// <returns>The pinned SDK version; null when the build baked none, or a blank one.</returns>
+    public static string? TryReadSdkPin()
     {
         try
         {
-            if (string.IsNullOrWhiteSpace(globalJsonPath) || !File.Exists(globalJsonPath))
-            {
-                return null;
-            }
-
-            using var stream = File.OpenRead(globalJsonPath);
-            using var document = JsonDocument.Parse(stream, GlobalJsonOptions);
-            var root = document.RootElement;
-            if (root.ValueKind == JsonValueKind.Object
-                && root.TryGetProperty("sdk", out var sdk)
-                && sdk.ValueKind == JsonValueKind.Object
-                && sdk.TryGetProperty("version", out var version)
-                && version.ValueKind == JsonValueKind.String)
-            {
-                var value = version.GetString();
-                return string.IsNullOrWhiteSpace(value) ? null : value;
-            }
-
-            return null;
+            var value = typeof(RunFacts).Assembly
+                .GetCustomAttributes<AssemblyMetadataAttribute>()
+                .FirstOrDefault(attribute => string.Equals(attribute.Key, SdkPinMetadataKey, StringComparison.Ordinal))
+                ?.Value;
+            return string.IsNullOrWhiteSpace(value) ? null : value.Trim();
         }
         catch (Exception)
         {
-            // The SDK pin is a reported fact only; an unreadable file reports it as unknown.
+            // The SDK pin is a reported fact only; metadata that cannot be read reports it as unknown.
             return null;
         }
     }
@@ -238,6 +225,13 @@ public interface IReportSource
     /// <summary>Catalogue operation id to its planned case ids, in matrix order.</summary>
     IReadOnlyDictionary<string, IReadOnlyList<string>> PlannedCasesByOperation { get; }
 
+    /// <summary>
+    /// Catalogue operation id to the case ids that have a baseline record, in record order: the capture
+    /// evidence, independent of whether the replay went on to compare each case. Empty until the
+    /// baseline records were read.
+    /// </summary>
+    IReadOnlyDictionary<string, IReadOnlyList<string>> CapturedCasesByOperation { get; }
+
     /// <summary>The separate checks' results, keyed by <see cref="CheckNames"/> value.</summary>
     IReadOnlyDictionary<string, CheckResult> Checks { get; }
 
@@ -266,7 +260,10 @@ public static class OperationResults
     /// <summary>Some case failed, and the register documents every failing case item.</summary>
     public const string DocumentedDifference = "documented difference";
 
-    /// <summary>Some failing case item is not documented, or a planned case is unaccounted for.</summary>
+    /// <summary>
+    /// Some failing case item is not documented, a planned case is unaccounted for, or a captured case
+    /// was not compared.
+    /// </summary>
     public const string UndocumentedDifference = "undocumented difference";
 
     /// <summary>None of the operation's cases was captured; counts towards neither N nor M.</summary>
@@ -278,11 +275,18 @@ public static class OperationResults
 /// <param name="JadeMethod">The JADE method name, for example <c>getPhoto</c>.</param>
 /// <param name="Surface">The surface; null when it cannot be derived from an id without a catalogue.</param>
 /// <param name="Planned">Planned cases.</param>
-/// <param name="Captured">Captured cases, that is cases with a baseline record that replay reported.</param>
+/// <param name="Captured">
+/// Captured cases, that is cases with a baseline record: each case result the replay reported, plus each
+/// captured case it reported no result for.
+/// </param>
 /// <param name="Compared">Captured cases that were compared.</param>
 /// <param name="EquivalentCases">Compared cases found equivalent.</param>
 /// <param name="Result">One of the <see cref="OperationResults"/> values.</param>
 /// <param name="FailingItems">The operation's failing <c>CASE:</c> items.</param>
+/// <param name="UnaccountedCases">
+/// The ids of captured cases the replay did not compare, in record order. Each makes the operation an
+/// undocumented difference; none is a failing item, so no register entry can document it.
+/// </param>
 public sealed record OperationRow(
     string OperationId,
     string JadeMethod,
@@ -292,7 +296,8 @@ public sealed record OperationRow(
     int Compared,
     int EquivalentCases,
     string Result,
-    IReadOnlyList<FailureItem> FailingItems);
+    IReadOnlyList<FailureItem> FailingItems,
+    IReadOnlyList<string> UnaccountedCases);
 
 /// <summary>A failing item with the register entry that documents it, if any (AAP 0.7.7).</summary>
 /// <param name="Item">The failing item.</param>
@@ -302,8 +307,8 @@ public sealed record ReportedFailure(FailureItem Item, RegisterEntry? Entry, boo
 
 /// <summary>
 /// The computed content of <c>RESULTS.md</c> (AAP 0.8.2): the per-operation results, N, M, the final
-/// line, demo acceptance and whether every failing item is documented, which
-/// <c>Modes/ReplayMode.cs</c> uses for the exit code (AAP 0.7.7, 0.8.4).
+/// line, demo acceptance, whether every failing item is documented and which captured cases were not
+/// compared, the last two of which <c>Modes/ReplayMode.cs</c> uses for the exit code (AAP 0.7.7, 0.8.4).
 /// </summary>
 /// <remarks>
 /// <see cref="Build"/> snapshots the source, so the report and its rendering stay consistent even if
@@ -323,6 +328,7 @@ public sealed class ResultsReport
         KnownLimitationsRegister register,
         Snapshot snapshot,
         IReadOnlyList<OperationRow> operations,
+        IReadOnlyDictionary<string, IReadOnlyList<string>> plannedByOperation,
         IReadOnlyList<ReportedFailure> failures,
         bool catalogueAvailable)
     {
@@ -347,6 +353,7 @@ public sealed class ResultsReport
 
         UndocumentedFailures = Array.AsReadOnly(failures.Where(failure => !failure.Documented).Select(failure => failure.Item).ToArray());
         AllFailuresDocumented = UndocumentedFailures.Count == 0;
+        UnaccountedCases = Array.AsReadOnly(operations.SelectMany(row => row.UnaccountedCases).ToArray());
         FinalLine = FormatFinalLine(EquivalentCount, DocumentedDifferenceCount);
 
         var casesById = CaseFailuresById(failures);
@@ -362,7 +369,7 @@ public sealed class ResultsReport
             ? Baseline.PlannedOperations
             : operations.Count(row => row.Planned > 0);
 
-        DemoAcceptanceShortfall = DemoShortfall(EquivalentCount, operations, Cases);
+        DemoAcceptanceShortfall = DemoShortfall(EquivalentCount, operations, Cases, plannedByOperation);
         DemoAcceptanceMet = DemoAcceptanceShortfall.Count == 0;
     }
 
@@ -408,8 +415,17 @@ public sealed class ResultsReport
     public IReadOnlyList<FailureItem> UndocumentedFailures { get; }
 
     /// <summary>
-    /// True when at least 20 operations are equivalent and every other operation has a compared case
-    /// and returns the baseline status with a well-formed payload in each. Reported, never enforced.
+    /// The ids of captured cases the replay did not compare, in <see cref="Operations"/> order and record
+    /// order within an operation: every <see cref="OperationRow.UnaccountedCases"/> entry. They are not
+    /// failing items, so <see cref="AllFailuresDocumented"/> does not reflect them; <c>Modes/ReplayMode.cs</c>
+    /// exits 1 when any is present, because their operations are undocumented differences.
+    /// </summary>
+    public IReadOnlyList<string> UnaccountedCases { get; }
+
+    /// <summary>
+    /// True when at least 20 operations are equivalent and every other operation has a compared response
+    /// for each of its planned and captured cases, each with the baseline status and a well-formed
+    /// payload. Reported, never enforced: it plays no part in the exit code.
     /// </summary>
     public bool DemoAcceptanceMet { get; }
 
@@ -482,7 +498,7 @@ public sealed class ResultsReport
         ArgumentNullException.ThrowIfNull(register);
 
         var snapshot = Snapshot.Take(source);
-        var caseOperations = IndexCaseOperations(snapshot.Cases, snapshot.Planned);
+        var caseOperations = IndexCaseOperations(snapshot.Cases, snapshot.Captured, snapshot.Planned);
         var failures = CollectFailures(snapshot, caseOperations, register);
 
         var casesByOperation = new Dictionary<string, List<CaseResult>>(StringComparer.Ordinal);
@@ -505,30 +521,44 @@ public sealed class ResultsReport
 
         var descriptors = catalogue is not null
             ? catalogue.Operations.Select(operation => (operation.Id, operation.JadeMethod, (Surface?)operation.Surface))
-            : DeriveOperations(snapshot.Planned.Keys, casesByOperation.Keys, caseFailuresByOperation.Keys);
+            : DeriveOperations(snapshot.Planned.Keys, snapshot.Captured.Keys, casesByOperation.Keys, caseFailuresByOperation.Keys);
 
         var rows = new List<OperationRow>();
+        var plannedByRow = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
         foreach (var (id, jadeMethod, surface) in descriptors)
         {
             var cases = casesByOperation.GetValueOrDefault(id) ?? [];
             var caseFailures = caseFailuresByOperation.GetValueOrDefault(id) ?? [];
+            var captured = CapturedIds(snapshot.Captured.GetValueOrDefault(id), cases);
             var planned = snapshot.Planned.TryGetValue(id, out var plannedIds) && plannedIds.Count > 0
                 ? plannedIds
-                : FallbackPlanned(id, cases, caseFailures, snapshot.NotCaptured, caseOperations);
+                : FallbackPlanned(id, captured, caseFailures, snapshot.NotCaptured, caseOperations);
+            plannedByRow[id] = planned;
+
+            // Every case result comes from a record, so each counts as captured; a recorded case the replay
+            // reported no result for counts as well.
+            var resultIds = cases.Select(result => result.CaseId).Where(caseId => !string.IsNullOrWhiteSpace(caseId)).ToHashSet(StringComparer.Ordinal);
+            var capturedCount = cases.Count + captured.Count(caseId => !resultIds.Contains(caseId));
+            var comparedIds = cases
+                .Where(result => result.Compared && !string.IsNullOrWhiteSpace(result.CaseId))
+                .Select(result => result.CaseId)
+                .ToHashSet(StringComparer.Ordinal);
+            var unaccounted = Array.AsReadOnly(captured.Where(caseId => !comparedIds.Contains(caseId)).ToArray());
 
             rows.Add(new OperationRow(
                 id,
                 jadeMethod,
                 surface,
                 planned.Count,
-                cases.Count,
+                capturedCount,
                 cases.Count(result => result.Compared),
                 cases.Count(result => result.Compared && result.Equivalent),
-                Classify(planned, cases, caseFailures),
-                Array.AsReadOnly(caseFailures.Select(failure => failure.Item).ToArray())));
+                Classify(planned, capturedCount, unaccounted, cases, caseFailures),
+                Array.AsReadOnly(caseFailures.Select(failure => failure.Item).ToArray()),
+                unaccounted));
         }
 
-        return new ResultsReport(source, register, snapshot, rows.AsReadOnly(), failures, catalogue is not null);
+        return new ResultsReport(source, register, snapshot, rows.AsReadOnly(), plannedByRow, failures, catalogue is not null);
     }
 
     private static int CountResult(IReadOnlyList<OperationRow> rows, string result) =>
@@ -550,10 +580,12 @@ public sealed class ResultsReport
             ? result.Operation
             : FailureItemIds.OperationIdFromCaseId(result.CaseId);
 
-    // Case id to operation, from the case results first and the plan second. A CASE: item that names
-    // no operation is attributed through this index before falling back to the case id's own shape.
+    // Case id to operation, from the case results first, the baseline records second and the plan third.
+    // A CASE: item that names no operation is attributed through this index before falling back to the
+    // case id's own shape.
     private static Dictionary<string, string> IndexCaseOperations(
         IReadOnlyList<CaseResult> cases,
+        IReadOnlyDictionary<string, IReadOnlyList<string>> captured,
         IReadOnlyDictionary<string, IReadOnlyList<string>> planned)
     {
         var index = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -562,6 +594,14 @@ public sealed class ResultsReport
             if (!string.IsNullOrEmpty(result.CaseId) && OperationOf(result) is { } operation)
             {
                 index.TryAdd(result.CaseId, operation);
+            }
+        }
+
+        foreach (var (operation, ids) in captured)
+        {
+            foreach (var id in ids)
+            {
+                index.TryAdd(id, operation);
             }
         }
 
@@ -664,20 +704,45 @@ public sealed class ResultsReport
         }
     }
 
+    // The operation's captured case ids: those its baseline records hold, in record order, then the ids of
+    // case results the records do not list, since every case result comes from a record.
+    private static List<string> CapturedIds(IReadOnlyList<string>? recorded, List<CaseResult> cases)
+    {
+        var ids = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var caseId in recorded ?? [])
+        {
+            if (!string.IsNullOrWhiteSpace(caseId) && seen.Add(caseId))
+            {
+                ids.Add(caseId);
+            }
+        }
+
+        foreach (var result in cases)
+        {
+            if (!string.IsNullOrWhiteSpace(result.CaseId) && seen.Add(result.CaseId))
+            {
+                ids.Add(result.CaseId);
+            }
+        }
+
+        return ids;
+    }
+
     private static IReadOnlyList<string> FallbackPlanned(
         string operation,
-        List<CaseResult> cases,
+        List<string> captured,
         List<ReportedFailure> caseFailures,
         IReadOnlyList<string> notCaptured,
         Dictionary<string, string> caseOperations)
     {
         var ids = new List<string>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
-        foreach (var result in cases)
+        foreach (var caseId in captured)
         {
-            if (!string.IsNullOrEmpty(result.CaseId) && seen.Add(result.CaseId))
+            if (seen.Add(caseId))
             {
-                ids.Add(result.CaseId);
+                ids.Add(caseId);
             }
         }
 
@@ -701,14 +766,26 @@ public sealed class ResultsReport
     }
 
 
-    // AAP 0.7.7: equivalent when every planned case was captured, compared and equivalent; a documented
-    // difference when every failing case item is documented and every planned case was either compared
-    // or is itself a documented failing item; otherwise an undocumented difference.
-    private static string Classify(IReadOnlyList<string> planned, List<CaseResult> cases, List<ReportedFailure> caseFailures)
+    // AAP 0.7.7: not compared when none of the operation's cases was captured; equivalent when every
+    // planned case was captured, compared and equivalent; a documented difference when every failing case
+    // item is documented and every planned case was either compared or is itself a documented failing
+    // item; otherwise an undocumented difference. A captured case the replay did not compare has no
+    // failing item a register entry could document, so its operation is always an undocumented difference.
+    private static string Classify(
+        IReadOnlyList<string> planned,
+        int captured,
+        IReadOnlyList<string> unaccounted,
+        List<CaseResult> cases,
+        List<ReportedFailure> caseFailures)
     {
-        if (cases.Count == 0)
+        if (captured == 0)
         {
             return OperationResults.NotCompared;
+        }
+
+        if (unaccounted.Count > 0)
+        {
+            return OperationResults.UndocumentedDifference;
         }
 
         var equivalentIds = new HashSet<string>(StringComparer.Ordinal);
@@ -751,8 +828,13 @@ public sealed class ResultsReport
     }
 
     // AAP 0.7.7 demo acceptance: at least 20 equivalent operations, and every other operation returns the
-    // baseline status code with a well-formed payload in each of its compared cases.
-    private static ReadOnlyCollection<string> DemoShortfall(int equivalent, IReadOnlyList<OperationRow> rows, IReadOnlyList<CaseResult> cases)
+    // baseline status code with a well-formed payload, shown by a compared response for each of its planned
+    // and captured cases.
+    private static ReadOnlyCollection<string> DemoShortfall(
+        int equivalent,
+        IReadOnlyList<OperationRow> rows,
+        IReadOnlyList<CaseResult> cases,
+        IReadOnlyDictionary<string, IReadOnlyList<string>> plannedByOperation)
     {
         var shortfall = new List<string>();
         if (equivalent < DemoAcceptanceThreshold)
@@ -767,16 +849,16 @@ public sealed class ResultsReport
                 continue;
             }
 
-            var compared = cases
-                .Where(result => result.Compared
-                    && string.Equals(OperationOf(result), row.OperationId, StringComparison.Ordinal))
-                .ToArray();
-            if (compared.Length == 0)
+            if (string.Equals(row.Result, OperationResults.NotCompared, StringComparison.Ordinal))
             {
                 shortfall.Add($"{row.OperationId}: not compared");
                 continue;
             }
 
+            var compared = cases
+                .Where(result => result.Compared
+                    && string.Equals(OperationOf(result), row.OperationId, StringComparison.Ordinal))
+                .ToArray();
             foreach (var result in compared)
             {
                 if (!result.StatusMatched)
@@ -790,6 +872,23 @@ public sealed class ResultsReport
                 {
                     shortfall.Add($"{row.OperationId}: malformed payload in {result.CaseId}");
                 }
+            }
+
+            // Only a compared response shows the baseline status and a well-formed payload, so every planned
+            // or captured case without one is a shortfall of its own.
+            var comparedIds = compared.Select(result => result.CaseId).ToHashSet(StringComparer.Ordinal);
+            var uncompared = row.UnaccountedCases.ToHashSet(StringComparer.Ordinal);
+            var planned = plannedByOperation.GetValueOrDefault(row.OperationId) ?? [];
+            var listed = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var caseId in planned.Concat(row.UnaccountedCases))
+            {
+                if (comparedIds.Contains(caseId) || !listed.Add(caseId))
+                {
+                    continue;
+                }
+
+                var why = uncompared.Contains(caseId) ? "captured, not compared" : "not captured";
+                shortfall.Add($"{row.OperationId}: no compared response for {caseId} ({why})");
             }
         }
 
@@ -830,6 +929,7 @@ public sealed class ResultsReport
         IReadOnlyList<FailureItem> Failures,
         IReadOnlyList<CaseResult> Cases,
         IReadOnlyDictionary<string, IReadOnlyList<string>> Planned,
+        IReadOnlyDictionary<string, IReadOnlyList<string>> Captured,
         IReadOnlyDictionary<string, CheckResult> Checks,
         RunFacts? Facts,
         BaselineFacts Baseline,
@@ -844,15 +944,8 @@ public sealed class ResultsReport
         public static Snapshot Take(IReportSource source)
         {
             var baseline = source.Baseline ?? BaselineFacts.None;
-
-            var planned = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
-            foreach (var (operation, ids) in source.PlannedCasesByOperation ?? new Dictionary<string, IReadOnlyList<string>>())
-            {
-                if (!string.IsNullOrWhiteSpace(operation))
-                {
-                    planned[operation] = DistinctIds(ids);
-                }
-            }
+            var planned = CaseIdsByOperation(source.PlannedCasesByOperation);
+            var captured = CaseIdsByOperation(source.CapturedCasesByOperation);
 
             var checks = new Dictionary<string, CheckResult>(StringComparer.Ordinal);
             foreach (var (name, result) in source.Checks ?? new Dictionary<string, CheckResult>())
@@ -874,7 +967,8 @@ public sealed class ResultsReport
             return new Snapshot(
                 Array.AsReadOnly(NonNull(source.Failures)),
                 Array.AsReadOnly(cases),
-                planned.AsReadOnly(),
+                planned,
+                captured,
                 checks.AsReadOnly(),
                 source.Facts,
                 baseline with { NotCaptured = Array.AsReadOnly(NonNull(baseline.NotCaptured)) },
@@ -887,6 +981,23 @@ public sealed class ResultsReport
         private static T[] NonNull<T>(IReadOnlyList<T>? items)
             where T : class =>
             items is null ? [] : items.Where(item => item is not null).ToArray();
+
+        // Operation id to its distinct, non-blank case ids in their given order; blank keys are skipped and
+        // a null dictionary or list reads as empty.
+        private static ReadOnlyDictionary<string, IReadOnlyList<string>> CaseIdsByOperation(
+            IReadOnlyDictionary<string, IReadOnlyList<string>>? caseIdsByOperation)
+        {
+            var copy = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
+            foreach (var (operation, ids) in caseIdsByOperation ?? new Dictionary<string, IReadOnlyList<string>>())
+            {
+                if (!string.IsNullOrWhiteSpace(operation))
+                {
+                    copy[operation] = DistinctIds(ids);
+                }
+            }
+
+            return copy.AsReadOnly();
+        }
 
         private static ReadOnlyCollection<string> DistinctIds(IReadOnlyList<string>? ids) =>
             ids is null
@@ -956,6 +1067,10 @@ public sealed class ResultsReportWriter : IResultsReportWriter
 
     private const string DiffNaturePrefix = "d:";
     private const string DiscrepancyArtifactDirectory = "artifacts/discrepancies/";
+
+    // Why a captured case is listed under "Captured cases not compared".
+    private const string UnaccountedReason =
+        "The case has a baseline record, but the replay did not compare it, so its operation is an undocumented difference.";
     private const string DateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'";
 
     private static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
@@ -1295,6 +1410,8 @@ public sealed class ResultsReportWriter : IResultsReportWriter
             md.Blank();
         }
 
+        RenderUnaccountedCases(md, report);
+
         md.Line("### Other failing items").Blank();
         var otherFailures = report.Failures.Where(failure => !failure.Item.IsCaseItem).ToArray();
         if (otherFailures.Length == 0)
@@ -1316,6 +1433,29 @@ public sealed class ResultsReportWriter : IResultsReportWriter
                 AttemptsText(failure),
                 ArtifactText(item),
                 PlainText(item.Detail));
+        }
+
+        md.Blank();
+    }
+
+    // Captured cases the replay never compared. They are no failing item, so the tables around this one do
+    // not list them; the subsection appears only when there is one, so a complete replay's report is
+    // unchanged by it.
+    private static void RenderUnaccountedCases(MarkdownBuilder md, ResultsReport report)
+    {
+        if (report.UnaccountedCases.Count == 0)
+        {
+            return;
+        }
+
+        md.Line("### Captured cases not compared").Blank();
+        md.Header("Case", "Operation", "Why");
+        foreach (var row in report.Operations)
+        {
+            foreach (var caseId in row.UnaccountedCases)
+            {
+                md.Row(Code(caseId), Code(row.OperationId), UnaccountedReason);
+            }
         }
 
         md.Blank();

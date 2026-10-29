@@ -2,7 +2,8 @@
 
   <!--
     Facade-only behaviour tests (per-operation routing, unreachable and timeout responses, listener
-    isolation) against the facade hosted on real loopback Kestrel sockets.
+    isolation) against the facade hosted on real loopback Kestrel sockets, and socket-free tests of the
+    log level floors the facade applies to its logging configuration.
 
     Target framework, runtime pin, nullable, implicit usings, central package management and lock
     files are inherited from facade/Directory.Build.props, which imports Erewhon.Strangler.props;
