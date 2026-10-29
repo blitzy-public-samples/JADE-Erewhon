@@ -20,7 +20,10 @@
 #   facade    REST 65000  SOAP 21001  admin  9090
 #
 # Environment overrides honoured:
-#   BACKEND_REST_URL, BACKEND_SOAP_URL  Where the facade forwards; default the local stand-in.
+#   BACKEND_REST_URL, BACKEND_SOAP_URL  Where the facade forwards; default the local stand-in. In replay
+#                         they are also the harness's backend URLs, as docker-compose.yml sets them, so
+#                         the report names them and the backend WSDL is fetched from BACKEND_SOAP_URL.
+#                         Capture ignores them and always targets the stand-in it starts.
 #                         BACKEND_REST_URL=http://127.0.0.1:1 is the local forced-502 exit-code check.
 #   BACKEND_TIMEOUT_SECONDS  The facade's Backend:TimeoutSeconds; default 30.
 #   BACKEND_ADMIN_URL     The harness's backend admin URL; default the local stand-in. Set it explicitly
@@ -47,7 +50,46 @@ if [ -z "${BASH_VERSINFO:-}" ] ||
     exit 1
 fi
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# A CDPATH match would make `cd` print a path into the $(cd ... && pwd) resolutions below.
+unset CDPATH
+
+# The repository is located from the script's own real path: every symbolic link to the script is
+# followed (plain readlink, so no GNU -f is needed) and `..` is resolved physically, so neither a link
+# nor a linked directory moves the root. The root is confirmed before anything is written under it.
+INVOKED_AS="${BASH_SOURCE[0]:-}"
+no_repository() {
+    echo "run-local.sh: cannot locate the repository: $1${INVOKED_AS:+ (invoked as $INVOKED_AS)}" >&2
+    exit 1
+}
+[ -n "$INVOKED_AS" ] || no_repository "the script was not run from its own file"
+SCRIPT_PATH="$INVOKED_AS"
+LINK_HOPS=0
+while [ -L "$SCRIPT_PATH" ]; do
+    LINK_HOPS=$((LINK_HOPS + 1))
+    [ "$LINK_HOPS" -le 40 ] || no_repository "more than 40 symbolic links lead to the script"
+    LINK_TARGET="$(readlink -- "$SCRIPT_PATH")" ||
+        no_repository "cannot read the symbolic link $SCRIPT_PATH"
+    case "$LINK_TARGET" in
+    /*) SCRIPT_PATH="$LINK_TARGET" ;;
+    *)
+        # A relative target is taken from the physical directory that holds the link.
+        LINK_DIR="$(cd -P -- "$(dirname -- "$SCRIPT_PATH")" 2>/dev/null && pwd -P)" ||
+            no_repository "cannot enter the directory of $SCRIPT_PATH"
+        SCRIPT_PATH="$LINK_DIR/$LINK_TARGET"
+        ;;
+    esac
+done
+SCRIPT_DIR="$(cd -P -- "$(dirname -- "$SCRIPT_PATH")" 2>/dev/null && pwd -P)" ||
+    no_repository "cannot enter the directory of $SCRIPT_PATH"
+REPO_ROOT="$(cd -P -- "$SCRIPT_DIR/../.." 2>/dev/null && pwd -P)" ||
+    no_repository "cannot enter $SCRIPT_DIR/../.."
+if ! [ "$REPO_ROOT/harness/scripts/run-local.sh" -ef "$SCRIPT_PATH" ]; then
+    no_repository "$REPO_ROOT does not hold this script as harness/scripts/run-local.sh"
+fi
+# facade/ is not required: capture runs before any facade/ path exists.
+if ! [ -d "$REPO_ROOT/standin" ] || ! [ -d "$REPO_ROOT/harness" ]; then
+    no_repository "$REPO_ROOT does not have both a standin/ and a harness/ directory"
+fi
 ART="$REPO_ROOT/artifacts"
 LOGDIR="$ART/local"
 TFM="${TFM:-net10.0}"
@@ -57,6 +99,11 @@ readonly CONFIGURATION=Release
 readonly LOOPBACK=127.0.0.1
 readonly STANDIN_REST_PORT=15000 STANDIN_SOAP_PORT=15001 STANDIN_ADMIN_PORT=15090
 readonly FACADE_REST_PORT=65000 FACADE_SOAP_PORT=21001 FACADE_ADMIN_PORT=9090
+
+# The backend the facade forwards to: BACKEND_REST_URL and BACKEND_SOAP_URL, each falling back to the
+# local stand-in when unset or empty. Set once here so the facade and the replay harness never disagree.
+readonly FORWARD_REST_URL="${BACKEND_REST_URL:-http://$LOOPBACK:$STANDIN_REST_PORT}"
+readonly FORWARD_SOAP_URL="${BACKEND_SOAP_URL:-http://$LOOPBACK:$STANDIN_SOAP_PORT}"
 
 readonly STANDIN_DLL="src/Erewhon.StandIn/bin/$CONFIGURATION/$TFM/Erewhon.StandIn.dll"
 readonly FACADE_DLL="src/Erewhon.Facade/bin/$CONFIGURATION/$TFM/Erewhon.Facade.dll"
@@ -122,17 +169,27 @@ facade_env() {
         "Facade__SoapPort=$FACADE_SOAP_PORT"
         "Facade__AdminPort=$FACADE_ADMIN_PORT"
         "Facade__WsdlPath=$REPO_ROOT/contracts/wsdl/ErewhonWebService.wsdl"
-        "Routing__Targets__backend__RestBaseUrl=${BACKEND_REST_URL:-http://$LOOPBACK:$STANDIN_REST_PORT}"
-        "Routing__Targets__backend__SoapBaseUrl=${BACKEND_SOAP_URL:-http://$LOOPBACK:$STANDIN_SOAP_PORT}"
+        "Routing__Targets__backend__RestBaseUrl=$FORWARD_REST_URL"
+        "Routing__Targets__backend__SoapBaseUrl=$FORWARD_SOAP_URL"
         "Backend__TimeoutSeconds=${BACKEND_TIMEOUT_SECONDS:-30}"
     )
 }
 
+# harness_env <mode>: the harness's settings for capture, export-openapi or replay.
 harness_env() {
-    # The backend REST and SOAP URLs name the local stand-in even when BACKEND_REST_URL or
-    # BACKEND_SOAP_URL redirect the facade, so reset and the WSDL fetch still reach the stand-in during
-    # the forced-502 check. The admin URL uses `-`, not `:-`: an explicitly empty BACKEND_ADMIN_URL stays
-    # empty and marks an external backend.
+    # In replay the backend REST and SOAP URLs are the ones the facade forwards to, as docker-compose.yml
+    # sets them, so the run facts, the external-backend banner and the WSDL fetch name the real backend.
+    # Reset reaches the stand-in through the admin URL alone. Capture always targets the stand-in this
+    # script started, whatever BACKEND_REST_URL and BACKEND_SOAP_URL say, so it never records another
+    # backend into baseline/**; export-openapi reads no backend URL. The admin URL uses `-`, not `:-`: an
+    # explicitly empty BACKEND_ADMIN_URL stays empty and marks an external backend.
+    local mode="$1"
+    local backend_rest="http://$LOOPBACK:$STANDIN_REST_PORT"
+    local backend_soap="http://$LOOPBACK:$STANDIN_SOAP_PORT"
+    if [ "$mode" = replay ]; then
+        backend_rest="$FORWARD_REST_URL"
+        backend_soap="$FORWARD_SOAP_URL"
+    fi
     PROC_ENV=(
         "Harness__RepoRoot=$REPO_ROOT"
         "Harness__ExecutionMode=local-processes"
@@ -140,8 +197,8 @@ harness_env() {
         "Harness__Target__RestBaseUrl=http://$LOOPBACK:$FACADE_REST_PORT"
         "Harness__Target__SoapBaseUrl=http://$LOOPBACK:$FACADE_SOAP_PORT"
         "Harness__Target__AdminUrl=http://$LOOPBACK:$FACADE_ADMIN_PORT"
-        "Harness__Backend__RestBaseUrl=http://$LOOPBACK:$STANDIN_REST_PORT"
-        "Harness__Backend__SoapBaseUrl=http://$LOOPBACK:$STANDIN_SOAP_PORT"
+        "Harness__Backend__RestBaseUrl=$backend_rest"
+        "Harness__Backend__SoapBaseUrl=$backend_soap"
         "Harness__Backend__AdminUrl=${BACKEND_ADMIN_URL-http://$LOOPBACK:$STANDIN_ADMIN_PORT}"
     )
 }
@@ -165,21 +222,38 @@ build() {
     fi
 }
 
-# port_busy <port>: true when something already accepts connections on 127.0.0.1:<port>. The /dev/tcp
-# path is bash's own connect syntax; nothing under /dev is opened or touched.
+# port_busy <port>: probes 127.0.0.1:<port> within 2 s and sets PROBE_STATUS to the probe's own exit
+# status. The /dev/tcp path is bash's own connect syntax; nothing under /dev is opened or touched.
+# Returns 0 when the connect succeeds (something already listens on the port), 1 when it is refused
+# (probe status 1: the port is free) and 2 when the probe itself failed, so the port's state is unknown:
+# it timed out (124), timeout or bash could not be run (125, 126, 127), or it ended on a signal.
 port_busy() {
     # shellcheck disable=SC2016 # $0 and $1 are expanded by the inner bash, from its arguments.
     timeout 2 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$LOOPBACK" "$1" 2>/dev/null
+    PROBE_STATUS=$?
+    case "$PROBE_STATUS" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) return 2 ;;
+    esac
 }
 
-# warn_busy <name> <port>...: warns about ports a leftover process already holds; the run continues.
+# warn_busy <name> <port>...: warns about ports a leftover process already holds, and about ports whose
+# probe failed, since those may be held as well; a free port gets no message. The run continues.
 warn_busy() {
     local name="$1" port
     shift
     for port in "$@"; do
-        if port_busy "$port"; then
+        port_busy "$port"
+        case $? in
+        0)
             echo "run-local.sh: warning: $LOOPBACK:$port is already in use; $name may fail to start" >&2
-        fi
+            ;;
+        2)
+            echo "run-local.sh: warning: could not probe $LOOPBACK:$port (probe status $PROBE_STATUS);" \
+                "$name may fail to start if the port is in use" >&2
+            ;;
+        esac
     done
 }
 
@@ -270,7 +344,7 @@ run_harness() {
     log="$LOGDIR/harness-$mode.log"
     exec 3> >(trap '' INT TERM HUP; exec tee "$log")
     TEE_PID=$!
-    harness_env
+    harness_env "$mode"
     (
         cd "$REPO_ROOT/harness" || exit 1
         exec env "${PROC_ENV[@]}" dotnet "$HARNESS_DLL" "$mode"
@@ -329,10 +403,22 @@ start_facade() {
 
 # --- Subcommands ----------------------------------------------------------------------------------
 
-# prepare: the checks and directories every subcommand needs, once its name is known to be valid.
+# prepare: the checks and directories every subcommand needs, once its name is known to be valid. Every
+# external program the script runs is looked up on PATH first, so a missing one stops the run with its
+# name before anything is built, started or written. Unchecked, a missing timeout or bash would make
+# every port probe fail, and a missing tee would lose the logs and the harness's console copy.
 prepare() {
-    if ! command -v dotnet >/dev/null 2>&1; then
-        echo "run-local.sh: dotnet is not on PATH" >&2
+    local tool missing=()
+    for tool in dotnet timeout bash tee env sed tail sleep mkdir rm basename dirname; do
+        if ! type -P "$tool" >/dev/null 2>&1; then
+            missing+=("$tool")
+        fi
+    done
+    if [ "${#missing[@]}" -eq 1 ]; then
+        echo "run-local.sh: required tool is not on PATH: ${missing[0]}" >&2
+        exit 1
+    elif [ "${#missing[@]}" -gt 1 ]; then
+        echo "run-local.sh: required tools are not on PATH: ${missing[*]}" >&2
         exit 1
     fi
     mkdir -p "$LOGDIR"
@@ -358,7 +444,9 @@ cmd_replay() {
     build harness src/Erewhon.Harness/Erewhon.Harness.csproj
     build facade tests/Erewhon.Facade.Tests/Erewhon.Facade.Tests.csproj
     run_facade_tests
-    # The stand-in is always started; BACKEND_* overrides change only where the facade forwards.
+    # The stand-in is always started, and reset reaches it through the admin URL. BACKEND_REST_URL and
+    # BACKEND_SOAP_URL change where the facade forwards and, as under Compose, the backend URLs the
+    # harness reports and fetches the backend WSDL from.
     start_standin
     start_facade
     run_harness replay
