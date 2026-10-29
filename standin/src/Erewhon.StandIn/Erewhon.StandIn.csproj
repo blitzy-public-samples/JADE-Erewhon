@@ -14,6 +14,11 @@
          replayed against the container, and both must produce byte-identical output. -->
     <InvariantGlobalization>true</InvariantGlobalization>
     <IsPackable>false</IsPackable>
+    <!-- `dotnet run` starts the app in standin/, the component directory every dotnet command runs
+         from, so that StandIn:SeedDirectory "../Erewhon/DataFiles" in appsettings.json resolves to
+         the repository's seed files. The Web SDK default would start it in this project directory,
+         where that relative path names no directory. -->
+    <RunWorkingDirectory>$([System.IO.Path]::GetFullPath('$(MSBuildProjectDirectory)/../..'))</RunWorkingDirectory>
   </PropertyGroup>
 
   <ItemGroup>
