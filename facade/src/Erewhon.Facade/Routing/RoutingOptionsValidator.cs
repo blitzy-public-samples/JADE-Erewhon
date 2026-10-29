@@ -24,16 +24,24 @@ namespace Erewhon.Facade.Routing;
 /// <item><description>the default target is named, defined and has both base URLs;</description></item>
 /// <item><description>every listed catalogue operation names a defined target with its surface's base URL;</description></item>
 /// <item><description>every listed key is a catalogue operation of its surface;</description></item>
-/// <item><description>every target is non-empty and every base URL it carries is well formed;</description></item>
+/// <item><description>every target is non-empty and every base URL it carries is an absolute http or https URL with a host and no user information, query or fragment;</description></item>
 /// <item><description>every target timeout is greater than 0.</description></item>
 /// </list>
+/// <para>
+/// No message quotes a configured base URL: a rejected one is named by its configuration path and the
+/// rule it breaks, for example <c>Routing:Targets:backend:RestBaseUrl must not contain user information</c>.
+/// A target name is quoted only when it holds no at-sign (<see cref="NamesUndefinedTarget"/>). The
+/// failures reach the host's start-up error log, the one line <c>Program.cs</c> writes to standard error
+/// and <c>OperationRouter</c>'s rejected-reload log entry, so a credential pasted into the routing
+/// configuration never reaches any of them.
+/// </para>
 /// <para>
 /// The set of operations comes only from the injected <see cref="OperationCatalogue"/>, and every
 /// lookup goes through <see cref="RoutingOptions.TryGetTarget"/> and
 /// <see cref="RoutingOperations.TryGetTargetName"/>, so an entry spelled in another case resolves
 /// exactly as <c>OperationRouter</c> resolves it. Only the form of an address is checked: reachability
-/// is not, and the facade carries no credential to check. The validator holds no state and never
-/// changes the options it validates.
+/// is not. The facade carries and adds no credential, so a base URL carrying one is rejected rather than
+/// silently unused. The validator holds no state and never changes the options it validates.
 /// </para>
 /// </remarks>
 /// <param name="catalogue">The operation catalogue, <see cref="OperationCatalogue.Default"/> in the facade.</param>
@@ -42,6 +50,10 @@ public sealed class RoutingOptionsValidator(OperationCatalogue catalogue) : IVal
     private const string DefaultTargetPath = RoutingOptions.SectionName + ":" + nameof(RoutingOptions.DefaultTarget);
     private const string TargetsPath = RoutingOptions.SectionName + ":" + nameof(RoutingOptions.Targets);
     private const string OperationsPath = RoutingOptions.SectionName + ":" + nameof(RoutingOptions.Operations);
+
+    // The characters that end user information in a URL: '@' and its two compatibility forms, U+FF20
+    // and U+FE6B, which NFKC folds to '@'. No other character folds to it.
+    private const string AtSignCharacters = "@\uFF20\uFE6B";
 
     // The two surfaces the routing table has sections for, in catalogue order, with the base URL each
     // surface's operations are forwarded to.
@@ -81,32 +93,101 @@ public sealed class RoutingOptionsValidator(OperationCatalogue catalogue) : IVal
     }
 
     /// <summary>
-    /// Parses a target base URL: an absolute <c>http</c> or <c>https</c> URL with a host and no query or
-    /// fragment, surrounding blanks ignored. <c>OperationRouter</c> parses with this method too, so the
-    /// router never accepts a URL start-up rejected.
+    /// Parses a target base URL: an absolute <c>http</c> or <c>https</c> URL with a host and no user
+    /// information, query or fragment, surrounding blanks ignored. <c>OperationRouter</c> parses with this
+    /// method too, so the router never accepts a URL start-up rejected.
     /// </summary>
     /// <remarks>
     /// YARP's <c>IHttpForwarder</c> appends the request's raw path and query to the destination prefix,
     /// so a query or fragment in the prefix would corrupt every forwarded address. A query or fragment
-    /// that is only a bare <c>?</c> or <c>#</c> is rejected as well.
+    /// that is only a bare <c>?</c> or <c>#</c> is rejected as well. The facade sends no credential, so
+    /// user information would go unused while <c>GET /admin/info</c> and the logs could show it; it is
+    /// rejected, and so is a host holding a compatibility form of <c>@</c> (U+FF20 or U+FE6B), which the
+    /// runtime reads as part of the host rather than as the end of user information.
+    /// <see cref="DescribeBaseUrlProblem"/> applies the same rules, so the two never disagree.
     /// </remarks>
     /// <param name="value">The configured value.</param>
     /// <param name="uri">The parsed URL; null when the value is rejected.</param>
     /// <returns>True when the value is a usable base URL; false for null, whitespace or any other form.</returns>
-    public static bool TryParseBaseUrl(string? value, [NotNullWhen(true)] out Uri? uri)
+    public static bool TryParseBaseUrl(string? value, [NotNullWhen(true)] out Uri? uri) =>
+        TryReadBaseUrl(value, out uri, out _);
+
+    /// <summary>
+    /// Says why a configured base URL is unusable, in a fixed phrase that quotes no part of the value, so
+    /// a credential in a rejected URL never reaches a failure message or a log.
+    /// </summary>
+    /// <param name="value">The configured value.</param>
+    /// <returns>
+    /// Null when <see cref="TryParseBaseUrl"/> accepts the value. Otherwise the first rule it breaks, worded
+    /// to follow the entry's configuration path: <c>is empty</c>, <c>is not an absolute URL</c>,
+    /// <c>is not an http or https URL</c>, <c>has no host</c>, <c>must not contain user information</c>,
+    /// <c>must not contain a query</c> or <c>must not contain a fragment</c>.
+    /// </returns>
+    internal static string? DescribeBaseUrlProblem(string? value) =>
+        TryReadBaseUrl(value, out _, out var problem) ? null : problem;
+
+    /// <summary>
+    /// The failure of an entry that names an undefined target. The name is quoted as configured unless it
+    /// holds <c>@</c> or a compatibility form of it: user information always needs one, so a URL with a
+    /// credential pasted where a target name belongs is never echoed.
+    /// </summary>
+    /// <param name="entry">The entry's configuration path, such as <c>Routing:DefaultTarget</c>.</param>
+    /// <param name="targetName">The target name the entry holds.</param>
+    /// <returns>The failure message, naming <paramref name="entry"/>.</returns>
+    internal static string NamesUndefinedTarget(string entry, string targetName) =>
+        HoldsAtSign(targetName)
+            ? $"{entry} names an undefined target, not shown because it may contain user information"
+            : $"{entry} names undefined target '{targetName}'";
+
+    /// <summary>True when <paramref name="text"/> holds <c>@</c> or one of its compatibility forms, U+FF20 and U+FE6B.</summary>
+    /// <param name="text">The text to search; null holds none.</param>
+    /// <returns>True when user information could end inside <paramref name="text"/>.</returns>
+    internal static bool HoldsAtSign(string? text) => text.AsSpan().IndexOfAny(AtSignCharacters) >= 0;
+
+    // The one implementation of the base URL rules behind TryParseBaseUrl and DescribeBaseUrlProblem.
+    // Every problem is a fixed phrase that quotes no part of the value, not even the scheme, because the
+    // runtime parses "user:secret@backend" as an absolute URL whose scheme is "user".
+    private static bool TryReadBaseUrl(
+        string? value,
+        [NotNullWhen(true)] out Uri? uri,
+        [NotNullWhen(false)] out string? problem)
     {
-        if (!string.IsNullOrWhiteSpace(value)
-            && Uri.TryCreate(value.Trim(), UriKind.Absolute, out var parsed)
-            && (parsed.Scheme == Uri.UriSchemeHttp || parsed.Scheme == Uri.UriSchemeHttps)
-            && parsed.Host.Length > 0
-            && parsed.Query.Length == 0
-            && parsed.Fragment.Length == 0)
+        uri = null;
+        if (string.IsNullOrWhiteSpace(value))
+        {
+            problem = "is empty";
+        }
+        else if (!Uri.TryCreate(value.Trim(), UriKind.Absolute, out var parsed))
+        {
+            problem = "is not an absolute URL";
+        }
+        else if (parsed.Scheme != Uri.UriSchemeHttp && parsed.Scheme != Uri.UriSchemeHttps)
+        {
+            problem = "is not an http or https URL";
+        }
+        else if (parsed.Host.Length == 0)
+        {
+            problem = "has no host";
+        }
+        else if (parsed.UserInfo.Length > 0 || HoldsAtSign(parsed.Host))
+        {
+            problem = "must not contain user information";
+        }
+        else if (parsed.Query.Length > 0)
+        {
+            problem = "must not contain a query";
+        }
+        else if (parsed.Fragment.Length > 0)
+        {
+            problem = "must not contain a fragment";
+        }
+        else
         {
             uri = parsed;
+            problem = null;
             return true;
         }
 
-        uri = null;
         return false;
     }
 
@@ -122,7 +203,7 @@ public sealed class RoutingOptionsValidator(OperationCatalogue catalogue) : IVal
 
         if (!options.TryGetTarget(options.DefaultTarget, out var configuredName, out var target))
         {
-            failures.Add($"{DefaultTargetPath} names undefined target '{options.DefaultTarget}'");
+            failures.Add(NamesUndefinedTarget(DefaultTargetPath, options.DefaultTarget));
             return null;
         }
 
@@ -166,7 +247,7 @@ public sealed class RoutingOptionsValidator(OperationCatalogue catalogue) : IVal
                 }
                 else if (!options.TryGetTarget(targetName, out var targetKey, out var target))
                 {
-                    failures.Add($"{entry} names undefined target '{targetName}'");
+                    failures.Add(NamesUndefinedTarget(entry, targetName));
                 }
                 else if (IsAbsent(surface.UrlOf(target)) && !ReferenceEquals(target, defaultTarget))
                 {
@@ -196,7 +277,8 @@ public sealed class RoutingOptionsValidator(OperationCatalogue catalogue) : IVal
     }
 
     // Rule 4. Applies to every target, referenced or not, so a typo in a target staged for a later
-    // cut-over is caught before that target is first used.
+    // cut-over is caught before that target is first used. The message names the entry and the rule it
+    // breaks, never the value, which may hold a credential.
     private static void ValidateBaseUrls(KeyValuePair<string, RoutingTarget>[] targets, List<string> failures)
     {
         foreach (var (name, target) in targets)
@@ -210,11 +292,9 @@ public sealed class RoutingOptionsValidator(OperationCatalogue catalogue) : IVal
             foreach (var surface in Surfaces)
             {
                 var value = surface.UrlOf(target);
-                if (!IsAbsent(value) && !TryParseBaseUrl(value, out _))
+                if (!IsAbsent(value) && DescribeBaseUrlProblem(value) is { } problem)
                 {
-                    failures.Add(
-                        $"{TargetsPath}:{name}:{surface.UrlName} '{value}' is not an absolute http or https URL " +
-                        "without query or fragment");
+                    failures.Add($"{TargetsPath}:{name}:{surface.UrlName} {problem}");
                 }
             }
         }

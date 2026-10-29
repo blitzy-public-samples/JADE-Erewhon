@@ -224,6 +224,11 @@ public sealed partial class OperationRouter
         return table;
     }
 
+    // Logs a rejected reload once per distinct failure set, and keeps that set as the key that suppresses
+    // repeats until a valid reload clears it. The failures can be logged verbatim: RoutingOptionsValidator
+    // builds every one from configuration paths and fixed phrases, never quoting a base URL or a target
+    // name that may hold user information, and the Backend check's message is fixed text, so neither the
+    // log entry nor the key holds a credential.
     private void ReportRejectedReload(OptionsValidationException exception)
     {
         var failures = string.Join("; ", exception.Failures);
@@ -286,7 +291,8 @@ public sealed partial class OperationRouter
     }
 
     // An entry that cannot be resolved becomes a failed route that names it in the validator's
-    // wording, so only the requests that entry serves fail and no other target is substituted.
+    // wording, so only the requests that entry serves fail and no other target is substituted. Like the
+    // validator's, the failure quotes no base URL and no target name that may hold user information.
     private static Route CompileRoute(
         RoutingOptions routing,
         BackendOptions backend,
@@ -302,7 +308,7 @@ public sealed partial class OperationRouter
 
         if (!routing.TryGetTarget(targetName, out var name, out var target))
         {
-            return Route.Failed(targetName, $"{entry} names undefined target '{targetName}'");
+            return Route.Failed(targetName, RoutingOptionsValidator.NamesUndefinedTarget(entry, targetName));
         }
 
         var url = surface.UrlOf(target);
@@ -311,11 +317,12 @@ public sealed partial class OperationRouter
             return Route.Failed(name, $"{TargetsPath}:{name} has no {surface.UrlName} but {usage}");
         }
 
+        // The failure names the entry and the rule it breaks, never the URL, which may hold a credential.
         if (!RoutingOptionsValidator.TryParseBaseUrl(url, out var baseUrl))
         {
             return Route.Failed(
                 name,
-                $"{TargetsPath}:{name}:{surface.UrlName} '{url}' is not an absolute http or https URL without query or fragment");
+                $"{TargetsPath}:{name}:{surface.UrlName} {RoutingOptionsValidator.DescribeBaseUrlProblem(url)}");
         }
 
         // A non-positive deadline would make the forwarder cancel every call at once or throw, so it is

@@ -146,11 +146,43 @@ public static partial class AdminEndpoints
     }
 
     /// <summary>
+    /// The form of a configured target base URL that <see cref="AdminRoutes.Info"/> reports, which never
+    /// holds user information, a query or a fragment: the endpoint is unauthenticated and the facade
+    /// carries no credential, so none may appear in its body.
+    /// </summary>
+    /// <param name="configured">The configured base URL, as the routing snapshot holds it.</param>
+    /// <returns>
+    /// Null for null. The configured string unchanged when
+    /// <see cref="RoutingOptionsValidator.TryParseBaseUrl"/> accepts it, which is every URL start-up
+    /// accepted. For an absolute <c>http</c> or <c>https</c> URL carrying user information, only its
+    /// scheme, host, port and path. Null for anything else, because no part of it can be shown safely.
+    /// </returns>
+    internal static string? DisplayBaseUrl(string? configured)
+    {
+        if (configured is null || RoutingOptionsValidator.TryParseBaseUrl(configured, out _))
+        {
+            return configured;
+        }
+
+        // A host holding a compatibility form of '@' still holds the user name before it, so such a URL
+        // is not shown at all.
+        return Uri.TryCreate(configured.Trim(), UriKind.Absolute, out var uri)
+            && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+            && uri.UserInfo.Length > 0
+            && uri.Host.Length > 0
+            && !RoutingOptionsValidator.HoldsAtSign(uri.Host)
+            ? uri.GetComponents(UriComponents.SchemeAndServer | UriComponents.Path, UriFormat.UriEscaped)
+            : null;
+    }
+
+    /// <summary>
     /// Writes the <see cref="AdminRoutes.Info"/> body: compact JSON whose members appear in the fixed order
     /// component, frameworkDescription, wsdl, backendTimeoutSeconds, routing. <c>routing</c> projects
     /// <paramref name="routing"/> as <see cref="OperationRouter.Resolve"/> uses it: the default target, the
     /// targets keyed by name in the snapshot's ordinal order, and one row per catalogue operation in the
-    /// snapshot's order, REST first, then SOAP.
+    /// snapshot's order, REST first, then SOAP. Each target's <c>restBaseUrl</c> and <c>soapBaseUrl</c>
+    /// pass through <see cref="DisplayBaseUrl"/>, so the body never shows user information; a URL start-up
+    /// accepted appears exactly as configured.
     /// </summary>
     private static Task WriteInfoAsync(
         HttpResponse response,
@@ -175,8 +207,8 @@ public static partial class AdminEndpoints
             foreach (var target in routing.Targets)
             {
                 writer.WriteStartObject(target.Name);
-                writer.WriteString(RestBaseUrlMember, target.RestBaseUrl);
-                writer.WriteString(SoapBaseUrlMember, target.SoapBaseUrl);
+                writer.WriteString(RestBaseUrlMember, DisplayBaseUrl(target.RestBaseUrl));
+                writer.WriteString(SoapBaseUrlMember, DisplayBaseUrl(target.SoapBaseUrl));
                 writer.WriteNumber(TimeoutSecondsMember, target.TimeoutSeconds);
                 writer.WriteEndObject();
             }
