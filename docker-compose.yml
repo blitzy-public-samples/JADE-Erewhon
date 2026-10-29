@@ -1,0 +1,149 @@
+# Erewhon strangler facade: one command starts the JADE stand-in, the facade, the facade tests and the
+# equivalence harness, replays the committed baseline through the facade and always ends with
+# RESULTS.md written:
+#
+#   docker compose up --build
+#
+# Requires Docker Compose v2.20 or later (depends_on.required: false). With older Compose, or without
+# Docker, use `harness/scripts/run-local.sh replay` instead (KL-SUB-DOCKER).
+#
+# Backend. `.env` sets COMPOSE_PROFILES=standin, so the JADE stand-in is the default backend. It answers
+# on the JADE application ports (ErewhonREST 65000, WebServiceHTTP 21001, from
+# Erewhon/ErehwhonExternalInterfacesSchema.ddx), but what it returns is stand-in output, not recorded
+# JADE behaviour. To point the facade at another backend, which has no admin port and so no state reset:
+#
+#   COMPOSE_PROFILES= BACKEND_REST_URL=http://<host>:65000 BACKEND_SOAP_URL=http://<host>:21001 BACKEND_ADMIN_URL= docker compose up --build
+#
+# Exit status. Plain `docker compose up` ignores container exit codes, and no Compose file key or
+# COMPOSE_* variable reproduces --exit-code-from, so the status travels through depends_on instead. The
+# harness replays the baseline, writes RESULTS.md, stops the facade and the stand-in through
+# POST /admin/shutdown on their admin ports and exits 0 or 1. On 1, the service_completed_successfully
+# dependency of run-complete fails: Compose prints `service "harness" didn't complete successfully:
+# exit 1` and returns 1. On 0, run-complete prints the report's final line and exits 0; every container
+# has then stopped, and Compose returns 0. The command's status is therefore the harness's. Abort-on-exit
+# semantics, exit-code-from or a restart policy would break this chain, so none is used.
+#
+# Trust. Every listener is plain HTTP without authentication, as the JADE applications are
+# (_webIsSecure false). That leaves the admin listener (9090) unauthenticated, and it is contained by
+# placement alone: no service publishes it, and the stand-in sits only on the internal network
+# `backend`, which only the facade and the harness join.
+#
+# Every build uses the repository root as its context, filtered by the root .dockerignore. No service
+# sets ASPNETCORE_URLS or ASPNETCORE_HTTP_PORTS, because the facade and the stand-in bind their three
+# listeners from their own Facade:* and StandIn:* port settings. No service has a healthcheck: the
+# aspnet images contain no curl, and the harness establishes readiness by polling GET /health on each
+# admin port.
+
+# harness and run-complete share one build, so the second is fully cached. A build rather than an
+# image-only reference, because `up --build` could otherwise try to pull the image.
+x-harness-build: &harness-build
+  context: .
+  dockerfile: harness/Dockerfile
+
+services:
+  # The backend of this run. No ports are published: REST 65000, SOAP 21001 and admin 9090 are reached
+  # only over the internal network.
+  standin:
+    profiles: ["standin"]
+    build:
+      context: .
+      dockerfile: standin/Dockerfile
+    # The image's copy of Erewhon/DataFiles/, made by standin/Dockerfile.
+    environment:
+      StandIn__SeedDirectory: /app/seed
+    networks:
+      - backend
+    restart: "no"
+
+  # Owns the caller-facing REST and SOAP addresses and forwards every operation to its routed target.
+  facade:
+    build:
+      context: .
+      dockerfile: facade/Dockerfile
+      target: runtime
+    ports:
+      - "65000:65000"
+      - "21001:21001"
+    environment:
+      Routing__Targets__backend__RestBaseUrl: ${BACKEND_REST_URL}
+      Routing__Targets__backend__SoapBaseUrl: ${BACKEND_SOAP_URL}
+      Backend__TimeoutSeconds: ${BACKEND_TIMEOUT_SECONDS}
+    networks:
+      - edge
+      - backend
+    # required: false keeps an external-backend run (COMPOSE_PROFILES empty) valid without the stand-in.
+    depends_on:
+      standin:
+        condition: service_started
+        required: false
+    restart: "no"
+
+  # Routing, failure-behaviour and listener-isolation tests on loopback. tests/run-tests.sh writes
+  # /repo/artifacts/facade-tests/facade-tests.trx and exit-code and always exits 0, so the harness's
+  # dependency on it always holds and the outcome travels in those files.
+  facade-tests:
+    build:
+      context: .
+      dockerfile: facade/Dockerfile
+      target: test
+    network_mode: none
+    volumes:
+      - .:/repo
+    restart: "no"
+
+  # Reads baseline/, harness/config/, contracts/, artifacts/facade-tests/ and .git; writes RESULTS.md
+  # and artifacts/. It reaches the facade's unpublished admin port container to container.
+  harness:
+    build: *harness-build
+    command: ["replay"]
+    environment:
+      Harness__RepoRoot: /repo
+      Harness__ReportPath: ${HARNESS_REPORT_PATH:-/repo/RESULTS.md}
+      Harness__ExecutionMode: docker
+      Harness__Target__RestBaseUrl: http://facade:65000
+      Harness__Target__SoapBaseUrl: http://facade:21001
+      Harness__Target__AdminUrl: http://facade:9090
+      # No `:-` defaults: .env supplies them, and an explicitly empty BACKEND_ADMIN_URL must reach the
+      # harness empty, which is how it recognises an external backend with no reset path (KL-SUB-NORESET).
+      Harness__Backend__RestBaseUrl: ${BACKEND_REST_URL}
+      Harness__Backend__SoapBaseUrl: ${BACKEND_SOAP_URL}
+      Harness__Backend__AdminUrl: ${BACKEND_ADMIN_URL}
+    networks:
+      - backend
+      - edge
+    volumes:
+      - .:/repo
+    depends_on:
+      facade:
+        condition: service_started
+      standin:
+        condition: service_started
+        required: false
+      facade-tests:
+        condition: service_completed_successfully
+    restart: "no"
+
+  # The last link of the exit-status chain: starts only after the harness exits 0 and prints the final
+  # line of RESULTS.md.
+  run-complete:
+    build: *harness-build
+    command: ["summary"]
+    environment:
+      Harness__RepoRoot: /repo
+      Harness__ReportPath: ${HARNESS_REPORT_PATH:-/repo/RESULTS.md}
+    network_mode: none
+    volumes:
+      - .:/repo:ro
+    depends_on:
+      harness:
+        condition: service_completed_successfully
+    restart: "no"
+
+networks:
+  # Carries the published facade ports and any egress an external backend needs.
+  edge:
+    driver: bridge
+  # Internal: no route outside Docker, so the stand-in is reachable only by the facade and the harness.
+  backend:
+    driver: bridge
+    internal: true
