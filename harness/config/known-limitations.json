@@ -1,0 +1,580 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "id": "KL-BASELINE-STANDIN",
+      "category": "substitution",
+      "operation": null,
+      "matches": [],
+      "reason": "No live JADE 2022 runtime is used: the baseline under baseline/** is stand-in output (jade-standin), ported from the reference method bodies [Erewhon/ErehwhonExternalInterfacesSchema.scm:2326-2868, 6526-6942] and the model-schema transaction-agent rules [Erewhon/ErewhonModelSchema.scm:9794-14146]. Equivalence therefore proves facade = stand-in, not facade = JADE.",
+      "attempts": 0,
+      "actionTaken": "Stand-in output is labelled in every baseline record, the baseline manifest, the WSDL header comment, the report banner and the console (AAP 0.8.3). Later runs strengthen the stand-in from the in-repo sources before each cut-over."
+    },
+    {
+      "id": "KL-REST-PATHS",
+      "category": "assumption",
+      "operation": null,
+      "matches": [],
+      "reason": "No REST path appears in the repository, so paths follow the JADE 2022 rule: the verb prefix is removed and the next letter lower-cased, primitive parameters become path segments in signature order, the single object parameter is a JSON body, and the direct form runs on port 65000 [Erewhon/ErehwhonExternalInterfacesSchema.ddx:82]. The relay form /<alias>/jadehttp.dll/<path>?ErewhonREST, which the jadehttp.dll setting admits [Erewhon/ErehwhonExternalInterfacesSchema.ddx:145], is not modelled.",
+      "attempts": 0,
+      "actionTaken": "Catalogue path templates follow the rule. The facade's REST catch-all forwards the relay form and every other unmatched request to the backend unchanged (AAP 0.4.5)."
+    },
+    {
+      "id": "KL-SOAP-ACTIONS",
+      "category": "assumption",
+      "operation": null,
+      "matches": [],
+      "reason": "The provider's soapAction properties are blank [Erewhon/ErehwhonExternalInterfacesSchema.scm:1157], so the JADE default urn:JadeWebServices/WebServiceHTTP/<op> is applied. This disagrees with the request's statement that the repository records none: the generated consumer HTTP_ErewhonWebService records exactly this form for all 9 operations [Erewhon/ErewhonWebServiceConsumerSchema.scm:1740-1868], but it was generated from a 2023 WSDL by runtime 22.0.01 and may lag the provider.",
+      "attempts": 0,
+      "actionTaken": "The catalogue, stand-in and WSDL use the default form. The facade resolves the operation by SOAPAction first, then by bounded body inspection, and forwards unresolved requests to the default target."
+    },
+    {
+      "id": "KL-SOAP-WSDL",
+      "category": "assumption",
+      "operation": null,
+      "matches": [],
+      "reason": "The provider's wsdl class property is empty [Erewhon/ErehwhonExternalInterfacesSchema.scm:1135], the consumer's WSDL path points outside the repository [Erewhon/ErewhonWebServiceConsumerSchema.scm:1723], and the &wsdl query form is undocumented. The stand-in generates the WSDL from the catalogue: namespace urn:JadeWebServices/WebServiceHTTP/, service ErewhonWebService, document/literal wrapped, ArrayOf* types.",
+      "attempts": 0,
+      "actionTaken": "contracts/wsdl/ErewhonWebService.wsdl is copied from the captured stand-in WSDL with a stand-in header comment. The facade rewrites only soap:address/@location, and WsdlContractCheck compares the facade and backend WSDLs."
+    },
+    {
+      "id": "KL-JADE-TESTS-NOT-RUN",
+      "category": "substitution",
+      "operation": null,
+      "matches": [],
+      "reason": "The JADE unit tests in the reference schema [Erewhon/ErehwhonExternalInterfacesSchema.scm:3284-6525] and the model schema need a JADE runtime and were not run.",
+      "attempts": 0,
+      "actionTaken": "Their expected statuses and messages were traced into the stand-in and the case matrix (AAP 0.9.2), and JadeUnchangedCheck proves that no file under Erewhon/ changed."
+    },
+    {
+      "id": "KL-REST-FORMAT",
+      "category": "assumption",
+      "operation": null,
+      "matches": [],
+      "reason": "_restServicesOptions 2 is unexplained [Erewhon/ErehwhonExternalInterfacesSchema.ddx:87], so JADE's default Microsoft JSON is assumed: \\/Date(ms)\\/ in UTC (_webDefaultTimeZone Etc/UTC [Erewhon/ErehwhonExternalInterfacesSchema.ddx:92]), __type for subclasses, nulls included, Binary as a byte array, Decimal with two decimals, and the null string as \"\". XML and JSONN, whether selected by a .xml/.jsonn suffix or by Accept, are neither modelled nor characterised (the stand-in answers 501).",
+      "attempts": 0,
+      "actionTaken": "The characterised forms are unsuffixed requests with no Accept header, and the .json suffix. The facade forwards every form, suffix and header unchanged."
+    },
+    {
+      "id": "KL-SOAP-SHAPES",
+      "category": "assumption",
+      "operation": null,
+      "matches": [],
+      "reason": "The <op>Response/<op>Result wrappers, xsi:nil for null results and the exposed-properties-only rule are assumed. The consumer marks results required, xmlNillable [Erewhon/ErewhonWebServiceConsumerSchema.scm:499, 557], but types them as HTTP_DTOObject and uses older types (DTOSaleItem, tenderSaleItem) [Erewhon/ErewhonWebServiceConsumerSchema.scm:405-466].",
+      "attempts": 0,
+      "actionTaken": "The stand-in follows the reference schema and the WebServiceHTTP exposure list [Erewhon/ErehwhonExternalInterfacesSchema.scm:1793-1932], with DTOName and String array items [Erewhon/ErewhonWebServiceConsumerSchema.scm:148-149]."
+    },
+    {
+      "id": "KL-SOAP-DTORESULT",
+      "category": "assumption",
+      "operation": null,
+      "matches": [],
+      "reason": "DTOResult is absent from the WebServiceHTTP exposure list [Erewhon/ErehwhonExternalInterfacesSchema.scm:1793-1932], yet the four update operations return it [Erewhon/ErehwhonExternalInterfacesSchema.scm:1236, 1252, 1276, 1292].",
+      "attempts": 0,
+      "actionTaken": "The stand-in writes allErrors, allWarnings and statusCode (no guid), and conformance inventories DTOResult on SOAP with those members."
+    },
+    {
+      "id": "KL-STANDIN-DATE",
+      "category": "assumption",
+      "operation": null,
+      "matches": [],
+      "reason": "The loader offsets every seed date by the days from 2000-01-01 to today [Erewhon/ErewhonModelSchema.scm:8466-8470]. The stand-in pins today to StandIn:ReferenceDate 2026-01-01, and its clock starts at 12:00:00 UTC and advances one second per state-changing request.",
+      "attempts": 0,
+      "actionTaken": "Date fields are reproducible. The set of closed tenders (items 70, 80, 92, 106) is unchanged because every date shifts equally, and TimeStamp values are normalised by N2."
+    },
+    {
+      "id": "KL-STANDIN-PHOTO",
+      "category": "assumption",
+      "operation": "Soap.getPhoto",
+      "matches": [],
+      "reason": "Photos load through app.loadPicture [Erewhon/ErewhonModelSchema.scm:8657], whose stored byte form is not visible. The test constant TestPhoto begins FF D8 FF E0 (JPEG) [Erewhon/ErehwhonExternalInterfacesSchema.scm:340].",
+      "attempts": 0,
+      "actionTaken": "The raw JPEG file bytes are returned base64-encoded and compared byte for byte."
+    },
+    {
+      "id": "KL-STANDIN-ROUNDING",
+      "category": "assumption",
+      "operation": null,
+      "matches": [],
+      "reason": "calculateAgentCommission computes price x rate / 100 [Erewhon/ErewhonModelSchema.scm:7527-7556], and JADE's Decimal assignment rounding is not stated.",
+      "attempts": 0,
+      "actionTaken": "Values are rounded half away from zero to two decimals, which affects agentCommission in the sale and sale-detail DTOs."
+    },
+    {
+      "id": "KL-CONF-DTOERROR",
+      "category": "conformance-gap",
+      "operation": null,
+      "matches": [
+        {
+          "itemId": "CONF:Rest:DTOError.allErrors",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:DTOError.guid",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:DTOError.statusCode",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOError.allErrors",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOError.statusCode",
+          "nature": "unreachable-in-source"
+        }
+      ],
+      "reason": "No in-scope method body creates DTOError [Erewhon/ErehwhonExternalInterfacesSchema.scm:149-153, 2326-2868, 6526-6942], so none of its members is emitted on either surface.",
+      "attempts": 0,
+      "actionTaken": "registered at once; no correction may close an unreachable-in-source gap (AAP 0.7.7)"
+    },
+    {
+      "id": "KL-CONF-REST-STATUS",
+      "category": "conformance-gap",
+      "operation": null,
+      "matches": [
+        {
+          "itemId": "CONF:Rest:STATUS:HTTP_Conflict",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:STATUS:HTTP_Forbidden",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:STATUS:HTTP_Unauthorized",
+          "nature": "unreachable-in-source"
+        }
+      ],
+      "reason": "HTTP_Unauthorized 401, HTTP_Forbidden 403 and HTTP_Conflict 409 are declared [Erewhon/ErehwhonExternalInterfacesSchema.scm:293-300] but never assigned by a REST method body [Erewhon/ErehwhonExternalInterfacesSchema.scm:2326-2868].",
+      "attempts": 0,
+      "actionTaken": "registered at once; no correction may close an unreachable-in-source gap (AAP 0.7.7)"
+    },
+    {
+      "id": "KL-CONF-SOAP-STATUS",
+      "category": "conformance-gap",
+      "operation": null,
+      "matches": [
+        {
+          "itemId": "CONF:Soap:STATUS:Error_Conflict",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:STATUS:Error_Forbidden",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:STATUS:Error_Server_Error",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:STATUS:Error_Unauthorized",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:STATUS:Status_Created",
+          "nature": "unreachable-in-source"
+        }
+      ],
+      "reason": "Error_Conflict, Error_Forbidden, Error_Unauthorized (declared 403), Error_Server_Error and Status_Created are declared [Erewhon/ErehwhonExternalInterfacesSchema.scm:1139-1146] but never assigned by the nine public methods [Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942].",
+      "attempts": 0,
+      "actionTaken": "registered at once; no correction may close an unreachable-in-source gap (AAP 0.7.7)"
+    },
+    {
+      "id": "KL-CONF-SOAP-UNRETURNED-CLASSES",
+      "category": "conformance-gap",
+      "operation": null,
+      "matches": [
+        {
+          "itemId": "CONF:Soap:DTOCompany.city",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOCompany.country",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOCompany.email",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOCompany.fax",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOCompany.name",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOCompany.phone",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOCompany.street",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOCompany.website",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOItem.agent",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOItem.categoryPrefix",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOItem.description",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOItem.itemCategory",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOItem.listedDate",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOItem.name",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOItem.number",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOItem.photo",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOItem.price",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOItem.region",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOItem.sale",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailItem.agent",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailItem.categoryPrefix",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailItem.description",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailItem.itemCategory",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailItem.listedDate",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailItem.name",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailItem.number",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailItem.photo",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailItem.price",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailItem.region",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailItem.sale",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailSale.agentCommission",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailSale.client",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailSale.item",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailSale.timestamp",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailSaleDetail.agentCommission",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailSaleDetail.client",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailSaleDetail.price",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTORetailSaleDetail.soldDate",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOSale.agentCommission",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOSale.client",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOSale.item",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOSaleDetail.agentCommission",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOSaleDetail.client",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTender.client",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTender.offer",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTender.tenderItem",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTender.timestamp",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderItem.agent",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderItem.categoryPrefix",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderItem.closureDate",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderItem.description",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderItem.itemCategory",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderItem.listedDate",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderItem.name",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderItem.number",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderItem.photo",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderItem.price",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderItem.region",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderItem.sale",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderSale.agentCommission",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderSale.client",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderSale.item",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderSale.offer",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderSale.tender",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderSaleDetail.agentCommission",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderSaleDetail.client",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderSaleDetail.offer",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOTenderSaleDetail.tenderDate",
+          "nature": "unreachable-in-source"
+        }
+      ],
+      "reason": "These classes are SOAP-exposed [Erewhon/ErehwhonExternalInterfacesSchema.scm:1793-1932], but no SOAP method returns them: the nine return only DTOAgent, DTOClient, DTONameArray, DTOPhoto and DTOResult [Erewhon/ErehwhonExternalInterfacesSchema.scm:1148-1307].",
+      "attempts": 0,
+      "actionTaken": "registered at once; no correction may close an unreachable-in-source gap (AAP 0.7.7)"
+    },
+    {
+      "id": "KL-CONF-DTOTENDERSALEDETAIL",
+      "category": "conformance-gap",
+      "operation": null,
+      "matches": [
+        {
+          "itemId": "CONF:Rest:DTOTenderSaleDetail.agentCommission",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:DTOTenderSaleDetail.client",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:DTOTenderSaleDetail.guid",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:DTOTenderSaleDetail.offer",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:DTOTenderSaleDetail.tenderDate",
+          "nature": "unreachable-in-source"
+        }
+      ],
+      "reason": "A sold tender item's sale is created as the declared plain DTOSaleDetail [Erewhon/ErehwhonExternalInterfacesSchema.scm:169, 2208-2209] and no other REST body creates DTOTenderSaleDetail, so none of its members, its own offer and tenderDate included, is ever emitted.",
+      "attempts": 0,
+      "actionTaken": "registered at once; no correction may close an unreachable-in-source gap (AAP 0.7.7)"
+    },
+    {
+      "id": "KL-CONF-DTOITEM-CATEGORYPREFIX-PHOTO",
+      "category": "conformance-gap",
+      "operation": null,
+      "matches": [
+        {
+          "itemId": "CONF:Rest:DTOItem.categoryPrefix",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:DTOItem.photo",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:DTORetailItem.categoryPrefix",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:DTORetailItem.photo",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:DTOTenderItem.categoryPrefix",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:DTOTenderItem.photo",
+          "nature": "unreachable-in-source"
+        }
+      ],
+      "reason": "The item population never assigns categoryPrefix or photo [Erewhon/ErehwhonExternalInterfacesSchema.scm:2156-2177], so DTOItem, DTORetailItem and DTOTenderItem always carry JADE's null value for them.",
+      "attempts": 0,
+      "actionTaken": "registered at once; no correction may close an unreachable-in-source gap (AAP 0.7.7)"
+    },
+    {
+      "id": "KL-CONF-DTOTENDERSALE-OFFER",
+      "category": "conformance-gap",
+      "operation": null,
+      "matches": [
+        {
+          "itemId": "CONF:Rest:DTOTenderSale.offer",
+          "nature": "unreachable-in-source"
+        }
+      ],
+      "reason": "The tender-sale population never sets DTOTenderSale's own offer; the offer is carried on the nested DTOTender [Erewhon/ErehwhonExternalInterfacesSchema.scm:2247-2259].",
+      "attempts": 0,
+      "actionTaken": "registered at once; no correction may close an unreachable-in-source gap (AAP 0.7.7)"
+    },
+    {
+      "id": "KL-CONF-OTHER-UNREACHABLE",
+      "category": "conformance-gap",
+      "operation": null,
+      "matches": [
+        {
+          "itemId": "CONF:Rest:DTOName.guid",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:DTOName.name",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:DTOPhoto.guid",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:DTOPhoto.photo",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Rest:DTOResult.allWarnings",
+          "nature": "unreachable-in-source"
+        },
+        {
+          "itemId": "CONF:Soap:DTOResult.allWarnings",
+          "nature": "unreachable-in-source"
+        }
+      ],
+      "reason": "DTOName and DTOPhoto are created only by SOAP bodies [Erewhon/ErehwhonExternalInterfacesSchema.scm:6579, 6638, 6671], so no REST body [Erewhon/ErehwhonExternalInterfacesSchema.scm:2326-2868] emits DTOName.guid, DTOName.name, DTOPhoto.guid or DTOPhoto.photo. DTOResult.allWarnings is declared [Erewhon/ErehwhonExternalInterfacesSchema.scm:199] but never assigned by any in-scope body on either surface [Erewhon/ErehwhonExternalInterfacesSchema.scm:2326-2868, 6528-6942].",
+      "attempts": 0,
+      "actionTaken": "registered at once; no correction may close an unreachable-in-source gap (AAP 0.7.7)"
+    }
+  ]
+}
