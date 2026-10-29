@@ -1,5 +1,8 @@
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Text.RegularExpressions;
+using Erewhon.Contracts.Catalogue;
 using Erewhon.Harness;
 using Erewhon.Harness.Lifecycle;
 using Erewhon.Harness.Modes;
@@ -13,7 +16,9 @@ namespace Erewhon.Harness.Tests;
 /// <see cref="ResultsReportWriter"/> but never touches the disk, and a shutdown client that records its
 /// calls. Whatever the body, the report write or a shutdown does, every component is shut down, the final
 /// line is the last line printed and the exit code is 0 or 1. The admin URLs name reserved
-/// <c>.invalid</c> hosts that nothing contacts, because every request goes through the fakes.
+/// <c>.invalid</c> hosts that nothing contacts, because every request goes through the fakes. The
+/// conformance-evidence tests run the real <see cref="ReplayBody"/> instead, against a temporary
+/// repository root and a closed loopback port, so every network step fails at once.
 /// </summary>
 /// <remarks>
 /// Assertions on the console and the report text use fixed messages, because both hold the per-test
@@ -24,6 +29,7 @@ public sealed class ReplayLifecycleTests : IDisposable
     private const string FacadeAdminUrl = "http://facade.invalid:9090";
     private const string StandInAdminUrl = "http://standin.invalid:9090";
     private const string RepoRootToken = "<repo-root>";
+    private const string CaseMatrixPath = "harness/config/case-matrix.json";
 
     private static readonly TimeSpan RunLimit = TimeSpan.FromSeconds(30);
 
@@ -225,7 +231,91 @@ public sealed class ReplayLifecycleTests : IDisposable
         AssertFinalLineLast();
     }
 
+    // Without baseline/conformance.json, a captured baseline (its manifest names how capture ran) fails
+    // the run through a never-documentable CHK-EXCEPTION item, while a baseline from which nothing was
+    // captured (the hand-written not-run manifest, or no manifest, and no record) reports the check as
+    // not run and adds no item. The committed case matrix is copied in, so no other step throws.
+    [Theory]
+    [InlineData("local-processes", true)]
+    [InlineData("not-run", false)]
+    [InlineData(null, false)]
+    public async Task ConformanceResultAbsent_FailsOnlyACapturedBaseline(string? captureExecution, bool expectFailure)
+    {
+        _repoRoot.Write(CaseMatrixPath, File.ReadAllText(Path.Combine(FindRepoRoot(), CaseMatrixPath)));
+        if (captureExecution is not null)
+        {
+            _repoRoot.Write("baseline/manifest.json", $$"""{"source":"jade-standin","captureExecution":"{{captureExecution}}","notCaptured":[],"wsdlCaptured":false}""");
+        }
+
+        var state = new ReplayRunState();
+        var body = new ReplayBody(ClosedPortOptions(), OperationCatalogue.Default, KnownLimitationsRegister.Empty, _stdout);
+
+        using var limit = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        limit.CancelAfter(RunLimit);
+        await body.ExecuteAsync(state, limit.Token).WaitAsync(limit.Token);
+
+        var check = state.Checks[CheckNames.Conformance];
+        Assert.Equal(CheckOutcomes.NotRun, check.Outcome);
+        var exceptions = state.Failures.Where(item => item.ItemId == FailureItemIds.Exception).ToList();
+        if (expectFailure)
+        {
+            var item = Assert.Single(exceptions);
+            Assert.Equal(typeof(FileNotFoundException).FullName, item.Nature);
+            Assert.StartsWith("stand-in conformance check: baseline/conformance.json is absent although the baseline was captured", item.Detail, StringComparison.Ordinal);
+            Assert.True(item.IsNeverDocumentable, "a missing conformance result can never be documented");
+            Assert.Equal("baseline/conformance.json absent although the baseline was captured", check.Detail);
+            Assert.Contains(
+                "[jade-standin] conformance: baseline/conformance.json absent although the baseline was captured; the stand-in conformance evidence is missing",
+                StdoutText,
+                StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.Empty(exceptions);
+            Assert.Equal("baseline/conformance.json absent", check.Detail);
+            Assert.Contains("[jade-standin] conformance: baseline/conformance.json absent; not run", StdoutText, StringComparison.Ordinal);
+        }
+    }
+
     private string StdoutText => _stdout.ToString();
+
+    // The message is fixed: a path would differ between checkouts and runs.
+    private static string FindRepoRoot()
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory); directory is not null; directory = directory.Parent)
+        {
+            if (File.Exists(Path.Combine(directory.FullName, CaseMatrixPath)))
+            {
+                return directory.FullName;
+            }
+        }
+
+        throw new DirectoryNotFoundException("No ancestor of the test assembly holds harness/config/case-matrix.json.");
+    }
+
+    // A loopback port that was just free: nothing listens there, so every request is refused at once.
+    private static int ClosedLoopbackPort()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var port = ((IPEndPoint)listener.LocalEndpoint).Port;
+        listener.Stop();
+        return port;
+    }
+
+    // Every listener on the closed port and the shortest limits, so readiness, reset and the contract
+    // fetches fail within seconds.
+    private HarnessOptions ClosedPortOptions()
+    {
+        var closed = $"http://127.0.0.1:{ClosedLoopbackPort().ToString(CultureInfo.InvariantCulture)}";
+        var options = Options();
+        options.Target = new HarnessEndpoints { RestBaseUrl = closed, SoapBaseUrl = closed, AdminUrl = closed };
+        options.Backend = new HarnessEndpoints { RestBaseUrl = closed, SoapBaseUrl = closed, AdminUrl = closed };
+        options.ReadinessTimeoutSeconds = 1;
+        options.ReadinessPollIntervalSeconds = 1;
+        options.RequestTimeoutSeconds = 2;
+        return options;
+    }
 
     private static bool IsShutdownItem(FailureItem item) =>
         item.ItemId.StartsWith(FailureItemIds.ShutdownPrefix, StringComparison.Ordinal);

@@ -65,7 +65,12 @@ public enum Surface
 /// <param name="Parameters">The declared parameters, in signature order.</param>
 /// <param name="Rest">The REST address binding; present only for <see cref="Surface.Rest"/>, otherwise null.</param>
 /// <param name="Soap">The SOAP message binding; present only for <see cref="Surface.Soap"/>, otherwise null.</param>
-/// <param name="Statuses">Every status outcome the method body can produce, with its evidence lines.</param>
+/// <param name="Statuses">
+/// Every status outcome a request for the operation can produce, with its evidence lines: each one its
+/// method body assigns, and, for a REST operation with an <c>Integer</c>, <c>Decimal</c> or DTO
+/// parameter, the 400 literal-<c>null</c> rejection of a path segment or JSON body that does not convert
+/// to its declared type, which happens before the method body runs.
+/// </param>
 public sealed record OperationDescriptor(
     string Id,
     Surface Surface,
@@ -144,16 +149,18 @@ public sealed record SoapBinding(
     string ResultSource);
 
 /// <summary>
-/// One status outcome of an operation, as assigned by its method body in
-/// Erewhon/ErehwhonExternalInterfacesSchema.scm.
+/// One status outcome of an operation: one its method body in
+/// Erewhon/ErehwhonExternalInterfacesSchema.scm assigns, or the REST rejection of a parameter that does
+/// not convert, which comes before the method body runs.
 /// </summary>
 /// <param name="HttpStatus">
 /// The HTTP status of the response: the REST status (200, 201, 400, 404 or 500), or 200 for every SOAP
 /// outcome, because business errors travel in the result and never as a Fault.
 /// </param>
 /// <param name="Constant">
-/// The <c>HTTP_*</c> or SOAP status constant the body assigns, for example <c>HTTP_Not_Found</c> or
-/// <c>Error_Not_Found</c>; null when the outcome assigns none.
+/// The <c>HTTP_*</c> or SOAP status constant the outcome assigns, whether the body or the rejection
+/// assigns it, for example <c>HTTP_Not_Found</c> or <c>Error_Not_Found</c>; null when the outcome
+/// assigns none.
 /// </param>
 /// <param name="ResultStatusCode">
 /// The <c>DTOResult.statusCode</c> the body carries when <paramref name="BodyType"/> is
@@ -169,10 +176,15 @@ public sealed record SoapBinding(
 /// <c>DTORetailItem</c> and <c>DTOTenderItem</c> for <c>getItemByCode</c>; null when only the
 /// declared type appears.
 /// </param>
-/// <param name="Condition">When the method body produces this outcome.</param>
+/// <param name="Condition">
+/// When the outcome occurs: what the method body tests, or, for a rejection, which parameter fails to
+/// convert.
+/// </param>
 /// <param name="SourceLines">
-/// The inclusive line range in Erewhon/ErehwhonExternalInterfacesSchema.scm that produces the outcome,
-/// written <c>first-last</c>, for example <c>2343-2345</c>.
+/// The inclusive line range in Erewhon/ErehwhonExternalInterfacesSchema.scm that produces the outcome;
+/// for a rejection, the method's signature lines, which declare the parameter types. Written
+/// <c>first-last</c>, for example <c>2343-2345</c>, or <c>308-310</c> for the <c>getItemByCode</c>
+/// rejection.
 /// </param>
 public sealed record OperationStatus(
     int HttpStatus,

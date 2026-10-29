@@ -363,6 +363,15 @@
           "runtimeTypes": null,
           "condition": "Item is neither a RetailItem nor a TenderItem",
           "sourceLines": "2532-2533"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "pCodeNumber is not an Integer segment (for example 18.0 or 1e2); rejected before the method body runs, with the literal null body",
+          "sourceLines": "308-310"
         }
       ]
     },
@@ -416,6 +425,15 @@
           "runtimeTypes": null,
           "condition": "Minimum below 0, maximum below 0, or maximum below minimum",
           "sourceLines": "2552-2567"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "pMinPrice or pMaxPrice is not an Integer segment (for example 18.0 or 1e2); rejected before the method body runs, with the literal null body",
+          "sourceLines": "311-313"
         }
       ]
     },
@@ -487,6 +505,15 @@
           "runtimeTypes": null,
           "condition": "Sale is neither a RetailSale nor a TenderSale",
           "sourceLines": "2648-2649"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "pCodeNumber is not an Integer segment (for example 18.0 or 1e2); rejected before the method body runs, with the literal null body",
+          "sourceLines": "314-316"
         }
       ]
     },
@@ -531,6 +558,15 @@
           "runtimeTypes": null,
           "condition": "AgentTA/AddressTA validation failed; allErrors holds the transaction-agent errors in order",
           "sourceLines": "2677-2681"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "The body is not a JSON object whose read members are strings or null (malformed JSON, invalid UTF-8, an empty body, a root other than an object, or a read member of another JSON kind), or a member name or read member's value holds an unpaired surrogate escape; rejected before the method body runs, with the literal null body",
+          "sourceLines": "317-317"
         }
       ]
     },
@@ -575,6 +611,15 @@
           "runtimeTypes": null,
           "condition": "ClientTA/AddressTA validation failed; allErrors holds the transaction-agent errors in order",
           "sourceLines": "2717-2721"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "The body is not a JSON object whose read members are strings or null (malformed JSON, invalid UTF-8, an empty body, a root other than an object, or a read member of another JSON kind), or a member name or read member's value holds an unpaired surrogate escape; rejected before the method body runs, with the literal null body",
+          "sourceLines": "318-318"
         }
       ]
     },
@@ -658,6 +703,15 @@
           "runtimeTypes": null,
           "condition": "RetailSaleTA validation failed; allErrors holds the transaction-agent errors in order",
           "sourceLines": "2782-2786"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "pCodeNumber is not an Integer segment (for example 18.0 or 1e2); rejected before the method body runs, with the literal null body",
+          "sourceLines": "319-322"
         }
       ]
     },
@@ -747,6 +801,15 @@
           "runtimeTypes": null,
           "condition": "TenderTA validation failed; allErrors holds the transaction-agent errors in order",
           "sourceLines": "2846-2850"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "pCodeNumber is not an Integer segment (for example 18.0 or 1e2), or pOffer not a Decimal segment (for example 1e7); rejected before the method body runs, with the literal null body",
+          "sourceLines": "323-327"
         }
       ]
     },

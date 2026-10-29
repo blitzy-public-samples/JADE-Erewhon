@@ -6,7 +6,7 @@
 
 | Fact | Value |
 | --- | --- |
-| Date (UTC) | 2026-10-29T17:34:35Z |
+| Date (UTC) | 2026-10-29T19:48:51Z |
 | Execution mode | `docker` |
 | .NET (facade runtime) | .NET 10.0.14 |
 | SDK pin (`harness/global.json`) | `10.0.403` |
@@ -46,7 +46,7 @@
 | Stand-in conformance | gaps: `unobserved` | 0 |
 | Stand-in conformance | gaps: `unreachable-in-source` | 99 |
 | Stand-in conformance | gaps: `wrong-type` | 0 |
-| Stand-in conformance | outcome | fail — 2 of 2 seed-token assertions hold |
+| Stand-in conformance | outcome | pass — 99 of 99 failing items documented by the register; 2 of 2 seed-token assertions hold |
 | Routing | cases | 2 |
 | Routing | passed | 2 |
 | Routing | outcome | pass |

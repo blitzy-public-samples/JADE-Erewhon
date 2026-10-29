@@ -171,7 +171,7 @@ internal static class Program
         IReplayBody body;
         try
         {
-            body = new ReplayBody(options, catalogue, stdout);
+            body = new ReplayBody(options, catalogue, register, stdout);
         }
         catch (Exception ex)
         {

@@ -13,7 +13,8 @@ namespace Erewhon.Harness.Tests;
 /// network or running system is involved. A member passes only on a non-null value of its declared wire
 /// type: a JADE Integer is a whole number in the 32-bit range, decided exactly; a collection is valid only
 /// when every item has the array's item type and, on SOAP, its item element name; and a body that cannot
-/// be decoded contributes nothing instead of aborting the check.
+/// be decoded, a raw body holding an invalid UTF-8 sequence included, contributes nothing instead of
+/// aborting the check.
 /// </summary>
 public sealed class ConformanceCheckTests
 {
@@ -37,6 +38,28 @@ public sealed class ConformanceCheckTests
     private const string SoapName = "CONF:Soap:DTOName.name";
     private const string SoapBadRequest = "CONF:Soap:STATUS:Error_Bad_Request";
     private const string SoapSuccess = "CONF:Soap:STATUS:Status_Success";
+    private const string RestSuccess = "CONF:Rest:STATUS:HTTP_Success";
+    private const string SoapPhoto = "CONF:Soap:DTOPhoto.photo";
+    private const string SeedPaulineWebsite = "CONF:SEED:pauline-wild-website";
+    private const string SeedBrianEmail = "CONF:SEED:brian-olsen-email";
+    private const string DiffersAbsent = "differs:absent";
+    private const string SoapAgentName = "CONF:Soap:DTOAgent.name";
+    private const string SoapItemName = "CONF:Soap:DTOItem.name";
+    private const string SoapItemSale = "CONF:Soap:DTOItem.sale";
+    private const string SoapRetailItemName = "CONF:Soap:DTORetailItem.name";
+    private const string SoapSaleDetailCommission = "CONF:Soap:DTOSaleDetail.agentCommission";
+    private const string SoapRetailSaleDetailPrice = "CONF:Soap:DTORetailSaleDetail.price";
+    private const string SoapResultAllWarnings = "CONF:Soap:DTOResult.allWarnings";
+
+    // The SOAP message namespace the catalogue names, and a namespace no SOAP evidence may come from.
+    private const string TargetNamespace = "urn:JadeWebServices/WebServiceHTTP/";
+    private const string ForeignNamespace = "urn:example:foreign";
+
+    // Where an envelope template holds this marker, a test puts the stand-in's getAgent response there.
+    private const string MessageMarker = "<message>";
+
+    // Where an xsi:type template holds this marker, a test puts the class the result position declares.
+    private const string DeclaredClassMarker = "<declared>";
 
     // The stand-in's first generated GUID.
     private const string CreatedGuid = "{00000000-0000-4000-8000-000000000001}";
@@ -45,6 +68,10 @@ public sealed class ConformanceCheckTests
     // \uD800, or as the raw UTF-16 unit, which theory data cannot carry because serialising it replaces
     // an unpaired surrogate.
     private const string SurrogateMarker = "<lone-surrogate>";
+
+    // Where a marked record's body holds this marker, a raw-body test puts the bytes of its row there,
+    // which no string can carry when they are invalid UTF-8.
+    private const string RawBytesMarker = "<raw-bytes>";
 
     private readonly ConformanceCheck _check = new(OperationCatalogue.Default);
 
@@ -76,6 +103,31 @@ public sealed class ConformanceCheckTests
         { "1e-999999999999", WrongNumber },
         { "1e" + new string('9', 40), WrongNumber },
         { "1" + new string('0', 400), WrongNumber },
+    };
+
+    /// <summary>
+    /// Raw bodies, as a record kept in a body file supplies them: the operation whose marked record is
+    /// sent, the bytes put at its marker in hexadecimal, whether a UTF-8 byte-order mark comes first, and
+    /// the result each listed member or seed-token assertion must have, as <c>itemId=result</c>. An
+    /// invalid UTF-8 sequence (a byte UTF-8 never uses, a truncated or overlong sequence, an encoded
+    /// surrogate) leaves the whole body undecodable, so it supplies no body observation while a REST
+    /// record's status is still observed; valid bytes, with or without a byte-order mark, are read as text.
+    /// </summary>
+    public static TheoryData<string, string, bool, string[]> RawBodies { get; } = new()
+    {
+        { "Rest.getAgent", "FF", false, [$"{RestAgentName}={Unobserved}", $"{RestAgentStreet}={Unobserved}", $"{RestSuccess}={Pass}"] },
+        { "Rest.getAgent", "C3", false, [$"{RestAgentName}={Unobserved}", $"{RestAgentStreet}={Unobserved}", $"{RestSuccess}={Pass}"] },
+        { "Rest.getAgent", "C0AF", false, [$"{RestAgentName}={Unobserved}", $"{RestAgentStreet}={Unobserved}", $"{RestSuccess}={Pass}"] },
+        { "Rest.getAgent", "EDA080", true, [$"{RestAgentName}={Unobserved}", $"{RestAgentStreet}={Unobserved}", $"{RestSuccess}={Pass}"] },
+        { "Rest.getAgent", "C3A9", false, [$"{RestAgentName}={Pass}", $"{RestAgentStreet}={Pass}", $"{RestSuccess}={Pass}"] },
+        { "Rest.getAgent", "C3A9", true, [$"{RestAgentName}={Pass}", $"{RestAgentStreet}={Pass}", $"{RestSuccess}={Pass}"] },
+        { "Soap.updateAgent", "FF", false, [$"{SoapResultAllErrors}={Unobserved}", $"{SoapResultStatusCode}={Unobserved}", $"{SoapBadRequest}={Unobserved}"] },
+        { "Soap.updateAgent", "C3A9", false, [$"{SoapResultAllErrors}={Pass}", $"{SoapResultStatusCode}={Pass}", $"{SoapBadRequest}={Pass}"] },
+        { "Soap.updateAgent", "C3A9", true, [$"{SoapResultAllErrors}={Pass}", $"{SoapResultStatusCode}={Pass}", $"{SoapBadRequest}={Pass}"] },
+        { "Soap.getPhoto", "C0AF", false, [$"{SoapPhoto}={Unobserved}"] },
+        { "Soap.getPhoto", "", false, [$"{SoapPhoto}={Pass}"] },
+        { "Rest.getAllClients", "C3", false, [$"{SeedPaulineWebsite}={DiffersAbsent}", $"{SeedBrianEmail}={DiffersAbsent}", $"{RestClientName}={Unobserved}", $"{RestSuccess}={Pass}"] },
+        { "Rest.getAllClients", "", true, [$"{SeedPaulineWebsite}={Pass}", $"{SeedBrianEmail}={Pass}", $"{RestClientName}={Pass}", $"{RestSuccess}={Pass}"] },
     };
 
     // ---- Positive oracle ------------------------------------------------------------------------
@@ -162,6 +214,11 @@ public sealed class ConformanceCheckTests
     [InlineData("<Bogus>x</Bogus>", "wrong-type:item-name:Bogus")]
     [InlineData("<Bogus xsi:nil=\"true\"/>", "wrong-type:item-name:Bogus")]
     [InlineData("<String><x/></String><Bogus>x</Bogus>", "wrong-type:item-name:Bogus")]
+    [InlineData("<m:String xmlns:m=\"urn:JadeWebServices/WebServiceHTTP/\">Agent Nobody not found</m:String>", Pass)]
+    [InlineData("<f:String xmlns:f=\"urn:example:foreign\">Agent Nobody not found</f:String>", "wrong-type:item-name:{urn:example:foreign}String")]
+    [InlineData("<String xmlns=\"\">Agent Nobody not found</String>", "wrong-type:item-name:{}String")]
+    [InlineData("<String>Agent Nobody not found</String><f:String xmlns:f=\"urn:example:foreign\"/>", "wrong-type:item-name:{urn:example:foreign}String")]
+    [InlineData("<f:Bogus xmlns:f=\"urn:example:foreign\">x</f:Bogus>", "wrong-type:item-name:{urn:example:foreign}Bogus")]
     [InlineData("x", WrongText)]
     [InlineData("x<String>y</String>", "wrong-type:element")]
     public void SoapStringArray_IsValidOnlyWhenEveryItemIsANamedString(string allErrorsContent, string expected)
@@ -176,6 +233,12 @@ public sealed class ConformanceCheckTests
     [InlineData("<DTOName xsi:nil=\"true\"/><DTOName><name>Hank Williams</name></DTOName>", Pass)]
     [InlineData("<Bogus><name>Hank Williams</name></Bogus>", Unobserved)]
     [InlineData("<DTOName>Hank<name>Hank Williams</name></DTOName>", Unobserved)]
+    [InlineData("<m:DTOName xmlns:m=\"urn:JadeWebServices/WebServiceHTTP/\"><m:name>Hank Williams</m:name></m:DTOName>", Pass)]
+    [InlineData("<f:DTOName xmlns:f=\"urn:example:foreign\"><name>Hank Williams</name></f:DTOName>", Unobserved)]
+    [InlineData("<DTOName xmlns=\"\"><name xmlns=\"urn:JadeWebServices/WebServiceHTTP/\">Hank Williams</name></DTOName>", Unobserved)]
+    [InlineData("<DTOName><f:name xmlns:f=\"urn:example:foreign\">Hank Williams</f:name></DTOName>", Unobserved)]
+    [InlineData("<DTOName xsi:type=\"DTOName\"><name>Hank Williams</name></DTOName>", Pass)]
+    [InlineData("<DTOName xsi:type=\"f:DTOName\" xmlns:f=\"urn:example:foreign\"><name>Hank Williams</name></DTOName>", Unobserved)]
     public void SoapNameArray_WalksOnlyItsNamedDtoItems(string items, string expected)
     {
         var result = Run(SoapRecord("Soap.getAgentNames", items));
@@ -197,6 +260,8 @@ public sealed class ConformanceCheckTests
     [Theory]
     [InlineData("[123]", "<Bogus>x</Bogus>", "item:number", "item-name:Bogus")]
     [InlineData("""["x",{}]""", "<String><x/></String>", "item:object", "item:element")]
+    [InlineData("[true]", "<f:String xmlns:f=\"urn:example:foreign\">x</f:String>", "item:boolean", "item-name:{urn:example:foreign}String")]
+    [InlineData("[[]]", "<String xmlns=\"\">x</String>", "item:array", "item-name:{}String")]
     public void Parse_RoundTripsCollectionItemTokens(string restAllErrors, string soapAllErrorsContent, string restToken, string soapToken)
     {
         var result = Run(
@@ -264,16 +329,428 @@ public sealed class ConformanceCheckTests
         Assert.Equal(Unobserved, ResultOf(result, RestClientName));
     }
 
+    // ---- Check result against the register ------------------------------------------------------
+
+    /// <summary>How much of a result's failing items the register in a test documents.</summary>
+    public enum RegisterCoverage
+    {
+        /// <summary>The exact pair of every failing item.</summary>
+        All,
+
+        /// <summary>The exact pair of every failing item but the first.</summary>
+        AllButFirst,
+
+        /// <summary>Nothing: <see cref="KnownLimitationsRegister.Empty"/>.</summary>
+        Empty,
+    }
+
+    // {0} is the result's failing-item count; the seed record makes both seed-token assertions hold.
+    [Theory]
+    [InlineData(RegisterCoverage.All, CheckOutcomes.Pass, "{0} of {0} failing items documented by the register; 2 of 2 seed-token assertions hold")]
+    [InlineData(RegisterCoverage.AllButFirst, CheckOutcomes.Fail, "1 of {0} failing items not documented by the register; 2 of 2 seed-token assertions hold")]
+    [InlineData(RegisterCoverage.Empty, CheckOutcomes.Fail, "{0} of {0} failing items not documented by the register; 2 of 2 seed-token assertions hold")]
+    public void ToCheckResult_PassesOnlyWhenTheRegisterDocumentsEveryFailingItem(RegisterCoverage coverage, string expectedOutcome, string expectedDetail)
+    {
+        var result = Run(ConformanceSeedRecord());
+        Assert.NotEmpty(result.Failures);
+        var register = coverage switch
+        {
+            RegisterCoverage.All => RegisterOf(result.Failures),
+            RegisterCoverage.AllButFirst => RegisterOf(result.Failures.Skip(1)),
+            _ => KnownLimitationsRegister.Empty,
+        };
+
+        var check = result.ToCheckResult(register);
+
+        Assert.Equal(CheckNames.Conformance, check.Name);
+        Assert.Equal(expectedOutcome, check.Outcome);
+        Assert.Equal(result.Members.Count + result.SeedAssertions.Count, check.Cases);
+        Assert.Equal(result.Counts.Passed + result.SeedAssertions.Count, check.Passed);
+        Assert.Equal(string.Format(System.Globalization.CultureInfo.InvariantCulture, expectedDetail, result.Failures.Count), check.Detail);
+    }
+
+    [Fact]
+    public void ToCheckResult_WithoutFailingItems_PassesAndStatesTheSeedTokenAssertions()
+    {
+        var result = new ConformanceResult(
+            [],
+            [new SeedAssertionResult("pauline-wild-website", "CONF:SEED:pauline-wild-website", "\"\"", "\"\"", Pass)]);
+
+        var check = result.ToCheckResult(KnownLimitationsRegister.Empty);
+
+        Assert.Empty(result.Failures);
+        Assert.Equal(CheckOutcomes.Pass, check.Outcome);
+        Assert.Equal("1 of 1 seed-token assertions hold", check.Detail);
+    }
+
+    [Fact]
+    public void ToCheckResult_RejectsANullRegister() =>
+        Assert.Throws<ArgumentNullException>("register", () => Run(ConformanceSeedRecord()).ToCheckResult(null!));
+
+    private static BaselineRecord ConformanceSeedRecord() => RestRecord(
+        ConformanceCheck.SeedAssertionCaseId,
+        "Rest.getAllClients",
+        200,
+        """[{"name":"Brian Olsen","email":"bo@wol.com","website":"www.olsen.com"},{"name":"Pauline Wild","email":"pw@wild.com","website":""}]""");
+
+    // Built through the register's own parser, as the harness loads harness/config/known-limitations.json.
+    private static KnownLimitationsRegister RegisterOf(IEnumerable<FailureItem> documented)
+    {
+        var matches = new JsonArray();
+        foreach (var item in documented)
+        {
+            matches.Add(new JsonObject { ["itemId"] = item.ItemId, ["nature"] = item.Nature });
+        }
+
+        var document = new JsonObject
+        {
+            ["version"] = KnownLimitationsRegister.SupportedVersion,
+            ["entries"] = new JsonArray(new JsonObject
+            {
+                ["id"] = "KL-CONF-TEST",
+                ["category"] = RegisterCategories.ConformanceGap,
+                ["matches"] = matches,
+                ["reason"] = "registered conformance gaps",
+                ["attempts"] = 0,
+                ["actionTaken"] = "registered",
+            }),
+        };
+
+        return KnownLimitationsRegister.Parse(document.ToJsonString());
+    }
+
+    // ---- Raw bodies -----------------------------------------------------------------------------
+
+    [Theory]
+    [MemberData(nameof(RawBodies))]
+    public void RawBody_IsDecodedAsStrictUtf8(string operation, string bytesHex, bool bom, string[] expected)
+    {
+        var result = RunRaw(AsRawRecord(MarkedRecord(operation), bytesHex, bom));
+
+        foreach (var expectation in expected)
+        {
+            var itemId = expectation[..expectation.IndexOf('=', StringComparison.Ordinal)];
+            Assert.Equal(expectation, $"{itemId}={MemberOrSeedResultOf(result, itemId)}");
+        }
+    }
+
+    // ---- SOAP expanded names -------------------------------------------------------------------
+
+    /// <summary>
+    /// The envelope and its body are SOAP evidence only as <c>Envelope</c> and <c>Body</c> in the SOAP 1.1
+    /// envelope namespace, whatever prefix spells them; the same names in no namespace, in the SOAP 1.2
+    /// namespace or in any other give no observation.
+    /// </summary>
+    [Theory]
+    [InlineData("<e:Envelope xmlns:e=\"http://schemas.xmlsoap.org/soap/envelope/\"><e:Body><message></e:Body></e:Envelope>", Pass)]
+    [InlineData("<Envelope xmlns=\"http://schemas.xmlsoap.org/soap/envelope/\"><Body><message></Body></Envelope>", Pass)]
+    [InlineData("<Envelope><Body><message></Body></Envelope>", Unobserved)]
+    [InlineData("<e:Envelope xmlns:e=\"http://www.w3.org/2003/05/soap-envelope\"><e:Body><message></e:Body></e:Envelope>", Unobserved)]
+    [InlineData("<e:Envelope xmlns:e=\"urn:example:foreign\"><b:Body xmlns:b=\"http://schemas.xmlsoap.org/soap/envelope/\"><message></b:Body></e:Envelope>", Unobserved)]
+    [InlineData("<e:Envelope xmlns:e=\"http://schemas.xmlsoap.org/soap/envelope/\"><Body><message></Body></e:Envelope>", Unobserved)]
+    [InlineData("<e:Envelope xmlns:e=\"http://schemas.xmlsoap.org/soap/envelope/\"><b:Body xmlns:b=\"urn:example:foreign\"><message></b:Body></e:Envelope>", Unobserved)]
+    public void SoapEnvelope_IsEvidenceOnlyInTheSoap11EnvelopeNamespace(string envelopeTemplate, string expected)
+    {
+        var message = $"""<getAgentResponse xmlns="{TargetNamespace}"><getAgentResult><name>Hank Williams</name></getAgentResult></getAgentResponse>""";
+        var result = Run(SoapBodyRecord("Soap.getAgent", envelopeTemplate.Replace(MessageMarker, message, StringComparison.Ordinal)));
+
+        Assert.Equal(expected, ResultOf(result, SoapAgentName));
+    }
+
+    /// <summary>
+    /// The <c>&lt;op&gt;Response</c> wrapper, its <c>&lt;op&gt;Result</c> and every property element are
+    /// evidence only in the target namespace: a prefixed form passes like the default-namespace form, and
+    /// the same local names in no namespace, in a near-miss namespace or in another namespace give no
+    /// observation, so a property found only there stays unobserved and is never judged by its value.
+    /// </summary>
+    [Theory]
+    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><name>Hank Williams</name></getAgentResult></getAgentResponse>", Pass)]
+    [InlineData("<m:getAgentResponse xmlns:m=\"urn:JadeWebServices/WebServiceHTTP/\"><m:getAgentResult><m:name>Hank Williams</m:name></m:getAgentResult></m:getAgentResponse>", Pass)]
+    [InlineData("<getAgentResponse><getAgentResult><name>Hank Williams</name></getAgentResult></getAgentResponse>", Unobserved)]
+    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP\"><getAgentResult><name>Hank Williams</name></getAgentResult></getAgentResponse>", Unobserved)]
+    [InlineData("<getAgentResponse xmlns=\"urn:example:foreign\"><getAgentResult><name>Hank Williams</name></getAgentResult></getAgentResponse>", Unobserved)]
+    [InlineData("<m:getAgentResponse xmlns:m=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><m:name>Hank Williams</m:name></getAgentResult></m:getAgentResponse>", Unobserved)]
+    [InlineData("<m:getAgentResponse xmlns:m=\"urn:JadeWebServices/WebServiceHTTP/\"><f:getAgentResult xmlns:f=\"urn:example:foreign\"><m:name>Hank Williams</m:name></f:getAgentResult></m:getAgentResponse>", Unobserved)]
+    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><f:name xmlns:f=\"urn:example:foreign\">Hank Williams</f:name></getAgentResult></getAgentResponse>", Unobserved)]
+    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><name xmlns=\"\">Hank Williams</name></getAgentResult></getAgentResponse>", Unobserved)]
+    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><f:name xmlns:f=\"urn:example:foreign\"><x/></f:name></getAgentResult></getAgentResponse>", Unobserved)]
+    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><f:name xmlns:f=\"urn:example:foreign\">x</f:name><name>Hank Williams</name></getAgentResult></getAgentResponse>", Pass)]
+    public void SoapMessageElements_AreEvidenceOnlyInTheTargetNamespace(string message, string expected)
+    {
+        var result = Run(SoapBodyRecord("Soap.getAgent", SoapEnvelope(message)));
+
+        Assert.Equal(expected, ResultOf(result, SoapAgentName));
+    }
+
+    /// <summary>
+    /// A <c>DTOResult</c>'s <c>statusCode</c> is evidence of the member and of the status constant it
+    /// carries only in the target namespace.
+    /// </summary>
+    [Theory]
+    [InlineData("<statusCode>400</statusCode>", Pass)]
+    [InlineData("<m:statusCode xmlns:m=\"urn:JadeWebServices/WebServiceHTTP/\">400</m:statusCode>", Pass)]
+    [InlineData("<f:statusCode xmlns:f=\"urn:example:foreign\">400</f:statusCode>", Unobserved)]
+    [InlineData("<statusCode xmlns=\"\">400</statusCode>", Unobserved)]
+    public void SoapStatusCode_IsEvidenceOnlyInTheTargetNamespace(string statusCodeElement, string expected)
+    {
+        var result = Run(SoapRecord("Soap.updateAgent", $"<allErrors/><allWarnings/>{statusCodeElement}"));
+
+        Assert.Equal(expected, ResultOf(result, SoapResultStatusCode));
+        Assert.Equal(expected, ResultOf(result, SoapBadRequest));
+    }
+
+    /// <summary>
+    /// A result's <c>xsi:type</c> is a QName resolved by its bound prefix, or by the default namespace when
+    /// unprefixed; it is valid only when it names a target-namespace DTO of the declared kind, here the
+    /// declared class itself, because no SOAP result class of the catalogue has a subclass. Any other
+    /// <c>xsi:type</c> makes the result an invalid structure that gives no member observation and no status
+    /// code, for a <c>DTOAgent</c> result and a <c>DTOResult</c> alike.
+    /// </summary>
+    [Theory]
+    [InlineData("", Pass)]
+    [InlineData("xsi:type=\"<declared>\"", Pass)]
+    [InlineData("xsi:type=\"m:<declared>\" xmlns:m=\"urn:JadeWebServices/WebServiceHTTP/\"", Pass)]
+    [InlineData("xsi:type=\" m:<declared>&#10;\" xmlns:m=\"urn:JadeWebServices/WebServiceHTTP/\"", Pass)]
+    [InlineData("xsi:type=\"f:<declared>\" xmlns:f=\"urn:example:foreign\"", Unobserved)]
+    [InlineData("xsi:type=\"xsd:<declared>\"", Unobserved)]
+    [InlineData("xsi:type=\"<declared>\" xmlns=\"\"", Unobserved)]
+    [InlineData("xsi:type=\"unbound:<declared>\"", Unobserved)]
+    [InlineData("xsi:type=\"m:<declared>:x\" xmlns:m=\"urn:JadeWebServices/WebServiceHTTP/\"", Unobserved)]
+    [InlineData("xsi:type=\"&#160;<declared>\"", Unobserved)]
+    [InlineData("xsi:type=\"\"", Unobserved)]
+    [InlineData("xsi:type=\"DTOUnknown\"", Unobserved)]
+    [InlineData("xsi:type=\"DTOClient\"", Unobserved)]
+    public void SoapResultXsiType_IsValidOnlyForATargetNamespaceDtoOfTheDeclaredKind(string attributesTemplate, string expected)
+    {
+        // Every message element carries the prefix r, so an xmlns="" undeclaration on the result changes
+        // only how an unprefixed xsi:type resolves.
+        var agent = SoapBodyRecord(
+            "Soap.getAgent",
+            SoapEnvelope($"""<r:getAgentResponse xmlns:r="{TargetNamespace}" xmlns="{TargetNamespace}"><r:getAgentResult {attributesTemplate.Replace(DeclaredClassMarker, "DTOAgent", StringComparison.Ordinal)}><r:name>Hank Williams</r:name></r:getAgentResult></r:getAgentResponse>"""));
+        var update = SoapBodyRecord(
+            "Soap.updateAgent",
+            SoapEnvelope($"""<r:updateAgentResponse xmlns:r="{TargetNamespace}" xmlns="{TargetNamespace}"><r:updateAgentResult {attributesTemplate.Replace(DeclaredClassMarker, "DTOResult", StringComparison.Ordinal)}><r:allErrors/><r:statusCode>400</r:statusCode></r:updateAgentResult></r:updateAgentResponse>"""));
+
+        var result = Run(agent, update);
+
+        Assert.Equal(expected, ResultOf(result, SoapAgentName));
+        Assert.Equal(expected, ResultOf(result, SoapResultAllErrors));
+        Assert.Equal(expected, ResultOf(result, SoapResultStatusCode));
+        Assert.Equal(expected, ResultOf(result, SoapBadRequest));
+    }
+
+    /// <summary>
+    /// <c>xsi:type</c> switching where a SOAP result can hold a subclass. The real catalogue has no such
+    /// SOAP result, so these rows run against <see cref="TypedSoapCatalogue"/>, in which <c>getPhoto</c>
+    /// returns a <c>DTOItem</c> whose <c>sale</c> is declared <c>DTOSaleDetail</c>. Each row holds the
+    /// result's attributes, the sale's attributes and each listed member's result as <c>itemId=result</c>.
+    /// A target-namespace subclass, prefixed or by default namespace, switches the walked class; any other
+    /// <c>xsi:type</c> on the result gives nothing, and on the sale makes <c>DTOItem.sale</c> a wrong type
+    /// named by its resolved Clark name, or <c>xsi-type:unresolved</c>, and leaves the subclass members
+    /// unobserved.
+    /// </summary>
+    public static TheoryData<string, string, string[]> TypedSoapXsiTypes { get; } = new()
+    {
+        { "", "", [$"{SoapItemName}={Pass}", $"{SoapItemSale}={Pass}", $"{SoapSaleDetailCommission}={Pass}", $"{SoapRetailSaleDetailPrice}={Unobserved}", $"{SoapRetailItemName}={Unobserved}"] },
+        { "", "xsi:type=\"DTORetailSaleDetail\"", [$"{SoapItemSale}={Pass}", $"{SoapSaleDetailCommission}={Pass}", $"{SoapRetailSaleDetailPrice}={Pass}"] },
+        { "", $"xsi:type=\"m:DTORetailSaleDetail\" xmlns:m=\"{TargetNamespace}\"", [$"{SoapItemSale}={Pass}", $"{SoapRetailSaleDetailPrice}={Pass}"] },
+        { "", $"xsi:type=\"f:DTORetailSaleDetail\" xmlns:f=\"{ForeignNamespace}\"", [$"{SoapItemName}={Pass}", $"{SoapItemSale}=wrong-type:xsi-type:{{{ForeignNamespace}}}DTORetailSaleDetail", $"{SoapSaleDetailCommission}={Unobserved}", $"{SoapRetailSaleDetailPrice}={Unobserved}"] },
+        { "", "xsi:type=\"unbound:DTORetailSaleDetail\"", [$"{SoapItemSale}=wrong-type:xsi-type:unresolved", $"{SoapRetailSaleDetailPrice}={Unobserved}"] },
+        { "", "xsi:type=\"DTORetailItem\"", [$"{SoapItemSale}=wrong-type:xsi-type:{{{TargetNamespace}}}DTORetailItem", $"{SoapSaleDetailCommission}={Unobserved}"] },
+        { "xsi:type=\"DTORetailItem\"", "xsi:type=\"DTORetailSaleDetail\"", [$"{SoapRetailItemName}={Pass}", $"{SoapItemName}={Pass}", $"{SoapItemSale}={Pass}", $"{SoapRetailSaleDetailPrice}={Pass}"] },
+        { $"xsi:type=\"f:DTORetailItem\" xmlns:f=\"{ForeignNamespace}\"", "xsi:type=\"DTORetailSaleDetail\"", [$"{SoapRetailItemName}={Unobserved}", $"{SoapItemName}={Unobserved}", $"{SoapItemSale}={Unobserved}", $"{SoapRetailSaleDetailPrice}={Unobserved}"] },
+    };
+
+    [Theory]
+    [MemberData(nameof(TypedSoapXsiTypes))]
+    public void TypedSoapXsiType_SwitchesOnlyToATargetNamespaceDtoOfTheDeclaredKind(string resultAttributes, string saleAttributes, string[] expected)
+    {
+        var check = new ConformanceCheck(TypedSoapCatalogue());
+        var record = SoapBodyRecord(
+            "Soap.getPhoto",
+            SoapEnvelope($"""<getPhotoResponse xmlns="{TargetNamespace}"><getPhotoResult {resultAttributes}><name>Desk</name><sale {saleAttributes}><agentCommission>12.50</agentCommission><price>250.00</price></sale></getPhotoResult></getPhotoResponse>"""));
+
+        var result = check.Run([record], NoBodyFile);
+
+        foreach (var expectation in expected)
+        {
+            var itemId = expectation[..expectation.IndexOf('=', StringComparison.Ordinal)];
+            Assert.Equal(expectation, $"{itemId}={ResultOf(result, itemId)}");
+        }
+
+        // Every token, the xsi-type ones included, survives baseline/conformance.json.
+        var written = result.ToJsonNode().ToJsonString();
+        Assert.Equal(written, ConformanceResult.Parse(JsonNode.Parse(written)).ToJsonNode().ToJsonString());
+    }
+
+    /// <summary>
+    /// A collection of DTO items is valid only when every item is the array's item element in the target
+    /// namespace with no or a valid <c>xsi:type</c>. The real catalogue has no SOAP collection of DTOs, so
+    /// these rows run against <see cref="TypedSoapCatalogue"/>, in which <c>DTOResult.allWarnings</c> is a
+    /// reachable <c>DTONameArray</c>.
+    /// </summary>
+    [Theory]
+    [InlineData("<DTOName><name>Hank Williams</name></DTOName>", Pass)]
+    [InlineData("<DTOName xsi:type=\"DTOName\"><name>Hank Williams</name></DTOName>", Pass)]
+    [InlineData("<DTOName xsi:type=\"f:DTOName\" xmlns:f=\"urn:example:foreign\"><name>Hank Williams</name></DTOName>", "wrong-type:item:xsi-type:{urn:example:foreign}DTOName")]
+    [InlineData("<DTOName xsi:type=\"unbound:DTOName\"><name>Hank Williams</name></DTOName>", "wrong-type:item:xsi-type:unresolved")]
+    [InlineData("<f:DTOName xmlns:f=\"urn:example:foreign\"><name>Hank Williams</name></f:DTOName>", "wrong-type:item-name:{urn:example:foreign}DTOName")]
+    public void TypedSoapDtoCollection_IsValidOnlyWithTargetNamespaceItemsOfAValidType(string allWarningsContent, string expected)
+    {
+        var check = new ConformanceCheck(TypedSoapCatalogue());
+
+        var result = check.Run([SoapRecord("Soap.updateAgent", $"<allErrors/><allWarnings>{allWarningsContent}</allWarnings><statusCode>200</statusCode>")], NoBodyFile);
+
+        Assert.Equal(expected, ResultOf(result, SoapResultAllWarnings));
+    }
+
+    [Theory]
+    [InlineData("", "envelopeNamespace")]
+    [InlineData(" ", "targetNamespace")]
+    public void Constructor_RejectsABlankSoapNamespace(string blank, string key)
+    {
+        var document = CatalogueDocument();
+        document["addresses"]!["soap"]![key] = blank;
+        var catalogue = OperationCatalogue.Parse(document.ToJsonString());
+
+        var exception = Assert.Throws<InvalidDataException>(() => new ConformanceCheck(catalogue));
+        Assert.Contains($"addresses.soap.{key}", exception.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// The embedded catalogue with SOAP positions that can carry subclasses: <c>getPhoto</c> returns
+    /// <c>DTOItem</c>, every SOAP member of the item and sale-detail classes is reachable, and
+    /// <c>DTOResult.allWarnings</c> is a reachable <c>DTONameArray</c>.
+    /// </summary>
+    private static OperationCatalogue TypedSoapCatalogue()
+    {
+        var document = CatalogueDocument();
+        foreach (var operation in document["operations"]!.AsArray())
+        {
+            if (operation!["id"]!.GetValue<string>() != "Soap.getPhoto")
+            {
+                continue;
+            }
+
+            operation["returnType"] = "DTOItem";
+            foreach (var status in operation["statuses"]!.AsArray())
+            {
+                if (status!["bodyType"]!.GetValue<string>() == "DTOPhoto")
+                {
+                    status["bodyType"] = "DTOItem";
+                }
+            }
+        }
+
+        string[] typedClasses = ["DTOItem", "DTORetailItem", "DTOTenderItem", "DTOSaleDetail", "DTORetailSaleDetail", "DTOTenderSaleDetail"];
+        foreach (var dto in document["dtos"]!.AsArray())
+        {
+            var name = dto!["name"]!.GetValue<string>();
+            foreach (var property in dto["properties"]!.AsArray())
+            {
+                var reachability = property!["reachability"];
+                if (reachability is null)
+                {
+                    continue;
+                }
+
+                if (typedClasses.Contains(name) && reachability["Soap"]!.GetValue<string>() == UnreachableInSource)
+                {
+                    reachability["Soap"] = "reachable";
+                }
+
+                if (name == "DTOResult" && property["name"]!.GetValue<string>() == "allWarnings")
+                {
+                    property["jadeType"] = "DTONameArray";
+                    property["xmlType"] = $"{{{TargetNamespace}}}ArrayOfDTOName";
+                    reachability["Soap"] = "reachable";
+                }
+            }
+        }
+
+        return OperationCatalogue.Parse(document.ToJsonString());
+    }
+
+    private static JsonObject CatalogueDocument()
+    {
+        using var stream = typeof(OperationCatalogue).Assembly.GetManifestResourceStream(OperationCatalogue.ResourceName)
+            ?? throw new InvalidOperationException($"The contracts assembly embeds no {OperationCatalogue.ResourceName}.");
+        return JsonNode.Parse(stream)!.AsObject();
+    }
+
+    // A SOAP 1.1 envelope as the stand-in writes it, holding message as the body's only child.
+    private static string SoapEnvelope(string message) =>
+        $"""<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema"><soap:Body>{message}</soap:Body></soap:Envelope>""";
+
+    private static BaselineRecord SoapBodyRecord(string operation, string body) =>
+        Record($"SOAP-{operation["Soap.".Length..]}-01", operation, 200, "text/xml; charset=utf-8", body);
+
     // ---- Helpers --------------------------------------------------------------------------------
 
     private ConformanceResult Run(params BaselineRecord[] records) => _check.Run(records, NoBodyFile);
 
-    // Every record here keeps its body as text, so the check must never ask for a body file.
+    // The check asks for the body bytes of the raw record only, which keeps no body text.
+    private ConformanceResult RunRaw((BaselineRecord Record, byte[] Body) raw) =>
+        _check.Run([raw.Record], record => ReferenceEquals(record, raw.Record) ? raw.Body : NoBodyFile(record));
+
+    // A record built by Record keeps its body as text, so the check must never ask for its body file.
     private static byte[] NoBodyFile(BaselineRecord record) =>
         throw new InvalidOperationException($"Record {record.CaseId} keeps its body as text, not in a body file.");
 
     private static string ResultOf(ConformanceResult result, string itemId) =>
         result.Members.Single(member => member.ItemId == itemId).Result;
+
+    private static string MemberOrSeedResultOf(ConformanceResult result, string itemId) =>
+        result.SeedAssertions.SingleOrDefault(assertion => assertion.ItemId == itemId)?.Result ?? ResultOf(result, itemId);
+
+    // The record each raw-body row sends, its body holding RawBytesMarker inside a string value or element.
+    private static BaselineRecord MarkedRecord(string operation) => operation switch
+    {
+        "Rest.getAgent" => RestRecord(
+            "REST-getAgent-01",
+            operation,
+            200,
+            """{"name":"Hank Williams","street":"9127 Bel Air <raw-bytes>"}"""),
+        "Rest.getAllClients" => RestRecord(
+            ConformanceCheck.SeedAssertionCaseId,
+            operation,
+            200,
+            """[{"name":"Brian Olsen","email":"bo@wol.com","website":""},{"name":"Pauline Wild","email":"pw@wild.com","website":"<raw-bytes>"}]"""),
+        "Soap.updateAgent" => SoapRecord(operation, SoapResultContent("<String>Agent name is required<raw-bytes></String>", "400")),
+        "Soap.getPhoto" => SoapRecord(operation, "<photo>/9j/4AAQ<raw-bytes></photo>"),
+        _ => throw new ArgumentOutOfRangeException(nameof(operation), operation, "No marked record is defined for this operation."),
+    };
+
+    /// <summary>
+    /// <paramref name="textRecord"/> as a record kept in a body file: no <c>bodyText</c>, and as its body
+    /// the UTF-8 of its text with the bytes of <paramref name="bytesHex"/> in place of
+    /// <see cref="RawBytesMarker"/>, after a UTF-8 byte-order mark when <paramref name="bom"/> is set.
+    /// </summary>
+    private static (BaselineRecord Record, byte[] Body) AsRawRecord(BaselineRecord textRecord, string bytesHex, bool bom)
+    {
+        var text = textRecord.Response.BodyText
+            ?? throw new ArgumentException($"Record {textRecord.CaseId} keeps no body text.", nameof(textRecord));
+        var marker = text.IndexOf(RawBytesMarker, StringComparison.Ordinal);
+        if (marker < 0)
+        {
+            throw new ArgumentException($"The body of record {textRecord.CaseId} holds no {RawBytesMarker} marker.", nameof(textRecord));
+        }
+
+        var body = new List<byte>();
+        if (bom)
+        {
+            body.AddRange(Encoding.UTF8.GetPreamble());
+        }
+
+        body.AddRange(Encoding.UTF8.GetBytes(text[..marker]));
+        body.AddRange(Convert.FromHexString(bytesHex));
+        body.AddRange(Encoding.UTF8.GetBytes(text[(marker + RawBytesMarker.Length)..]));
+        var raw = body.ToArray();
+
+        var response = BaselineResponse.FromRawBody(
+            textRecord.Response.Status, textRecord.Response.ContentType, raw, BaselineStore.BodyFileName(textRecord));
+        return (textRecord with { Response = response }, raw);
+    }
 
     private static string RestResultBody(string guid, string allErrors, string statusCode) =>
         $$"""{"guid":"{{guid}}","allErrors":{{allErrors}},"allWarnings":[],"statusCode":{{statusCode}}}""";

@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Collections.ObjectModel;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Runtime.CompilerServices;
 using System.Text;
@@ -103,6 +104,8 @@ public sealed class ConformanceCheck
     private const string ResultStatusCodeProperty = "statusCode";
 
     private const string AbsentObservation = "absent";
+
+    // The SOAP 1.1 envelope's local names; they are evidence only in the catalogue's envelope namespace.
     private const string SoapEnvelopeElement = "Envelope";
     private const string SoapBodyElement = "Body";
 
@@ -116,9 +119,17 @@ public sealed class ConformanceCheck
     private const string XmlTextToken = "text";
 
     // Wrong wire-type tokens of a collection's contents: the offending item's own token after the item
-    // prefix, or the local name of an XML item element the array does not name after the item-name prefix.
+    // prefix, or the name of an XML item element the array does not name after the item-name prefix (its
+    // local name in the target namespace, its Clark name {namespace}local in any other).
     private const string CollectionItemPrefix = "item:";
     private const string CollectionItemNamePrefix = "item-name:";
+
+    // Wrong wire-type tokens of a DTO element whose xsi:type names no catalogue DTO of the declared kind
+    // in the target namespace: the Clark name {namespace}local its QName resolves to after the prefix, or
+    // the unresolved token when it is no QName or its prefix is unbound. A Clark name always starts with
+    // '{', so the two forms never collide.
+    private const string XsiTypeTokenPrefix = "xsi-type:";
+    private const string UnresolvedXsiTypeToken = XsiTypeTokenPrefix + "unresolved";
 
     // The JSON wire token each JADE primitive must carry in OperationCatalogue.WireTypes.
     private const string StringJsonToken = "string";
@@ -130,6 +141,9 @@ public sealed class ConformanceCheck
     private static readonly XNamespace XsiNamespace = "http://www.w3.org/2001/XMLSchema-instance";
     private static readonly XName XsiNil = XsiNamespace + "nil";
     private static readonly XName XsiType = XsiNamespace + "type";
+
+    // The XML whitespace characters, which the whitespace facet of an xsd:QName value removes around it.
+    private static readonly char[] XmlWhitespace = [' ', '\t', '\r', '\n'];
 
     // xsd:decimal admits a sign and a decimal point but no exponent or group separator; the whitespace
     // facet of XML Schema is collapse, so surrounding whitespace is allowed.
@@ -149,6 +163,10 @@ public sealed class ConformanceCheck
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
     };
 
+    // Strict, so a raw body holding an invalid byte sequence is undecodable instead of being read with
+    // U+FFFD in place of its bytes, which would let replacement text count as a valid string value.
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
     // The seed-token assertions of AAP 0.3.2.3: Pauline Wild's website is the seed literal `null`
     // (Erewhon/DataFiles/Clients.txt:1), which loads as the JADE null string, written "" in JSON; Brian
     // Olsen's email `bo@wol.com ` (Clients.txt:2) loses its trailing blank to the tokenizer.
@@ -165,20 +183,34 @@ public sealed class ConformanceCheck
     private readonly IReadOnlySet<string> _resultDtos;
     private readonly IReadOnlyDictionary<string, WireClass> _itemWires;
 
+    // SOAP evidence is selected by expanded name: the envelope and its body in the envelope namespace,
+    // and every message, result, property and array item element, and every xsi:type, in the target
+    // namespace, both taken from the catalogue's SOAP address.
+    private readonly XNamespace _targetNamespace;
+    private readonly XName _soapEnvelope;
+    private readonly XName _soapBody;
+    private readonly XName _resultStatusCode;
+
     /// <summary>Builds the conformance inventory from <paramref name="catalogue"/>.</summary>
     /// <param name="catalogue">The operation catalogue, normally <see cref="OperationCatalogue.Default"/>.</param>
     /// <exception cref="ArgumentNullException"><paramref name="catalogue"/> is null.</exception>
     /// <exception cref="InvalidDataException">
-    /// A catalogue fact the check relies on is inconsistent: a primitive property or array item type whose
-    /// JADE type has no wire mapping or a mapping other than its type's, a SOAP property whose XML type
-    /// disagrees with the mapping, a result DTO without an Integer <c>statusCode</c>, or a surface whose
-    /// operations do not share one declaring class.
+    /// A catalogue fact the check relies on is inconsistent: a blank SOAP envelope or target namespace, a
+    /// primitive property or array item type whose JADE type has no wire mapping or a mapping other than
+    /// its type's, a SOAP property whose XML type disagrees with the mapping, a result DTO without an
+    /// Integer <c>statusCode</c>, or a surface whose operations do not share one declaring class.
     /// </exception>
     public ConformanceCheck(OperationCatalogue catalogue)
     {
         ArgumentNullException.ThrowIfNull(catalogue);
         _catalogue = catalogue;
         _itemWires = catalogue.Arrays.ToDictionary(array => array.Name, ItemWireOf, StringComparer.Ordinal);
+
+        var envelopeNamespace = SoapNamespace(catalogue.Addresses.Soap.EnvelopeNamespace, "envelopeNamespace");
+        _targetNamespace = SoapNamespace(catalogue.Addresses.Soap.TargetNamespace, "targetNamespace");
+        _soapEnvelope = envelopeNamespace + SoapEnvelopeElement;
+        _soapBody = envelopeNamespace + SoapBodyElement;
+        _resultStatusCode = _targetNamespace + ResultStatusCodeProperty;
 
         _selfAndAncestors = catalogue.Dtos.ToDictionary(
             dto => dto.Name,
@@ -201,11 +233,14 @@ public sealed class ConformanceCheck
     /// <summary>
     /// Runs the check over captured records: walks every body that parses and decodes by its declared
     /// type, records each member observation, and decides every member, constant and seed-token assertion.
+    /// A raw body that is not valid UTF-8 supplies no body observation, so every member only it would have
+    /// evidenced stays a gap; a REST record still counts its status, which is not part of the body.
     /// </summary>
     /// <param name="records">The captured records, in replay order.</param>
     /// <param name="bodyBytes">
-    /// Returns a record's raw body bytes; called only for a record whose <c>bodyText</c> is null, which is
-    /// a <c>getPhoto</c> record whose body is kept in its <c>.body.bin</c> file.
+    /// Returns a record's raw body bytes; called only for a record whose <c>bodyText</c> is null, whose
+    /// body is kept in its <c>.body.bin</c> file: a <c>getPhoto</c> record, or any record whose body was not
+    /// reproducible as text.
     /// </param>
     /// <returns>The conformance result, members in inventory order.</returns>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
@@ -233,18 +268,23 @@ public sealed class ConformanceCheck
                     $"Baseline record {record.CaseId} names operation '{record.Operation}', which the operation catalogue does not define.");
             }
 
+            // Null when the raw body cannot be decoded; the seed-token assertions then observe it as absent.
             var body = BodyText(record, bodyBytes);
             if (operation.Surface == Surface.Rest)
             {
                 observations.RestStatuses.Add(record.Response.Status);
-                ObserveRest(operation, record.Response.Status, body, observations);
+                if (body is not null)
+                {
+                    ObserveRest(operation, record.Response.Status, body, observations);
+                }
+
                 if (seedRecord is null && string.Equals(record.CaseId, SeedAssertionCaseId, StringComparison.Ordinal))
                 {
                     seedRecord = record;
                     seedBody = body;
                 }
             }
-            else
+            else if (body is not null)
             {
                 ObserveSoap(operation, record.Response.Status, body, observations);
             }
@@ -259,7 +299,15 @@ public sealed class ConformanceCheck
         return new ConformanceResult(members, RunSeedAssertions(seedRecord is null ? null : seedBody));
     }
 
-    private static string BodyText(BaselineRecord record, Func<BaselineRecord, byte[]> bodyBytes)
+    /// <summary>
+    /// The response body of <paramref name="record"/> as text with a leading byte-order mark removed, or
+    /// null when its raw bytes are not valid UTF-8. A stored <c>bodyText</c> is used as it is. Raw bytes
+    /// from <paramref name="bodyBytes"/> are decoded strictly after a UTF-8 byte-order mark is stripped, so
+    /// a stray, truncated or overlong sequence or an encoded surrogate leaves the body undecodable instead
+    /// of turning into U+FFFD, which would parse and could count as a valid string or DTO observation.
+    /// </summary>
+    /// <exception cref="InvalidOperationException"><paramref name="bodyBytes"/> returned null.</exception>
+    private static string? BodyText(BaselineRecord record, Func<BaselineRecord, byte[]> bodyBytes)
     {
         string text;
         if (record.Response.BodyText is { } stored)
@@ -272,7 +320,14 @@ public sealed class ConformanceCheck
                 ?? throw new InvalidOperationException($"The body delegate returned null for baseline record {record.CaseId}.");
             ReadOnlySpan<byte> raw = bytes;
             ReadOnlySpan<byte> utf8Bom = [0xEF, 0xBB, 0xBF];
-            text = Encoding.UTF8.GetString(raw.StartsWith(utf8Bom) ? raw[utf8Bom.Length..] : raw);
+            try
+            {
+                text = StrictUtf8.GetString(raw.StartsWith(utf8Bom) ? raw[utf8Bom.Length..] : raw);
+            }
+            catch (DecoderFallbackException)
+            {
+                return null;
+            }
         }
 
         // A stored body keeps a byte-order mark as U+FEFF, which no JSON or XML parser accepts as content.
@@ -868,6 +923,21 @@ public sealed class ConformanceCheck
 
     // SOAP: XML envelopes.
 
+    /// <summary>A namespace of the catalogue's SOAP address, which must not be blank.</summary>
+    private static XNamespace SoapNamespace(string uri, string key) =>
+        string.IsNullOrWhiteSpace(uri)
+            ? throw new InvalidDataException(
+                $"operation-catalogue.json: addresses.soap.{key} must name the namespace SOAP evidence is selected by.")
+            : XNamespace.Get(uri);
+
+    /// <summary>
+    /// Observes one SOAP record. Elements are selected by expanded name, so prefix choice is irrelevant
+    /// and an element in any other namespace is not evidence: the root must be <c>Envelope</c> and its
+    /// child <c>Body</c> in the envelope namespace, and the <c>&lt;op&gt;Response</c> wrapper, its
+    /// <c>&lt;op&gt;Result</c> and the result's <c>statusCode</c> must be in the target namespace. A body
+    /// that is no such envelope, a nil result, and a DTO result whose <c>xsi:type</c> is invalid (see
+    /// <see cref="TryRuntimeDtoXml"/>) give no observation and no status code.
+    /// </summary>
     private void ObserveSoap(OperationDescriptor operation, int status, string body, Observations observations)
     {
         var rootType = DeclaredRootType(operation, status);
@@ -876,10 +946,10 @@ public sealed class ConformanceCheck
             return;
         }
 
-        if (!string.Equals(envelope.Name.LocalName, SoapEnvelopeElement, StringComparison.Ordinal)
-            || ChildByLocalName(envelope, SoapBodyElement) is not { } soapBody
-            || ChildByLocalName(soapBody, binding.ResponseElement) is not { } wrapper
-            || ChildByLocalName(wrapper, binding.ResultElement) is not { } result
+        if (envelope.Name != _soapEnvelope
+            || envelope.Element(_soapBody) is not { } soapBody
+            || soapBody.Element(_targetNamespace + binding.ResponseElement) is not { } wrapper
+            || wrapper.Element(_targetNamespace + binding.ResultElement) is not { } result
             || IsNil(result))
         {
             return;
@@ -888,10 +958,10 @@ public sealed class ConformanceCheck
         WalkXml(result, rootType, observations);
 
         if (_catalogue.TryGetDto(rootType, out var declared)
-            && RuntimeDtoXml(result, declared) is var runtime
+            && TryRuntimeDtoXml(result, declared, out var runtime, out _)
             && _resultDtos.Any(resultDto => _catalogue.IsKindOf(runtime.Name, resultDto)))
         {
-            foreach (var statusCode in result.Elements().Where(child => child.Name.LocalName == ResultStatusCodeProperty))
+            foreach (var statusCode in result.Elements(_resultStatusCode))
             {
                 if (!IsNil(statusCode)
                     && !statusCode.HasElements
@@ -909,8 +979,8 @@ public sealed class ConformanceCheck
 
         if (_catalogue.TryGetArray(type, out var array))
         {
-            // Only elements the array names as its items are items; any other child element, and an item
-            // not of the item wire type, gives no observation.
+            // Only elements the array names as its items, in the target namespace, are items; any other
+            // child element, and an item not of the item wire type, gives no observation.
             var itemWire = _itemWires[array.Name];
             foreach (var item in element.Elements())
             {
@@ -923,16 +993,18 @@ public sealed class ConformanceCheck
             return;
         }
 
-        if (!_catalogue.TryGetDto(type, out var declared))
+        // A DTO element whose xsi:type is invalid gives no observation of any of its members.
+        if (!_catalogue.TryGetDto(type, out var declared) || !TryRuntimeDtoXml(element, declared, out var runtime, out _))
         {
             return;
         }
 
-        var runtime = RuntimeDtoXml(element, declared);
         foreach (var property in _soapProperties[runtime.Name])
         {
             var wire = WireOf(property);
-            foreach (var value in element.Elements().Where(child => child.Name.LocalName == property.Name))
+
+            // A property element in any namespace but the target namespace is not this property.
+            foreach (var value in element.Elements(_targetNamespace + property.Name))
             {
                 if (IsNil(value))
                 {
@@ -943,6 +1015,15 @@ public sealed class ConformanceCheck
                 if (!IsXmlWire(value, wire))
                 {
                     Record(observations, Surface.Soap, runtime.Name, property.Name, Outcome.Wrong, value.HasElements ? XmlElementToken : XmlTextToken);
+                    continue;
+                }
+
+                // A nested DTO whose xsi:type is invalid is no value of the property's type.
+                if (wire == WireClass.Dto
+                    && _catalogue.TryGetDto(property.JadeType, out var valueType)
+                    && !TryRuntimeDtoXml(value, valueType, out _, out var typeWrong))
+                {
+                    Record(observations, Surface.Soap, runtime.Name, property.Name, Outcome.Wrong, typeWrong);
                     continue;
                 }
 
@@ -965,29 +1046,68 @@ public sealed class ConformanceCheck
     }
 
     /// <summary>
-    /// The class an element is walked as: the local name of its <c>xsi:type</c> QName, resolved against
-    /// the element's in-scope namespaces, when that is a catalogue DTO of the declared kind; otherwise the
-    /// declared class.
+    /// The class a DTO element is walked as. Without <c>xsi:type</c> it is the declared class. An
+    /// <c>xsi:type</c> is an XML Schema QName, read with surrounding XML whitespace removed: a prefixed name
+    /// resolves through the prefix bound in scope at the element, and an unprefixed name through the
+    /// in-scope default namespace, or to no namespace when none is declared. It switches the class only
+    /// when its expanded name is in the target namespace and its local name is a catalogue DTO of the
+    /// declared kind, the declared class itself included. Any other <c>xsi:type</c> (no QName, an unbound
+    /// prefix, another namespace, an unknown class, or a class not of the declared kind) makes the element
+    /// an invalid SOAP structure, which is never walked as the declared class and gives no pass.
     /// </summary>
-    private DtoDefinition RuntimeDtoXml(XElement element, DtoDefinition declared)
+    /// <param name="element">The DTO element.</param>
+    /// <param name="declared">The class its position declares.</param>
+    /// <param name="runtime">The class to walk the element as, when the method returns true.</param>
+    /// <param name="wrongToken">
+    /// When the method returns false, the element's wrong wire-type token: <c>xsi-type:</c> and the Clark
+    /// name <c>{namespace}local</c> the QName resolves to, or <c>xsi-type:unresolved</c> when it does not
+    /// resolve.
+    /// </param>
+    /// <returns>True when the element has no <c>xsi:type</c> or a valid one.</returns>
+    private bool TryRuntimeDtoXml(
+        XElement element,
+        DtoDefinition declared,
+        [NotNullWhen(true)] out DtoDefinition? runtime,
+        [NotNullWhen(false)] out string? wrongToken)
     {
+        runtime = null;
+        wrongToken = null;
         if (element.Attribute(XsiType) is not { } typeAttribute)
         {
-            return declared;
+            runtime = declared;
+            return true;
         }
 
-        var text = typeAttribute.Value.Trim();
+        var text = typeAttribute.Value.Trim(XmlWhitespace);
         var colon = text.IndexOf(':', StringComparison.Ordinal);
-        var prefix = colon < 0 ? string.Empty : text[..colon];
         var local = colon < 0 ? text : text[(colon + 1)..];
-        var resolvable = colon < 0 || (IsNcName(prefix) && element.GetNamespaceOfPrefix(prefix) is not null);
+        XNamespace? typeNamespace;
+        if (colon < 0)
+        {
+            typeNamespace = element.GetDefaultNamespace();
+        }
+        else
+        {
+            var prefix = text[..colon];
+            typeNamespace = IsNcName(prefix) ? element.GetNamespaceOfPrefix(prefix) : null;
+        }
 
-        return resolvable
-            && IsNcName(local)
-            && _catalogue.TryGetDto(local, out var runtime)
-            && _catalogue.IsKindOf(runtime.Name, declared.Name)
-                ? runtime
-                : declared;
+        if (typeNamespace is null || !IsNcName(local))
+        {
+            wrongToken = UnresolvedXsiTypeToken;
+            return false;
+        }
+
+        if (typeNamespace == _targetNamespace
+            && _catalogue.TryGetDto(local, out var named)
+            && _catalogue.IsKindOf(named.Name, declared.Name))
+        {
+            runtime = named;
+            return true;
+        }
+
+        wrongToken = XsiTypeTokenPrefix + ClarkName(typeNamespace + local);
+        return false;
     }
 
     private static bool IsXmlWire(XElement value, WireClass wire)
@@ -1024,12 +1144,15 @@ public sealed class ConformanceCheck
 
     /// <summary>
     /// The wrong wire-type token of an XML collection's contents, the ordinal-smallest when several items
-    /// offend; null when every child element is named as the array's SOAP item element and is
-    /// <c>xsi:nil</c> or of the item wire type. An item named otherwise, every item when the array has no
-    /// SOAP item element, gives <c>item-name:&lt;local name&gt;</c>; a primitive item holding child
+    /// offend; null when every child element is the array's SOAP item element in the target namespace and
+    /// is <c>xsi:nil</c> or of the item wire type. An item named otherwise, every item when the array has
+    /// no SOAP item element, gives <c>item-name:&lt;local name&gt;</c> when it is in the target namespace
+    /// and <c>item-name:{namespace}local</c> (<c>{}local</c> for no namespace) when it is not, so an item
+    /// whose local name matches in another namespace is never a valid item; a primitive item holding child
     /// elements gives <c>item:element</c>; a primitive item whose text is not of the item type, or a DTO or
-    /// array item holding non-whitespace text, gives <c>item:text</c>; an array item whose own contents
-    /// offend gives <c>item:</c> and their token.
+    /// array item holding non-whitespace text, gives <c>item:text</c>; a DTO item whose <c>xsi:type</c> is
+    /// invalid gives <c>item:</c> and its <c>xsi-type:</c> token; an array item whose own contents offend
+    /// gives <c>item:</c> and their token.
     /// </summary>
     private string? XmlItemsWrongToken(XElement collection, ArrayDefinition array)
     {
@@ -1042,7 +1165,8 @@ public sealed class ConformanceCheck
             string? token = null;
             if (!IsSoapItem(item, array))
             {
-                token = CollectionItemNamePrefix + item.Name.LocalName;
+                token = CollectionItemNamePrefix
+                    + (item.Name.Namespace == _targetNamespace ? item.Name.LocalName : ClarkName(item.Name));
             }
             else if (IsNil(item))
             {
@@ -1052,6 +1176,12 @@ public sealed class ConformanceCheck
             {
                 token = CollectionItemPrefix
                     + (itemWire is not (WireClass.Dto or WireClass.Array) && item.HasElements ? XmlElementToken : XmlTextToken);
+            }
+            else if (itemWire == WireClass.Dto
+                && _catalogue.TryGetDto(array.ItemType, out var itemType)
+                && !TryRuntimeDtoXml(item, itemType, out _, out var typeWrong))
+            {
+                token = CollectionItemPrefix + typeWrong;
             }
             else if (itemWire == WireClass.Array
                 && _catalogue.TryGetArray(array.ItemType, out var nested)
@@ -1069,15 +1199,15 @@ public sealed class ConformanceCheck
         return wrong;
     }
 
-    private static bool IsSoapItem(XElement element, ArrayDefinition array) =>
-        array.SoapItemElement is { } itemElement
-        && string.Equals(element.Name.LocalName, itemElement, StringComparison.Ordinal);
+    /// <summary>True when <paramref name="element"/> is the array's SOAP item element in the target namespace.</summary>
+    private bool IsSoapItem(XElement element, ArrayDefinition array) =>
+        array.SoapItemElement is { } itemElement && element.Name == _targetNamespace + itemElement;
 
     private static bool IsNil(XElement element) =>
         element.Attribute(XsiNil)?.Value.Trim() is "true" or "1";
 
-    private static XElement? ChildByLocalName(XElement parent, string localName) =>
-        parent.Elements().FirstOrDefault(child => string.Equals(child.Name.LocalName, localName, StringComparison.Ordinal));
+    /// <summary>An expanded name in Clark notation, <c>{namespace}local</c>, with <c>{}</c> for no namespace.</summary>
+    private static string ClarkName(XName name) => "{" + name.NamespaceName + "}" + name.LocalName;
 
     private static bool IsNcName(string text)
     {
@@ -1454,19 +1584,43 @@ public sealed class ConformanceResult
     public ConformanceSummary Summary => new(Counts.MembersChecked, Counts.Passed, Counts.GapsByNature);
 
     /// <summary>
-    /// The <see cref="CheckNames.Conformance"/> check: every member and seed-token assertion is a case,
-    /// and the outcome is <see cref="CheckOutcomes.Pass"/> only when nothing failed. Registered gaps still
-    /// make it fail; whether they are documented is the register's decision.
+    /// The <see cref="CheckNames.Conformance"/> check: every member and seed-token assertion is a case, and
+    /// the cases passed are the passing members and the seed-token assertions that hold. The outcome is
+    /// <see cref="CheckOutcomes.Pass"/> when <paramref name="register"/> documents every item of
+    /// <see cref="Failures"/>, and so when nothing failed, because a gap or failed assertion that is
+    /// registered is the accepted result for it: an unreachable member is always registered, and a
+    /// reachable member or a seed-token assertion is registered once its correction attempts are spent.
+    /// One undocumented item makes it <see cref="CheckOutcomes.Fail"/>. The detail states how many failing
+    /// items the register documents, or leaves undocumented, and how many seed-token assertions hold.
     /// </summary>
-    public CheckResult ToCheckResult()
+    /// <param name="register">
+    /// The known-limitations register, matched by exact (<c>itemId</c>, <c>nature</c>) pair as
+    /// <see cref="KnownLimitationsRegister.IsDocumented"/> decides.
+    /// </param>
+    /// <returns>The check result.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="register"/> is null.</exception>
+    public CheckResult ToCheckResult(KnownLimitationsRegister register)
     {
+        ArgumentNullException.ThrowIfNull(register);
+
         var passedAssertions = SeedAssertions.Count(assertion => IsPass(assertion.Result));
+        var assertionText = string.Create(
+            CultureInfo.InvariantCulture,
+            $"{passedAssertions} of {SeedAssertions.Count} seed-token assertions hold");
+        var undocumented = Failures.Count(item => !register.IsDocumented(item));
+
+        var detail = Failures.Count == 0
+            ? assertionText
+            : undocumented == 0
+                ? string.Create(CultureInfo.InvariantCulture, $"{Failures.Count} of {Failures.Count} failing items documented by the register; {assertionText}")
+                : string.Create(CultureInfo.InvariantCulture, $"{undocumented} of {Failures.Count} failing items not documented by the register; {assertionText}");
+
         return new CheckResult(
             CheckNames.Conformance,
-            Failures.Count == 0 ? CheckOutcomes.Pass : CheckOutcomes.Fail,
+            undocumented == 0 ? CheckOutcomes.Pass : CheckOutcomes.Fail,
             Members.Count + SeedAssertions.Count,
             Counts.Passed + passedAssertions,
-            $"{passedAssertions} of {SeedAssertions.Count} seed-token assertions hold");
+            detail);
     }
 
     /// <summary>

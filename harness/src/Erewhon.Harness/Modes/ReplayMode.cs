@@ -728,14 +728,25 @@ public sealed class ReplayMode
 /// </remarks>
 /// <param name="options">The harness settings.</param>
 /// <param name="catalogue">The operation catalogue; null when it could not be loaded, which fails the body at once.</param>
+/// <param name="register">
+/// The known-limitations register, the same instance <see cref="ReplayMode"/> matches failing items
+/// against; the stand-in conformance check's outcome is judged against it.
+/// </param>
 /// <param name="stdout">Where the body's console lines go.</param>
-/// <exception cref="ArgumentNullException"><paramref name="options"/> or <paramref name="stdout"/> is null.</exception>
-public sealed class ReplayBody(HarnessOptions options, OperationCatalogue? catalogue, TextWriter stdout) : IReplayBody
+/// <exception cref="ArgumentNullException">
+/// <paramref name="options"/>, <paramref name="register"/> or <paramref name="stdout"/> is null.
+/// </exception>
+public sealed class ReplayBody(
+    HarnessOptions options,
+    OperationCatalogue? catalogue,
+    KnownLimitationsRegister register,
+    TextWriter stdout) : IReplayBody
 {
     private const string Unknown = "unknown";
 
     private readonly HarnessOptions _options = options ?? throw new ArgumentNullException(nameof(options));
     private readonly OperationCatalogue? _catalogue = catalogue;
+    private readonly KnownLimitationsRegister _register = register ?? throw new ArgumentNullException(nameof(register));
     private readonly TextWriter _stdout = stdout ?? throw new ArgumentNullException(nameof(stdout));
 
     /// <inheritdoc/>
@@ -749,7 +760,7 @@ public sealed class ReplayBody(HarnessOptions options, OperationCatalogue? catal
 
         using var runner = CaseRunner.FromOptions(_options);
         using var reset = new StateReset(_options);
-        var execution = new Execution(_options, catalogue, state, runner, reset, _stdout, ct);
+        var execution = new Execution(_options, catalogue, _register, state, runner, reset, _stdout, ct);
         await execution.RunAsync().ConfigureAwait(false);
     }
 
@@ -804,6 +815,7 @@ public sealed class ReplayBody(HarnessOptions options, OperationCatalogue? catal
     private sealed class Execution(
         HarnessOptions options,
         OperationCatalogue catalogue,
+        KnownLimitationsRegister register,
         ReplayRunState state,
         CaseRunner runner,
         StateReset reset,
@@ -1221,23 +1233,42 @@ public sealed class ReplayBody(HarnessOptions options, OperationCatalogue? catal
 
         // Conformance is read from capture's result, never recomputed: the stand-in's conformance is a fact
         // about the baseline, not about the facade.
+        //
+        // Capture writes the conformance result beside the records it captured, so a captured baseline
+        // without it has lost mandatory evidence. That absence is thrown, and the guard records it as the
+        // CHK-EXCEPTION item no register entry can document, so the run cannot exit 0 on it. Only a baseline
+        // from which nothing was captured has no result to read: the hand-written not-run manifest, or no
+        // manifest at all, with no record. Such a baseline reports the check as not run and adds no item.
         private async Task ConformanceAsync()
         {
             state.SetCheck(NotRun(CheckNames.Conformance, IncompleteDetail));
             var node = await _store.TryReadConformanceAsync(ct).ConfigureAwait(false);
             if (node is null)
             {
+                if (_manifest is { IsNotRun: false } || _entries.Count > 0)
+                {
+                    const string detail = $"{ConformanceName} absent although the baseline was captured";
+                    state.SetCheck(NotRun(CheckNames.Conformance, detail));
+                    PrintBaseline($"conformance: {detail}; the stand-in conformance evidence is missing");
+                    throw new FileNotFoundException(
+                        $"{ConformanceName} is absent although the baseline was captured; capture writes the stand-in conformance result beside its records, so the conformance evidence is missing.",
+                        options.ConformancePath);
+                }
+
                 state.SetCheck(NotRun(CheckNames.Conformance, $"{ConformanceName} absent"));
                 PrintBaseline($"conformance: {ConformanceName} absent; not run");
                 return;
             }
 
             var result = ConformanceResult.Parse(node);
-            var check = result.ToCheckResult();
+            var check = result.ToCheckResult(register);
             state.Conformance = result.Summary;
             state.SetCheck(check);
             state.AddFailures(result.Failures);
-            PrintBaseline(DescribeCheck(check));
+
+            // The detail carries the verdict's reason: how many failing items the register documents and
+            // how many seed-token assertions hold.
+            PrintBaseline(string.IsNullOrWhiteSpace(check.Detail) ? DescribeCheck(check) : $"{DescribeCheck(check)}; {check.Detail}");
         }
 
         private async Task OpenApiDriftAsync()
