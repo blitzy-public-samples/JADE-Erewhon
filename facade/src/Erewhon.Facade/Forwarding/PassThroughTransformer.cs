@@ -16,19 +16,30 @@ namespace Erewhon.Facade.Forwarding;
 
 /// <summary>
 /// The request and response transform used for every forwarded call: a byte-faithful pass-through
-/// that adds no header and rebuilds no payload (AAP 0.3.2.1, 0.4.1).
+/// that rebuilds no payload and adds no header but one, <c>Expect: 100-continue</c> on large or
+/// unknown-length uploads (AAP 0.3.2.1, 0.4.1).
 /// </summary>
 /// <remarks>
 /// <para>
 /// Towards the backend, the method, the raw path and query bytes, the body and every end-to-end
 /// request header pass unchanged, <c>SOAPAction</c> quotes, <c>Authorization</c>, <c>Cookie</c>,
-/// <c>traceparent</c> and any caller-supplied <c>X-Forwarded-*</c> included. None of them is
-/// interpreted. The one header not forwarded is the caller's <c>Host</c>: the outgoing
-/// <c>Host</c> is the target authority, which the HTTP stack derives from the destination URI.
-/// No <c>X-Forwarded-*</c>, <c>Forwarded</c>, <c>Via</c>, credential or token header is added,
-/// because no layer of the facade authenticates or derives an identity and the backend is plain
-/// HTTP without authentication. A body-less write carries the <c>Content-Length: 0</c> the HTTP
+/// <c>traceparent</c>, the caller's own <c>Expect</c> and any caller-supplied <c>X-Forwarded-*</c>
+/// included. None of them is interpreted. The one header not forwarded is the caller's <c>Host</c>:
+/// the outgoing <c>Host</c> is the target authority, which the HTTP stack derives from the
+/// destination URI. No <c>X-Forwarded-*</c>, <c>Forwarded</c>, <c>Via</c>, credential or token header
+/// is added, because no layer of the facade authenticates or derives an identity and the backend is
+/// plain HTTP without authentication. A body-less write carries the <c>Content-Length: 0</c> the HTTP
 /// stack would write for it anyway, as an empty content, so the stack sends it to the backend once.
+/// </para>
+/// <para>
+/// The one header added is <c>Expect: 100-continue</c>, on a request whose body is at least
+/// <see cref="ExpectContinueThreshold"/> bytes or of unknown length and that carries no <c>Expect</c>
+/// of its own. The HTTP stack sends a whole request body before it reads any response unless the
+/// request asks for 100-continue, so a backend that rejects an upload early, for example with 413
+/// for its own body-size limit, and closes the connection would otherwise surface only as a failed
+/// upload, never as its response. With the expectation the backend's early answer reaches the caller
+/// unchanged, and a backend that accepts the upload answers 100 Continue and receives the body as
+/// before. Smaller bodies, which carry every ordinary JADE call, are sent exactly as before.
 /// </para>
 /// <para>
 /// The request target is taken from the raw target the caller sent, never from the decoded
@@ -59,11 +70,19 @@ namespace Erewhon.Facade.Forwarding;
 /// on, and the fields either nominates are dropped.
 /// </para>
 /// <para>
-/// The instance holds no state, so one singleton serves every request concurrently.
+/// The instance holds no state, so one singleton serves every request concurrently; the one fact it
+/// reports about a call, that the backend's whole response has been relayed, goes to that call's own
+/// <see cref="BackendCallState"/>.
 /// </para>
 /// </remarks>
 public sealed class PassThroughTransformer : HttpTransformer
 {
+    /// <summary>
+    /// The request body size, 1 MiB, from which a request without an <c>Expect</c> header of its own is
+    /// forwarded with <c>Expect: 100-continue</c>; curl applies the same threshold to its uploads.
+    /// </summary>
+    public const long ExpectContinueThreshold = 1024 * 1024;
+
     /// <summary>The asterisk-form request target, which only <c>OPTIONS</c> carries (RFC 9112 3.2.4).</summary>
     internal const string AsteriskFormTarget = "*";
 
@@ -87,6 +106,17 @@ public sealed class PassThroughTransformer : HttpTransformer
     /// <returns>The raw request target, for example <c>/agent/Hank%20Williams</c>, <c>http://host/company</c> or <c>*</c>.</returns>
     internal static string? GetRawTarget(HttpContext context) =>
         context.Features.Get<IHttpRequestFeature>()?.RawTarget;
+
+    /// <summary>
+    /// Tells whether the request carries a body for the backend, decided as YARP decides whether to send
+    /// one: the server's answer when it gives one, otherwise a chunked or non-empty declared body.
+    /// </summary>
+    /// <param name="context">The incoming request.</param>
+    /// <returns>True for a request with a body, whatever its length.</returns>
+    internal static bool CarriesBody(HttpContext context) =>
+        context.Features.Get<IHttpRequestBodyDetectionFeature>() is { } detection
+            ? detection.CanHaveBody
+            : context.Request.ContentLength > 0 || context.Request.Headers.TransferEncoding.Count > 0;
 
     /// <summary>Tells whether a raw request target is the asterisk form, <c>*</c>.</summary>
     /// <param name="rawTarget">The raw request target, or null.</param>
@@ -153,8 +183,9 @@ public sealed class PassThroughTransformer : HttpTransformer
     /// <summary>
     /// Copies every end-to-end request header unchanged, drops the fields the caller's
     /// <c>Connection</c> header nominates, replaces the caller's <c>Host</c> with the target
-    /// authority and points the request at <paramref name="destinationPrefix"/> followed by the
-    /// origin form of the caller's raw request target. A body-less request whose method the HTTP stack
+    /// authority, asks for 100-continue on a large or unknown-length body that carries no
+    /// <c>Expect</c> of its own, and points the request at <paramref name="destinationPrefix"/>
+    /// followed by the origin form of the caller's raw request target. A body-less request whose method the HTTP stack
     /// sends with <c>Content-Length: 0</c> gets an empty content carrying that same header, so the
     /// handler sends it to the backend once.
     /// </summary>
@@ -196,6 +227,18 @@ public sealed class PassThroughTransformer : HttpTransformer
 
         // With no Host header set, the handler writes the destination URI's authority.
         proxyRequest.Headers.Host = null;
+
+        // A body of unknown length (chunked) or of at least 1 MiB waits for the backend's 100 Continue,
+        // so an early rejection reaches the caller as the backend's response instead of a failed upload.
+        // A caller's own Expect header, already copied above, is left exactly as sent, and a request
+        // without a body, which has content here only to carry content headers, gets none.
+        if (proxyRequest.Content is not null
+            && CarriesBody(httpContext)
+            && httpContext.Request.Headers.Expect.Count == 0
+            && httpContext.Request.ContentLength is not < ExpectContinueThreshold)
+        {
+            proxyRequest.Headers.ExpectContinue = true;
+        }
 
         // The origin form of an origin-form or absolute-form target is appended to the prefix. An
         // asterisk-form request is addressed to the target's base URL, and BackendForwarder writes the
@@ -301,6 +344,28 @@ public sealed class PassThroughTransformer : HttpTransformer
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Copies the backend's response trailers unchanged, if the caller's response supports them, and
+    /// records on the call's <see cref="BackendCallState"/> that the backend's whole response has been
+    /// relayed.
+    /// </summary>
+    /// <param name="httpContext">The incoming request, whose response is being written.</param>
+    /// <param name="proxyResponse">The backend's response, whose body has been copied in full.</param>
+    /// <param name="cancellationToken">Cancelled when the call is abandoned or its deadline expires.</param>
+    /// <returns>A task that completes when the trailers have been copied.</returns>
+    public override async ValueTask TransformResponseTrailersAsync(
+        HttpContext httpContext,
+        HttpResponseMessage proxyResponse,
+        CancellationToken cancellationToken)
+    {
+        await base.TransformResponseTrailersAsync(httpContext, proxyResponse, cancellationToken).ConfigureAwait(false);
+
+        // The forwarder asks for the trailers only after it has copied the backend's whole response
+        // body, and checks the upload only after this: BackendForwarder then keeps the backend's answer
+        // even when the upload did not complete.
+        BackendCallState.Current?.MarkResponseRelayed();
     }
 
     // The field names a sender's Connection header values nominate: every element of each

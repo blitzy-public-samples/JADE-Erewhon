@@ -77,11 +77,21 @@ COPY --from=build --chmod=a=rX /app/publish/ /app/
 # Routing__Targets__backend__SoapBaseUrl and Backend__TimeoutSeconds from .env.
 ENV ASPNETCORE_HTTP_PORTS=
 
+# Temporary storage of SOAP bodies. A SOAP request without a matching SOAPAction is buffered whole
+# (Request.EnableBuffering, with no limit) so that its first 64 KiB can be inspected and the full body
+# still forwarded; a body over 30 KiB is buffered in a file here. This location must hold the largest
+# SOAP bodies sent concurrently without a matching SOAPAction: when it fills, the call fails with a
+# bare 500 and a "failed" log line. For larger bodies, mount a volume of the needed size and point
+# ASPNETCORE_TEMP at it. /tmp is the image's world-writable default, named here so the requirement is
+# visible.
+ENV ASPNETCORE_TEMP=/tmp
+
 # REST (ErewhonREST 0.0.0.0:65000), SOAP (WebServiceHTTP 0.0.0.0:21001), admin (AdminRoutes.DefaultPort).
 # Documentation only: Compose publishes 65000 and 21001 and never 9090.
 EXPOSE 65000 21001 9090
 
-# Every port is above 1024, and the facade only reads its WSDL and embedded catalogue; it writes no file.
+# Every port is above 1024. The facade reads its WSDL and embedded catalogue, and writes only the
+# temporary files of buffered SOAP bodies under ASPNETCORE_TEMP.
 USER $APP_UID
 
 # No HEALTHCHECK: the image has no curl, and the harness polls GET /health on the admin port.

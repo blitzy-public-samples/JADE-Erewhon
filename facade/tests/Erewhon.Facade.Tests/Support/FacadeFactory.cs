@@ -28,6 +28,7 @@ using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 // The facade tests bind real sockets and assert on elapsed times, and WebApplicationFactory captures the
 // facade's host through hosting diagnostics that every host built in the process raises, so no two tests
@@ -73,6 +74,13 @@ public sealed class FacadeTestSettings
     /// <c>wsdl: absent</c> and forwards WSDL requests to the default target.
     /// </summary>
     public string? WsdlPath { get; init; }
+
+    /// <summary>
+    /// A logger provider added to the facade's logging, for example a <see cref="LogCapture"/>; null adds
+    /// none. It is registered after the facade's own logging set-up, which clears every other provider,
+    /// and the facade's configured level filters apply to it. The caller owns it.
+    /// </summary>
+    public ILoggerProvider? LoggerProvider { get; init; }
 }
 
 /// <summary>
@@ -122,6 +130,7 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
     private static int _abandonedStarts;
 
     private readonly KeyValuePair<string, string?>[] _settings;
+    private readonly ILoggerProvider? _loggerProvider;
 
     /// <summary>
     /// Draws three distinct free loopback ports and prepares the facade's settings. The facade is not
@@ -137,6 +146,7 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
         SoapBaseAddress = LoopbackAddress(SoapPort);
         AdminBaseAddress = LoopbackAddress(AdminPort);
         _settings = BuildSettings(settings, RestPort, SoapPort, AdminPort);
+        _loggerProvider = settings.LoggerProvider;
     }
 
     /// <summary>The port of the REST listener (<c>Facade:RestPort</c>) on 127.0.0.1.</summary>
@@ -362,7 +372,8 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
     /// twice: as a host setting, which reaches the facade's builder through its arguments, and as an
     /// in-memory application configuration source, added last, so it also wins over the facade's
     /// <c>appsettings.json</c> and any <c>Facade__*</c>, <c>Backend__*</c> or <c>Routing__*</c> environment
-    /// variable.
+    /// variable. A <see cref="FacadeTestSettings.LoggerProvider"/> is registered here, after the facade's
+    /// entry point has replaced the default logging providers.
     /// </remarks>
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
@@ -373,6 +384,11 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
         }
 
         builder.ConfigureAppConfiguration((_, configuration) => configuration.AddInMemoryCollection(_settings));
+
+        if (_loggerProvider is { } loggerProvider)
+        {
+            builder.ConfigureServices(services => services.AddSingleton(loggerProvider));
+        }
     }
 
     /// <inheritdoc />
@@ -977,4 +993,411 @@ public static class OperationRequests
         "Decimal" => DecimalSample,
         _ => StringSample,
     };
+}
+
+// LogCapture sits here, beside FacadeTestSettings.LoggerProvider, which hands it to a facade on real
+// sockets.
+//
+// Captures the log entries a facade writes during a test, so that a test can assert on BackendForwarder's
+// per-call line (event 1001, BackendCall) and on the absence of error-level output. Hand an instance to
+// FacadeTestSettings.LoggerProvider for a facade on real sockets, or to a LoggerFactory for a forwarder
+// constructed directly.
+//
+// Facade test failures are identified across runs by a signature over the exception type, the failing
+// line and the assertion message, so every message raised here is a fixed literal.
+/// <summary>One log entry as the facade wrote it.</summary>
+/// <param name="Category">The logger category, for example <c>Erewhon.Facade.Forwarding.BackendForwarder</c>.</param>
+/// <param name="Level">The entry's level.</param>
+/// <param name="EventId">The entry's event id.</param>
+/// <param name="State">The structured values of the entry, keyed by placeholder name.</param>
+/// <param name="Message">The formatted message.</param>
+/// <param name="Exception">The exception logged with the entry, if any.</param>
+public sealed record CapturedLog(
+    string Category,
+    LogLevel Level,
+    EventId EventId,
+    IReadOnlyDictionary<string, object?> State,
+    string Message,
+    Exception? Exception)
+{
+    /// <summary>Returns the structured value of the named placeholder, or null when the entry has none.</summary>
+    public object? Value(string name) => State.TryGetValue(name, out object? value) ? value : null;
+}
+
+/// <summary>
+/// An <see cref="ILoggerProvider"/> that keeps every entry it receives in memory, in the order written.
+/// The facade's own level filters still decide which entries reach it.
+/// </summary>
+public sealed class LogCapture : ILoggerProvider
+{
+    /// <summary>The event id of BackendForwarder's per-call line.</summary>
+    public const int BackendCallEventId = 1001;
+
+    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(20);
+
+    private readonly Lock _gate = new();
+    private readonly List<CapturedLog> _entries = [];
+
+    /// <summary>A snapshot of every entry received so far.</summary>
+    public IReadOnlyList<CapturedLog> Entries
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _entries.ToArray();
+            }
+        }
+    }
+
+    /// <summary>A snapshot of the per-call lines (event 1001) received so far.</summary>
+    public IReadOnlyList<CapturedLog> BackendCalls => Entries.Where(entry => entry.EventId.Id == BackendCallEventId).ToArray();
+
+    /// <summary>
+    /// Waits until at least <paramref name="count"/> per-call lines have been received and returns them;
+    /// fails the test when they have not arrived within <paramref name="bound"/>.
+    /// </summary>
+    /// <param name="count">The number of lines to wait for.</param>
+    /// <param name="bound">How long to wait.</param>
+    /// <param name="ct">The test's cancellation token.</param>
+    /// <returns>Every per-call line received.</returns>
+    public async Task<IReadOnlyList<CapturedLog>> WaitForBackendCallsAsync(int count, TimeSpan bound, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + bound;
+        while (true)
+        {
+            IReadOnlyList<CapturedLog> calls = BackendCalls;
+            if (calls.Count >= count)
+            {
+                return calls;
+            }
+
+            if (DateTime.UtcNow >= deadline)
+            {
+                Assert.Fail("expected backend call log lines did not arrive in time");
+            }
+
+            await Task.Delay(PollInterval, ct);
+        }
+    }
+
+    /// <inheritdoc />
+    public ILogger CreateLogger(string categoryName) => new CapturingLogger(this, categoryName);
+
+    /// <inheritdoc />
+    public void Dispose()
+    {
+        // Entries stay readable after the host that wrote them has stopped.
+    }
+
+    private void Add(CapturedLog entry)
+    {
+        lock (_gate)
+        {
+            _entries.Add(entry);
+        }
+    }
+
+    private sealed class CapturingLogger(LogCapture owner, string category) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state)
+            where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => logLevel != LogLevel.None;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            var values = new Dictionary<string, object?>(StringComparer.Ordinal);
+            if (state is IEnumerable<KeyValuePair<string, object?>> pairs)
+            {
+                foreach ((string name, object? value) in pairs)
+                {
+                    values[name] = value;
+                }
+            }
+
+            owner.Add(new CapturedLog(category, logLevel, eventId, values, formatter(state, exception), exception));
+        }
+    }
+}
+
+// RawSocketClient sits here, beside the facade host whose REST and SOAP sockets it calls.
+//
+// Raw HTTP/1.1 over a plain TCP socket, for the requests HttpClient cannot send: an upload that trickles
+// one byte at a time while the response is read, a chunked upload that is never completed while the
+// response is read, an upload cut short by closing the socket, and a caller that disconnects before the
+// response. HttpClient sends a whole request body before it reads any response, and never sends less
+// body than it declares.
+//
+// Facade test failures are identified across runs by a signature over the exception type, the failing
+// line and the assertion message, so every message raised here is a fixed literal: no port, URL, elapsed
+// time or byte count.
+/// <summary>A response read from a raw socket.</summary>
+/// <param name="Status">The status code of the status line.</param>
+/// <param name="Body">The body bytes, as many as <c>Content-Length</c> declares.</param>
+/// <param name="Elapsed">The time from the end of the request head to the end of the body.</param>
+public sealed record RawSocketResponse(int Status, byte[] Body, TimeSpan Elapsed)
+{
+    /// <summary>The body decoded as UTF-8.</summary>
+    public string BodyText => Encoding.UTF8.GetString(Body);
+}
+
+/// <summary>Sends raw HTTP/1.1 requests whose bodies arrive late, short or never.</summary>
+public static class RawSocketClient
+{
+    // A response that has not arrived by then fails the test instead of stalling it.
+    private static readonly TimeSpan ResponseBound = TimeSpan.FromSeconds(15);
+
+    private static readonly byte[] HeadTerminator = "\r\n\r\n"u8.ToArray();
+
+    /// <summary>
+    /// Sends a <c>POST</c> head declaring <paramref name="declaredLength"/> body bytes, then one body byte
+    /// per <paramref name="interval"/>, never completing the body, and reads the response while the bytes
+    /// trickle. The upload stops when the response has been read or the connection closes.
+    /// </summary>
+    /// <param name="baseAddress">The facade socket, for example <c>FacadeFactory.RestBaseAddress</c>.</param>
+    /// <param name="pathAndQuery">The request target.</param>
+    /// <param name="contentType">The <c>Content-Type</c> value.</param>
+    /// <param name="declaredLength">The <c>Content-Length</c> value; at least 2, so the body is never completed.</param>
+    /// <param name="interval">The pause before each body byte.</param>
+    /// <param name="ct">The test's cancellation token.</param>
+    /// <returns>The response, with the time from the end of the head to the end of the body.</returns>
+    public static async Task<RawSocketResponse> SendTrickledUploadAsync(
+        Uri baseAddress, string pathAndQuery, string contentType, int declaredLength, TimeSpan interval, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(baseAddress);
+        ArgumentOutOfRangeException.ThrowIfLessThan(declaredLength, 2);
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(baseAddress.Host, baseAddress.Port, ct);
+        NetworkStream stream = client.GetStream();
+        await stream.WriteAsync(Head("POST", baseAddress, pathAndQuery, contentType, declaredLength), ct);
+        var stopwatch = Stopwatch.StartNew();
+
+        using var stopUpload = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task upload = TrickleAsync(stream, declaredLength - 1, interval, stopUpload.Token);
+        try
+        {
+            (int status, byte[] body) = await ReadResponseAsync(stream, ct);
+            stopwatch.Stop();
+            return new RawSocketResponse(status, body, stopwatch.Elapsed);
+        }
+        finally
+        {
+            await stopUpload.CancelAsync();
+            await upload;
+        }
+    }
+
+    /// <summary>
+    /// Sends a <c>POST</c> head with <c>Transfer-Encoding: chunked</c> and no <c>Expect</c>, then
+    /// <paramref name="bodyLength"/> body bytes in 64 KiB chunks as fast as the facade takes them, never
+    /// sending the terminating chunk, and reads the response while the upload is under way. The upload
+    /// stops when the response has been read or the connection closes, so a response arrives only if the
+    /// facade answers before the body is complete.
+    /// </summary>
+    /// <param name="baseAddress">The facade socket, for example <c>FacadeFactory.RestBaseAddress</c>.</param>
+    /// <param name="pathAndQuery">The request target.</param>
+    /// <param name="headers">Further request headers, for example <c>Content-Type</c> and <c>SOAPAction</c>.</param>
+    /// <param name="bodyLength">How many body bytes to send; the body is never completed.</param>
+    /// <param name="ct">The test's cancellation token.</param>
+    /// <returns>The response, with the time from the end of the head to the end of the body.</returns>
+    public static async Task<RawSocketResponse> SendUnfinishedChunkedUploadAsync(
+        Uri baseAddress, string pathAndQuery, IReadOnlyList<KeyValuePair<string, string>> headers, long bodyLength, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(baseAddress);
+        ArgumentNullException.ThrowIfNull(headers);
+        ArgumentOutOfRangeException.ThrowIfNegative(bodyLength);
+
+        var head = new StringBuilder();
+        head.Append(CultureInfo.InvariantCulture, $"POST {pathAndQuery} HTTP/1.1\r\nHost: {baseAddress.Authority}\r\n");
+        foreach ((string name, string value) in headers)
+        {
+            head.Append(CultureInfo.InvariantCulture, $"{name}: {value}\r\n");
+        }
+
+        head.Append("Transfer-Encoding: chunked\r\n\r\n");
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(baseAddress.Host, baseAddress.Port, ct);
+        NetworkStream stream = client.GetStream();
+        await stream.WriteAsync(Encoding.ASCII.GetBytes(head.ToString()), ct);
+        var stopwatch = Stopwatch.StartNew();
+
+        using var stopUpload = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task upload = SendChunksAsync(stream, bodyLength, stopUpload.Token);
+        try
+        {
+            (int status, byte[] body) = await ReadResponseAsync(stream, ct);
+            stopwatch.Stop();
+            return new RawSocketResponse(status, body, stopwatch.Elapsed);
+        }
+        finally
+        {
+            await stopUpload.CancelAsync();
+            await upload;
+        }
+    }
+
+    /// <summary>
+    /// Sends a request head, and for a declared body the first <paramref name="sentBodyLength"/> bytes of
+    /// it, then closes the socket after <paramref name="closeAfter"/> without reading any response.
+    /// </summary>
+    /// <param name="baseAddress">The facade socket.</param>
+    /// <param name="method">The request method.</param>
+    /// <param name="pathAndQuery">The request target.</param>
+    /// <param name="contentType">The <c>Content-Type</c> value; null with no declared body.</param>
+    /// <param name="declaredLength">The <c>Content-Length</c> value; 0 for a request without a body.</param>
+    /// <param name="sentBodyLength">How many of the declared body bytes are sent; less than declared truncates the upload.</param>
+    /// <param name="closeAfter">How long to wait before closing the socket.</param>
+    /// <param name="ct">The test's cancellation token.</param>
+    public static async Task SendAndCloseAsync(
+        Uri baseAddress,
+        string method,
+        string pathAndQuery,
+        string? contentType,
+        int declaredLength,
+        int sentBodyLength,
+        TimeSpan closeAfter,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(baseAddress);
+        ArgumentOutOfRangeException.ThrowIfNegative(declaredLength);
+        ArgumentOutOfRangeException.ThrowIfNegative(sentBodyLength);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(sentBodyLength, declaredLength);
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(baseAddress.Host, baseAddress.Port, ct);
+        NetworkStream stream = client.GetStream();
+        await stream.WriteAsync(Head(method, baseAddress, pathAndQuery, contentType, declaredLength), ct);
+        if (sentBodyLength > 0)
+        {
+            byte[] body = new byte[sentBodyLength];
+            Array.Fill(body, (byte)'x');
+            await stream.WriteAsync(body, ct);
+        }
+
+        await Task.Delay(closeAfter, ct);
+        client.Close();
+    }
+
+    private static byte[] Head(string method, Uri baseAddress, string pathAndQuery, string? contentType, int declaredLength)
+    {
+        var head = new StringBuilder();
+        head.Append(CultureInfo.InvariantCulture, $"{method} {pathAndQuery} HTTP/1.1\r\nHost: {baseAddress.Authority}\r\n");
+        if (declaredLength > 0)
+        {
+            if (contentType is not null)
+            {
+                head.Append(CultureInfo.InvariantCulture, $"Content-Type: {contentType}\r\n");
+            }
+
+            head.Append(CultureInfo.InvariantCulture, $"Content-Length: {declaredLength}\r\n");
+        }
+
+        head.Append("\r\n");
+        return Encoding.ASCII.GetBytes(head.ToString());
+    }
+
+    private static async Task TrickleAsync(Stream stream, int count, TimeSpan interval, CancellationToken ct)
+    {
+        byte[] one = "x"u8.ToArray();
+        try
+        {
+            for (int sent = 0; sent < count; sent++)
+            {
+                await Task.Delay(interval, ct);
+                await stream.WriteAsync(one, ct);
+            }
+        }
+        catch (Exception exception) when (exception is OperationCanceledException or IOException or ObjectDisposedException)
+        {
+            // Stopped once the response was read, or the facade closed the connection: the upload ends here.
+        }
+    }
+
+    // Sends the chunks of an upload that never ends, then waits until the response has been read.
+    private static async Task SendChunksAsync(Stream stream, long bodyLength, CancellationToken ct)
+    {
+        const int ChunkLength = 64 * 1024;
+        byte[] chunk = Chunk(ChunkLength);
+        try
+        {
+            for (long sent = 0; sent < bodyLength; sent += ChunkLength)
+            {
+                int length = (int)Math.Min(ChunkLength, bodyLength - sent);
+                await stream.WriteAsync(length == ChunkLength ? chunk : Chunk(length), ct);
+            }
+
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        }
+        catch (Exception exception) when (exception is OperationCanceledException or IOException or ObjectDisposedException)
+        {
+            // Stopped once the response was read, or the facade closed the connection: the upload ends here.
+        }
+
+        // One chunk of the chunked transfer coding: hexadecimal size, CRLF, data, CRLF.
+        static byte[] Chunk(int length) =>
+            [.. Encoding.ASCII.GetBytes(length.ToString("X", CultureInfo.InvariantCulture) + "\r\n"), .. Enumerable.Repeat((byte)'x', length), .. "\r\n"u8];
+    }
+
+    // Reads one response with a Content-Length body; chunked responses are not expected from these tests.
+    private static async Task<(int Status, byte[] Body)> ReadResponseAsync(Stream stream, CancellationToken ct)
+    {
+        using var bound = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        bound.CancelAfter(ResponseBound);
+        using var received = new MemoryStream();
+        byte[] buffer = new byte[4096];
+        try
+        {
+            int headEnd;
+            while ((headEnd = received.GetBuffer().AsSpan(0, (int)received.Length).IndexOf(HeadTerminator)) < 0)
+            {
+                int read = await stream.ReadAsync(buffer, bound.Token);
+                Assert.True(read > 0, "facade closed the connection before a complete response head");
+                received.Write(buffer, 0, read);
+            }
+
+            string[] lines = Encoding.ASCII.GetString(received.GetBuffer(), 0, headEnd).Split("\r\n");
+            string[] statusLine = lines[0].Split(' ', 3);
+            int status = -1;
+            Assert.True(
+                statusLine.Length >= 2 && int.TryParse(statusLine[1], NumberStyles.None, CultureInfo.InvariantCulture, out status),
+                "response status line is malformed");
+
+            int contentLength = -1;
+            foreach (string line in lines.Skip(1))
+            {
+                int colon = line.IndexOf(':', StringComparison.Ordinal);
+                if (colon > 0
+                    && line.AsSpan(0, colon).Trim().Equals("Content-Length", StringComparison.OrdinalIgnoreCase)
+                    && int.TryParse(line.AsSpan(colon + 1).Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out int length))
+                {
+                    contentLength = length;
+                }
+            }
+
+            Assert.True(contentLength >= 0, "response has no Content-Length");
+
+            int bodyStart = headEnd + HeadTerminator.Length;
+            while (received.Length - bodyStart < contentLength)
+            {
+                int read = await stream.ReadAsync(buffer, bound.Token);
+                Assert.True(read > 0, "facade closed the connection before the response body was complete");
+                received.Write(buffer, 0, read);
+            }
+
+            return (status, received.GetBuffer().AsSpan(bodyStart, contentLength).ToArray());
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            Assert.Fail("no complete response arrived within 15 s");
+            throw new UnreachableException();
+        }
+        catch (IOException)
+        {
+            Assert.Fail("connection failed while the response was read");
+            throw new UnreachableException();
+        }
+    }
 }

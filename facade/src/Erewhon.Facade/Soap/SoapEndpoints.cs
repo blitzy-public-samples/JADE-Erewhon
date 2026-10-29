@@ -98,6 +98,10 @@ public static partial class SoapEndpoints
         BackendForwarder forwarder,
         ILogger logger)
     {
+        // Installed before the resolver can buffer the body, so the forwarder's later reads of the server's
+        // body, through the buffer, can be cancelled without leaving the server's body reader invalid.
+        CancellableRequestBody.Install(context);
+
         SoapResolution resolution;
         try
         {

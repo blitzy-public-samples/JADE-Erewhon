@@ -1,21 +1,25 @@
 using System.Buffers;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.IO.Pipelines;
 using System.Net;
+using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using Erewhon.Contracts.Catalogue;
 using Erewhon.Facade.Routing;
 using Erewhon.Facade.Soap;
+using Microsoft.AspNetCore.Connections;
+using Microsoft.AspNetCore.Http.Features;
 using Yarp.ReverseProxy.Forwarder;
 
 namespace Erewhon.Facade.Forwarding;
 
 /// <summary>
 /// Forwards one REST or SOAP request to the target its operation is routed to, within that target's
-/// deadline, and builds the only responses the facade makes besides the WSDL: backend unavailable and
-/// backend timed out.
+/// deadline, and builds the only responses the facade makes besides the WSDL: backend unavailable,
+/// backend timed out, and a bare 500 when the facade itself fails a call.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -25,22 +29,60 @@ namespace Erewhon.Facade.Forwarding;
 /// the caller unchanged, 4xx and 5xx results included; nothing is parsed or re-serialised.
 /// </para>
 /// <para>
-/// A failure before the backend's response headers arrive gives REST 502 or 504 with a problem+json body,
-/// or a SOAP 1.1 Fault from <see cref="SoapFaultWriter"/>. A failure after them aborts the connection,
-/// because the backend's status line has already been taken over and must never be replaced. Neither
-/// path outlasts the deadline: a linked token cancels the call when it expires, even while
-/// <see cref="ForwarderRequestConfig.ActivityTimeout"/> is still being reset by activity.
+/// An unreachable backend or an expired deadline before the backend's response headers arrive gives
+/// REST 502 or 504 with a problem+json body, or a SOAP 1.1 Fault from <see cref="SoapFaultWriter"/>. A
+/// failure after them aborts the connection, because the backend's status line has already been taken
+/// over and must never be replaced. Neither path outlasts the deadline: a linked token cancels the call
+/// when it expires, even while <see cref="ForwarderRequestConfig.ActivityTimeout"/> is still being reset
+/// by activity, and writing a failure response has a budget of its own, after which the connection is
+/// aborted.
+/// </para>
+/// <para>
+/// The logged outcome says how the call ended:
+/// <list type="bullet">
+/// <item><description>
+/// <c>forwarded</c>: the backend's response was taken over; the status is the backend's. That includes an
+/// answer the backend gave before it had read the whole upload, such as 413 for its own body-size limit,
+/// and a response relayed in full before YARP found the upload incomplete.
+/// </description></item>
+/// <item><description>
+/// <c>unavailable</c>: the backend could not be reached before the deadline (refused, unresolved or failed
+/// connect), or it closed the connection unanswered before any byte of the request body was sent to it,
+/// as happens to every request without a body; the caller gets 502 or the "Backend unavailable" Fault. A
+/// backend that answered, or that dropped an upload it had begun to receive, is never reported
+/// unavailable.
+/// </description></item>
+/// <item><description>
+/// <c>timeout</c>: the deadline expired; the caller gets 504 or the "Backend timed out" Fault, or an
+/// aborted connection when the backend's response had already started.
+/// </description></item>
+/// <item><description>
+/// <c>aborted</c>: the caller left or broke its own request (disconnected, reset or truncated its upload)
+/// before the call completed. Nothing is written; the status is the one already sent, or 0 when no
+/// response was sent.
+/// </description></item>
+/// <item><description>
+/// <c>failed</c>: anything else. The backend dropped the connection during the upload or the response
+/// body, the facade could not read the request body (for example when the temporary storage of a
+/// buffered SOAP body is full), or an exception escaped. A dropped upload or a started response is
+/// aborted (status 0, or the status already sent); otherwise the caller gets a bare 500 and the
+/// connection is closed. An escaping exception is rethrown unchanged and logged with the status already
+/// sent, or the 500 the server sends for an unhandled exception.
+/// </description></item>
+/// </list>
+/// Forwarded and aborted calls are logged at Information, every other outcome at Warning.
 /// </para>
 /// <para>
 /// Each distinct <see cref="ResolvedTarget"/> gets its own <see cref="HttpMessageInvoker"/> over a
 /// <see cref="SocketsHttpHandler"/> with no proxy, redirects, cookies, decompression or trace-header
-/// injection, created on the first call to it and reused, with its connection pool, by every later
-/// call. The target is resolved on every call, so a routing reload applies to the next request. A call
-/// holds a lease on its invoker until its response has been forwarded, written or aborted. When a
-/// reload leaves a target out of the routing table, or the forwarder is disposed, the target's invoker
-/// is retired: no new call takes it, and it is disposed once its last lease is released, so calls in
-/// flight finish on it and no superseded invoker or connection pool outlives them. The class is safe
-/// for concurrent use as a singleton.
+/// injection, whose connections are <see cref="BackendConnectionStream"/>s, created on the first call to
+/// it and reused, with its connection pool, by every later call. The target is resolved on every call,
+/// so a routing reload applies to the next request. A call holds a lease on its invoker until its
+/// response has been forwarded, written or aborted. When a reload leaves a target out of the routing
+/// table, or the forwarder is disposed, the target's invoker is retired: no new call takes it, and it is
+/// disposed once its last lease is released, so calls in flight finish on it and no superseded invoker
+/// or connection pool outlives them. The class keeps no per-request state, which lives in each call's
+/// <see cref="BackendCallState"/>, and is safe for concurrent use as a singleton.
 /// </para>
 /// <para>
 /// The handler writes a known method in upper case whatever case the caller sent, and it cannot write
@@ -50,9 +92,10 @@ namespace Erewhon.Facade.Forwarding;
 /// handler's. Every other byte of the request is the handler's, unchanged.
 /// </para>
 /// <para>
-/// Each call writes one operational log line (surface, operation, target, status, duration, outcome).
-/// No body or header value is logged, and no write is audited or persisted: state changes only in the
-/// backend.
+/// Each call writes exactly one operational log line (surface, operation, target, status, duration,
+/// outcome), whether it returns or throws; a call whose target was never resolved names the target
+/// <c>unresolved</c>. No body or header value is logged, and no write is audited or persisted: state
+/// changes only in the backend.
 /// </para>
 /// </remarks>
 public sealed partial class BackendForwarder : IDisposable
@@ -74,6 +117,19 @@ public sealed partial class BackendForwarder : IDisposable
     private const string OutcomeForwarded = "forwarded";
     private const string OutcomeUnavailable = "unavailable";
     private const string OutcomeTimeout = "timeout";
+    private const string OutcomeAborted = "aborted";
+    private const string OutcomeFailed = "failed";
+
+    // The target logged for a call whose target was never resolved.
+    private const string UnresolvedTarget = "unresolved";
+
+    // The status logged when no response was sent: the caller left first, or the connection was aborted.
+    private const int NoResponseStatus = 0;
+
+    // How long writing a 502, 504 or Fault may take. The body is a few hundred bytes, so only a caller
+    // that stops reading holds the write up; the connection is then aborted rather than left to hold the
+    // failure path, and the call's line, beyond the deadline.
+    private static readonly TimeSpan FailureWriteBudget = TimeSpan.FromSeconds(2);
 
     // The routing validators bound deadlines only from below, while CancelAfter, ActivityTimeout and
     // SocketsHttpHandler.ConnectTimeout reject more than int.MaxValue milliseconds (about 24.8 days). A
@@ -123,19 +179,6 @@ public sealed partial class BackendForwarder : IDisposable
         _logger = logger;
     }
 
-    /// <summary>The category of a <see cref="ForwarderError"/>, which decides what the caller receives.</summary>
-    private enum FailureCategory
-    {
-        /// <summary>The caller disconnected or sent a broken body; nothing is written.</summary>
-        CallerSide,
-
-        /// <summary>The backend's status and headers were already taken over; the connection is aborted.</summary>
-        ResponseStarted,
-
-        /// <summary>No backend response was taken over; the facade writes its failure response.</summary>
-        PreResponse,
-    }
-
     /// <summary>
     /// Forwards the request to the target routed for <paramref name="operation"/> and copies the
     /// backend's response to the caller, or writes the facade's failure response when the backend is
@@ -155,67 +198,102 @@ public sealed partial class BackendForwarder : IDisposable
     /// surface, as reported by <see cref="OperationRouter.Resolve"/>.
     /// </exception>
     /// <exception cref="InvalidOperationException">The routing entry serving the request names no usable target.</exception>
+    /// <remarks>
+    /// Every exception after the argument check, from these or from YARP, the transformer or a failure
+    /// response write, propagates unchanged after the call's line has been written with outcome
+    /// <c>failed</c>.
+    /// </remarks>
     public async Task ForwardAsync(HttpContext context, Surface surface, OperationDescriptor? operation)
     {
         ArgumentNullException.ThrowIfNull(context);
-        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
 
-        var target = _router.Resolve(surface, operation);
-        var opName = operation?.JadeMethod ?? UnmatchedOperation;
-        var timeout = DeadlineOf(target);
-
-        // The deadline's own source is cancelled only by its timer, so after the call it still tells an
-        // expired deadline apart from a caller abort; the call itself observes both.
+        // From here on, every call writes exactly one line, from the finally block, with what the call
+        // reached; an exception still propagates unchanged.
         var start = Stopwatch.GetTimestamp();
-        using var deadline = new CancellationTokenSource(timeout);
-        using var call = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, deadline.Token);
-
-        // HTTP/1.1, as the JADE applications speak it; response buffering stays off so bodies stream.
-        var config = new ForwarderRequestConfig
-        {
-            ActivityTimeout = timeout,
-            Version = HttpVersion.Version11,
-            VersionPolicy = HttpVersionPolicy.RequestVersionOrLower,
-        };
-
-        // PassThroughTransformer appends the caller's raw request target to this prefix.
-        var prefix = target.BaseUrl.AbsoluteUri.TrimEnd('/');
-
-        // A request whose request line the handler would write differently from the caller's gets an
-        // invoker of its own that restores the caller's line, for this call only; every other call shares
-        // the target's pooled invoker. SendAsync returns once the response body has been copied or the
-        // call has failed, so the single-use invoker and its connection are released on every path.
-        // A call on the target's pooled invoker holds a lease on it until the call ends, so neither a
-        // reload nor Dispose can dispose that invoker under it; a single-use invoker needs none.
-        var callerLine = CallerRequestLineToRestore(context);
-        var singleUse = callerLine is null ? null : CreateInvoker(timeout, callerLine);
-        using var lease = singleUse is null ? AcquireInvoker(target) : default;
-        var invoker = singleUse ?? lease.Invoker;
-
-        ForwarderError error;
+        var opName = operation?.JadeMethod ?? UnmatchedOperation;
+        var targetName = UnresolvedTarget;
+        CallResult? result = null;
+        BackendCallState? callState = null;
         try
         {
-            error = await _forwarder
-                .SendAsync(context, prefix, invoker, config, _transformer, call.Token)
-                .ConfigureAwait(false);
+            ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+            var target = _router.Resolve(surface, operation);
+            targetName = target.Name;
+            var timeout = DeadlineOf(target);
+
+            // The deadline's own source is cancelled only by its timer, so after the call it still tells an
+            // expired deadline apart from a caller abort; the call itself observes both.
+            var callStart = Stopwatch.GetTimestamp();
+            using var deadline = new CancellationTokenSource(timeout);
+            using var call = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted, deadline.Token);
+
+            // HTTP/1.1, as the JADE applications speak it; response buffering stays off so bodies stream.
+            var config = new ForwarderRequestConfig
+            {
+                ActivityTimeout = timeout,
+                Version = HttpVersion.Version11,
+                VersionPolicy = HttpVersionPolicy.RequestVersionOrLower,
+            };
+
+            // PassThroughTransformer appends the caller's raw request target to this prefix.
+            var prefix = target.BaseUrl.AbsoluteUri.TrimEnd('/');
+
+            // A request whose request line the handler would write differently from the caller's gets an
+            // invoker of its own that restores the caller's line, for this call only; every other call shares
+            // the target's pooled invoker. SendAsync returns once the response body has been copied or the
+            // call has failed, so the single-use invoker and its connection are released on every path.
+            // A call on the target's pooled invoker holds a lease on it until the call ends, so neither a
+            // reload nor Dispose can dispose that invoker under it; a single-use invoker needs none.
+            var callerLine = CallerRequestLineToRestore(context);
+            var singleUse = callerLine is null ? null : CreateInvoker(timeout, callerLine);
+            using var lease = singleUse is null ? AcquireInvoker(target) : default;
+            var invoker = singleUse ?? lease.Invoker;
+
+            // The deadline can cancel YARP's read of an upload still arriving; this keeps the server's body
+            // reader valid for its drain after the 504 or Fault. SOAP inspection installs it earlier.
+            CancellableRequestBody.Install(context);
+
+            // Shared with the body reader, the backend connection and the transformer for the rest of the
+            // call, so that a backend answering before the upload is over has its answer returned.
+            callState = BackendCallState.Begin(PassThroughTransformer.CarriesBody(context));
+
+            ForwarderError error;
+            try
+            {
+                error = await _forwarder
+                    .SendAsync(context, prefix, invoker, config, _transformer, call.Token)
+                    .ConfigureAwait(false);
+            }
+            finally
+            {
+                singleUse?.Dispose();
+            }
+
+            result = error == ForwarderError.None
+                ? new CallResult(OutcomeForwarded, context.Response.StatusCode)
+                : await HandleFailureAsync(context, surface, opName, timeout, error, deadline, callStart, callState).ConfigureAwait(false);
         }
         finally
         {
-            singleUse?.Dispose();
+            callState?.End();
+
+            // No result means an exception is propagating: the server answers it with 500 unless the
+            // response has already started, in which case the status already sent stands.
+            var (outcome, status) = result ?? new CallResult(
+                OutcomeFailed,
+                context.Response.HasStarted ? context.Response.StatusCode : StatusCodes.Status500InternalServerError);
+
+            LogBackendCall(
+                _logger,
+                LevelOf(outcome),
+                surface,
+                opName,
+                targetName,
+                status,
+                (long)Math.Round(Stopwatch.GetElapsedTime(start).TotalMilliseconds),
+                outcome);
         }
-
-        var outcome = error == ForwarderError.None
-            ? OutcomeForwarded
-            : await HandleFailureAsync(context, surface, opName, timeout, error, deadline, start).ConfigureAwait(false);
-
-        LogBackendCall(
-            _logger,
-            surface,
-            opName,
-            target.Name,
-            context.Response.StatusCode,
-            (long)Math.Round(Stopwatch.GetElapsedTime(start).TotalMilliseconds),
-            outcome);
     }
 
     /// <summary>
@@ -237,92 +315,285 @@ public sealed partial class BackendForwarder : IDisposable
     }
 
     /// <summary>Decides and writes what the caller receives after a failed backend call.</summary>
-    /// <returns>The logged outcome.</returns>
-    private async Task<string> HandleFailureAsync(
+    /// <remarks>
+    /// The checks run in a fixed order: an expired deadline, a backend response already relayed in full,
+    /// a caller that left, an upload the backend's connection broke, a client-side error the caller did
+    /// not cause, a timeout YARP or the handler reported, an unreachable backend, and last every other
+    /// failure.
+    /// </remarks>
+    /// <returns>The logged outcome and status.</returns>
+    private async Task<CallResult> HandleFailureAsync(
         HttpContext context,
         Surface surface,
         string opName,
         TimeSpan timeout,
         ForwarderError error,
         CancellationTokenSource deadline,
-        long start)
+        long start,
+        BackendCallState callState)
     {
-        var category = Categorise(error);
+        var response = context.Response;
         var exception = context.GetForwarderErrorFeature()?.Exception;
+
+        // Once YARP copies the backend's body, the backend's status line and headers are the response's,
+        // even before the first flush has sent them; a response relayed in full may not have been flushed.
+        var responseRelayed = callState.ResponseRelayed;
+        var responseTaken = response.HasStarted || IsResponseBodyError(error) || responseRelayed;
 
         // YARP reports an expired deadline token as RequestCanceled with 502, so the timeout is read from
         // the timer-only source, never from YARP's status.
-        var deadlineFired = deadline.IsCancellationRequested;
-
-        // RequestAborted alone does not mean the caller left: when the backend fails after the response
-        // started, YARP aborts the connection itself, which also cancels RequestAborted. The caller is
-        // taken to have aborted only when the call ended in a cancellation before the deadline fired.
-        var clientAborted = context.RequestAborted.IsCancellationRequested
-            && !deadlineFired
-            && (exception is null or OperationCanceledException);
-
-        // The caller is gone or sent a broken body: there is nobody to answer, and YARP's state stands.
-        if (clientAborted || category == FailureCategory.CallerSide)
+        if (deadline.IsCancellationRequested)
         {
-            return OutcomeForwarded;
+            return await AnswerAsync(context, surface, opName, responseTaken, isTimeout: true).ConfigureAwait(false);
         }
 
-        var elapsed = Stopwatch.GetElapsedTime(start);
-        var isTimeout = error is ForwarderError.RequestTimedOut or ForwarderError.UpgradeActivityTimeout
-            || deadlineFired
+        // YARP checks the upload only after it has copied the backend's whole response, so a request-body
+        // error it reports then, a backend that stopped reading or a caller that stopped sending, leaves
+        // the caller with the backend's complete answer, which stands as it was sent.
+        if (responseRelayed && IsRequestBodyError(error))
+        {
+            return new CallResult(OutcomeForwarded, response.StatusCode);
+        }
+
+        // The caller is gone or broke its own request: nobody is left to answer, and the status YARP set
+        // for this case is a placeholder of its own, never one the backend sent.
+        if (IsCallerAbort(context, error, exception))
+        {
+            return new CallResult(OutcomeAborted, response.HasStarted ? response.StatusCode : NoResponseStatus);
+        }
+
+        // The backend's connection broke during the upload, so the facade stopped reading the caller's
+        // body, and the HTTP stack kept no answer: whatever YARP reports for the shortened upload, the
+        // caller's connection ends as the backend's did.
+        if (callState.UploadAbandoned)
+        {
+            return Fail(context, responseTaken, abortBeforeResponse: true);
+        }
+
+        // A client-side copy error the caller did not cause is the facade's own: it could not read the
+        // request body, for example because the temporary storage of a buffered SOAP body is full.
+        if (error is ForwarderError.RequestBodyClient
+            or ForwarderError.ResponseBodyClient
+            or ForwarderError.UpgradeRequestClient
+            or ForwarderError.UpgradeResponseClient)
+        {
+            return Fail(context, responseTaken, abortBeforeResponse: false);
+        }
+
+        if (error is ForwarderError.RequestTimedOut or ForwarderError.UpgradeActivityTimeout
             || HasTimeoutInChain(exception)
-            || elapsed >= timeout;
+            || Stopwatch.GetElapsedTime(start) >= timeout)
+        {
+            return await AnswerAsync(context, surface, opName, responseTaken, isTimeout: true).ConfigureAwait(false);
+        }
+
+        if (error == ForwarderError.Request)
+        {
+            // Refused, unresolved or failed connect before the deadline: the one unreachable case. A backend
+            // that closes or resets the connection before any response header, and before any byte of the
+            // body was sent to it, has received only the request head and answered nothing: a request without
+            // a body, one whose body waited for a 100 Continue that never came, or one on a pooled connection
+            // the backend had dropped, which SingleDeliveryHandler fails once rather than resending.
+            if (!callState.CarriesBody || !callState.UploadStarted || IsConnectFailure(exception))
+            {
+                return await AnswerAsync(context, surface, opName, responseTaken, isTimeout: false).ConfigureAwait(false);
+            }
+
+            // The backend was reached and dropped the upload it had begun to receive, by a reset, a broken
+            // pipe or a close, without an answer the HTTP stack kept: the caller's connection ends as the
+            // backend's did.
+            return Fail(context, responseTaken, abortBeforeResponse: true);
+        }
+
+        // The backend was reached. RequestBodyDestination means it dropped the connection during the upload
+        // without a response the HTTP stack could read, so any facade status would invent its answer: the
+        // caller's connection ends as the backend's did.
+        return Fail(context, responseTaken, abortBeforeResponse: error == ForwarderError.RequestBodyDestination);
+    }
+
+    /// <summary>Answers an unreachable backend or an expired deadline with the facade's failure response.</summary>
+    /// <returns>The outcome and the status written, or the backend's status when the response was aborted.</returns>
+    private async Task<CallResult> AnswerAsync(HttpContext context, Surface surface, string opName, bool responseTaken, bool isTimeout)
+    {
         var outcome = isTimeout ? OutcomeTimeout : OutcomeUnavailable;
+        var response = context.Response;
 
         // The backend's status line and headers are already the response's: a facade 502 or 504 would
         // replace them, so the response is aborted and never re-headed.
-        if (context.Response.HasStarted || category == FailureCategory.ResponseStarted)
+        if (responseTaken)
         {
             context.Abort();
-            return outcome;
+            return new CallResult(outcome, response.StatusCode);
         }
 
         // Drops the empty-bodied 502/504 and any headers YARP set on its error path.
-        context.Response.Clear();
+        response.Clear();
 
+        // The write gets a budget of its own, never the expired deadline's token, which would cancel the
+        // 504 before it is written. A caller that leaves or stops reading gets nothing more.
+        using var budget = CancellationTokenSource.CreateLinkedTokenSource(context.RequestAborted);
+        budget.CancelAfter(FailureWriteBudget);
         try
         {
             if (surface == Surface.Soap)
             {
                 var faultString = isTimeout ? SoapFaultWriter.BackendTimedOut : SoapFaultWriter.BackendUnavailable;
-                await _faultWriter.WriteAsync(context.Response, faultString, context.RequestAborted).ConfigureAwait(false);
+                await _faultWriter.WriteAsync(response, faultString, budget.Token).ConfigureAwait(false);
             }
             else
             {
-                await WriteProblemAsync(context.Response, isTimeout, opName, context.RequestAborted).ConfigureAwait(false);
+                await WriteProblemAsync(response, isTimeout, opName, budget.Token).ConfigureAwait(false);
             }
         }
         catch (Exception writeFailure) when (writeFailure is OperationCanceledException or IOException)
         {
-            // The caller disconnected while the failure response was being written; nobody is left to answer.
+            // The caller disconnected, or the budget ran out while the caller was not reading: the
+            // connection is ended rather than left holding the response.
+            if (!context.RequestAborted.IsCancellationRequested)
+            {
+                context.Abort();
+            }
         }
 
-        return outcome;
+        return new CallResult(outcome, response.StatusCode);
     }
 
-    private static FailureCategory Categorise(ForwarderError error) => error switch
+    /// <summary>Ends a call that failed for a reason the facade has no failure response for.</summary>
+    /// <param name="context">The call's context.</param>
+    /// <param name="responseTaken">Whether the backend's status line and headers are already the response's.</param>
+    /// <param name="abortBeforeResponse">Whether to abort the connection even though no response was taken over.</param>
+    /// <returns>Outcome <c>failed</c> with the status sent, the backend's taken-over status, or 0 when nothing is sent.</returns>
+    private static CallResult Fail(HttpContext context, bool responseTaken, bool abortBeforeResponse)
     {
-        ForwarderError.RequestBodyClient
-            or ForwarderError.ResponseBodyClient
-            or ForwarderError.UpgradeRequestClient
-            or ForwarderError.UpgradeResponseClient => FailureCategory.CallerSide,
+        var response = context.Response;
+        if (responseTaken || abortBeforeResponse)
+        {
+            context.Abort();
+            return new CallResult(OutcomeFailed, responseTaken ? response.StatusCode : NoResponseStatus);
+        }
 
-        ForwarderError.ResponseBodyDestination
+        // A bare 500, as for an unhandled exception, with no body that could pass for the backend's or for
+        // an unreachable or timed-out backend. The request body may be partly unread, so the connection is
+        // closed after the response.
+        response.Clear();
+        response.StatusCode = StatusCodes.Status500InternalServerError;
+        response.ContentLength = 0;
+        response.Headers.Connection = "close";
+        return new CallResult(OutcomeFailed, StatusCodes.Status500InternalServerError);
+    }
+
+    // YARP reports these only after the backend's status line and headers were copied to the response.
+    private static bool IsResponseBodyError(ForwarderError error) => error is ForwarderError.ResponseBodyDestination
+        or ForwarderError.ResponseBodyCanceled
+        or ForwarderError.ResponseBodyClient
+        or ForwarderError.UpgradeResponseDestination
+        or ForwarderError.UpgradeResponseCanceled
+        or ForwarderError.UpgradeResponseClient;
+
+    private static bool IsRequestBodyError(ForwarderError error) => error is ForwarderError.RequestBodyClient
+        or ForwarderError.RequestBodyDestination
+        or ForwarderError.RequestBodyCanceled;
+
+    /// <summary>
+    /// Tells whether a <see cref="ForwarderError.Request"/> failure is a connect that never succeeded: the
+    /// connection was refused, the host was not resolved or the connect failed.
+    /// </summary>
+    /// <remarks>
+    /// SocketsHttpHandler reports a failed connect, from the default connect or from a connect callback,
+    /// as an <see cref="HttpRequestException"/> with <see cref="HttpRequestError.ConnectionError"/> or
+    /// <see cref="HttpRequestError.NameResolutionError"/>; a <see cref="SocketException"/> that only a
+    /// connect or a name lookup raises settles it as well. Any other failure happened on a connection that
+    /// was open, so the backend was reached: for an upload it is the backend dropping the call (a reset,
+    /// a broken pipe or a close), never an unreachable backend.
+    /// </remarks>
+    private static bool IsConnectFailure(Exception? exception) =>
+        HasInChain(exception, static current => current switch
+        {
+            HttpRequestException { HttpRequestError: HttpRequestError.ConnectionError or HttpRequestError.NameResolutionError } => true,
+            SocketException socket => socket.SocketErrorCode is SocketError.ConnectionRefused
+                or SocketError.HostNotFound
+                or SocketError.TryAgain
+                or SocketError.NoData
+                or SocketError.AddressNotAvailable,
+            _ => false,
+        });
+
+    /// <summary>
+    /// Tells whether the call ended because the caller left or broke its own request; the deadline has
+    /// already been ruled out.
+    /// </summary>
+    /// <remarks>
+    /// Only Kestrel raises <see cref="BadHttpRequestException"/> (a truncated or malformed upload),
+    /// <see cref="ConnectionResetException"/> and <see cref="ConnectionAbortedException"/>, and only for the
+    /// caller's connection, so any of them in the error's chain settles it. Otherwise a cancellation or a
+    /// client-side copy error counts when the caller's connection is gone or the copy was cancelled.
+    /// A cancelled <see cref="HttpContext.RequestAborted"/> alone is not enough: YARP aborts the
+    /// connection itself after a backend failure during the response body (ResponseBodyDestination),
+    /// which is not among these errors.
+    /// </remarks>
+    private static bool IsCallerAbort(HttpContext context, ForwarderError error, Exception? exception)
+    {
+        if (HasInChain(exception, static current => current is BadHttpRequestException or ConnectionResetException or ConnectionAbortedException))
+        {
+            return true;
+        }
+
+        var cancelledOrClientSide = error is ForwarderError.RequestCanceled
+            or ForwarderError.RequestBodyCanceled
             or ForwarderError.ResponseBodyCanceled
-            or ForwarderError.UpgradeResponseDestination
-            or ForwarderError.UpgradeResponseCanceled => FailureCategory.ResponseStarted,
+            or ForwarderError.RequestBodyClient
+            or ForwarderError.ResponseBodyClient
+            or ForwarderError.UpgradeRequestCanceled
+            or ForwarderError.UpgradeResponseCanceled
+            or ForwarderError.UpgradeRequestClient
+            or ForwarderError.UpgradeResponseClient;
 
-        // Request (refused, unresolved or failed connect, reset before headers), RequestTimedOut,
-        // RequestCanceled, RequestBodyCanceled, RequestBodyDestination, ResponseHeaders, RequestCreation,
-        // NoAvailableDestinations, UpgradeRequestCanceled, UpgradeRequestDestination,
-        // UpgradeActivityTimeout and any member a later YARP adds.
-        _ => FailureCategory.PreResponse,
-    };
+        return cancelledOrClientSide
+            && (context.RequestAborted.IsCancellationRequested
+                || HasInChain(exception, static current => current is OperationCanceledException));
+    }
+
+    // Walks inner exceptions, all of an AggregateException's included, visiting each exception once.
+    private static bool HasInChain(Exception? exception, Func<Exception, bool> match)
+    {
+        if (exception is null)
+        {
+            return false;
+        }
+
+        var pending = new Stack<Exception>();
+        var seen = new HashSet<Exception>(ReferenceEqualityComparer.Instance);
+        pending.Push(exception);
+        while (pending.TryPop(out var current))
+        {
+            if (!seen.Add(current))
+            {
+                continue;
+            }
+
+            if (match(current))
+            {
+                return true;
+            }
+
+            if (current is AggregateException aggregate)
+            {
+                foreach (var inner in aggregate.InnerExceptions)
+                {
+                    pending.Push(inner);
+                }
+            }
+            else if (current.InnerException is { } inner)
+            {
+                pending.Push(inner);
+            }
+        }
+
+        return false;
+    }
+
+    private static LogLevel LevelOf(string outcome) =>
+        outcome is OutcomeForwarded or OutcomeAborted ? LogLevel.Information : LogLevel.Warning;
 
     // SocketsHttpHandler reports an expired ConnectTimeout as a cancellation wrapping a TimeoutException.
     private static bool HasTimeoutInChain(Exception? exception)
@@ -588,9 +859,11 @@ public sealed partial class BackendForwarder : IDisposable
 
     // An HttpMessageInvoker over a bare handler, never HttpClient or IHttpClientFactory, which would add
     // default headers and policies. With no ActivityHeadersPropagator the handler injects no traceparent,
-    // so a caller's own trace headers pass through unchanged. Given a caller's request line, the invoker
-    // serves one call only, because the line belongs to that call's request: every connection it opens
-    // writes that line in place of the first request line the handler writes, and nothing else changes.
+    // so a caller's own trace headers pass through unchanged. The connect callback opens the socket as the
+    // handler does by default, over a stream that lets a backend's answer during an upload through. Given
+    // a caller's request line, the invoker serves one call only, because the line belongs to that call's
+    // request: every connection it opens writes that line in place of the first request line the handler
+    // writes, and nothing else changes.
     private static HttpMessageInvoker CreateInvoker(TimeSpan connectTimeout, CallerRequestLine? callerLine = null)
     {
         var handler = new SocketsHttpHandler
@@ -601,6 +874,7 @@ public sealed partial class BackendForwarder : IDisposable
             AutomaticDecompression = DecompressionMethods.None,
             ConnectTimeout = connectTimeout,
             ActivityHeadersPropagator = null,
+            ConnectCallback = BackendConnectionStream.ConnectAsync,
 
             // Latin-1 maps each header byte to one char and back, matching the selectors Kestrel uses
             // in Program.cs, so non-ASCII header bytes pass unchanged in both directions instead of
@@ -622,19 +896,26 @@ public sealed partial class BackendForwarder : IDisposable
         return new HttpMessageInvoker(new SingleDeliveryHandler(handler), disposeHandler: true);
     }
 
+    // The one completion event of every call; its level comes from LevelOf, so a filter at Warning still
+    // shows every unavailable, timed-out and failed call.
     [LoggerMessage(
         EventId = 1001,
         EventName = "BackendCall",
-        Level = LogLevel.Information,
         Message = "Backend call {Surface} {Operation} -> {Target}: status {Status}, {DurationMs} ms, outcome {Outcome}")]
     private static partial void LogBackendCall(
         ILogger logger,
+        LogLevel level,
         Surface surface,
         string operation,
         string target,
         int status,
         long durationMs,
         string outcome);
+
+    /// <summary>How a call ended, as its line reports it.</summary>
+    /// <param name="Outcome"><c>forwarded</c>, <c>unavailable</c>, <c>timeout</c>, <c>aborted</c> or <c>failed</c>.</param>
+    /// <param name="Status">The status sent or taken over from the backend; 0 when no response was sent.</param>
+    private readonly record struct CallResult(string Outcome, int Status);
 
     /// <summary>The parts of a caller's request line the backend must receive as the caller sent them.</summary>
     /// <param name="Method">The caller's exact method token, for example <c>get</c>.</param>
@@ -1031,4 +1312,609 @@ internal sealed class SingleDeliveryHandler : DelegatingHandler
             return read;
         }
     }
+}
+
+// BackendCallState, BackendConnectionStream and CancellableRequestBody live in this file because each
+// serves the call ForwardAsync makes: ForwardAsync begins every call's BackendCallState, CreateInvoker
+// opens every backend connection as a BackendConnectionStream, and ForwardAsync installs
+// CancellableRequestBody, as SoapEndpoints does before its inspection.
+/// <summary>
+/// What one forwarded call has reached so far, shared by the parts of the forwarding path that see
+/// the same call from different sides: <see cref="BackendForwarder"/>, which begins and ends it and
+/// reads it to decide the outcome, <see cref="CancellableRequestBody"/>, which reads the caller's
+/// upload, <see cref="BackendConnectionStream"/>, which writes it to the backend, and
+/// <see cref="PassThroughTransformer"/>, which sees the backend's response go through.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The state travels with the call's execution context, so the backend connection, which serves one
+/// call after another and knows nothing of them, finds the call it is writing for. Every read and write
+/// of a forwarded body runs in that context, because YARP copies both inside the forwarder's call.
+/// Outside a forwarded call, <see cref="Current"/> is null and nothing here applies.
+/// </para>
+/// <para>
+/// A backend may answer an upload before it has read all of it, for example with 413 for its own
+/// body-size limit, and close the connection. The HTTP stack has then read that answer, but it still
+/// waits for the upload to finish and fails it at the next write, discarding the answer. The backend
+/// connection therefore takes the first write failure of a started upload as the end of the upload:
+/// it records it here and drops the rest, and the caller's body ends at the next read, so the backend's
+/// answer is returned as it was sent and the caller is read no further.
+/// </para>
+/// </remarks>
+internal sealed class BackendCallState
+{
+    private static readonly AsyncLocal<BackendCallState?> CurrentCall = new();
+
+    private readonly Lock _gate = new();
+
+    // The caller's body reader while an upload read is waiting on it; cancelled when the upload ends.
+    private PipeReader? _waitingUploadReader;
+    private bool _uploadStarted;
+    private bool _uploadAbandoned;
+    private bool _ended;
+    private int _responseRelayed;
+
+    private BackendCallState(bool carriesBody) => CarriesBody = carriesBody;
+
+    /// <summary>The forwarded call the current execution context belongs to; null outside one.</summary>
+    public static BackendCallState? Current => CurrentCall.Value;
+
+    /// <summary>Whether the incoming request carries a body for the backend.</summary>
+    public bool CarriesBody { get; }
+
+    /// <summary>
+    /// Whether the backend's connection broke during the upload, so that the rest of the upload was
+    /// dropped and the caller's body was ended early.
+    /// </summary>
+    public bool UploadAbandoned
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _uploadAbandoned;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Whether the HTTP stack has begun sending the request body to the backend, which it does by reading
+    /// the caller's upload; false while a body still waits for the backend's 100 Continue. Of a SOAP body
+    /// that inspection buffered, only a read past the buffered part reaches the caller's upload, so a body
+    /// inspection read to its end is never seen to start.
+    /// </summary>
+    public bool UploadStarted
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _uploadStarted;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Whether the backend's whole response, status line, headers and body, has been copied to the
+    /// caller's response.
+    /// </summary>
+    public bool ResponseRelayed => Volatile.Read(ref _responseRelayed) != 0;
+
+    /// <summary>
+    /// Starts the state of a new forwarded call and makes it <see cref="Current"/> for the rest of the
+    /// calling method and everything it awaits.
+    /// </summary>
+    /// <param name="carriesBody">Whether the incoming request carries a body for the backend.</param>
+    /// <returns>The call's state; end it with <see cref="End"/> when the call is over.</returns>
+    public static BackendCallState Begin(bool carriesBody)
+    {
+        var state = new BackendCallState(carriesBody);
+        CurrentCall.Value = state;
+        return state;
+    }
+
+    /// <summary>
+    /// Ends the call: no later write failure can abandon its upload, and no reader is cancelled for it.
+    /// </summary>
+    public void End()
+    {
+        lock (_gate)
+        {
+            _ended = true;
+            _waitingUploadReader = null;
+        }
+
+        CurrentCall.Value = null;
+    }
+
+    /// <summary>Records that the backend's whole response has been copied to the caller's response.</summary>
+    public void MarkResponseRelayed() => Volatile.Write(ref _responseRelayed, 1);
+
+    /// <summary>
+    /// Registers a read of the caller's upload that is about to wait on <paramref name="reader"/>.
+    /// </summary>
+    /// <param name="reader">The server's request-body reader the read waits on.</param>
+    /// <returns>
+    /// False when the upload has been abandoned, so the read must end the body instead of reading;
+    /// otherwise true, and the read must call <see cref="EndUploadRead"/> when it returns.
+    /// </returns>
+    public bool TryBeginUploadRead(PipeReader reader)
+    {
+        ArgumentNullException.ThrowIfNull(reader);
+
+        lock (_gate)
+        {
+            if (_uploadAbandoned)
+            {
+                return false;
+            }
+
+            _uploadStarted = true;
+            if (!_ended)
+            {
+                _waitingUploadReader = reader;
+            }
+
+            return true;
+        }
+    }
+
+    /// <summary>Unregisters the read registered by <see cref="TryBeginUploadRead"/>.</summary>
+    public void EndUploadRead()
+    {
+        lock (_gate)
+        {
+            _waitingUploadReader = null;
+        }
+    }
+
+    /// <summary>
+    /// Abandons the upload after the backend's connection failed a write: the rest of it is dropped, and
+    /// a read waiting on the caller's body returns at once to end it.
+    /// </summary>
+    /// <returns>
+    /// True when the upload had started and the call is still running, so the failure is the end of
+    /// the upload; false when the failure must surface as it is, because it happened before the upload
+    /// (the request head) or after the call.
+    /// </returns>
+    public bool TryAbandonUpload()
+    {
+        lock (_gate)
+        {
+            if (_ended || !_uploadStarted)
+            {
+                return false;
+            }
+
+            if (!_uploadAbandoned)
+            {
+                _uploadAbandoned = true;
+
+                // Returns the waiting read as cancelled, which CancellableRequestBody turns into the end
+                // of the body; the reader stays valid for the server's drain of what the caller still sends.
+                _waitingUploadReader?.CancelPendingRead();
+            }
+
+            return true;
+        }
+    }
+}
+
+/// <summary>
+/// The connection to a backend, as each target's <see cref="SocketsHttpHandler"/> opens it: the
+/// handler's own socket and stream, except that a backend which closes the connection during an upload
+/// ends the upload instead of failing the call, so that its answer reaches the caller.
+/// </summary>
+/// <remarks>
+/// <para>
+/// A backend may answer before it has read the whole request body, for example 413 for its own
+/// body-size limit once a chunked upload crosses it, and then close the connection. The HTTP stack reads
+/// that answer while it sends the body, but it returns it only once the body has been sent, and the next
+/// write to the closed connection fails the call: the caller would get no answer at all, or the facade's
+/// "Backend unavailable" in place of the backend's own.
+/// </para>
+/// <para>
+/// A write that fails because the backend reset or closed the connection (<see cref="SocketError.ConnectionReset"/>,
+/// <see cref="SocketError.Shutdown"/> for a broken pipe, or <see cref="SocketError.ConnectionAborted"/>)
+/// after the call's upload has started is therefore taken as the end of the upload: it is recorded on
+/// the call's <see cref="BackendCallState"/>, it and every later write of that call complete without
+/// sending anything, and the caller's body ends at its next read. The HTTP stack then returns the
+/// backend's answer exactly as the backend sent it, or, when the backend sent none, fails the call when
+/// it reads the closed connection. Every other failure, and any failure before the upload has started,
+/// such as the request head on a pooled connection the backend has dropped, or after the handler has
+/// disposed the connection to cancel the call, surfaces unchanged.
+/// </para>
+/// <para>
+/// A connection whose upload was ended is never used for another call: once the call is over, every read
+/// returns the end of the stream, which the handler takes as a connection it must not reuse.
+/// </para>
+/// <para>
+/// Everything else is the handler's default: the socket is created, connected and disposed on failure
+/// as SocketsHttpHandler does without a connect callback, so connect failures, their
+/// <see cref="HttpRequestError"/> and the connect timeout are unchanged, and bytes are read and written
+/// without buffering.
+/// </para>
+/// </remarks>
+internal sealed class BackendConnectionStream : NetworkStream
+{
+    // The call whose upload this connection ended; set once.
+    private BackendCallState? _abandonedBy;
+    private int _disposed;
+
+    private BackendConnectionStream(Socket socket)
+        : base(socket, ownsSocket: true)
+    {
+    }
+
+    /// <summary>
+    /// Opens a connection to the backend, for <see cref="SocketsHttpHandler.ConnectCallback"/>: a TCP
+    /// socket with Nagle's algorithm disabled, connected to the endpoint the handler names.
+    /// </summary>
+    /// <param name="context">The endpoint and the request that needs the connection.</param>
+    /// <param name="cancellationToken">Cancelled by the handler's connect timeout or by the call.</param>
+    /// <returns>The connected stream, which owns the socket.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="context"/> is null.</exception>
+    /// <exception cref="SocketException">The connection was refused, the name was not resolved or the connect failed.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public static async ValueTask<Stream> ConnectAsync(SocketsHttpConnectionContext context, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+
+        var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+        try
+        {
+            await socket.ConnectAsync(context.DnsEndPoint, cancellationToken).ConfigureAwait(false);
+            return new BackendConnectionStream(socket);
+        }
+        catch
+        {
+            socket.Dispose();
+            throw;
+        }
+    }
+
+    /// <inheritdoc />
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        ValidateBufferArguments(buffer, offset, count);
+        return Read(buffer.AsSpan(offset, count));
+    }
+
+    /// <inheritdoc />
+    public override int Read(Span<byte> buffer) => IsEndedForAnotherCall() ? 0 : base.Read(buffer);
+
+    /// <inheritdoc />
+    public override int ReadByte()
+    {
+        byte value = 0;
+        return Read(new Span<byte>(ref value)) == 0 ? -1 : value;
+    }
+
+    /// <inheritdoc />
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        ValidateBufferArguments(buffer, offset, count);
+        return ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+    }
+
+    /// <inheritdoc />
+    public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+        IsEndedForAnotherCall() ? ValueTask.FromResult(0) : base.ReadAsync(buffer, cancellationToken);
+
+    /// <inheritdoc />
+    public override IAsyncResult BeginRead(byte[] buffer, int offset, int count, AsyncCallback? callback, object? state) =>
+        TaskToAsyncResult.Begin(ReadAsync(buffer, offset, count, CancellationToken.None), callback, state);
+
+    /// <inheritdoc />
+    public override int EndRead(IAsyncResult asyncResult) => TaskToAsyncResult.End<int>(asyncResult);
+
+    /// <inheritdoc />
+    public override void Write(byte[] buffer, int offset, int count)
+    {
+        ValidateBufferArguments(buffer, offset, count);
+        Write(new ReadOnlySpan<byte>(buffer, offset, count));
+    }
+
+    /// <inheritdoc />
+    /// <remarks>Completes without sending once the backend's connection has ended the call's upload.</remarks>
+    public override void Write(ReadOnlySpan<byte> buffer)
+    {
+        if (Volatile.Read(ref _abandonedBy) is { } abandonedBy)
+        {
+            if (ReferenceEquals(abandonedBy, BackendCallState.Current))
+            {
+                return;
+            }
+
+            throw ClosedByBackend();
+        }
+
+        try
+        {
+            base.Write(buffer);
+        }
+        catch (IOException failure) when (TryEndUpload(failure))
+        {
+            // The backend closed the connection during the upload; its answer, if any, is read next.
+        }
+    }
+
+    /// <inheritdoc />
+    public override void WriteByte(byte value) => Write(new ReadOnlySpan<byte>(in value));
+
+    /// <inheritdoc />
+    public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        ValidateBufferArguments(buffer, offset, count);
+        return WriteAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+    }
+
+    /// <inheritdoc />
+    /// <remarks>Completes without sending once the backend's connection has ended the call's upload.</remarks>
+    public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        if (Volatile.Read(ref _abandonedBy) is { } abandonedBy)
+        {
+            return ReferenceEquals(abandonedBy, BackendCallState.Current)
+                ? ValueTask.CompletedTask
+                : ValueTask.FromException(ClosedByBackend());
+        }
+
+        ValueTask write;
+        try
+        {
+            write = base.WriteAsync(buffer, cancellationToken);
+        }
+        catch (IOException failure) when (TryEndUpload(failure))
+        {
+            return ValueTask.CompletedTask;
+        }
+
+        // A write that completed at once, as most do, is returned as it is.
+        return write.IsCompletedSuccessfully ? write : AwaitWriteAsync(write);
+    }
+
+    /// <inheritdoc />
+    public override IAsyncResult BeginWrite(byte[] buffer, int offset, int count, AsyncCallback? callback, object? state) =>
+        TaskToAsyncResult.Begin(WriteAsync(buffer, offset, count, CancellationToken.None), callback, state);
+
+    /// <inheritdoc />
+    public override void EndWrite(IAsyncResult asyncResult) => TaskToAsyncResult.End(asyncResult);
+
+    /// <inheritdoc />
+    protected override void Dispose(bool disposing)
+    {
+        // A write failing from here on was failed by the handler's own cancellation, never by the backend.
+        Volatile.Write(ref _disposed, 1);
+        base.Dispose(disposing);
+    }
+
+    private async ValueTask AwaitWriteAsync(ValueTask write)
+    {
+        try
+        {
+            await write.ConfigureAwait(false);
+        }
+        catch (IOException failure) when (TryEndUpload(failure))
+        {
+            // The backend closed the connection during the upload; its answer, if any, is read next.
+        }
+    }
+
+    // Once the upload has been ended, a write of that call sends nothing. A write of any other call cannot
+    // happen, because the handler never reuses the connection, and fails as the closed connection would.
+    private static IOException ClosedByBackend() => new(
+        "The backend closed this connection during an earlier upload.",
+        new SocketException((int)SocketError.ConnectionReset));
+
+    // Once the upload has been ended, a read for anything but the backend's answer to that call, the
+    // handler's checks of an idle connection included, finds the end of the stream.
+    private bool IsEndedForAnotherCall() =>
+        Volatile.Read(ref _abandonedBy) is { } abandonedBy && !ReferenceEquals(abandonedBy, BackendCallState.Current);
+
+    // Takes a write failure as the end of the upload when the backend reset or closed the connection
+    // while the current call's upload was being sent.
+    private bool TryEndUpload(IOException failure)
+    {
+        if (Volatile.Read(ref _disposed) != 0
+            || failure.InnerException is not SocketException
+            {
+                SocketErrorCode: SocketError.ConnectionReset or SocketError.Shutdown or SocketError.ConnectionAborted,
+            })
+        {
+            return false;
+        }
+
+        if (BackendCallState.Current is not { } call || !call.TryAbandonUpload())
+        {
+            return false;
+        }
+
+        Interlocked.CompareExchange(ref _abandonedBy, call, null);
+        return true;
+    }
+}
+
+/// <summary>
+/// The request body as the forwarder and the SOAP inspection read it: the server's own body reader,
+/// with a cancelled read ended through <see cref="PipeReader.CancelPendingRead"/> rather than through
+/// the read's token.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Kestrel leaves its HTTP/1.1 request-body reader marked as reading when a read is cancelled through
+/// its token. That happens whenever the deadline or a caller abort cancels YARP's copy of an upload that
+/// is still arriving, and once the facade's 504 or Fault has been sent, Kestrel's automatic drain of the
+/// rest of the body fails with "Reading is already in progress", logged as an Error
+/// (RequestBodyDrainBodyReaderInvalidState). A read ended by <see cref="PipeReader.CancelPendingRead"/>
+/// returns normally and is completed with <see cref="PipeReader.AdvanceTo(SequencePosition)"/>, so the
+/// reader stays valid and the drain runs.
+/// </para>
+/// <para>
+/// During a forwarded call, a read also ends the body once the backend's connection has closed during
+/// the upload (<see cref="BackendCallState.UploadAbandoned"/>): the rest of the upload has nowhere to go,
+/// so the caller is read no further and the backend's answer is returned without waiting for the rest.
+/// A read already waiting for the caller's next bytes returns at once with the end of the body.
+/// </para>
+/// <para>
+/// Everything else is the server's own behaviour: the bytes, the end of the body, Kestrel's errors for a
+/// truncated or reset upload, the 100 Continue sent on the first read and the synchronous-IO policy,
+/// which synchronous reads keep by going to the server's stream.
+/// </para>
+/// </remarks>
+internal sealed class CancellableRequestBody : Stream
+{
+    private static readonly Action<object?> CancelPendingRead = static reader => ((PipeReader)reader!).CancelPendingRead();
+
+    private readonly PipeReader _reader;
+    private readonly Stream _serverBody;
+
+    private CancellableRequestBody(PipeReader reader, Stream serverBody)
+    {
+        _reader = reader;
+        _serverBody = serverBody;
+    }
+
+    /// <inheritdoc />
+    public override bool CanRead => true;
+
+    /// <inheritdoc />
+    public override bool CanSeek => false;
+
+    /// <inheritdoc />
+    public override bool CanWrite => false;
+
+    /// <inheritdoc />
+    /// <exception cref="NotSupportedException">Always: the body is a forward-only stream.</exception>
+    public override long Length => throw new NotSupportedException();
+
+    /// <inheritdoc />
+    /// <exception cref="NotSupportedException">Always: the body is a forward-only stream.</exception>
+    public override long Position
+    {
+        get => throw new NotSupportedException();
+        set => throw new NotSupportedException();
+    }
+
+    /// <summary>
+    /// Puts this stream in place of the request body of <paramref name="context"/>, once per request.
+    /// Call it before anything else reads, wraps or buffers the body, so that every later read of the
+    /// server's body goes through it; a request that cannot have a body is left as it is.
+    /// </summary>
+    /// <param name="context">The incoming request.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="context"/> is null.</exception>
+    public static void Install(HttpContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+
+        if (context.Features.Get<CancellableRequestBody>() is not null
+            || context.Features.Get<IHttpRequestBodyDetectionFeature>() is { CanHaveBody: false })
+        {
+            return;
+        }
+
+        // BodyReader is read before Body is replaced, so it is the server's own reader.
+        var request = context.Request;
+        var body = new CancellableRequestBody(request.BodyReader, request.Body);
+        request.Body = body;
+        context.Features.Set(body);
+    }
+
+    /// <inheritdoc />
+    public override int Read(byte[] buffer, int offset, int count) => _serverBody.Read(buffer, offset, count);
+
+    /// <inheritdoc />
+    public override int Read(Span<byte> buffer) => _serverBody.Read(buffer);
+
+    /// <inheritdoc />
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        ValidateBufferArguments(buffer, offset, count);
+        return ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// A zero-length <paramref name="buffer"/> waits for data and returns 0 without consuming any, as
+    /// the server's stream does. A cancelled read throws <see cref="OperationCanceledException"/> after
+    /// the reader has been completed. During a forwarded call whose upload the backend's connection has
+    /// ended, the read returns 0, the end of the body, without consuming anything.
+    /// </remarks>
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // Outside a forwarded call, for example during SOAP inspection, there is no call state.
+        var call = BackendCallState.Current;
+        if (call is not null && !call.TryBeginUploadRead(_reader))
+        {
+            return 0;
+        }
+
+        try
+        {
+            while (true)
+            {
+                ReadResult result;
+                using (cancellationToken.UnsafeRegister(CancelPendingRead, _reader))
+                {
+                    result = await _reader.ReadAsync(CancellationToken.None).ConfigureAwait(false);
+                }
+
+                var readable = result.Buffer;
+                if (result.IsCanceled)
+                {
+                    _reader.AdvanceTo(readable.Start);
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    // Cancelled because the backend's connection ended the upload: the body ends here.
+                    if (call is { UploadAbandoned: true })
+                    {
+                        return 0;
+                    }
+
+                    throw new OperationCanceledException("The request body read was canceled.");
+                }
+
+                if (!readable.IsEmpty)
+                {
+                    var count = (int)Math.Min(readable.Length, buffer.Length);
+                    var copied = readable.Slice(0, count);
+                    copied.CopyTo(buffer.Span);
+                    _reader.AdvanceTo(copied.End);
+                    return count;
+                }
+
+                _reader.AdvanceTo(readable.End);
+                if (result.IsCompleted)
+                {
+                    return 0;
+                }
+            }
+        }
+        finally
+        {
+            call?.EndUploadRead();
+        }
+    }
+
+    /// <inheritdoc />
+    public override void Flush()
+    {
+    }
+
+    /// <inheritdoc />
+    public override Task FlushAsync(CancellationToken cancellationToken) => Task.CompletedTask;
+
+    /// <inheritdoc />
+    /// <exception cref="NotSupportedException">Always: the body is a forward-only stream.</exception>
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+    /// <inheritdoc />
+    /// <exception cref="NotSupportedException">Always: the request body is read-only.</exception>
+    public override void SetLength(long value) => throw new NotSupportedException();
+
+    /// <inheritdoc />
+    /// <exception cref="NotSupportedException">Always: the request body is read-only.</exception>
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
 }

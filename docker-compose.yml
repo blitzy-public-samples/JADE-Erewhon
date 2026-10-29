@@ -65,6 +65,9 @@ services:
     restart: "no"
 
   # Owns the caller-facing REST and SOAP addresses and forwards every operation to its routed target.
+  # SOAP bodies sent without a matching SOAPAction are buffered whole in the image's ASPNETCORE_TEMP
+  # (/tmp, see facade/Dockerfile), which must hold the largest such bodies sent at once; for larger
+  # uploads mount a volume of that size and set ASPNETCORE_TEMP to it.
   facade:
     build:
       context: .

@@ -6,7 +6,7 @@
 
 | Fact | Value |
 | --- | --- |
-| Date (UTC) | 2026-10-29T21:40:11Z |
+| Date (UTC) | 2026-10-29T21:51:15Z |
 | Execution mode | `docker` |
 | .NET (facade runtime) | .NET 10.0.14 |
 | SDK pin (`harness/global.json`) | `10.0.403` |
@@ -50,10 +50,10 @@
 | Routing | cases | 2 |
 | Routing | passed | 2 |
 | Routing | outcome | pass |
-| Failure (unreachable and timeout) | cases | 6 |
-| Failure (unreachable and timeout) | passed | 6 |
+| Failure (unreachable and timeout) | cases | 7 |
+| Failure (unreachable and timeout) | passed | 7 |
 | Failure (unreachable and timeout) | outcome | pass |
-| Failure (unreachable and timeout) | unreachable / timeout | unreachable 4/4 passed; timeout 2/2 passed |
+| Failure (unreachable and timeout) | unreachable / timeout | unreachable 4/4 passed; timeout 3/3 passed |
 | Listener isolation | cases | 14 |
 | Listener isolation | passed | 14 |
 | Listener isolation | outcome | pass |
