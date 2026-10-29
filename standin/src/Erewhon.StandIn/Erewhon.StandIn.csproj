@@ -1,0 +1,23 @@
+<!--
+  JADE stand-in: a deterministic test fake of the ErewhonREST and WebServiceHTTP services.
+  Target framework, runtime pin, central package management, lock files, nullable and implicit
+  usings are inherited from ../../Directory.Build.props (Erewhon.Strangler.props); do not restate
+  them here. The project uses the shared framework only, so it has no PackageReference.
+-->
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <!-- Explicit because standin/Dockerfile starts the app as `dotnet Erewhon.StandIn.dll`. -->
+    <AssemblyName>Erewhon.StandIn</AssemblyName>
+    <RootNamespace>Erewhon.StandIn</RootNamespace>
+    <!-- No host ICU or locale dependency: the baseline is captured from a local process and
+         replayed against the container, and both must produce byte-identical output. -->
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../../contracts/src/Erewhon.Contracts/Erewhon.Contracts.csproj" />
+  </ItemGroup>
+
+</Project>

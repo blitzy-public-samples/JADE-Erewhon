@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <!--
+    TargetFramework, the runtime pin, central package management and lock files are inherited
+    from facade/Directory.Build.props (../Erewhon.Strangler.props). Package versions live only
+    in the root Directory.Packages.props, so no PackageReference here carries a Version.
+  -->
+  <PropertyGroup>
+    <RootNamespace>Erewhon.Facade</RootNamespace>
+    <AssemblyName>Erewhon.Facade</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" />
+    <PackageReference Include="Yarp.ReverseProxy" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../../contracts/src/Erewhon.Contracts/Erewhon.Contracts.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Erewhon.Facade.Tests" />
+  </ItemGroup>
+</Project>
