@@ -204,9 +204,17 @@ public sealed class DtoNode
     public DtoDefinition Definition => Shape.Definition;
 
     /// <summary>
-    /// True when <see cref="RuntimeClass"/> differs ordinally from <see cref="DeclaredClass"/>, which is
-    /// exactly when the JSON writer emits the <c>__type</c> member first.
+    /// True when <see cref="RuntimeClass"/> differs ordinally from <see cref="DeclaredClass"/>. No writer
+    /// reads it: each compares <see cref="RuntimeClass"/> ordinally with the declared class of the
+    /// position it is writing, so this gives the writers' answer exactly when <see cref="DeclaredClass"/>
+    /// equals that class.
     /// </summary>
+    /// <remarks>
+    /// The builder enforces that equality for an array item, whose position is
+    /// <see cref="DtoArray.ItemDeclaredClass"/>, and for a reference assigned through <see cref="Set"/>,
+    /// whose position is the property's declared type. A root's position is the declared type the handler
+    /// passes the writer, so the two agree when the handler created the root with that same type.
+    /// </remarks>
     public bool EmitsTypeMember => !string.Equals(RuntimeClass, DeclaredClass, StringComparison.Ordinal);
 
     /// <summary>Every member of the object, in <see cref="DtoDefinition.Properties"/> order, <c>guid</c> included.</summary>
@@ -395,8 +403,16 @@ public sealed class DtoArray
 /// Guarantees to the writers:
 /// </para>
 /// <list type="bullet">
-/// <item>No writer decides on <c>__type</c> from model types: it uses <see cref="DtoNode.EmitsTypeMember"/>,
-/// and the JSON writer names the member <c>JadeWireFormats.TypeMemberName</c>.</item>
+/// <item>No writer decides on <c>__type</c> from model types. Each compares a node's
+/// <see cref="DtoNode.RuntimeClass"/> ordinally with the declared class of the position it is writing:
+/// the declared type the handler passes it for a root (the operation's return type),
+/// <see cref="DtoArray.ItemDeclaredClass"/> for an array item, and the member's declared JADE type for a
+/// reference. Where they differ, the JSON writer writes the member <c>JadeWireFormats.TypeMemberName</c>
+/// first, and the SOAP writer, which never writes <c>xsi:type</c>, refuses the node with
+/// <see cref="NotSupportedException"/>. <see cref="DtoNode.EmitsTypeMember"/> gives the same answer
+/// whenever <see cref="DtoNode.DeclaredClass"/> equals that position's class, which the builder enforces
+/// for array items and references and which holds for a root created with the type its writer is
+/// given.</item>
 /// <item>Every catalogue property of a node's runtime class is filled, <c>guid</c> included; the SOAP
 /// writer filters members by <see cref="DtoProperty.SoapExposed"/>.</item>
 /// <item>A built tree holds no reference to a model object (only immutable values and the photo bytes,

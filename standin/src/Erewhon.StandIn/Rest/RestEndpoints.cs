@@ -92,6 +92,9 @@ public static class RestEndpoints
 
         private static readonly byte[] FormatNotModelledBody = "jade-standin: output format not modelled"u8.ToArray();
 
+        // U+FEFF in UTF-8; a JSON body may start with one.
+        private static ReadOnlySpan<byte> Utf8ByteOrderMark => [0xEF, 0xBB, 0xBF];
+
         private readonly RestOperationMatcher _matcher;
         private readonly StandInState _state;
         private readonly DtoBuilder _dto;
@@ -148,6 +151,27 @@ public static class RestEndpoints
             catch (Exception exception) when (aborted.IsCancellationRequested && exception is OperationCanceledException or IOException)
             {
                 _logger.LogDebug("REST {OperationId}: the client aborted the request.", operation.Id);
+            }
+            catch (BadHttpRequestException exception)
+            {
+                // Kestrel rejected the request body (413 over the size limit, 400 malformed framing, 408 too
+                // slow). That is the client's error: its status, with no body and no Content-Type, as Kestrel
+                // answers the rejections it makes itself.
+                _logger.LogDebug(
+                    exception,
+                    "REST {OperationId}: the request body was rejected; answering {Status} with no body.",
+                    operation.Id,
+                    exception.StatusCode);
+                if (context.Response.HasStarted)
+                {
+                    // Part of a response is already on the wire; aborting keeps it from passing as complete.
+                    context.Abort();
+                }
+                else
+                {
+                    context.Response.Clear();
+                    context.Response.StatusCode = exception.StatusCode;
+                }
             }
             catch (Exception exception)
             {
@@ -240,17 +264,12 @@ public static class RestEndpoints
                 return NoCompany();
             }
 
+            // Array enumerates the projection at once, inside the state's Read lock, into its only list;
+            // OfType drops the null that a sale of neither kind yields.
             string itemClass = arguments.ArrayItemClass;
-            var sales = new List<DtoNode>();
-            foreach (Sale sale in company.AllSalesByItem)
-            {
-                if (_dto.Sale(sale, itemClass) is { } node)
-                {
-                    sales.Add(node);
-                }
-            }
-
-            return Success(_dto.Array(arguments.Operation.ReturnType, sales));
+            return Success(_dto.Array(
+                arguments.Operation.ReturnType,
+                company.AllSalesByItem.Select(sale => _dto.Sale(sale, itemClass)).OfType<DtoNode>()));
         }
 
         // getClient (scm:2435-2458): the name is trimmed of blanks before the lookup (scm:2444).
@@ -313,18 +332,16 @@ public static class RestEndpoints
                 return NoCompany();
             }
 
-            // An empty allItems takes JADE's early return of the empty array, which the loop also yields.
+            // An empty allItems takes JADE's early return of the empty array, which the walk also yields.
+            // Array enumerates the walk at once, inside the state's Read lock, into its only list; an item
+            // is built only when in range, and OfType drops the null that an item of neither kind yields.
             string itemClass = arguments.ArrayItemClass;
-            var items = new List<DtoNode>();
-            foreach (Item item in company.AllItems)
-            {
-                if (item.Price >= minPrice && item.Price <= maxPrice && _dto.Item(item, itemClass) is { } node)
-                {
-                    items.Add(node);
-                }
-            }
-
-            return Success(_dto.Array(arguments.Operation.ReturnType, items));
+            return Success(_dto.Array(
+                arguments.Operation.ReturnType,
+                company.AllItems
+                    .Where(item => item.Price >= minPrice && item.Price <= maxPrice)
+                    .Select(item => _dto.Item(item, itemClass))
+                    .OfType<DtoNode>()));
         }
 
         // getSale (scm:2598-2651): the trimmed prefix is validated (scm:2610), but the lookup uses the
@@ -589,10 +606,17 @@ public static class RestEndpoints
             return new RestArguments(binding.Operation, binding.ArrayItemClass, values);
         }
 
-        // A path segment as its JADE primitive: a String exactly as decoded (only the bodies that trim
-        // do so), an Integer or Decimal in the invariant culture.
+        // A path segment as its JADE primitive, in the invariant culture: a String exactly as decoded (only
+        // the bodies that trim do so); an Integer as an optional leading sign and digits; a Decimal as the
+        // same with at most one '.' among the digits. Both allow surrounding white space. No group
+        // separator, trailing sign, parentheses, exponent or currency symbol is accepted, so "2600000,00"
+        // or "100-" is not read as another number. A Decimal with more fraction digits than decimal holds
+        // is rounded.
         private static bool TryConvertPrimitive(string jadeType, string text, [NotNullWhen(true)] out object? value)
         {
+            const NumberStyles DecimalLiteral = NumberStyles.AllowLeadingWhite | NumberStyles.AllowTrailingWhite
+                | NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint;
+
             switch (jadeType)
             {
                 case JadeTypes.String:
@@ -601,7 +625,7 @@ public static class RestEndpoints
                 case JadeTypes.Integer when int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int integer):
                     value = integer;
                     return true;
-                case JadeTypes.Decimal when decimal.TryParse(text, NumberStyles.Number, CultureInfo.InvariantCulture, out decimal amount):
+                case JadeTypes.Decimal when decimal.TryParse(text, DecimalLiteral, CultureInfo.InvariantCulture, out decimal amount):
                     value = amount;
                     return true;
                 default:
@@ -610,11 +634,12 @@ public static class RestEndpoints
             }
         }
 
-        // The JSON object parameter: the whole body under the default (strict) reader options. Each member
-        // the body reads is taken by ordinal name, the last duplicate winning; a missing member or JSON
-        // null is the JADE null string. Malformed JSON (invalid UTF-8 and unpaired surrogate escapes
-        // included), an empty body, a root that is not an object, or a read member of another JSON kind
-        // gives null. guid, __type and unknown members are ignored.
+        // The JSON object parameter: the whole body, after at most one leading UTF-8 byte order mark, under
+        // the default (strict) reader options. Each member the body reads is taken by ordinal name, the
+        // last duplicate winning; a missing member or JSON null is the JADE null string. Malformed JSON
+        // (invalid UTF-8 included), an unpaired surrogate escape in any member name or in a read member's
+        // value, an empty body, a root that is not an object, or a read member of another JSON kind gives
+        // null. guid, __type and unknown members are ignored, and their values are not decoded.
         private static async Task<IReadOnlyDictionary<string, string>?> ReadBodyAsync(
             HttpRequest request,
             IReadOnlyList<string> members,
@@ -625,16 +650,24 @@ public static class RestEndpoints
 
             // The JSON reader checks only the structure, so text that is not UTF-8 would otherwise surface
             // as a failure to read a member's value instead of as a malformed body.
-            if (!Utf8.IsValid(buffer.GetBuffer().AsSpan(0, (int)buffer.Length)))
+            ReadOnlyMemory<byte> utf8Json = buffer.GetBuffer().AsMemory(0, (int)buffer.Length);
+            if (!Utf8.IsValid(utf8Json.Span))
             {
                 return null;
             }
 
-            buffer.Position = 0;
+            // The body is parsed in place: the document references the buffer, which is disposed after it.
+            // Parsing memory, unlike parsing a stream, does not skip a byte order mark, so one is skipped
+            // here; a second one still fails the parse.
+            if (utf8Json.Span.StartsWith(Utf8ByteOrderMark))
+            {
+                utf8Json = utf8Json[Utf8ByteOrderMark.Length..];
+            }
+
             JsonDocument document;
             try
             {
-                document = JsonDocument.Parse(buffer);
+                document = JsonDocument.Parse(utf8Json);
             }
             catch (JsonException)
             {
@@ -649,10 +682,26 @@ public static class RestEndpoints
                     return null;
                 }
 
+                // One pass in document order decodes every member name, so an invalid name anywhere makes the
+                // body malformed, and a later duplicate of a read member replaces an earlier one.
+                var elements = new Dictionary<string, JsonElement>(members.Count, StringComparer.Ordinal);
+                foreach (JsonProperty property in root.EnumerateObject())
+                {
+                    if (!TryGetName(property, out string? name))
+                    {
+                        return null;
+                    }
+
+                    if (members.Contains(name, StringComparer.Ordinal))
+                    {
+                        elements[name] = property.Value;
+                    }
+                }
+
                 var values = new Dictionary<string, string>(members.Count, StringComparer.Ordinal);
                 foreach (string member in members)
                 {
-                    if (!root.TryGetProperty(member, out JsonElement element))
+                    if (!elements.TryGetValue(member, out JsonElement element))
                     {
                         values[member] = "";
                         continue;
@@ -686,6 +735,21 @@ public static class RestEndpoints
             catch (InvalidOperationException)
             {
                 text = null;
+                return false;
+            }
+        }
+
+        // A member name is a JSON string as well, so the same escapes make it valid syntax but no name.
+        private static bool TryGetName(JsonProperty property, [NotNullWhen(true)] out string? name)
+        {
+            try
+            {
+                name = property.Name;
+                return true;
+            }
+            catch (InvalidOperationException)
+            {
+                name = null;
                 return false;
             }
         }
