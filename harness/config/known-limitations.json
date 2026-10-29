@@ -80,7 +80,7 @@
       "matches": [],
       "reason": "The loader offsets every seed date by the days from 2000-01-01 to today [Erewhon/ErewhonModelSchema.scm:8466-8470]. The stand-in pins today to StandIn:ReferenceDate 2026-01-01, and its clock starts at 12:00:00 UTC and advances one second per state-changing request.",
       "attempts": 0,
-      "actionTaken": "Date fields are reproducible. The set of closed tenders (items 70, 80, 92, 106) is unchanged because every date shifts equally, and TimeStamp values are normalised by N2."
+      "actionTaken": "Date fields are reproducible. The set of closed tenders is unchanged because every date shifts equally, and TimeStamp values are normalised by N2. At load only PROP/70 closes into a tender sale, because the tenders on the items that close before the reference date are rejected (KL-STANDIN-TENDER-LOAD)."
     },
     {
       "id": "KL-STANDIN-PHOTO",
@@ -99,6 +99,15 @@
       "reason": "calculateAgentCommission computes price x rate / 100 [Erewhon/ErewhonModelSchema.scm:7527-7556], and JADE's Decimal assignment rounding is not stated.",
       "attempts": 0,
       "actionTaken": "Values are rounded half away from zero to two decimals, which affects agentCommission in the sale and sale-detail DTOs."
+    },
+    {
+      "id": "KL-STANDIN-TENDER-LOAD",
+      "category": "assumption",
+      "operation": "Rest.getAllSales",
+      "matches": [],
+      "reason": "The seed facts (AAP 0.9.4, 0.7.3) state 160 tenders [Erewhon/DataFiles/Tenders.txt:1-160], tender sales closed at load for PROP/70, ANQU/80, ANQU/92 and DEST/106, and getAllSales returning 19 retail and 4 tender sales. That disagrees with the model schema: loadTenders persists every row through TenderTA [Erewhon/ErewhonModelSchema.scm:8852-8927], which rejects a tender whose item is already closed [Erewhon/ErewhonModelSchema.scm:13910-13914], that is whose closure date is before the current date [Erewhon/ErewhonModelSchema.scm:7207-7222]. Every seed date is offset equally, so item 80 (Settee, closure November 29 1999 [Erewhon/DataFiles/TenderItems.txt:22]), item 92 (Coffee Mill, November 19 1999 [Erewhon/DataFiles/TenderItems.txt:34]) and item 106 (Camel trekking, December 12 1999 [Erewhon/DataFiles/TenderItems.txt:48]) close before the reference date, while item 70 (Castle, January 1 2000 [Erewhon/DataFiles/TenderItems.txt:12]) closes on it and is still open when its tenders load. The 60 rows on items 80, 92 and 106 [Erewhon/DataFiles/Tenders.txt:21-40, 81-100, 141-160] are rejected with \"The Tender Item has already closed\" [Erewhon/ErewhonModelSchema.scm:2872].",
+      "attempts": 0,
+      "actionTaken": "TenderTA is ported as written and never bypassed, so the stand-in loads 100 tenders and closes one tender sale at load: PROP/70, won by Philip Jenkins with 6500931.00 [Erewhon/DataFiles/Tenders.txt:137], the highest of the item's 20 tenders [Erewhon/DataFiles/Tenders.txt:121-140]. ANQU/80, ANQU/92 and DEST/106 stay unsold, so getSale returns 404 for each, and items 64, 86, 98 and 100 stay open. getAllSales returns the 19 retail sales and the 1 tender sale, which case REST-getAllSales-01 describes. The outcome does not depend on the reference date, because every seed date shifts equally."
     },
     {
       "id": "KL-CONF-DTOERROR",

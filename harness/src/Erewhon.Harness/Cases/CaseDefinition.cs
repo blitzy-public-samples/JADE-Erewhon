@@ -6,7 +6,9 @@ namespace Erewhon.Harness.Cases;
 /// <summary>
 /// The case groups of <c>harness/config/case-matrix.json</c>, which fix the replay order of AAP 0.7.3:
 /// REST reads, SOAP reads, REST writes, SOAP writes, and last the <c>getCompany</c> empty-state case.
-/// Because every read runs before any write, no read depends on a write.
+/// Because every seed-state read runs before any write, no read depends on a write. The empty-state
+/// <c>getCompany</c> read follows the writes, but the reset to the empty state before it, and the seed
+/// reset after it, isolate it from them.
 /// </summary>
 public static class CaseGroups
 {

@@ -32,7 +32,8 @@ namespace Erewhon.StandIn.Soap;
 /// HTTP 500 Faults are reserved for requests the stand-in cannot model: an unresolved operation, malformed
 /// XML, a missing request element or DTO parameter (<c>soap:Client</c>), and the empty state with no
 /// company (<c>soap:Server</c>). An unexpected exception is a stand-in defect and is not caught, so the
-/// framework's 500 surfaces it during capture.
+/// framework's 500 surfaces it during capture. A client that goes away mid-request is logged at Debug,
+/// and nothing more is written to it.
 /// </para>
 /// <para>
 /// Every endpoint, the catch-all included, is dispatched only for requests arriving on the SOAP socket
@@ -40,11 +41,19 @@ namespace Erewhon.StandIn.Soap;
 /// except through the resolver, nothing is authenticated, and no payload is logged.
 /// </para>
 /// </remarks>
-public static class SoapEndpoint
+public static partial class SoapEndpoint
 {
+    private const string LoggerCategory = "Erewhon.StandIn.Soap";
+
     // A plain Map catch-all: the framework's fallback mapping adds a nonfile constraint that skips
     // dotted paths such as /company.json.
     private const string CatchAllPattern = "/{**path}";
+
+    // The request log's operation label for a WSDL request, which is no catalogue operation.
+    private const string WsdlOperation = "wsdl";
+
+    // DTOResult.statusCode (Erewhon/ErehwhonExternalInterfacesSchema.scm:200), the status an update body assigns.
+    private const string ResultStatusMember = "statusCode";
 
     /// <summary>
     /// Maps the SOAP <c>POST</c>, the WSDL <c>GET</c> and the SOAP listener's catch-all, each restricted to
@@ -69,7 +78,8 @@ public static class SoapEndpoint
             services.GetRequiredService<OperationCatalogue>(),
             services.GetRequiredService<SoapOperationResolver>(),
             services.GetRequiredService<StandInState>(),
-            services.GetService<DtoBuilder>() ?? DtoBuilder.Default);
+            services.GetService<DtoBuilder>() ?? DtoBuilder.Default,
+            services.GetRequiredService<ILoggerFactory>().CreateLogger(LoggerCategory));
 
         RequestDelegate post = service.HandlePostAsync;
         RequestDelegate get = service.HandleGetAsync;
@@ -102,8 +112,34 @@ public static class SoapEndpoint
         await response.Body.WriteAsync(body, context.RequestAborted).ConfigureAwait(false);
     }
 
-    private static Task WriteFaultAsync(HttpContext context, string faultCode, string faultString) =>
-        WriteXmlAsync(context, StatusCodes.Status500InternalServerError, SoapEnvelopeWriter.WriteFault(faultCode, faultString));
+    // Every Fault string is fixed by the stand-in (a constant, or a catalogue parameter name), never taken
+    // from the request, so the request log records it as written.
+    private static Task WriteFaultAsync(HttpContext context, string faultCode, string faultString)
+    {
+        RequestLogEntry.For(context).FaultString = faultString;
+        return WriteXmlAsync(context, StatusCodes.Status500InternalServerError, SoapEnvelopeWriter.WriteFault(faultCode, faultString));
+    }
+
+    // The statusCode of a result whose class declares one, which among the SOAP results is the update
+    // bodies' DTOResult; read from the built tree, never from the written bytes.
+    private static int? ResultStatusCodeOf(object? result)
+    {
+        if (result is DtoNode node)
+        {
+            foreach (DtoMember member in node.Members)
+            {
+                if (string.Equals(member.Property.Name, ResultStatusMember, StringComparison.Ordinal) && member.Value is int statusCode)
+                {
+                    return statusCode;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    [LoggerMessage(EventId = 1, Level = LogLevel.Debug, Message = "SOAP {OperationId}: the client aborted the request.")]
+    private static partial void LogClientAborted(ILogger logger, string operationId);
 
     /// <summary>What a handler produced under the state lock: its result, or no company to run against.</summary>
     /// <param name="Result">A <see cref="DtoNode"/>, a <see cref="DtoArray"/> or null, which is written as <c>xsi:nil</c>.</param>
@@ -162,15 +198,17 @@ public static class SoapEndpoint
         private readonly SoapOperationResolver _resolver;
         private readonly StandInState _state;
         private readonly DtoBuilder _dto;
+        private readonly ILogger _logger;
         private readonly SoapStatuses _status;
         private readonly FrozenDictionary<string, OperationBinding> _bindings;
 
-        public SoapService(OperationCatalogue catalogue, SoapOperationResolver resolver, StandInState state, DtoBuilder dto)
+        public SoapService(OperationCatalogue catalogue, SoapOperationResolver resolver, StandInState state, DtoBuilder dto, ILogger logger)
         {
             _catalogue = catalogue;
             _resolver = resolver;
             _state = state;
             _dto = dto;
+            _logger = logger;
 
             SoapAddress address = catalogue.Addresses.Soap;
             RequireNamespace("addresses.soap.envelopeNamespace", address.EnvelopeNamespace, SoapEnvelopeWriter.SoapEnvelopeNamespace);
@@ -192,11 +230,29 @@ public static class SoapEndpoint
                 return WriteNotFoundAsync(context);
             }
 
+            RequestLogEntry.For(context).Operation = WsdlOperation;
             string location = WsdlGenerator.BuildAddressLocation(context.Request, _catalogue);
             return WriteXmlAsync(context, StatusCodes.Status200OK, WsdlGenerator.Generate(_catalogue, location));
         }
 
+        // A client that goes away while its body is read or its answer written ends the request with a Debug
+        // line, exactly when the request's abort token has fired; any other exception is left to the host.
         public async Task HandlePostAsync(HttpContext context)
+        {
+            RequestLogEntry log = RequestLogEntry.For(context);
+            CancellationToken aborted = context.RequestAborted;
+            try
+            {
+                await AnswerPostAsync(context, log).ConfigureAwait(false);
+            }
+            catch (Exception exception) when (aborted.IsCancellationRequested && exception is OperationCanceledException or IOException)
+            {
+                log.Outcome = RequestOutcome.Aborted;
+                LogClientAborted(_logger, log.Operation);
+            }
+        }
+
+        private async Task AnswerPostAsync(HttpContext context, RequestLogEntry log)
         {
             HttpRequest request = context.Request;
             CancellationToken aborted = context.RequestAborted;
@@ -210,6 +266,7 @@ public static class SoapEndpoint
                 return;
             }
 
+            log.Operation = operation.Id;
             request.Body.Position = 0;
             XDocument document;
             try
@@ -242,6 +299,7 @@ public static class SoapEndpoint
                 return;
             }
 
+            log.ResultStatusCode = ResultStatusCodeOf(outcome.Result);
             byte[] body = SoapEnvelopeWriter.WriteResponse(operation, outcome.Result);
             await WriteXmlAsync(context, StatusCodes.Status200OK, body).ConfigureAwait(false);
         }

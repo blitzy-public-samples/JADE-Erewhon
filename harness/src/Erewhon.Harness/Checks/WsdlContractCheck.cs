@@ -34,8 +34,9 @@ namespace Erewhon.Harness.Checks;
 /// signature on every run; run-varying transport text goes to the detail only. The check writes only
 /// <c>artifacts/wsdl/**</c>. It never writes <c>contracts/**</c> or <c>baseline/**</c>, which capture alone
 /// writes, and the discrepancy artifact is written by the caller from
-/// <see cref="ContractCheckResult.Discrepancies"/>. A failure to save or remove an artifact is reported in
-/// the detail and never thrown.</para>
+/// <see cref="ContractCheckResult.Canonical"/> through
+/// <see cref="CanonicalDiscrepancies.ToArtifact(FailureItem)"/>. A failure to save or
+/// remove an artifact is reported in the detail and never thrown.</para>
 /// <para>The instance keeps no per-run state, but concurrent runs would race on the artifact files, so one
 /// run at a time is expected. The <see cref="CaseRunner"/> belongs to the caller and is not disposed here.</para>
 /// </remarks>
@@ -140,8 +141,9 @@ public sealed class WsdlContractCheck(
                 []);
         }
 
-        discrepancies.Sort(Discrepancy.CanonicalOrder);
-        var first = discrepancies[0];
+        // Sorted into canonical order, written and hashed once; the caller writes the artifact from the same result.
+        var canonical = DiscrepancySignature.Prepare(discrepancies);
+        var first = canonical.Entries[0];
         var summary = string.Create(
             CultureInfo.InvariantCulture,
             $"{discrepancies.Count} difference{(discrepancies.Count == 1 ? "" : "s")} between the backend WSDL ({backendUri}) "
@@ -154,8 +156,11 @@ public sealed class WsdlContractCheck(
         var detail = Join(summary, artifactNote);
         return new ContractCheckResult(
             new CheckResult(CheckNames.WsdlContract, CheckOutcomes.Fail, Cases: 1, Passed: 0, detail),
-            new FailureItem(FailureItemIds.WsdlContract, FailureItemIds.Diff(DiscrepancySignature.Compute(discrepancies)), Detail: detail),
-            discrepancies.AsReadOnly());
+            new FailureItem(FailureItemIds.WsdlContract, FailureItemIds.Diff(canonical.Signature), Detail: detail),
+            canonical.Entries)
+        {
+            Canonical = canonical,
+        };
     }
 
     private static ContractCheckResult NotRun(string detail) =>

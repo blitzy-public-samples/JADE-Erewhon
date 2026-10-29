@@ -314,7 +314,10 @@ public static class FailureItemIds
     }
 
     /// <summary>Returns the discrepancy nature <c>d:&lt;signature&gt;</c>.</summary>
-    /// <param name="signature">The <see cref="DiscrepancySignature.Compute"/> value.</param>
+    /// <param name="signature">
+    /// The <see cref="DiscrepancySignature.Compute"/> value, or the <see cref="CanonicalDiscrepancies.Signature"/>
+    /// of a prepared list.
+    /// </param>
     /// <exception cref="ArgumentException"><paramref name="signature"/> is null or blank.</exception>
     public static string Diff(string signature) => DiffPrefix + NonBlank(signature);
 
@@ -425,6 +428,10 @@ public static class FailureItemIds
 /// sorted ordinally by path, then kind, then the baseline token's text, then the observed token's text,
 /// which is the same order as <see cref="Discrepancy.CanonicalOrder"/>; permuted input therefore gives
 /// the same text. The encoder is fixed here, so the text does not depend on any caller's options.
+/// <see cref="Prepare"/> sorts, writes and hashes a list once; <see cref="Compute"/>,
+/// <see cref="CanonicalJson"/> and <see cref="ToArtifact(FailureItem, IEnumerable{Discrepancy})"/> each
+/// do that work themselves, so a caller that needs both the nature and the artifact prepares once and
+/// calls <see cref="CanonicalDiscrepancies.ToArtifact(FailureItem)"/> on the result.
 /// All members are pure and thread-safe.
 /// </remarks>
 public static class DiscrepancySignature
@@ -437,33 +444,39 @@ public static class DiscrepancySignature
         Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
     };
 
+    /// <summary>
+    /// Prepares <paramref name="discrepancies"/> once for both the failure nature and the artifact: sorts
+    /// them into canonical order, writes the canonical JSON text in one pass and hashes the written UTF-8
+    /// bytes.
+    /// </summary>
+    /// <param name="discrepancies">The discrepancies in any order; null is treated as empty.</param>
+    /// <returns>
+    /// The entries in canonical order, the canonical text and its signature; <c>[]</c> and its hash for none.
+    /// </returns>
+    /// <exception cref="ArgumentException">The list contains a null entry.</exception>
+    public static CanonicalDiscrepancies Prepare(IEnumerable<Discrepancy>? discrepancies)
+    {
+        var entries = Canonicalise(discrepancies);
+        var buffer = Write(entries);
+
+        // A copy, so later changes to the caller's list cannot make the entries disagree with the text.
+        var ordered = new Discrepancy[entries.Count];
+        for (var i = 0; i < ordered.Length; i++)
+        {
+            ordered[i] = entries[i].Discrepancy;
+        }
+
+        return new CanonicalDiscrepancies(
+            Array.AsReadOnly(ordered),
+            Encoding.UTF8.GetString(buffer.WrittenSpan),
+            HashUtf8(buffer.WrittenSpan));
+    }
+
     /// <summary>Returns the canonical JSON text of <paramref name="discrepancies"/>; <c>[]</c> for none.</summary>
     /// <param name="discrepancies">The discrepancies in any order; null is treated as empty.</param>
     /// <exception cref="ArgumentException">The list contains a null entry.</exception>
-    public static string CanonicalJson(IEnumerable<Discrepancy>? discrepancies)
-    {
-        var entries = Canonicalise(discrepancies);
-        var buffer = new ArrayBufferWriter<byte>();
-        using (var writer = new Utf8JsonWriter(buffer, WriterOptions))
-        {
-            writer.WriteStartArray();
-            foreach (var entry in entries)
-            {
-                writer.WriteStartObject();
-                writer.WriteString("path", entry.Discrepancy.Path);
-                writer.WriteString("kind", entry.Discrepancy.Kind);
-                writer.WritePropertyName("baseline");
-                WriteToken(writer, entry.Discrepancy.Baseline);
-                writer.WritePropertyName("observed");
-                WriteToken(writer, entry.Discrepancy.Observed);
-                writer.WriteEndObject();
-            }
-
-            writer.WriteEndArray();
-        }
-
-        return Encoding.UTF8.GetString(buffer.WrittenSpan);
-    }
+    public static string CanonicalJson(IEnumerable<Discrepancy>? discrepancies) =>
+        Encoding.UTF8.GetString(Write(Canonicalise(discrepancies)).WrittenSpan);
 
     /// <summary>
     /// Returns the first 16 lowercase hex digits of the SHA-256 of <paramref name="canonicalText"/>'s
@@ -475,19 +488,19 @@ public static class DiscrepancySignature
     public static string Hash16(string canonicalText)
     {
         ArgumentNullException.ThrowIfNull(canonicalText);
-        return Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(canonicalText)), 0, SignatureBytes);
+        return HashUtf8(Encoding.UTF8.GetBytes(canonicalText));
     }
 
     /// <summary>Returns the signature of <paramref name="discrepancies"/>; an empty list hashes <c>[]</c>.</summary>
     /// <param name="discrepancies">The discrepancies in any order; null is treated as empty.</param>
     /// <exception cref="ArgumentException">The list contains a null entry.</exception>
-    public static string Compute(IEnumerable<Discrepancy>? discrepancies) => Hash16(CanonicalJson(discrepancies));
+    public static string Compute(IEnumerable<Discrepancy>? discrepancies) =>
+        HashUtf8(Write(Canonicalise(discrepancies)).WrittenSpan);
 
     /// <summary>
-    /// Returns the discrepancy artifact of a failing item: <c>itemId</c>, <c>nature</c>,
-    /// <c>operation</c>, <c>detail</c>, <c>signature</c> and <c>discrepancies</c>, the last being the
-    /// canonical list the signature is computed over. The caller writes it to
-    /// <c>artifacts/discrepancies/&lt;SanitiseFileName(itemId)&gt;.json</c>.
+    /// Returns the discrepancy artifact of a failing item, preparing <paramref name="discrepancies"/>
+    /// once; see <see cref="CanonicalDiscrepancies.ToArtifact(FailureItem)"/> for its content. A caller
+    /// that already prepared the list for the item's nature calls that method on the prepared result instead.
     /// </summary>
     /// <param name="item">The failing item the discrepancies belong to.</param>
     /// <param name="discrepancies">The discrepancies in any order; null is treated as empty.</param>
@@ -496,18 +509,7 @@ public static class DiscrepancySignature
     public static JsonNode ToArtifact(FailureItem item, IEnumerable<Discrepancy>? discrepancies)
     {
         ArgumentNullException.ThrowIfNull(item);
-
-        // Parsing the hashed text guarantees the artifact lists exactly what the signature covers.
-        var canonical = CanonicalJson(discrepancies);
-        return new JsonObject
-        {
-            ["itemId"] = item.ItemId,
-            ["nature"] = item.Nature,
-            ["operation"] = item.Operation,
-            ["detail"] = item.Detail,
-            ["signature"] = Hash16(canonical),
-            ["discrepancies"] = JsonNode.Parse(canonical),
-        };
+        return Prepare(discrepancies).ToArtifact(item);
     }
 
     /// <summary>
@@ -572,6 +574,40 @@ public static class DiscrepancySignature
         return entries;
     }
 
+    // The one writer of the canonical text, shared by Prepare, CanonicalJson and Compute.
+    private static ArrayBufferWriter<byte> Write(List<CanonicalEntry> entries)
+    {
+        var buffer = new ArrayBufferWriter<byte>();
+        using (var writer = new Utf8JsonWriter(buffer, WriterOptions))
+        {
+            writer.WriteStartArray();
+            foreach (var entry in entries)
+            {
+                writer.WriteStartObject();
+                writer.WriteString("path", entry.Discrepancy.Path);
+                writer.WriteString("kind", entry.Discrepancy.Kind);
+                writer.WritePropertyName("baseline");
+                WriteToken(writer, entry.Discrepancy.Baseline);
+                writer.WritePropertyName("observed");
+                WriteToken(writer, entry.Discrepancy.Observed);
+                writer.WriteEndObject();
+            }
+
+            writer.WriteEndArray();
+        }
+
+        return buffer;
+    }
+
+    // Utf8JsonWriter emits only valid UTF-8, so hashing its bytes equals hashing the UTF-8 bytes of the
+    // text they decode to, which is what Hash16 does.
+    private static string HashUtf8(ReadOnlySpan<byte> utf8)
+    {
+        Span<byte> digest = stackalloc byte[SHA256.HashSizeInBytes];
+        SHA256.HashData(utf8, digest);
+        return Convert.ToHexStringLower(digest[..SignatureBytes]);
+    }
+
     private static string TokenText(DiscrepancyValue? value)
     {
         var buffer = new ArrayBufferWriter<byte>();
@@ -600,5 +636,93 @@ public static class DiscrepancySignature
         writer.WriteEndObject();
     }
 
+    // The node form of WriteToken, with the same member and value, so the artifact lists exactly the
+    // tokens the signature hashes. Internal so CanonicalDiscrepancies.ToArtifact builds its tokens here.
+    internal static JsonObject TokenNode(DiscrepancyValue? value) =>
+        value is { IsValid: true }
+            ? new JsonObject { ["valid"] = value.ValidRule }
+            : new JsonObject { ["literal"] = value?.Text };
+
     private sealed record CanonicalEntry(Discrepancy Discrepancy, string BaselineToken, string ObservedToken);
+}
+
+/// <summary>
+/// A discrepancy list prepared once by <see cref="DiscrepancySignature.Prepare"/>: the entries in
+/// canonical order, the canonical JSON text and its signature. A caller builds the
+/// <c>d:&lt;signature&gt;</c> nature from <see cref="Signature"/> and the artifact through
+/// <see cref="ToArtifact(FailureItem)"/>, so the list is sorted, written and hashed only once per failing
+/// item.
+/// </summary>
+/// <remarks>
+/// Instances are immutable and thread-safe. <see cref="Entries"/> is a read-only copy of the caller's
+/// list, and each <see cref="Discrepancy"/> is itself immutable, so the entries, the text and the
+/// signature always describe the same list. Only <see cref="DiscrepancySignature"/> creates instances.
+/// </remarks>
+public sealed class CanonicalDiscrepancies
+{
+    internal CanonicalDiscrepancies(IReadOnlyList<Discrepancy> entries, string json, string signature)
+    {
+        Entries = entries;
+        Json = json;
+        Signature = signature;
+    }
+
+    /// <summary>
+    /// The discrepancies in canonical order, which equals <see cref="Discrepancy.CanonicalOrder"/>;
+    /// read-only and never null, empty for none.
+    /// </summary>
+    public IReadOnlyList<Discrepancy> Entries { get; }
+
+    /// <summary>
+    /// The canonical JSON text, exactly what <see cref="DiscrepancySignature.CanonicalJson"/> returns for
+    /// the same list; <c>[]</c> for none.
+    /// </summary>
+    public string Json { get; }
+
+    /// <summary>
+    /// The first 16 lowercase hex digits of the SHA-256 of <see cref="Json"/>'s UTF-8 bytes, exactly what
+    /// <see cref="DiscrepancySignature.Compute"/> returns for the same list.
+    /// </summary>
+    public string Signature { get; }
+
+    /// <summary>
+    /// Returns the discrepancy artifact of a failing item: <c>itemId</c>, <c>nature</c>,
+    /// <c>operation</c>, <c>detail</c>, <c>signature</c> and <c>discrepancies</c>, the last being the
+    /// canonical list the signature is computed over, built from <see cref="Entries"/> without preparing
+    /// or parsing the list again. The caller writes it to
+    /// <c>artifacts/discrepancies/&lt;SanitiseFileName(itemId)&gt;.json</c>.
+    /// </summary>
+    /// <remarks>
+    /// Each entry has the members and tokens the canonical writer emits, so the list serialised with
+    /// <see cref="JavaScriptEncoder.UnsafeRelaxedJsonEscaping"/> and no indentation is exactly
+    /// <see cref="Json"/>.
+    /// </remarks>
+    /// <param name="item">The failing item the discrepancies belong to.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="item"/> is null.</exception>
+    public JsonNode ToArtifact(FailureItem item)
+    {
+        ArgumentNullException.ThrowIfNull(item);
+
+        var list = new JsonArray();
+        foreach (var discrepancy in Entries)
+        {
+            list.Add(new JsonObject
+            {
+                ["path"] = discrepancy.Path,
+                ["kind"] = discrepancy.Kind,
+                ["baseline"] = DiscrepancySignature.TokenNode(discrepancy.Baseline),
+                ["observed"] = DiscrepancySignature.TokenNode(discrepancy.Observed),
+            });
+        }
+
+        return new JsonObject
+        {
+            ["itemId"] = item.ItemId,
+            ["nature"] = item.Nature,
+            ["operation"] = item.Operation,
+            ["detail"] = item.Detail,
+            ["signature"] = Signature,
+            ["discrepancies"] = list,
+        };
+    }
 }

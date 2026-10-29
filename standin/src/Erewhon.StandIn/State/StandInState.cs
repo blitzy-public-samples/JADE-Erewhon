@@ -26,12 +26,18 @@ public sealed class StandInOptions
     /// <summary>
     /// The seed directory, absolute or relative to the process working directory: the repository's
     /// <c>Erewhon/DataFiles</c> seen from <c>standin/</c> by default, <c>/app/seed</c> in the image.
+    /// Leading and trailing blanks are ignored, as the seed loader's JADE <c>validateDirectoryPath</c>
+    /// ignores them, so the fingerprinted directory is always the loaded one
+    /// (<see cref="StandInState.ResolveSeedDirectory(string?)"/>).
     /// </summary>
     public string SeedDirectory { get; set; } = "../Erewhon/DataFiles";
 
     /// <summary>
     /// The date that replaces JADE's current date, in <c>yyyy-MM-dd</c> form. It must equal the
-    /// harness's <c>ExpectedReferenceDate</c>.
+    /// harness's <c>ExpectedReferenceDate</c>, and lie from 1001-01-01 to 8999-12-31 inclusive: the
+    /// loader moves every seed date (all in 1999 and 2000) by the days from 2000-01-01 to this date,
+    /// and the range keeps any seed date from 1000-01-01 to 2999-12-31, and the clock that starts at
+    /// this date's 12:00:00 UTC, inside the representable dates after that move.
     /// </summary>
     public string ReferenceDate { get; set; } = "2026-01-01";
 
@@ -182,6 +188,14 @@ public sealed class StandInState
 
     private static readonly TimeOnly ClockStartTime = new(12, 0, 0);
 
+    // The loader moves every seed date by the days from 2000-01-01 to the reference date, and the
+    // seed's dates all lie in 1999 and 2000. With the reference date in this inclusive range, any seed
+    // date from 1000-01-01 to 2999-12-31 stays inside the DateOnly and DateTime range (0001-01-01 to
+    // 9999-12-31) after that shift, and the clock (the reference date at 12:00:00 UTC plus one second
+    // per state-changing request) starts at least 1000 years before DateTime.MaxValue.
+    private static readonly DateOnly MinReferenceDate = new(1001, 1, 1);
+    private static readonly DateOnly MaxReferenceDate = new(8999, 12, 31);
+
     // Serialises every request handler and guards _current, _generation and _mutations.
     private readonly Lock _gate = new();
 
@@ -198,22 +212,17 @@ public sealed class StandInState
     /// <param name="options">The <see cref="StandInOptions.SectionName"/> settings.</param>
     /// <exception cref="ArgumentNullException"><paramref name="options"/> is null.</exception>
     /// <exception cref="InvalidOperationException">
-    /// <c>StandIn:SeedDirectory</c> is empty, or <c>StandIn:ReferenceDate</c> is not a <c>yyyy-MM-dd</c> date.
+    /// <c>StandIn:SeedDirectory</c> is empty or not a valid path
+    /// (<see cref="ResolveSeedDirectory(string?)"/>), or <c>StandIn:ReferenceDate</c> is not a
+    /// <c>yyyy-MM-dd</c> date from 1001-01-01 to 8999-12-31, the range that keeps every seed date
+    /// moved by its offset from 2000-01-01, and the clock, representable.
     /// </exception>
     public StandInState(IOptions<StandInOptions> options)
     {
         ArgumentNullException.ThrowIfNull(options);
         StandInOptions settings = options.Value;
 
-        if (string.IsNullOrWhiteSpace(settings.SeedDirectory))
-        {
-            throw new InvalidOperationException(
-                $"{StandInOptions.SectionName}:{nameof(StandInOptions.SeedDirectory)} must name the seed directory.");
-        }
-
-        // Resolved once against the process working directory, not the content root: standin/ for a
-        // local process, so the relative default reaches Erewhon/DataFiles; the image sets an absolute path.
-        SeedDirectory = Path.GetFullPath(settings.SeedDirectory);
+        SeedDirectory = ResolveSeedDirectory(settings.SeedDirectory);
 
         if (!DateOnly.TryParseExact(settings.ReferenceDate, DateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out DateOnly referenceDate))
         {
@@ -221,9 +230,58 @@ public sealed class StandInState
                 $"{StandInOptions.SectionName}:{nameof(StandInOptions.ReferenceDate)} must be a {DateFormat} date; the value is '{settings.ReferenceDate}'.");
         }
 
+        if (referenceDate < MinReferenceDate || referenceDate > MaxReferenceDate)
+        {
+            throw new InvalidOperationException(
+                $"{StandInOptions.SectionName}:{nameof(StandInOptions.ReferenceDate)} must be between {MinReferenceDate.ToString(DateFormat, CultureInfo.InvariantCulture)} and {MaxReferenceDate.ToString(DateFormat, CultureInfo.InvariantCulture)}; the value is '{settings.ReferenceDate}'.");
+        }
+
         ReferenceDate = referenceDate;
         ReferenceDateText = referenceDate.ToString(DateFormat, CultureInfo.InvariantCulture);
         ClockBase = referenceDate.ToDateTime(ClockStartTime, DateTimeKind.Utc);
+    }
+
+    /// <summary>
+    /// Resolves a <c>StandIn:SeedDirectory</c> value to the absolute directory every reset
+    /// fingerprints and loads. The constructor uses it, and start-up diagnostics use it to name the
+    /// same directory before any state exists.
+    /// </summary>
+    /// <remarks>
+    /// The value is trimmed of blanks with <see cref="SeedTokenizer.TrimBlanks(string)"/>, the rule the
+    /// seed loader's JADE <c>validateDirectoryPath</c> applies, and then resolved against the process
+    /// working directory, not the content root: <c>standin/</c> for a local process, so the relative
+    /// default reaches <c>Erewhon/DataFiles</c>; the image sets an absolute path. The loader's own trim
+    /// never changes the result, so the seed fingerprint and the seed load read one directory.
+    /// </remarks>
+    /// <param name="configured">The configured value; null, empty and white space name no directory.</param>
+    /// <returns>The absolute seed directory.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// <paramref name="configured"/> names no directory, or is not a valid path.
+    /// </exception>
+    public static string ResolveSeedDirectory(string? configured)
+    {
+        if (string.IsNullOrWhiteSpace(configured))
+        {
+            throw new InvalidOperationException(
+                $"{StandInOptions.SectionName}:{nameof(StandInOptions.SeedDirectory)} must name the seed directory.");
+        }
+
+        string fullPath;
+        try
+        {
+            fullPath = Path.GetFullPath(SeedTokenizer.TrimBlanks(configured));
+        }
+        catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            throw new InvalidOperationException(
+                $"{StandInOptions.SectionName}:{nameof(StandInOptions.SeedDirectory)} must be a valid directory path; the value is '{configured}'. {ex.Message}",
+                ex);
+        }
+
+        // A "." or ".." segment can resolve to a last segment that ends in a blank ("dir /." is
+        // "dir "). A trailing separator names the same directory and keeps the loader's trim from
+        // dropping that blank.
+        return fullPath.EndsWith(' ') ? fullPath + Path.DirectorySeparatorChar : fullPath;
     }
 
     /// <summary>The absolute seed directory every reset reads.</summary>

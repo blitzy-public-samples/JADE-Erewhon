@@ -1,3 +1,4 @@
+using System.Text;
 using Erewhon.Contracts.Catalogue;
 using Erewhon.Harness.Compare;
 
@@ -10,6 +11,8 @@ namespace Erewhon.Harness.Tests;
 /// order, leaf text including whitespace, QName resolution, nil results, unnormalised SOAP values, missing and
 /// extra elements). Operation, element and namespace names come from the contracts catalogue, and every
 /// equivalence has a neighbouring case that must differ, so a comparer that never reports cannot pass.
+/// The response-level cases send SOAP bodies through <see cref="ResponseComparer"/>: XML dispatch, the
+/// media type, well-formedness as a SOAP 1.1 envelope, the byte-order mark and strict UTF-8 decoding.
 /// </summary>
 public sealed class XmlSemanticComparerTests
 {
@@ -29,6 +32,9 @@ public sealed class XmlSemanticComparerTests
 
     private const string GuidA = "{00000000-0000-4000-8000-000000000001}";
     private const string GuidB = "{eaf359ee-e216-ee11-9fbd-0050568d0023}";
+
+    // A SOAP 1.2 envelope is XML, but not the SOAP 1.1 envelope a well-formed response must be.
+    private const string Soap12EnvelopeNamespace = "http://www.w3.org/2003/05/soap-envelope";
 
     private static readonly OperationCatalogue Catalogue = OperationCatalogue.Default;
     private static readonly SoapAddress SoapAddressing = Catalogue.Addresses.Soap;
@@ -61,6 +67,10 @@ public sealed class XmlSemanticComparerTests
     private static readonly string FacadeLocation =
         $"http://localhost:{SoapAddressing.Port}{SoapAddressing.EndpointPathAndQuery}";
 
+    // Every SOAP outcome of getAgent shares one HTTP status; business errors travel in the result.
+    private static readonly int SoapStatus = GetAgent.Statuses.Select(status => status.HttpStatus).Distinct().Single();
+    private static readonly string SoapContentType = SoapAddressing.ContentType;
+
     /// <summary>
     /// Hank Williams as the seed loads him (Erewhon/DataFiles/Agents.txt:4): the eight properties the
     /// <c>WebServiceHTTP</c> list exposes for <c>DTOAgent</c>, in loader field order, fax before phone.
@@ -78,6 +88,10 @@ public sealed class XmlSemanticComparerTests
     ];
 
     private readonly XmlSemanticComparer _comparer = new(
+        OperationCatalogue.Default,
+        new Normaliser(NormalisationRules.FromCatalogue(OperationCatalogue.Default)));
+
+    private readonly ResponseComparer _responses = new(
         OperationCatalogue.Default,
         new Normaliser(NormalisationRules.FromCatalogue(OperationCatalogue.Default)));
 
@@ -473,7 +487,135 @@ public sealed class XmlSemanticComparerTests
             discrepancy);
     }
 
+    // ---- Response level --------------------------------------------------------------------------
+
+    // A SOAP operation other than getPhoto goes to the XML comparer: layout inside the envelope is
+    // ignored, and a leaf difference is reported at its XML path.
+    [Fact]
+    public void Response_SoapBody_IsComparedAsXml()
+    {
+        var indented = SoapSnapshot(Envelope(GetAgent, Agent()));
+
+        AssertResponse(
+            _responses.Compare(GetAgent, indented, SoapSnapshot(Envelope(GetAgent, Agent(indent: false), indent: false))),
+            [],
+            wellFormed: true,
+            statusMatched: true);
+        AssertResponse(
+            _responses.Compare(GetAgent, indented, SoapSnapshot(Envelope(GetAgent, AgentWith("email", "<email>hank@it.com </email>")))),
+            [new($"{AgentResultPath}/email/text()", DiscrepancyKinds.Value, DiscrepancyValue.Literal("hank@it.com"), DiscrepancyValue.Literal("hank@it.com "))],
+            wellFormed: true,
+            statusMatched: true);
+    }
+
+    [Fact]
+    public void Response_DifferentMediaType_IsOneContentTypeDiscrepancy()
+    {
+        var body = Envelope(GetAgent, Agent());
+
+        var comparison = _responses.Compare(GetAgent, SoapSnapshot(body, "text/xml"), SoapSnapshot(body, "application/xml"));
+
+        AssertResponse(
+            comparison,
+            [new("$content-type", DiscrepancyKinds.Value, DiscrepancyValue.Literal("text/xml"), DiscrepancyValue.Literal("application/xml"))],
+            wellFormed: true,
+            statusMatched: true);
+    }
+
+    [Fact]
+    public void Response_UnloadableObservedSoap_IsMalformedAndDiffersAsText()
+    {
+        const string Truncated = "<soap:Envelope";
+        var baselineBody = Envelope(GetAgent, Agent());
+
+        var comparison = _responses.Compare(GetAgent, SoapSnapshot(baselineBody), SoapSnapshot(Truncated));
+
+        AssertResponse(
+            comparison,
+            [
+                new("$body", DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, DiscrepancyValue.Absent),
+                new("$body", DiscrepancyKinds.Value, DiscrepancyValue.Literal(baselineBody), DiscrepancyValue.Literal(Truncated)),
+            ],
+            wellFormed: false,
+            statusMatched: true);
+    }
+
+    // XML that loads but is not a SOAP 1.1 envelope is still compared as XML, and is not well formed.
+    [Theory]
+    [InlineData("<v>a</v>", "v")]
+    [InlineData("<env:Envelope xmlns:env=\"" + Soap12EnvelopeNamespace + "\"><env:Body/></env:Envelope>", "{" + Soap12EnvelopeNamespace + "}Envelope")]
+    public void Response_XmlThatIsNotASoapEnvelope_IsMalformed(string observedBody, string observedRootName)
+    {
+        var comparison = _responses.Compare(GetAgent, SoapSnapshot(Envelope(GetAgent, Agent())), SoapSnapshot(observedBody));
+
+        AssertResponse(
+            comparison,
+            [
+                new("$body", DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, DiscrepancyValue.Absent),
+                new("/", DiscrepancyKinds.Value, DiscrepancyValue.Literal($"{{{EnvelopeNamespace}}}Envelope"), DiscrepancyValue.Literal(observedRootName)),
+            ],
+            wellFormed: false,
+            statusMatched: true);
+    }
+
+    // One leading UTF-8 byte-order mark is not part of a SOAP body that is compared as XML.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Response_ByteOrderMarkOnOneSide_IsEquivalent(bool markOnBaseline)
+    {
+        var plain = Encoding.UTF8.GetBytes(Envelope(GetAgent, Agent()));
+        byte[] marked = [0xEF, 0xBB, 0xBF, .. plain];
+
+        var comparison = _responses.Compare(
+            GetAgent,
+            SoapSnapshot(markOnBaseline ? marked : plain),
+            SoapSnapshot(markOnBaseline ? plain : marked));
+
+        AssertResponse(comparison, [], wellFormed: true, statusMatched: true);
+    }
+
+    // Replacement decoding would load the corrupt envelope with U+FFFD in the agent's name. Decoded
+    // strictly, it has no text, so it does not load, is not well formed and is reported by its bytes.
+    [Fact]
+    public void Response_InvalidUtf8Soap_IsMalformedTypeDifference()
+    {
+        var baselineBody = Envelope(GetAgent, Agent());
+        var observed = Encoding.UTF8.GetBytes(baselineBody);
+        observed[baselineBody.IndexOf("Hank Williams", StringComparison.Ordinal)] = 0xFF;
+
+        var comparison = _responses.Compare(GetAgent, SoapSnapshot(baselineBody), SoapSnapshot(observed));
+
+        AssertResponse(
+            comparison,
+            [
+                new("$body", DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, DiscrepancyValue.Absent),
+                new("$body", DiscrepancyKinds.Type, DiscrepancyValue.Literal(baselineBody), DiscrepancyValue.Literal(Convert.ToHexStringLower(observed))),
+            ],
+            wellFormed: false,
+            statusMatched: true);
+    }
+
     // ---- Helpers ---------------------------------------------------------------------------------
+
+    /// <summary>A SOAP response with the catalogue status and content type whose body is <paramref name="body"/> in UTF-8, without a byte-order mark.</summary>
+    private static ResponseSnapshot SoapSnapshot(string body) => SoapSnapshot(body, SoapContentType);
+
+    /// <summary>A SOAP response with the catalogue status and content type whose body is exactly <paramref name="body"/>.</summary>
+    private static ResponseSnapshot SoapSnapshot(byte[] body) => new(SoapStatus, SoapContentType, body);
+
+    /// <summary>A SOAP response with the catalogue status and <paramref name="contentType"/>, null for none, whose body is <paramref name="body"/> in UTF-8.</summary>
+    private static ResponseSnapshot SoapSnapshot(string body, string? contentType) =>
+        new(SoapStatus, contentType, Encoding.UTF8.GetBytes(body));
+
+    /// <summary>Asserts the complete, ordered discrepancy list and all three flags of a response comparison.</summary>
+    private static void AssertResponse(ResponseComparison comparison, Discrepancy[] expected, bool wellFormed, bool statusMatched)
+    {
+        Assert.Equal(expected, comparison.Discrepancies);
+        Assert.Equal(expected.Length == 0, comparison.Equivalent);
+        Assert.Equal(wellFormed, comparison.WellFormed);
+        Assert.Equal(statusMatched, comparison.StatusMatched);
+    }
 
     /// <summary>Asserts that the two bodies are equal in <paramref name="context"/>, compared in both directions.</summary>
     private void AssertEquivalent(string baseline, string observed, XmlComparisonContext context)

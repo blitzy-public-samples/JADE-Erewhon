@@ -1,12 +1,15 @@
 using System.Globalization;
 using System.Text;
+using Erewhon.Contracts.Catalogue;
 using Erewhon.Harness.Compare;
 
 namespace Erewhon.Harness.Tests;
 
 /// <summary>
 /// Byte-exact comparison of raw <c>getPhoto</c> response bodies: no normalisation rule, no
-/// canonicalisation and no tolerance applies, so any changed, missing or extra byte is reported.
+/// canonicalisation and no tolerance applies, so any changed, missing or extra byte is reported. The
+/// response-level cases show that <see cref="ResponseComparer"/> sends <c>getPhoto</c>, and only it,
+/// to this comparer on the raw bytes, byte-order mark included.
 /// </summary>
 public sealed class BinaryComparerTests
 {
@@ -80,6 +83,18 @@ public sealed class BinaryComparerTests
         + "<soap:Body><getPhotoResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getPhotoResult>"
         + "<photo xsi:nil=\"false\" xsi:type=\"xsd:base64Binary\">/9j/4AAQSkZJRgABAgAAZABkAAD/2Q==</photo>"
         + "</getPhotoResult></getPhotoResponse></soap:Body></soap:Envelope>";
+
+    private const string XsiNamespace = "http://www.w3.org/2001/XMLSchema-instance";
+
+    private static readonly OperationCatalogue Catalogue = OperationCatalogue.Default;
+    private static readonly OperationDescriptor GetPhoto = Catalogue.Find(Surface.Soap, "getPhoto");
+    private static readonly OperationDescriptor GetAgent = Catalogue.Find(Surface.Soap, "getAgent");
+    private static readonly string SoapContentType = Catalogue.Addresses.Soap.ContentType;
+
+    // Every SOAP outcome of getPhoto shares one HTTP status; business errors travel in the result.
+    private static readonly int SoapStatus = GetPhoto.Statuses.Select(status => status.HttpStatus).Distinct().Single();
+
+    private readonly ResponseComparer _responses = new(Catalogue, new Normaliser(NormalisationRules.FromCatalogue(Catalogue)));
 
     [Fact]
     public void IdenticalBytes_GiveNoDiscrepancy()
@@ -222,6 +237,111 @@ public sealed class BinaryComparerTests
         {
             Assert.Contains(discrepancy, discrepancies);
         }
+    }
+
+    // ---- Response level: getPhoto dispatch ---------------------------------------------------------
+
+    // Two layouts that are equal as XML differ as bytes: getPhoto reports the byte difference, while the
+    // same two bodies through another SOAP operation are equivalent.
+    [Fact]
+    public void GetPhoto_LayoutOnlyDifference_IsAByteDifference()
+    {
+        var compact = NilResultEnvelope(GetPhoto, indent: false);
+        var indented = NilResultEnvelope(GetPhoto, indent: true);
+        var firstDifference = compact.IndexOf("<soap:Body>", StringComparison.Ordinal);
+        Assert.Equal(compact[..firstDifference], indented[..firstDifference]);
+
+        AssertResponse(
+            _responses.Compare(GetPhoto, SoapSnapshot(compact), SoapSnapshot(indented)),
+            [
+                new("$body", DiscrepancyKinds.Length, CountLiteral(compact.Length), CountLiteral(indented.Length)),
+                new(
+                    string.Create(CultureInfo.InvariantCulture, $"$body[{firstDifference}]"),
+                    DiscrepancyKinds.Value,
+                    DiscrepancyValue.Literal("3c"),
+                    DiscrepancyValue.Literal("0a")),
+            ],
+            wellFormed: true,
+            statusMatched: true);
+        AssertResponse(_responses.Compare(GetAgent, SoapSnapshot(compact), SoapSnapshot(indented)), [], wellFormed: true, statusMatched: true);
+    }
+
+    // A getPhoto body keeps its byte-order mark as an ordinary leading byte; an XML-compared body drops it.
+    [Fact]
+    public void GetPhoto_ByteOrderMark_IsNotStripped()
+    {
+        var plain = Encoding.UTF8.GetBytes(NilResultEnvelope(GetPhoto, indent: false));
+        byte[] marked = [0xEF, 0xBB, 0xBF, .. plain];
+
+        AssertResponse(
+            _responses.Compare(GetPhoto, SoapSnapshot(plain), SoapSnapshot(marked)),
+            [
+                new("$body", DiscrepancyKinds.Length, CountLiteral(plain.Length), CountLiteral(marked.Length)),
+                new("$body[0]", DiscrepancyKinds.Value, DiscrepancyValue.Literal("3c"), DiscrepancyValue.Literal("ef")),
+            ],
+            wellFormed: true,
+            statusMatched: true);
+        AssertResponse(_responses.Compare(GetAgent, SoapSnapshot(plain), SoapSnapshot(marked)), [], wellFormed: true, statusMatched: true);
+    }
+
+    // Replacement decoding would load the corrupt envelope as one in another wrapper namespace. Decoded
+    // strictly, a getPhoto body that is not valid UTF-8 is not well formed, and its bytes still compare raw.
+    [Fact]
+    public void GetPhoto_InvalidUtf8_IsNotWellFormed()
+    {
+        var text = NilResultEnvelope(GetPhoto, indent: false);
+        var baseline = Encoding.UTF8.GetBytes(text);
+        var observed = baseline.ToArray();
+        var offset = text.IndexOf(Catalogue.Addresses.Soap.TargetNamespace, StringComparison.Ordinal);
+        observed[offset] = 0xFF;
+
+        AssertResponse(
+            _responses.Compare(GetPhoto, SoapSnapshot(baseline), SoapSnapshot(observed)),
+            [
+                new("$body", DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, DiscrepancyValue.Absent),
+                new(
+                    string.Create(CultureInfo.InvariantCulture, $"$body[{offset}]"),
+                    DiscrepancyKinds.Value,
+                    DiscrepancyValue.Literal(Convert.ToHexStringLower(baseline, offset, 1)),
+                    DiscrepancyValue.Literal("ff")),
+            ],
+            wellFormed: false,
+            statusMatched: true);
+    }
+
+    /// <summary>A SOAP response with the catalogue status whose body is <paramref name="body"/> in UTF-8, without a byte-order mark.</summary>
+    private static ResponseSnapshot SoapSnapshot(string body) => SoapSnapshot(Encoding.UTF8.GetBytes(body));
+
+    /// <summary>A SOAP response with the catalogue status whose body is exactly <paramref name="body"/>.</summary>
+    private static ResponseSnapshot SoapSnapshot(byte[] body) => new(SoapStatus, SoapContentType, body);
+
+    private static DiscrepancyValue CountLiteral(int count) =>
+        DiscrepancyValue.Literal(count.ToString(CultureInfo.InvariantCulture));
+
+    /// <summary>
+    /// A SOAP 1.1 response envelope of <paramref name="operation"/> whose result is <c>xsi:nil</c>. The indented
+    /// layout breaks lines only inside <c>Envelope</c> and <c>Body</c>, whose whitespace-only text every SOAP
+    /// comparison ignores, so the two layouts are equal as XML for any SOAP operation.
+    /// </summary>
+    private static string NilResultEnvelope(OperationDescriptor operation, bool indent)
+    {
+        var soap = Catalogue.Addresses.Soap;
+        var binding = operation.Soap!;
+        string Break(int depth) => indent ? "\n" + new string(' ', 2 * depth) : string.Empty;
+
+        return $"<soap:Envelope xmlns:soap=\"{soap.EnvelopeNamespace}\" xmlns:xsi=\"{XsiNamespace}\">"
+            + $"{Break(1)}<soap:Body>"
+            + $"{Break(2)}<{binding.ResponseElement} xmlns=\"{soap.TargetNamespace}\"><{binding.ResultElement} xsi:nil=\"true\"/></{binding.ResponseElement}>"
+            + $"{Break(1)}</soap:Body>{Break(0)}</soap:Envelope>";
+    }
+
+    /// <summary>Asserts the complete, ordered discrepancy list and all three flags of a response comparison.</summary>
+    private static void AssertResponse(ResponseComparison comparison, Discrepancy[] expected, bool wellFormed, bool statusMatched)
+    {
+        Assert.Equal(expected, comparison.Discrepancies);
+        Assert.Equal(expected.Length == 0, comparison.Equivalent);
+        Assert.Equal(wellFormed, comparison.WellFormed);
+        Assert.Equal(statusMatched, comparison.StatusMatched);
     }
 
     /// <summary>

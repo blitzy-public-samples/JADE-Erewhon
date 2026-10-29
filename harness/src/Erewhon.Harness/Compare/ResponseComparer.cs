@@ -4,7 +4,7 @@ using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Nodes;
-using System.Xml;
+using System.Text.Unicode;
 using System.Xml.Linq;
 using Erewhon.Contracts.Catalogue;
 
@@ -49,7 +49,10 @@ public static class DiscrepancyKinds
     /// <summary>The observed response holds a value at the path and the baseline does not.</summary>
     public const string Extra = "extra";
 
-    /// <summary>The two values at the path are of different kinds, for example a string and a number.</summary>
+    /// <summary>
+    /// The two values at the path are of different kinds, for example a string and a number, or a body
+    /// that is UTF-8 text and a body whose bytes are not valid UTF-8.
+    /// </summary>
     public const string Type = "type";
 
     /// <summary>The two sides hold different counts at the path: array items, repeated elements or bytes.</summary>
@@ -90,6 +93,19 @@ public sealed record DiscrepancyValue
     /// <summary>The rule id <c>N2</c>.</summary>
     private const string RuleN2 = "N2";
 
+    // Canonical keys use the same relaxed, fixed encoder as the canonical signature list, so the order
+    // Discrepancy.CanonicalOrder sorts in and the order the signature is computed in agree on non-ASCII
+    // literals.
+    private static readonly JsonWriterOptions TokenWriterOptions = new()
+    {
+        Indented = false,
+        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+    };
+
+    // Derived only from ValidRule and Text, which never change, so it is written on first use and kept.
+    // Concurrent first uses write equal strings and either write may win; no lock is needed.
+    private string? _canonicalKey;
+
     private DiscrepancyValue(string? validRule, string? text)
     {
         ValidRule = validRule;
@@ -110,6 +126,13 @@ public sealed record DiscrepancyValue
 
     /// <summary>True when nothing exists at the path on this side.</summary>
     public bool IsAbsent => ValidRule is null && Text is null;
+
+    /// <summary>
+    /// The compact JSON text of <see cref="ToToken"/>, written with a fixed relaxed encoder: the key
+    /// <see cref="Discrepancy.CanonicalOrder"/> sorts by. It is computed on first use and kept, so a sort
+    /// serialises each value at most once however many comparisons it makes.
+    /// </summary>
+    internal string CanonicalKey => _canonicalKey ??= WriteCanonicalKey();
 
     /// <summary>Returns a value valid under a normalisation rule; its content is deliberately not kept.</summary>
     /// <param name="rule">The rule id, exactly <c>N1</c> or <c>N2</c>.</param>
@@ -139,6 +162,32 @@ public sealed record DiscrepancyValue
     /// </summary>
     public override string ToString() =>
         IsValid ? $"{{valid:{ValidRule}}}" : Text ?? "(absent)";
+
+    /// <summary>
+    /// True when <paramref name="other"/> has the same <see cref="ValidRule"/> and <see cref="Text"/>,
+    /// compared ordinally. Declared explicitly so the cached <see cref="CanonicalKey"/>, which is derived
+    /// from those two, takes no part in equality.
+    /// </summary>
+    /// <param name="other">The value to compare with; null is never equal.</param>
+    public bool Equals(DiscrepancyValue? other) =>
+        other is not null
+        && (ReferenceEquals(this, other)
+            || (string.Equals(ValidRule, other.ValidRule, StringComparison.Ordinal)
+                && string.Equals(Text, other.Text, StringComparison.Ordinal)));
+
+    /// <summary>Returns a hash of <see cref="ValidRule"/> and <see cref="Text"/>, consistent with <see cref="Equals(DiscrepancyValue?)"/>.</summary>
+    public override int GetHashCode() => HashCode.Combine(ValidRule, Text);
+
+    private string WriteCanonicalKey()
+    {
+        using var buffer = new MemoryStream();
+        using (var writer = new Utf8JsonWriter(buffer, TokenWriterOptions))
+        {
+            ToToken().WriteTo(writer);
+        }
+
+        return Encoding.UTF8.GetString(buffer.GetBuffer(), 0, (int)buffer.Length);
+    }
 }
 
 /// <summary>
@@ -163,14 +212,6 @@ public sealed record DiscrepancyValue
 /// <param name="Observed">The observed side's value at <paramref name="Path"/>.</param>
 public sealed record Discrepancy(string Path, string Kind, DiscrepancyValue Baseline, DiscrepancyValue Observed)
 {
-    // Token texts for ordering use the same relaxed, fixed encoder as the canonical signature list, so
-    // the order here and the order the signature is computed in agree on non-ASCII literals.
-    private static readonly JsonWriterOptions TokenWriterOptions = new()
-    {
-        Indented = false,
-        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-    };
-
     /// <summary>Where the difference is; never empty.</summary>
     public string Path { get; init; } = string.IsNullOrEmpty(Path)
         ? throw new ArgumentException("A discrepancy needs a non-empty path.", nameof(Path))
@@ -207,17 +248,6 @@ public sealed record Discrepancy(string Path, string Kind, DiscrepancyValue Base
         ["observed"] = Observed.ToToken(),
     };
 
-    private static string TokenText(DiscrepancyValue value)
-    {
-        using var buffer = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(buffer, TokenWriterOptions))
-        {
-            value.ToToken().WriteTo(writer);
-        }
-
-        return Encoding.UTF8.GetString(buffer.GetBuffer(), 0, (int)buffer.Length);
-    }
-
     private sealed class CanonicalComparer : IComparer<Discrepancy>
     {
         public int Compare(Discrepancy? x, Discrepancy? y)
@@ -249,8 +279,8 @@ public sealed record Discrepancy(string Path, string Kind, DiscrepancyValue Base
                 return order;
             }
 
-            order = string.CompareOrdinal(TokenText(x.Baseline), TokenText(y.Baseline));
-            return order != 0 ? order : string.CompareOrdinal(TokenText(x.Observed), TokenText(y.Observed));
+            order = string.CompareOrdinal(x.Baseline.CanonicalKey, y.Baseline.CanonicalKey);
+            return order != 0 ? order : string.CompareOrdinal(x.Observed.CanonicalKey, y.Observed.CanonicalKey);
         }
     }
 }
@@ -277,7 +307,8 @@ public sealed record ResponseSnapshot(int? Status, string? ContentType, ReadOnly
 /// <param name="Equivalent">True when <paramref name="Discrepancies"/> is empty.</param>
 /// <param name="Discrepancies">Every difference found, in <see cref="Discrepancy.CanonicalOrder"/>.</param>
 /// <param name="WellFormed">
-/// True when the OBSERVED body is well formed for its surface: JSON that parses for REST, and a SOAP 1.1
+/// True when the OBSERVED body is well formed for its surface: after one leading UTF-8 byte-order mark is
+/// removed, its bytes are valid UTF-8 and the text parses as JSON for REST, or loads as a SOAP 1.1
 /// envelope with a <c>Body</c> for SOAP. Demo acceptance judges a non-equivalent operation by it.
 /// </param>
 /// <param name="StatusMatched">True when the observed status code equals the baseline's.</param>
@@ -294,8 +325,25 @@ public sealed record ResponseComparison(
 /// normalisation rules only decide pairwise equality inside the semantic comparers.
 /// </summary>
 /// <remarks>
+/// <para>
+/// Every body is decoded strictly: one leading UTF-8 byte-order mark is removed and the remaining bytes
+/// must be valid UTF-8. A body that is not has no text, so it neither parses nor is well formed. It is
+/// never decoded with replacement characters, which would let different bytes, or a corrupt body and one
+/// that holds U+FFFD, compare equal. The <c>getPhoto</c> bodies are still compared as raw bytes, mark
+/// included.
+/// </para>
+/// <para>
+/// When the two bodies do not both parse, they are compared exactly as one value at <c>$body</c>: two
+/// decoded texts ordinally, otherwise the bytes after the mark. Identical bytes give no discrepancy, a
+/// decoded text against bytes that are not valid UTF-8 gives a <c>type</c> discrepancy, and two different
+/// byte sequences that are not valid UTF-8 give a <c>value</c> discrepancy. Each side's literal is its
+/// exact text when it decodes and the lowercase hexadecimal of its bytes after the mark when it does not,
+/// so, against one baseline, two different observed bodies never yield the same discrepancy list.
+/// </para>
+/// <para>
 /// The instance holds only immutable state and performs no I/O, so concurrent <see cref="Compare"/>
-/// calls are safe.
+/// calls are safe, and no observed body makes <see cref="Compare"/> throw.
+/// </para>
 /// </remarks>
 /// <param name="catalogue">The operation catalogue the semantic comparers type bodies by.</param>
 /// <param name="normaliser">The N1/N2 normaliser the semantic comparers apply at targeted positions.</param>
@@ -400,20 +448,30 @@ public sealed class ResponseComparer(OperationCatalogue catalogue, Normaliser no
         ResponseSnapshot observed,
         List<Discrepancy> discrepancies)
     {
-        var baselineText = DecodeBody(baseline.Body.Span);
-        var observedText = DecodeBody(observed.Body.Span);
+        var baselineBody = WithoutBom(baseline.Body.Span);
+        var observedBody = WithoutBom(observed.Body.Span);
+        var baselineText = DecodeBody(baselineBody);
+        var observedText = DecodeBody(observedBody);
 
-        // For REST, a body is well formed exactly when it parses as JSON; the literal null parses.
-        var baselineWellFormed = IsJson(baselineText);
-        var observedWellFormed = IsJson(observedText);
+        // For REST, a body is well formed exactly when it decodes and parses as JSON; the literal null parses.
+        // Each body is parsed once, and the JSON comparer walks the same documents.
+        using var baselineDocument = baselineText is null ? null : JsonSemanticComparer.TryParse(baselineText);
+        using var observedDocument = observedText is null ? null : JsonSemanticComparer.TryParse(observedText);
+        var baselineWellFormed = baselineDocument is not null;
+        var observedWellFormed = observedDocument is not null;
 
-        if (baselineWellFormed && observedWellFormed)
+        if (baselineDocument is not null && observedDocument is not null)
         {
-            discrepancies.AddRange(_jsonComparer.Compare(baselineText, observedText, RestDeclaredType(operation, baseline.Status)));
+            discrepancies.AddRange(_jsonComparer.Compare(
+                baselineText!,
+                baselineDocument,
+                observedText!,
+                observedDocument,
+                RestDeclaredType(operation, baseline.Status)));
         }
         else
         {
-            AddExactTextDifference(baselineText, observedText, discrepancies);
+            AddExactBodyDifference(baselineBody, baselineText, observedBody, observedText, discrepancies);
         }
 
         AddMalformed(baselineWellFormed, observedWellFormed, discrepancies);
@@ -430,26 +488,30 @@ public sealed class ResponseComparer(OperationCatalogue catalogue, Normaliser no
         ResponseSnapshot observed,
         List<Discrepancy> discrepancies)
     {
-        var baselineText = DecodeBody(baseline.Body.Span);
-        var observedText = DecodeBody(observed.Body.Span);
+        var baselineBody = WithoutBom(baseline.Body.Span);
+        var observedBody = WithoutBom(observed.Body.Span);
+        var baselineText = DecodeBody(baselineBody);
+        var observedText = DecodeBody(observedBody);
 
-        var baselineDocument = TryLoadXml(baselineText);
-        var observedDocument = TryLoadXml(observedText);
-        var baselineWellFormed = IsSoapEnvelope(baselineDocument);
-        var observedWellFormed = IsSoapEnvelope(observedDocument);
+        // A body that does not decode does not load, so it is never a well-formed envelope, getPhoto included.
+        // Each body is loaded once, and the XML comparer walks the same trees.
+        var baselineRoot = baselineText is null ? null : XmlSemanticComparer.TryLoadRoot(baselineText);
+        var observedRoot = observedText is null ? null : XmlSemanticComparer.TryLoadRoot(observedText);
+        var baselineWellFormed = IsSoapEnvelope(baselineRoot);
+        var observedWellFormed = IsSoapEnvelope(observedRoot);
 
         if (string.Equals(operation.JadeMethod, BinaryComparedSoapMethod, StringComparison.Ordinal))
         {
             // The raw bytes as received, BOM included: no rule and no canonicalisation applies.
             discrepancies.AddRange(BinaryComparer.Compare(baseline.Body.Span, observed.Body.Span));
         }
-        else if (baselineDocument is not null && observedDocument is not null)
+        else if (baselineRoot is not null && observedRoot is not null)
         {
-            discrepancies.AddRange(_xmlComparer.Compare(baselineText, observedText, XmlComparisonContext.SoapResponse(operation)));
+            discrepancies.AddRange(_xmlComparer.Compare(baselineRoot, observedRoot, XmlComparisonContext.SoapResponse(operation)));
         }
         else
         {
-            AddExactTextDifference(baselineText, observedText, discrepancies);
+            AddExactBodyDifference(baselineBody, baselineText, observedBody, observedText, discrepancies);
         }
 
         AddMalformed(baselineWellFormed, observedWellFormed, discrepancies);
@@ -500,62 +562,76 @@ public sealed class ResponseComparer(OperationCatalogue catalogue, Normaliser no
     private static string? Unquote(string? value) =>
         value is { Length: >= 2 } && value[0] == '"' && value[^1] == '"' ? value[1..^1] : value;
 
-    /// <summary>Removes one leading UTF-8 byte-order mark and decodes the rest as UTF-8.</summary>
-    private static string DecodeBody(ReadOnlySpan<byte> body)
+    /// <summary>Returns <paramref name="body"/> without one leading UTF-8 byte-order mark, when it starts with one.</summary>
+    private static ReadOnlySpan<byte> WithoutBom(ReadOnlySpan<byte> body)
     {
         ReadOnlySpan<byte> utf8Bom = [0xEF, 0xBB, 0xBF];
-        return Encoding.UTF8.GetString(body.StartsWith(utf8Bom) ? body[utf8Bom.Length..] : body);
+        return body.StartsWith(utf8Bom) ? body[utf8Bom.Length..] : body;
     }
 
-    private static bool IsJson(string text)
-    {
-        try
-        {
-            using var document = JsonDocument.Parse(text);
-            return true;
-        }
-        catch (JsonException)
-        {
-            return false;
-        }
-    }
+    /// <summary>
+    /// Decodes <paramref name="body"/> strictly as UTF-8; null when it is not valid UTF-8. Invalid bytes are
+    /// never replaced, so the text, when there is one, is a lossless image of the bytes.
+    /// </summary>
+    private static string? DecodeBody(ReadOnlySpan<byte> body) =>
+        Utf8.IsValid(body) ? Encoding.UTF8.GetString(body) : null;
 
-    /// <summary>Loads <paramref name="text"/> as XML with DTDs prohibited and no resolver; null when it does not load.</summary>
-    private static XDocument? TryLoadXml(string text)
-    {
-        var settings = new XmlReaderSettings
-        {
-            DtdProcessing = DtdProcessing.Prohibit,
-            XmlResolver = null,
-        };
-
-        try
-        {
-            using var reader = XmlReader.Create(new StringReader(text), settings);
-            return XDocument.Load(reader);
-        }
-        catch (XmlException)
-        {
-            return null;
-        }
-    }
-
-    private static bool IsSoapEnvelope(XDocument? document) =>
-        document?.Root is { } root
+    /// <summary>True when <paramref name="root"/> is a SOAP 1.1 <c>Envelope</c> with a <c>Body</c> child.</summary>
+    private static bool IsSoapEnvelope(XElement? root) =>
+        root is not null
         && root.Name == SoapEnvelope
         && root.Element(SoapBody) is not null;
 
-    private static void AddExactTextDifference(string baselineText, string observedText, List<Discrepancy> discrepancies)
+    /// <summary>
+    /// Compares two bodies that do not both parse, exactly, as one value at <c>$body</c>. Two decoded texts
+    /// are compared ordinally and differ by <c>value</c>. When either side does not decode, the bytes after
+    /// the byte-order mark are compared: identical bytes give no discrepancy, a decoded text against bytes
+    /// that are not valid UTF-8 differs by <c>type</c>, and two such byte sequences differ by <c>value</c>.
+    /// </summary>
+    /// <param name="baselineBody">The baseline bytes after the byte-order mark.</param>
+    /// <param name="baselineText">The decoded baseline text; null when the bytes are not valid UTF-8.</param>
+    /// <param name="observedBody">The observed bytes after the byte-order mark.</param>
+    /// <param name="observedText">The decoded observed text; null when the bytes are not valid UTF-8.</param>
+    /// <param name="discrepancies">The list the discrepancy, if any, is added to.</param>
+    private static void AddExactBodyDifference(
+        ReadOnlySpan<byte> baselineBody,
+        string? baselineText,
+        ReadOnlySpan<byte> observedBody,
+        string? observedText,
+        List<Discrepancy> discrepancies)
     {
-        if (!string.Equals(baselineText, observedText, StringComparison.Ordinal))
+        if (baselineText is not null && observedText is not null)
         {
-            discrepancies.Add(new Discrepancy(
-                BodyPath,
-                DiscrepancyKinds.Value,
-                DiscrepancyValue.Literal(baselineText),
-                DiscrepancyValue.Literal(observedText)));
+            if (!string.Equals(baselineText, observedText, StringComparison.Ordinal))
+            {
+                discrepancies.Add(new Discrepancy(
+                    BodyPath,
+                    DiscrepancyKinds.Value,
+                    DiscrepancyValue.Literal(baselineText),
+                    DiscrepancyValue.Literal(observedText)));
+            }
+
+            return;
         }
+
+        if (baselineBody.SequenceEqual(observedBody))
+        {
+            return;
+        }
+
+        discrepancies.Add(new Discrepancy(
+            BodyPath,
+            (baselineText is null) == (observedText is null) ? DiscrepancyKinds.Value : DiscrepancyKinds.Type,
+            BodyLiteral(baselineBody, baselineText),
+            BodyLiteral(observedBody, observedText)));
     }
+
+    /// <summary>
+    /// A body's literal: its exact text when it decodes, otherwise the lowercase hexadecimal of its bytes
+    /// after the byte-order mark, which keeps every byte.
+    /// </summary>
+    private static DiscrepancyValue BodyLiteral(ReadOnlySpan<byte> body, string? text) =>
+        DiscrepancyValue.Literal(text ?? Convert.ToHexStringLower(body));
 
     private static void AddMalformed(bool baselineWellFormed, bool observedWellFormed, List<Discrepancy> discrepancies)
     {

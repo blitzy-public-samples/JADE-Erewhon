@@ -173,6 +173,25 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
             ];
         }
 
+        return Compare(baselineRoot, observedRoot, context);
+    }
+
+    /// <summary>
+    /// Compares two bodies that have already been loaded, so a caller that loaded them to judge their
+    /// well-formedness does not load them again. The result is the one
+    /// <see cref="Compare(string, string, XmlComparisonContext)"/> returns for the same two texts when both load.
+    /// </summary>
+    /// <param name="baselineRoot">The baseline root element as <see cref="TryLoadRoot"/> returned it; it is not modified.</param>
+    /// <param name="observedRoot">The observed root element as <see cref="TryLoadRoot"/> returned it; it is not modified.</param>
+    /// <param name="context">What the bodies are, which types their elements.</param>
+    /// <returns>Every discrepancy in <see cref="Discrepancy.CanonicalOrder"/>; empty when the bodies are equal.</returns>
+    /// <exception cref="ArgumentNullException">An argument is null.</exception>
+    internal IReadOnlyList<Discrepancy> Compare(XElement baselineRoot, XElement observedRoot, XmlComparisonContext context)
+    {
+        ArgumentNullException.ThrowIfNull(baselineRoot);
+        ArgumentNullException.ThrowIfNull(observedRoot);
+        ArgumentNullException.ThrowIfNull(context);
+
         if (baselineRoot.Name != observedRoot.Name)
         {
             return
@@ -194,9 +213,9 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
     /// Loads <paramref name="text"/> with whitespace preserved, DTDs prohibited and no resolver, and returns
     /// its root element; null when it does not load. Whitespace must be preserved: the default load drops
     /// whitespace-only text even inside leaf elements, which would make <c>&lt;a&gt; &lt;/a&gt;</c> equal
-    /// <c>&lt;a/&gt;</c>.
+    /// <c>&lt;a/&gt;</c>. The one load every XML body comparison uses, well-formedness checks included.
     /// </summary>
-    private static XElement? TryLoadRoot(string text)
+    internal static XElement? TryLoadRoot(string text)
     {
         var settings = new XmlReaderSettings
         {

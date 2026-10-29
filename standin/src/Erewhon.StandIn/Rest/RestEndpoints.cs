@@ -130,6 +130,8 @@ public static class RestEndpoints
             }
 
             OperationDescriptor operation = match.Operation;
+            RequestLogEntry log = RequestLogEntry.For(context);
+            log.Operation = operation.Id;
             CancellationToken aborted = context.RequestAborted;
             try
             {
@@ -150,6 +152,7 @@ public static class RestEndpoints
             }
             catch (Exception exception) when (aborted.IsCancellationRequested && exception is OperationCanceledException or IOException)
             {
+                log.Outcome = RequestOutcome.Aborted;
                 _logger.LogDebug("REST {OperationId}: the client aborted the request.", operation.Id);
             }
             catch (BadHttpRequestException exception)
@@ -175,6 +178,7 @@ public static class RestEndpoints
             }
             catch (Exception exception)
             {
+                log.Outcome = RequestOutcome.Failed;
                 _logger.LogError(
                     exception,
                     "REST {OperationId} failed unexpectedly; answering {Status} with null.",

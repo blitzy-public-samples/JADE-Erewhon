@@ -83,6 +83,33 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
             ];
         }
 
+        return Compare(baseline, baselineDocument, observed, observedDocument, declaredType);
+    }
+
+    /// <summary>
+    /// Compares two bodies that have already been parsed, so a caller that parsed them to judge their
+    /// well-formedness does not parse them again. The result is the one
+    /// <see cref="Compare(string, string, string)"/> returns for the same two texts when both parse.
+    /// </summary>
+    /// <param name="baseline">The baseline body text that <paramref name="baselineDocument"/> was parsed from.</param>
+    /// <param name="baselineDocument">The baseline body as <see cref="TryParse"/> returned it; the caller keeps ownership.</param>
+    /// <param name="observed">The observed body text that <paramref name="observedDocument"/> was parsed from.</param>
+    /// <param name="observedDocument">The observed body as <see cref="TryParse"/> returned it; the caller keeps ownership.</param>
+    /// <param name="declaredType">The catalogue DTO or array name the root is declared as; null compares untyped.</param>
+    /// <returns>The discrepancies in walk order, empty when the bodies are equivalent.</returns>
+    /// <exception cref="ArgumentNullException">A text or a document is null.</exception>
+    internal IReadOnlyList<Discrepancy> Compare(
+        string baseline,
+        JsonDocument baselineDocument,
+        string observed,
+        JsonDocument observedDocument,
+        string? declaredType)
+    {
+        ArgumentNullException.ThrowIfNull(baseline);
+        ArgumentNullException.ThrowIfNull(baselineDocument);
+        ArgumentNullException.ThrowIfNull(observed);
+        ArgumentNullException.ThrowIfNull(observedDocument);
+
         var baselineRoot = baselineDocument.RootElement;
         var observedRoot = observedDocument.RootElement;
 
@@ -280,6 +307,11 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
     }
 
     /// <summary>Compares two arrays: a count difference first, then the common prefix item by item, in order.</summary>
+    /// <remarks>
+    /// The two arrays are enumerated in lockstep rather than indexed: a <see cref="JsonElement"/> index
+    /// lookup rescans every preceding item of an array that holds objects or arrays, which would make
+    /// the walk of a DTO collection quadratic in its item count.
+    /// </remarks>
     private void WalkArray(string path, JsonElement baseline, JsonElement observed, string? type, List<Discrepancy> discrepancies)
     {
         var itemType = type is not null && _catalogue.TryGetArray(type, out var array) ? array.ItemType : null;
@@ -291,10 +323,11 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
             discrepancies.Add(new Discrepancy(path, DiscrepancyKinds.Length, CountValue(baselineCount), CountValue(observedCount)));
         }
 
-        var common = Math.Min(baselineCount, observedCount);
-        for (var index = 0; index < common; index++)
+        using var baselineItems = baseline.EnumerateArray();
+        using var observedItems = observed.EnumerateArray();
+        for (var index = 0; baselineItems.MoveNext() && observedItems.MoveNext(); index++)
         {
-            Walk(IndexPath(path, index), baseline[index], observed[index], itemType, discrepancies);
+            Walk(IndexPath(path, index), baselineItems.Current, observedItems.Current, itemType, discrepancies);
         }
     }
 
@@ -418,8 +451,11 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
         return true;
     }
 
-    /// <summary>Parses with the default options (no comments, no trailing commas); null when the text is not JSON.</summary>
-    private static JsonDocument? TryParse(string text)
+    /// <summary>
+    /// Parses with the default options (no comments, no trailing commas); null when the text is not JSON.
+    /// The one parse every JSON body comparison uses, well-formedness checks included.
+    /// </summary>
+    internal static JsonDocument? TryParse(string text)
     {
         try
         {

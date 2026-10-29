@@ -133,8 +133,10 @@ public static class KnownLimitationIds
 /// </para>
 /// <para>
 /// Only the execution agent edits the file; this type has no API that writes, appends to or
-/// regenerates it. An instance is immutable once constructed: lookups are built from the entries as
-/// they stand at construction, so concurrent reads are safe.
+/// regenerates it. An instance is immutable once constructed: it keeps its own copy of each entry,
+/// with a read-only snapshot of the entry's matches taken at construction, and builds its lookups from
+/// those copies. Later changes to a caller's match lists therefore affect neither
+/// <see cref="Entries"/> nor the lookups, and concurrent reads are safe.
 /// </para>
 /// </remarks>
 public sealed class KnownLimitationsRegister
@@ -167,6 +169,10 @@ public sealed class KnownLimitationsRegister
         AllowDuplicateProperties = false,
     };
 
+    // Strict, because lenient decoding turns every invalid byte sequence into the same U+FFFD text, so
+    // two different item ids or natures could load as one string and change what matches exactly.
+    private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+
     // Keyed on the pair alone; string equality in a value tuple is ordinal.
     private readonly Dictionary<(string ItemId, string Nature), RegisterEntry> _byMatch;
     private readonly Dictionary<string, RegisterEntry> _byId;
@@ -178,6 +184,10 @@ public sealed class KnownLimitationsRegister
     /// <see cref="RegisterEntry.Matches"/>, a non-negative <see cref="RegisterEntry.Attempts"/>, and
     /// matches whose item id and nature are non-blank. Values are kept exactly, untrimmed. When two
     /// entries list the same pair, the earlier one is the entry <see cref="FindEntry"/> returns.
+    /// Each entry is stored as a copy holding a read-only snapshot of its matches, so
+    /// <see cref="Entries"/>, <see cref="FindEntry"/> and <see cref="FindById"/> return the register's
+    /// copies, never the given instances, and later changes to a given entry's match list affect
+    /// neither the entries nor the lookups.
     /// </summary>
     /// <param name="entries">The entries, in file order.</param>
     /// <exception cref="ArgumentNullException"><paramref name="entries"/> is null.</exception>
@@ -193,13 +203,19 @@ public sealed class KnownLimitationsRegister
         {
             var index = ordered.Count;
             var matches = Validate(entry, index, byId);
-            byId.Add(entry.Id, entry);
+
+            // The caller's match list may be an array or list it changes later, even behind a read-only
+            // wrapper. The register stores its own entry, built over the validated copy, so the matches an
+            // entry shows are always the pairs the lookups hold. RegisterMatch is immutable, so a shallow
+            // copy suffices.
+            var stored = entry with { Matches = Array.AsReadOnly(matches) };
+            byId.Add(stored.Id, stored);
             foreach (var match in matches)
             {
-                byMatch.TryAdd((match.ItemId, match.Nature), entry);
+                byMatch.TryAdd((match.ItemId, match.Nature), stored);
             }
 
-            ordered.Add(entry);
+            ordered.Add(stored);
         }
 
         Entries = ordered.AsReadOnly();
@@ -213,18 +229,40 @@ public sealed class KnownLimitationsRegister
     /// <summary>Every entry, in file order.</summary>
     public IReadOnlyList<RegisterEntry> Entries { get; }
 
-    /// <summary>Reads and parses a register file, as <see cref="Parse"/> does.</summary>
+    /// <summary>
+    /// Reads a register file as UTF-8, with or without one leading byte order mark, and parses it as
+    /// <see cref="Parse"/> does. Bytes that are not valid UTF-8 are rejected, never replaced.
+    /// </summary>
     /// <param name="path">The file path, normally <c>harness/config/known-limitations.json</c>.</param>
     /// <returns>The register.</returns>
     /// <exception cref="ArgumentException"><paramref name="path"/> is null or empty.</exception>
     /// <exception cref="FileNotFoundException">The file does not exist.</exception>
     /// <exception cref="DirectoryNotFoundException">A directory on the path does not exist.</exception>
-    /// <exception cref="InvalidDataException">The content is not JSON or not a valid register; the message names the path.</exception>
+    /// <exception cref="InvalidDataException">
+    /// The content is not valid UTF-8, not JSON or not a valid register as <see cref="Parse"/> describes;
+    /// the message names the path.
+    /// </exception>
     public static KnownLimitationsRegister Load(string path)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
 
-        var json = File.ReadAllText(path, Encoding.UTF8);
+        var bytes = File.ReadAllBytes(path);
+        string json;
+        try
+        {
+            json = StrictUtf8.GetString(bytes);
+        }
+        catch (DecoderFallbackException exception)
+        {
+            throw new InvalidDataException($"{path}: {ErrorPrefix}not valid UTF-8: {exception.Message}", exception);
+        }
+
+        // The decoder keeps a byte order mark as U+FEFF, which only a leading EF BB BF produces at index 0.
+        if (json.StartsWith('\uFEFF'))
+        {
+            json = json[1..];
+        }
+
         try
         {
             return Parse(json);
@@ -242,12 +280,17 @@ public sealed class KnownLimitationsRegister
     /// null (no matches) or an array of objects with string <c>itemId</c> and <c>nature</c>;
     /// <c>attempts</c> is absent (0) or a non-negative integer; <c>reason</c> and <c>actionTaken</c> are
     /// absent or null (empty) or strings. Member names are matched exactly, unknown members are
-    /// ignored, and the entries are then validated as the constructor does.
+    /// ignored, and the entries are then validated as the constructor does. The text, every member
+    /// name and every string read must be valid UTF-16: an unpaired surrogate, raw or as a
+    /// <c>\u</c> escape, is an error, never replaced.
     /// </summary>
     /// <param name="json">The register text; comments and trailing commas are allowed, repeated members are not.</param>
     /// <returns>The register.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="json"/> is null.</exception>
-    /// <exception cref="InvalidDataException">The text is not JSON or breaks a condition above; the message names the entry index and id.</exception>
+    /// <exception cref="InvalidDataException">
+    /// The text is not valid UTF-16, is not JSON or breaks a condition above; for an entry, the message
+    /// names its index, its id when that could be read, and the member.
+    /// </exception>
     public static KnownLimitationsRegister Parse(string json)
     {
         ArgumentNullException.ThrowIfNull(json);
@@ -260,6 +303,18 @@ public sealed class KnownLimitationsRegister
         catch (JsonException exception)
         {
             throw new InvalidDataException($"{ErrorPrefix}not valid JSON: {exception.Message}", exception);
+        }
+        catch (ArgumentException exception)
+        {
+            // json is not null and the options are fixed, so this is text holding an unpaired surrogate,
+            // which cannot be transcoded to UTF-8 for parsing.
+            throw new InvalidDataException($"{ErrorPrefix}not valid UTF-16 text: {exception.Message}", exception);
+        }
+        catch (InvalidOperationException exception)
+        {
+            // Rejecting repeated members unescapes every escaped member name while parsing, so a lone
+            // surrogate escape in a name fails here; one in a string value fails only when it is read.
+            throw new InvalidDataException($"{ErrorPrefix}a member name is not valid UTF-16 text: {exception.Message}", exception);
         }
 
         List<RegisterEntry> entries;
@@ -484,7 +539,7 @@ public sealed class KnownLimitationsRegister
         }
 
         return value.ValueKind == JsonValueKind.String
-            ? value.GetString()!
+            ? ReadString(value, index, id, member)
             : throw InvalidEntry(index, id, $"'{member}' must be a string, but is {value.ValueKind}.");
     }
 
@@ -496,15 +551,32 @@ public sealed class KnownLimitationsRegister
         }
 
         return value.ValueKind == JsonValueKind.String
-            ? value.GetString()!
+            ? ReadString(value, index, id, key)
             : throw InvalidEntry(index, id, $"'{key}' must be a string or null, but is {value.ValueKind}.");
     }
 
-    private static InvalidDataException InvalidEntry(int index, string? id, string message) =>
-        Invalid(string.IsNullOrWhiteSpace(id)
-            ? $"{EntriesKey}[{index}]: {message}"
-            : $"{EntriesKey}[{index}] ({id}): {message}");
+    // JSON can escape a lone surrogate (\uD800 or \uDC00): the document parses, but the string has no
+    // UTF-16 value, and reading it throws. When the id itself is that string, id is still null here.
+    private static string ReadString(JsonElement value, int index, string? id, string member)
+    {
+        try
+        {
+            return value.GetString()!;
+        }
+        catch (InvalidOperationException exception)
+        {
+            throw InvalidEntry(index, id, $"'{member}' is not valid UTF-16 text: {exception.Message}", exception);
+        }
+    }
 
-    private static InvalidDataException Invalid(string message) => new(ErrorPrefix + message);
+    private static InvalidDataException InvalidEntry(int index, string? id, string message, Exception? innerException = null) =>
+        Invalid(
+            string.IsNullOrWhiteSpace(id)
+                ? $"{EntriesKey}[{index}]: {message}"
+                : $"{EntriesKey}[{index}] ({id}): {message}",
+            innerException);
+
+    private static InvalidDataException Invalid(string message, Exception? innerException = null) =>
+        new(ErrorPrefix + message, innerException);
 }
 

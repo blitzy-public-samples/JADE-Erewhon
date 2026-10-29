@@ -123,8 +123,9 @@ public sealed partial class CaseMatrix
     public string Description { get; }
 
     /// <summary>
-    /// Every case in matrix order, which is the fixed replay order of AAP 0.7.3: every read runs before any
-    /// write, and the empty-state case is last.
+    /// Every case in matrix order, which is the fixed replay order of AAP 0.7.3: every seed-state read runs
+    /// before any write, and the empty-state <c>getCompany</c> read is last, after the writes, isolated from
+    /// them by the reset to the empty state before it and the seed reset after it.
     /// </summary>
     public IReadOnlyList<CaseDefinition> Cases { get; }
 

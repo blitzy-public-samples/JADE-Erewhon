@@ -12,7 +12,8 @@ namespace Erewhon.Harness.Checks;
 /// The outcome of one contract check (OpenAPI drift or WSDL contract): the check row for the report, the
 /// failing item when the check did not pass, and the discrepancies behind a <c>d:&lt;signature&gt;</c>
 /// nature, which the caller writes to <c>artifacts/discrepancies/&lt;itemId&gt;.json</c> through
-/// <see cref="DiscrepancySignature.ToArtifact"/>.
+/// <see cref="CanonicalDiscrepancies.ToArtifact(FailureItem)"/> on
+/// <see cref="Canonical"/>, so the list is not prepared a second time.
 /// </summary>
 /// <param name="Result">The check row keyed by its <see cref="CheckNames"/> value.</param>
 /// <param name="Failure">
@@ -30,6 +31,12 @@ public sealed record ContractCheckResult(CheckResult Result, FailureItem? Failur
     /// <summary>The differences behind a <c>d:</c> nature; never null.</summary>
     public IReadOnlyList<Discrepancy> Discrepancies { get; init; } =
         Discrepancies ?? throw new ArgumentNullException(nameof(Discrepancies));
+
+    /// <summary>
+    /// The prepared list behind a <c>d:</c> nature, whose <see cref="CanonicalDiscrepancies.Entries"/> are
+    /// <see cref="Discrepancies"/> and whose signature is the nature's; null for every other result.
+    /// </summary>
+    public CanonicalDiscrepancies? Canonical { get; init; }
 }
 
 /// <summary>
@@ -50,7 +57,10 @@ public sealed record ContractCheckResult(CheckResult Result, FailureItem? Failur
 /// </list>
 /// <para>The check writes only <c>artifacts/openapi/live.json</c>. It never creates, rewrites or regenerates
 /// the checked-in contract, which only <c>harness export-openapi</c> writes, and never touches
-/// <c>baseline/**</c>. A failure to save the artifact is reported in the detail and never thrown.</para>
+/// <c>baseline/**</c>. The discrepancy artifact is written by the caller from
+/// <see cref="ContractCheckResult.Canonical"/> through
+/// <see cref="CanonicalDiscrepancies.ToArtifact(FailureItem)"/>. A failure to save the
+/// artifact is reported in the detail and never thrown.</para>
 /// <para>The instance keeps no per-run state, but concurrent runs would race on the artifact file, so one
 /// run at a time is expected. The <see cref="CaseRunner"/> belongs to the caller and is not disposed here.</para>
 /// </remarks>
@@ -129,7 +139,7 @@ public sealed class OpenApiDriftCheck(HarnessOptions options, JsonSemanticCompar
             return Failed(
                 FailureItemIds.Missing,
                 Join($"checked-in {contractName} is absent; replay never creates it, harness export-openapi generates it", artifactNote),
-                []);
+                canonical: null);
         }
 
         var discrepancies = CompareDocuments(checkedIn, response.Body);
@@ -141,14 +151,16 @@ public sealed class OpenApiDriftCheck(HarnessOptions options, JsonSemanticCompar
                 []);
         }
 
-        var first = discrepancies[0];
+        // Sorted, written and hashed once; the caller writes the artifact from the same result.
+        var canonical = DiscrepancySignature.Prepare(discrepancies);
+        var first = canonical.Entries[0];
         var summary = string.Create(
             CultureInfo.InvariantCulture,
             $"{discrepancies.Count} difference{(discrepancies.Count == 1 ? "" : "s")} from {contractName}; first at {first.Path} ({first.Kind})");
         return Failed(
-            FailureItemIds.Diff(DiscrepancySignature.Compute(discrepancies)),
+            FailureItemIds.Diff(canonical.Signature),
             Join(summary, artifactNote),
-            discrepancies.AsReadOnly());
+            canonical);
     }
 
     private static ContractCheckResult NotRun(string detail) =>
@@ -157,11 +169,14 @@ public sealed class OpenApiDriftCheck(HarnessOptions options, JsonSemanticCompar
             new FailureItem(FailureItemIds.OpenApiDrift, FailureItemIds.NotRun, Detail: detail),
             []);
 
-    private static ContractCheckResult Failed(string nature, string detail, IReadOnlyList<Discrepancy> discrepancies) =>
+    private static ContractCheckResult Failed(string nature, string detail, CanonicalDiscrepancies? canonical) =>
         new(
             new CheckResult(CheckNames.OpenApiDrift, CheckOutcomes.Fail, Cases: 1, Passed: 0, detail),
             new FailureItem(FailureItemIds.OpenApiDrift, nature, Detail: detail),
-            discrepancies);
+            canonical?.Entries ?? [])
+        {
+            Canonical = canonical,
+        };
 
     private static string Join(string detail, string? note) => note is null ? detail : $"{detail}; {note}";
 
@@ -188,7 +203,7 @@ public sealed class OpenApiDriftCheck(HarnessOptions options, JsonSemanticCompar
             discrepancies = [.. _comparer.Compare(baselineText, observedText, declaredType: null)];
         }
 
-        discrepancies.Sort(Discrepancy.CanonicalOrder);
+        // Unsorted: DiscrepancySignature.Prepare puts the list into canonical order once.
         return discrepancies;
     }
 

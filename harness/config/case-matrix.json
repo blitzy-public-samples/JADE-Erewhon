@@ -80,7 +80,7 @@
         "bodyText": null
       },
       "expectedStatus": 200,
-      "description": "GET /allSales returns 200 with a DTOSaleArray of the 19 seeded retail sales and the 4 tender sales closed at load (items 70, 80, 92, 106) in category-prefix and code-number order [Erewhon/ErehwhonExternalInterfacesSchema.scm:2410-2431; Erewhon/DataFiles/RetailSales.txt:1-19; Erewhon/ErewhonModelSchema.scm:5205-5209]."
+      "description": "GET /allSales returns 200 with a DTOSaleArray of the 19 seeded retail sales and the 1 tender sale closed at load (PROP/70) in category-prefix and code-number order; the tenders on items 80, 92 and 106 are rejected at load as already closed (KL-STANDIN-TENDER-LOAD) [Erewhon/ErehwhonExternalInterfacesSchema.scm:2410-2431; Erewhon/DataFiles/RetailSales.txt:1-19; Erewhon/DataFiles/Tenders.txt:121-140; Erewhon/ErewhonModelSchema.scm:5205-5209, 13910-13914]."
     },
     {
       "id": "REST-getClient-01",
