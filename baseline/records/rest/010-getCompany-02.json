@@ -1,0 +1,22 @@
+{
+  "order": 10,
+  "caseId": "REST-getCompany-02",
+  "operation": "Rest.getCompany",
+  "kind": "success",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "GET",
+    "pathAndQuery": "/company.json",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 200,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"guid\":\"{00000000-0000-4000-8000-000000000001}\",\"city\":\"Christchurch\",\"country\":\"New Zealand\",\"email\":\"discover@jadeworld.com\",\"fax\":\"(64) 3 555 1267\",\"name\":\"Erewhon Investments Inc\",\"phone\":\"(64) 3 555 4519\",\"street\":\"Erewhon House\",\"website\":\"www.jadeworld.com\"}",
+    "bodySha256": "9de853d8f0fe52b80f2020da7a566499011c31fb5c9fae5c68de6a42ab347190",
+    "bodyFile": null
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "order": 1,
+  "caseId": "REST-getAgent-01",
+  "operation": "Rest.getAgent",
+  "kind": "success",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "GET",
+    "pathAndQuery": "/agent/Hank%20Williams",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 200,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"guid\":\"{00000000-0000-4000-8000-00000000002a}\",\"city\":\"Los Angeles\",\"country\":\"United States of America\",\"email\":\"hank@it.com\",\"fax\":\"1 8 6354 7364\",\"name\":\"Hank Williams\",\"phone\":\"1 8 2938 4756\",\"street\":\"9127 Bel Air Drive\",\"website\":\"www.it.com\"}",
+    "bodySha256": "52c38c5811b3540a985ebdb52748b874efe7ac4874600a01e3e612bfe54b3955",
+    "bodyFile": null
+  }
+}

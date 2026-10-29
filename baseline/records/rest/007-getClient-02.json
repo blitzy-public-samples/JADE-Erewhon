@@ -1,0 +1,22 @@
+{
+  "order": 7,
+  "caseId": "REST-getClient-02",
+  "operation": "Rest.getClient",
+  "kind": "success",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "GET",
+    "pathAndQuery": "/client/%20Pauline%20Wild%20",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 200,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"guid\":\"{00000000-0000-4000-8000-000000000034}\",\"city\":\"Christchurch\",\"country\":\"New Zealand\",\"email\":\"wild@more.co.nz\",\"fax\":\"64 3 834 7172\",\"name\":\"Pauline Wild\",\"phone\":\"64 3 923 1010\",\"street\":\"24c Dryside Place\",\"website\":\"\"}",
+    "bodySha256": "116d0741bb0fa9665eca31441e0114008ca1a3f31c1acdabe5a3c9625dc5f017",
+    "bodyFile": null
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "order": 3,
+  "caseId": "REST-getAllAgents-01",
+  "operation": "Rest.getAllAgents",
+  "kind": "success",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "GET",
+    "pathAndQuery": "/allAgents",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 200,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "[{\"guid\":\"{00000000-0000-4000-8000-00000000002c}\",\"city\":\"Kyoto\",\"country\":\"Japan\",\"email\":\"airi@yippe.co.jp\",\"fax\":\"81 4 2845 6362\",\"name\":\"Airi Hamada\",\"phone\":\"81 4 8586 7273\",\"street\":\"145 Tokyo Road\",\"website\":\"www.yippe.co.jp\"},{\"guid\":\"{00000000-0000-4000-8000-000000000026}\",\"city\":\"London\",\"country\":\"England\",\"email\":\"angela@fieldplus.co.uk\",\"fax\":\"44 3 6574 7485\",\"name\":\"Angela Bettersfield\",\"phone\":\"44 3 8574 8394\",\"street\":\"12b St Michael's Place\",\"website\":\"www.fieldplus.co.uk\"},{\"guid\":\"{00000000-0000-4000-8000-00000000002a}\",\"city\":\"Los Angeles\",\"country\":\"United States of America\",\"email\":\"hank@it.com\",\"fax\":\"1 8 6354 7364\",\"name\":\"Hank Williams\",\"phone\":\"1 8 2938 4756\",\"street\":\"9127 Bel Air Drive\",\"website\":\"www.it.com\"},{\"guid\":\"{00000000-0000-4000-8000-000000000024}\",\"city\":\"Christchurch\",\"country\":\"New Zealand\",\"email\":\"ps@theplace.co.nz\",\"fax\":\"64 3 378 2992\",\"name\":\"Peter Smallsmith\",\"phone\":\"64 3 392 3746\",\"street\":\"645 Gregan Road\",\"website\":\"www.theplace.co.nz\"},{\"guid\":\"{00000000-0000-4000-8000-00000000002e}\",\"city\":\"Moscow\",\"country\":\"Russia\",\"email\":\"petra@here.com\",\"fax\":\"7 3 4857 8182\",\"name\":\"Petra Petrovski\",\"phone\":\"7 3 8939 8384\",\"street\":\"8765 The Parade\",\"website\":\"www.here.com\"},{\"guid\":\"{00000000-0000-4000-8000-000000000028}\",\"city\":\"Paris\",\"country\":\"France\",\"email\":\"plafayette@champagne.com\",\"fax\":\"33 8 9403 6475\",\"name\":\"Pierre Lafayette\",\"phone\":\"33 8 7463 1102\",\"street\":\"167 Rue Patisserie\",\"website\":\"www.champagne.com\"},{\"guid\":\"{00000000-0000-4000-8000-000000000030}\",\"city\":\"Singapore\",\"country\":\"Singapore\",\"email\":\"suzie@holiday.com\",\"fax\":\"65 7374 9734\",\"name\":\"Suzie Wu\",\"phone\":\"65 1837 8234\",\"street\":\"26b Colonial Plaza\",\"website\":\"www.holiday.com\"},{\"guid\":\"{00000000-0000-4000-8000-000000000032}\",\"city\":\"Suva\",\"country\":\"Fiji\",\"email\":\"tabai@mytours.com\",\"fax\":\"679 2662 7327\",\"name\":\"Tabai Tanivula\",\"phone\":\"679 3837 7382\",\"street\":\"14 Suva Street\",\"website\":\"www.mytours.com\"}]",
+    "bodySha256": "303d78d079993df5bde7fce3c8cd629454b01f35857d20eba58f6a607a6f8302",
+    "bodyFile": null
+  }
+}
