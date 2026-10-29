@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -99,6 +100,8 @@ public sealed class CaseRunner : IDisposable
 {
     /// <summary>The per-request limit used when no other is configured, 60 seconds.</summary>
     public static readonly TimeSpan DefaultRequestTimeout = TimeSpan.FromSeconds(60);
+
+    private const string NotHttpUrlProblem = "The URL is not an absolute http or https URL.";
 
     // CancellationTokenSource.CancelAfter and SocketsHttpHandler.ConnectTimeout both reject a finite
     // duration beyond int.MaxValue milliseconds, so it is rejected where the value enters.
@@ -206,14 +209,14 @@ public sealed class CaseRunner : IDisposable
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
     /// <exception cref="ArgumentException">
     /// <paramref name="baseUrl"/> is not an absolute <c>http</c>/<c>https</c> URL without user information,
-    /// or <paramref name="pathAndQuery"/> is not a raw target.
+    /// or <paramref name="pathAndQuery"/> is not a raw target. A message about the base URL never quotes it.
     /// </exception>
     public static Uri Combine(string baseUrl, string pathAndQuery)
     {
         ArgumentNullException.ThrowIfNull(baseUrl);
-        if (!Uri.TryCreate(baseUrl, UriKind.Absolute, out var parsed))
+        if (!TryParseHttpUrl(baseUrl, out var parsed, out var problem))
         {
-            throw new ArgumentException($"Base URL '{baseUrl}' is not an absolute http or https URL.", nameof(baseUrl));
+            throw new ArgumentException(problem, nameof(baseUrl));
         }
 
         return Combine(parsed, pathAndQuery);
@@ -272,7 +275,9 @@ public sealed class CaseRunner : IDisposable
     /// <param name="timeout">The deadline for the whole call; positive or infinite.</param>
     /// <param name="ct">The caller's cancellation.</param>
     /// <returns>The raw response, or the reason none was obtained.</returns>
-    /// <exception cref="ArgumentException"><paramref name="absoluteUri"/> is not an absolute http or https URI.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="absoluteUri"/> is not an absolute http or https URI without user information.
+    /// </exception>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="timeout"/> is not positive or infinite.</exception>
     /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
     public Task<CaseResponse> GetAsync(Uri absoluteUri, TimeSpan timeout, CancellationToken ct) =>
@@ -400,6 +405,91 @@ public sealed class CaseRunner : IDisposable
         }
 
         return null;
+    }
+
+    /// <summary>
+    /// Parses a configured base or admin URL under the one rule every harness HTTP client applies: an
+    /// absolute <c>http</c> or <c>https</c> URL without user information. Surrounding white space is
+    /// ignored.
+    /// </summary>
+    /// <remarks>
+    /// No layer sends credentials, so a URL carrying user information is refused before any request
+    /// instead of being carried into the authority. <paramref name="problem"/> is printed and reported,
+    /// so it never quotes <paramref name="text"/>, which may hold a password.
+    /// </remarks>
+    /// <param name="text">The configured URL, for example <c>http://standin:9090</c>.</param>
+    /// <param name="uri">The parsed URL; null when the method returns false.</param>
+    /// <param name="problem">
+    /// Why <paramref name="text"/> was rejected, as one sentence naming at most the host or a scheme the
+    /// runtime knows; empty when it was accepted.
+    /// </param>
+    /// <returns>
+    /// True when <paramref name="text"/> is an absolute <c>http</c> or <c>https</c> URL without user
+    /// information; false when it is null, blank, relative, of another scheme or carries user information.
+    /// </returns>
+    internal static bool TryParseHttpUrl(string? text, [NotNullWhen(true)] out Uri? uri, out string problem)
+    {
+        uri = null;
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            problem = "The URL is blank.";
+            return false;
+        }
+
+        if (!Uri.TryCreate(text.Trim(), UriKind.Absolute, out var parsed))
+        {
+            problem = NotHttpUrlProblem;
+            return false;
+        }
+
+        if (!IsCredentialFreeHttpUrl(parsed, out problem))
+        {
+            return false;
+        }
+
+        uri = parsed;
+        return true;
+    }
+
+    /// <summary>Applies the rule of <see cref="TryParseHttpUrl"/> to an already parsed URI.</summary>
+    /// <param name="uri">The URI to check.</param>
+    /// <param name="problem">
+    /// Why <paramref name="uri"/> was rejected, as one sentence naming at most the host or a scheme the
+    /// runtime knows; empty when it was accepted.
+    /// </param>
+    /// <returns>True when <paramref name="uri"/> is an absolute <c>http</c> or <c>https</c> URL without user information.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="uri"/> is null.</exception>
+    internal static bool IsCredentialFreeHttpUrl(Uri uri, out string problem)
+    {
+        ArgumentNullException.ThrowIfNull(uri);
+
+        // A relative URI has no scheme to read. On Unix an absolute file path parses as a file: URI, so
+        // the scheme is checked as well.
+        if (!uri.IsAbsoluteUri)
+        {
+            problem = NotHttpUrlProblem;
+            return false;
+        }
+
+        if (!string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.Ordinal)
+            && !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.Ordinal))
+        {
+            // A URL written without its scheme, such as user:password@host:9090, parses with the user
+            // name as its scheme, so only a scheme the runtime itself registers is named.
+            problem = UriParser.IsKnownScheme(uri.Scheme)
+                ? $"The URL uses the '{uri.Scheme}' scheme; only http and https are accepted."
+                : NotHttpUrlProblem;
+            return false;
+        }
+
+        if (uri.UserInfo.Length > 0)
+        {
+            problem = $"The URL for host '{uri.Host}' carries user information, which the harness never sends.";
+            return false;
+        }
+
+        problem = "";
+        return true;
     }
 
     private static HttpRequestMessage BuildRequest(
@@ -566,20 +656,9 @@ public sealed class CaseRunner : IDisposable
 
     private static void ValidateTargetUri(Uri uri, string paramName)
     {
-        if (!uri.IsAbsoluteUri
-            || (!string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.Ordinal)
-                && !string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.Ordinal)))
+        if (!IsCredentialFreeHttpUrl(uri, out var problem))
         {
-            throw new ArgumentException($"'{uri.OriginalString}' is not an absolute http or https URL.", paramName);
-        }
-
-        // No layer sends credentials, so user information in a URL is refused rather than carried
-        // into the authority. The message leaves it out, because it may hold a password.
-        if (uri.UserInfo.Length > 0)
-        {
-            throw new ArgumentException(
-                $"The URL for host '{uri.Host}' carries user information, which the harness never sends.",
-                paramName);
+            throw new ArgumentException(problem, paramName);
         }
     }
 

@@ -8,6 +8,7 @@ using System.Text.Json;
 using Erewhon.Contracts;
 using Erewhon.Contracts.Admin;
 using Erewhon.Contracts.Seed;
+using Erewhon.Harness.Http;
 using Erewhon.Harness.Report;
 
 namespace Erewhon.Harness.Lifecycle;
@@ -141,7 +142,7 @@ public sealed record AdminInfo(
 /// after a reset to <see cref="AdminRoutes.ResetStateSeed"/>; the generation, mutation count and source
 /// are checked after every reset.
 /// </summary>
-/// <remarks>Which factory applies is the caller's choice: <see cref="FirstCapture"/> when no
+/// <remarks>Which factory applies is the caller's choice: <see cref="FirstCapture(HarnessOptions)"/> when no
 /// <c>baseline/manifest.json</c> exists, <see cref="FromManifest"/> for a re-capture or a replay, and
 /// <see cref="None"/> for a manifest recording <c>captureExecution: "not-run"</c>, which holds no seed
 /// facts.</remarks>
@@ -155,20 +156,47 @@ public sealed record ResetExpectations(string? SeedSha256, string? ReferenceDate
     /// </summary>
     internal const string UnavailableSeedSha256 = "unavailable";
 
+    /// <summary>
+    /// The expected reference date when <see cref="HarnessOptions.ExpectedReferenceDate"/> is not a
+    /// <c>yyyy-MM-dd</c> date. The check records a <c>referenceDate</c> mismatch for it whatever the
+    /// stand-in reports, instead of silently passing or comparing against a malformed setting.
+    /// </summary>
+    internal const string InvalidExpectedReferenceDate = "invalid";
+
+    /// <summary>The configuration key of <see cref="HarnessOptions.ExpectedReferenceDate"/>, as diagnostics name it.</summary>
+    internal const string ExpectedReferenceDateKey =
+        HarnessOptions.SectionName + ":" + nameof(HarnessOptions.ExpectedReferenceDate);
+
+    private const string ReferenceDateFormat = "yyyy-MM-dd";
+
     /// <summary>No seed facts: only generation, mutations and source are checked.</summary>
     public static ResetExpectations None { get; } = new(null, null);
 
     /// <summary>
     /// The expectations of a first capture: the shared seed fingerprint of
     /// <see cref="HarnessOptions.EffectiveSeedDirectory"/>, which holds the files the stand-in loads, and
-    /// <see cref="HarnessOptions.ExpectedReferenceDate"/>.
+    /// <see cref="HarnessOptions.EffectiveExpectedReferenceDate"/>.
+    /// </summary>
+    /// <remarks>Settings problems never throw; each prints one <c>[jade-standin]</c> console line. A blank
+    /// reference date expects the default <c>2026-01-01</c>. A seed directory that cannot be fingerprinted,
+    /// or a reference date that is not a <c>yyyy-MM-dd</c> date, becomes an expectation no stand-in
+    /// meets, so the seed reset records a <c>seedSha256</c> or <c>referenceDate</c> mismatch.</remarks>
+    /// <param name="options">The harness settings.</param>
+    /// <returns>The expectations; both members are always set, so both facts are always checked.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="options"/> is null.</exception>
+    public static ResetExpectations FirstCapture(HarnessOptions options) => FirstCapture(options, Console.Out);
+
+    /// <summary>
+    /// <see cref="FirstCapture(HarnessOptions)"/> with its console lines written to <paramref name="output"/>.
     /// </summary>
     /// <param name="options">The harness settings.</param>
-    /// <returns>The expectations; a blank reference date is not checked.</returns>
-    /// <exception cref="ArgumentNullException"><paramref name="options"/> is null.</exception>
-    public static ResetExpectations FirstCapture(HarnessOptions options)
+    /// <param name="output">Where console lines go, for example a test's writer.</param>
+    /// <returns>The expectations; both members are always set.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="options"/> or <paramref name="output"/> is null.</exception>
+    internal static ResetExpectations FirstCapture(HarnessOptions options, TextWriter output)
     {
         ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(output);
 
         var directory = options.SeedDirectory;
         string seedSha256;
@@ -180,12 +208,12 @@ public sealed record ResetExpectations(string? SeedSha256, string? ReferenceDate
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException
                                        or NotSupportedException or SecurityException)
         {
-            Console.Out.WriteLine(
+            output.WriteLine(
                 $"{SourceLabels.ConsolePrefix} seed fingerprint of '{directory}' unavailable: {ex.GetType().Name}");
             seedSha256 = UnavailableSeedSha256;
         }
 
-        return new ResetExpectations(seedSha256, NullIfBlank(options.ExpectedReferenceDate));
+        return new ResetExpectations(seedSha256, ResolveExpectedReferenceDate(options, output));
     }
 
     /// <summary>The expectations recorded in <c>baseline/manifest.json</c>.</summary>
@@ -196,6 +224,29 @@ public sealed record ResetExpectations(string? SeedSha256, string? ReferenceDate
         new(NullIfBlank(seedSha256), NullIfBlank(referenceDate));
 
     private static string? NullIfBlank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
+
+    // A blank setting falls back to the default; any other value must be exactly yyyy-MM-dd, so a
+    // lenient parse can never turn a malformed setting into a date that happens to match.
+    private static string ResolveExpectedReferenceDate(HarnessOptions options, TextWriter output)
+    {
+        var date = options.EffectiveExpectedReferenceDate;
+        if (string.IsNullOrWhiteSpace(options.ExpectedReferenceDate))
+        {
+            output.WriteLine(
+                $"{SourceLabels.ConsolePrefix} {ExpectedReferenceDateKey} is blank; expecting the default reference date {date}");
+            return date;
+        }
+
+        if (DateOnly.TryParseExact(date, ReferenceDateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out _))
+        {
+            return date;
+        }
+
+        output.WriteLine(
+            $"{SourceLabels.ConsolePrefix} {ExpectedReferenceDateKey} '{date}' is not a {ReferenceDateFormat} date; "
+            + "the seed reset records a referenceDate mismatch");
+        return InvalidExpectedReferenceDate;
+    }
 }
 
 /// <summary>The outcome of one state reset and its confirmation.</summary>
@@ -255,12 +306,14 @@ public static class ResetPoints
 /// </summary>
 /// <remarks>
 /// <para>Backend state is reached only through these admin endpoints. They are unauthenticated, so no
-/// credential or extra header is sent.</para>
+/// credential or extra header is sent, and an admin URL carrying user information is rejected before any
+/// request.</para>
 /// <para>Every mismatch becomes a <c>CHK-RESET:&lt;point&gt;</c> item with nature
 /// <c>mismatch:&lt;field&gt;:&lt;observed&gt;</c> and the run continues. Such items can be documented, so
 /// the observed part is always a deterministic token (a status code, <c>connect</c>, <c>timeout</c>,
-/// <c>reset</c> or the raw observed value); timings, URLs and exception messages go into
-/// <see cref="FailureItem.Detail"/> only. Network conditions never throw; only the caller's
+/// <c>reset</c>, <c>before-</c> followed by the pre-reset read's token or <c>null</c> when the generation
+/// the reset had to increase is unknown, or the raw observed value); timings, URLs and exception messages
+/// go into <see cref="FailureItem.Detail"/> only. Network conditions never throw; only the caller's
 /// cancellation does.</para>
 /// <para>Each request is bounded by <see cref="HarnessOptions.RequestTimeout"/>. The instance is safe
 /// for concurrent use.</para>
@@ -280,6 +333,7 @@ public sealed class StateReset : IDisposable
     private const string InvalidBodyFailure = "invalid";
     private const string InvalidUrlFailure = "invalid-url";
     private const string InfoFailurePrefix = "info-";
+    private const string BeforeFailurePrefix = "before-";
     private const string NullObserved = "null";
 
     private const string DateFormat = "yyyy-MM-dd";
@@ -320,13 +374,14 @@ public sealed class StateReset : IDisposable
     /// <param name="adminUrl">The component's admin base URL, for example <c>http://facade:9090</c>.</param>
     /// <param name="ct">Cancels the read; its cancellation is the only exception thrown.</param>
     /// <returns>
-    /// The parsed info, or null when the URL is blank or invalid, the request fails, the status is not
-    /// 2xx or the body is not a JSON object.
+    /// The parsed info, or null when the URL is blank, is not an absolute <c>http</c>/<c>https</c> URL
+    /// or carries user information, the request fails, the status is not 2xx or the body is not a JSON
+    /// object.
     /// </returns>
     /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
     public async Task<AdminInfo?> ReadInfoAsync(string? adminUrl, CancellationToken ct = default)
     {
-        if (string.IsNullOrWhiteSpace(adminUrl) || !TryBuildUri(adminUrl, AdminRoutes.Info, out var infoUri))
+        if (string.IsNullOrWhiteSpace(adminUrl) || !TryBuildUri(adminUrl, AdminRoutes.Info, out var infoUri, out _))
         {
             return null;
         }
@@ -345,7 +400,10 @@ public sealed class StateReset : IDisposable
     /// <returns>
     /// Every mismatch, and the info read after the reset. A reset request that fails yields the single
     /// item <c>mismatch:http:&lt;observed&gt;</c> and no field checks, because a reset that did not
-    /// happen cannot be confirmed.
+    /// happen cannot be confirmed. The generation must exceed the one read before the reset; when that
+    /// read failed or reported no generation, the reset and the other checks still run and the
+    /// unproven increase is <c>mismatch:generation:before-&lt;token&gt;</c>, for example
+    /// <c>before-503</c>, <c>before-connect</c> or <c>before-null</c>.
     /// </returns>
     /// <exception cref="ArgumentException">
     /// <paramref name="point"/> is blank, or <paramref name="state"/> is not a reset state.
@@ -378,19 +436,22 @@ public sealed class StateReset : IDisposable
 
         var failures = new List<FailureItem>();
 
-        // An admin URL that is not an absolute http(s) URL can never be reset; its own token keeps it
-        // apart from a stand-in that is merely down.
+        // An admin URL that is not an absolute http(s) URL without user information can never be reset;
+        // its own token keeps it apart from a stand-in that is merely down. The detail gives the reason
+        // and never quotes the setting, which may carry a password.
         var resetPath = $"{AdminRoutes.Reset}?{AdminRoutes.ResetStateQueryKey}={Uri.EscapeDataString(state)}";
-        if (!TryBuildUri(adminUrl, AdminRoutes.Info, out var infoUri)
-            || !TryBuildUri(adminUrl, resetPath, out var resetUri))
+        if (!TryBuildUri(adminUrl, AdminRoutes.Info, out var infoUri, out var urlProblem)
+            || !TryBuildUri(adminUrl, resetPath, out var resetUri, out urlProblem))
         {
-            AddMismatch(failures, point, state, HttpField, InvalidUrlFailure, $"expected an absolute http(s) admin URL, got '{adminUrl}'");
+            AddMismatch(
+                failures, point, state, HttpField, InvalidUrlFailure, $"expected an absolute http(s) admin URL without user information; {urlProblem}");
             return new StateResetResult(failures.AsReadOnly(), null);
         }
 
-        // A failed read here is not itself a failure: it only means the generation cannot be compared.
+        // One bounded read of the generation the reset must increase. When it fails or reports no
+        // generation, the reset still runs, because the run needs it, but the increase stays unproven
+        // and CheckFields records it under this read's failure token.
         var before = await ReadInfoCoreAsync(infoUri, ct).ConfigureAwait(false);
-        var previousGeneration = before.Info?.Generation;
 
         var reset = await SendAsync(HttpMethod.Post, resetUri, ct).ConfigureAwait(false);
         if (reset.Failure is not null)
@@ -408,7 +469,7 @@ public sealed class StateReset : IDisposable
             return new StateResetResult(failures.AsReadOnly(), null);
         }
 
-        CheckFields(failures, point, state, expected, previousGeneration, after);
+        CheckFields(failures, point, state, expected, before, after);
 
         if (failures.Count == 0)
         {
@@ -421,24 +482,52 @@ public sealed class StateReset : IDisposable
     /// <inheritdoc />
     public void Dispose() => _client.Dispose();
 
+    /// <summary>
+    /// Confirms the info read after a reset, adding at most one item per field. The generation passes
+    /// only when both reads report one and the later is greater. Otherwise it is observed as
+    /// <c>null</c> when the read after the reset has none; as <c>before-&lt;token&gt;</c> when the
+    /// prior generation is unknown, where the token is the pre-reset read's failure token
+    /// (<c>connect</c>, <c>timeout</c>, <c>reset</c>, the status code or <c>invalid</c>) or <c>null</c>
+    /// when that read reported no generation; and as itself when it did not increase.
+    /// </summary>
     private void CheckFields(
         List<FailureItem> failures,
         string point,
         string state,
         ResetExpectations expected,
-        long? previousGeneration,
+        InfoRead before,
         AdminInfo after)
     {
-        if (previousGeneration is { } previous)
+        var previousGeneration = before.Info?.Generation;
+        if (after.Generation is not { } generation)
         {
-            if (after.Generation is not { } generation || generation <= previous)
-            {
-                AddMismatch(failures, point, state, GenerationField, Text(after.Generation), $"expected a generation greater than {previous}");
-            }
+            AddMismatch(
+                failures,
+                point,
+                state,
+                GenerationField,
+                NullObserved,
+                previousGeneration is { } known ? $"expected a generation greater than {known}" : "expected a generation");
         }
-        else if (after.Generation is null)
+        else if (previousGeneration is not { } previous)
         {
-            AddMismatch(failures, point, state, GenerationField, NullObserved, "expected a generation");
+            // A generation present after the reset proves nothing on its own: a reset that changed
+            // nothing reports one too.
+            var cause = before.Failure is null
+                ? $"its {AdminRoutes.Info} reported no generation"
+                : $"its {AdminRoutes.Info} read failed: {before.Detail}";
+            AddMismatch(
+                failures,
+                point,
+                state,
+                GenerationField,
+                BeforeFailurePrefix + (before.Failure ?? NullObserved),
+                $"expected a generation increase, unproven because the pre-reset generation is unavailable ({cause}); "
+                + $"the generation read after the reset is {generation}");
+        }
+        else if (generation <= previous)
+        {
+            AddMismatch(failures, point, state, GenerationField, Text(generation), $"expected a generation greater than {previous}");
         }
 
         if (after.Mutations != 0)
@@ -463,7 +552,17 @@ public sealed class StateReset : IDisposable
             AddMismatch(failures, point, state, SeedSha256Field, after.SeedSha256 ?? NullObserved, $"expected {expectedSeed}");
         }
 
-        if (expected.ReferenceDate is { } expectedDate && !DatesMatch(expectedDate, after.ReferenceDate))
+        if (string.Equals(expected.ReferenceDate, ResetExpectations.InvalidExpectedReferenceDate, StringComparison.Ordinal))
+        {
+            AddMismatch(
+                failures,
+                point,
+                state,
+                ReferenceDateField,
+                after.ReferenceDate ?? NullObserved,
+                $"{ResetExpectations.ExpectedReferenceDateKey} is not a {DateFormat} date, so the reference date cannot be confirmed");
+        }
+        else if (expected.ReferenceDate is { } expectedDate && !DatesMatch(expectedDate, after.ReferenceDate))
         {
             AddMismatch(failures, point, state, ReferenceDateField, after.ReferenceDate ?? NullObserved, $"expected {expectedDate}");
         }
@@ -564,17 +663,22 @@ public sealed class StateReset : IDisposable
     private static string Describe(HttpMethod method, Uri uri, Exception ex) =>
         $"{method} {uri}: {ex.GetType().Name}: {ex.Message}";
 
-    private static bool TryBuildUri(string baseUrl, string pathAndQuery, [NotNullWhen(true)] out Uri? uri)
+    // The base keeps its path and the admin route is appended to it. The base and the result must both be
+    // absolute http(s) URLs without user information, so no admin request and no detail built from the
+    // result carries a credential; problem never quotes the base.
+    private static bool TryBuildUri(
+        string baseUrl,
+        string pathAndQuery,
+        [NotNullWhen(true)] out Uri? uri,
+        out string problem)
     {
-        var text = baseUrl.Trim().TrimEnd('/') + pathAndQuery;
-        if (Uri.TryCreate(text, UriKind.Absolute, out uri)
-            && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
+        if (!CaseRunner.TryParseHttpUrl(baseUrl, out _, out problem))
         {
-            return true;
+            uri = null;
+            return false;
         }
 
-        uri = null;
-        return false;
+        return CaseRunner.TryParseHttpUrl(baseUrl.Trim().TrimEnd('/') + pathAndQuery, out uri, out problem);
     }
 
     private static bool DatesMatch(string expected, string? observed)

@@ -60,6 +60,7 @@ public sealed class HarnessOptions
 
     private const string DefaultRepoRoot = "/repo";
     private const string DefaultSeedDirectory = "Erewhon/DataFiles";
+    private const string DefaultExpectedReferenceDate = "2026-01-01";
     private const string DefaultExecutionMode = "docker";
     private const int DefaultReadinessTimeoutSeconds = 120;
     private const int DefaultReadinessPollIntervalSeconds = 1;
@@ -100,9 +101,10 @@ public sealed class HarnessOptions
 
     /// <summary>
     /// Expected stand-in reference date (<c>yyyy-MM-dd</c>) at first capture; equal to the stand-in's
-    /// <c>StandIn:ReferenceDate</c>.
+    /// <c>StandIn:ReferenceDate</c>. Blank means <c>2026-01-01</c>. Read through
+    /// <see cref="EffectiveExpectedReferenceDate"/>.
     /// </summary>
-    public string ExpectedReferenceDate { get; set; } = "2026-01-01";
+    public string ExpectedReferenceDate { get; set; } = DefaultExpectedReferenceDate;
 
     /// <summary>
     /// Seed directory fingerprinted at first capture, relative to <see cref="RepoRoot"/> unless absolute;
@@ -138,6 +140,14 @@ public sealed class HarnessOptions
     /// <summary><see cref="SeedDirectory"/> resolved.</summary>
     public string EffectiveSeedDirectory =>
         ResolvePath(string.IsNullOrWhiteSpace(SeedDirectory) ? DefaultSeedDirectory : SeedDirectory);
+
+    /// <summary>
+    /// <see cref="ExpectedReferenceDate"/> trimmed, or <c>2026-01-01</c> when it is blank (for example an
+    /// empty <c>Harness__ExpectedReferenceDate</c>), so the first-capture date check always has a value.
+    /// The value is not validated here; the first capture requires it to be a <c>yyyy-MM-dd</c> date.
+    /// </summary>
+    public string EffectiveExpectedReferenceDate =>
+        string.IsNullOrWhiteSpace(ExpectedReferenceDate) ? DefaultExpectedReferenceDate : ExpectedReferenceDate.Trim();
 
     /// <summary><c>&lt;RepoRoot&gt;/baseline</c>, the only tree capture writes records into.</summary>
     public string BaselineDirectory => ResolvePath("baseline");

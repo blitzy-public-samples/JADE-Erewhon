@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using Erewhon.Contracts.Admin;
+using Erewhon.Harness.Http;
 using Erewhon.Harness.Report;
 
 namespace Erewhon.Harness.Lifecycle;
@@ -19,7 +20,7 @@ namespace Erewhon.Harness.Lifecycle;
 /// Compose cannot health-check the facade or the stand-in.</para>
 /// <para>Components are reached only through their admin URL; the probe sends no credential and no
 /// header of its own, because the admin listeners are unauthenticated and contained by network
-/// placement.</para>
+/// placement. An admin URL carrying user information is therefore rejected before any probe.</para>
 /// <para>Network conditions and caller cancellation never throw: they end in the timeout item, so
 /// replay's report and shutdown steps always run. Instances are thread-safe, so one instance can wait on
 /// the facade and the stand-in concurrently. One line is printed per wait, never one per probe.</para>
@@ -52,7 +53,8 @@ public sealed class Readiness(HarnessOptions options) : IDisposable
     /// Null when the component answered 200, or when <paramref name="adminUrl"/> is blank and nothing
     /// was probed. Otherwise <c>CHK-READY:&lt;component&gt;</c> with nature <c>timeout</c>: the limit
     /// passed, the caller cancelled, or <paramref name="adminUrl"/> is not an absolute
-    /// <c>http</c>/<c>https</c> URL.
+    /// <c>http</c>/<c>https</c> URL without user information. The detail of a rejected URL gives the
+    /// reason without quoting the setting.
     /// </returns>
     /// <exception cref="ArgumentException"><paramref name="component"/> is null, empty or white space.</exception>
     /// <exception cref="ObjectDisposedException">The instance has been disposed.</exception>
@@ -67,9 +69,10 @@ public sealed class Readiness(HarnessOptions options) : IDisposable
             return null;
         }
 
-        if (!TryCreateProbeUri(adminUrl, out var probeUri))
+        // The setting is never quoted: a rejected URL may carry a password.
+        if (!TryCreateProbeUri(adminUrl, out var probeUri, out var problem))
         {
-            return NotReady(component, $"invalid admin URL '{adminUrl}'", limit: null);
+            return NotReady(component, $"invalid admin URL: {problem}", limit: null);
         }
 
         var limit = options.ReadinessTimeout;
@@ -196,19 +199,22 @@ public sealed class Readiness(HarnessOptions options) : IDisposable
         return new FailureItem(FailureItemIds.Ready(component), FailureItemIds.Timeout, Detail: detail);
     }
 
-    // The admin URL is an opaque base; only absolute http and https URLs can be probed, so any other
-    // scheme (including a host:port that parses as a scheme) counts as invalid rather than throwing.
-    private static bool TryCreateProbeUri(string adminUrl, [NotNullWhen(true)] out Uri? probeUri)
+    // The admin URL is an opaque base whose path is kept, and /health is appended to it. Only an absolute
+    // http or https URL without user information can be probed, so any other scheme (including a
+    // host:port that parses as a scheme) or a URL carrying credentials counts as invalid rather than
+    // throwing. The probe URL is checked under the same rule, so a timeout detail never holds credentials.
+    private static bool TryCreateProbeUri(
+        string adminUrl,
+        [NotNullWhen(true)] out Uri? probeUri,
+        out string problem)
     {
-        if (Uri.TryCreate(adminUrl.Trim().TrimEnd('/') + AdminRoutes.Health, UriKind.Absolute, out var uri)
-            && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps))
+        if (!CaseRunner.TryParseHttpUrl(adminUrl, out _, out problem))
         {
-            probeUri = uri;
-            return true;
+            probeUri = null;
+            return false;
         }
 
-        probeUri = null;
-        return false;
+        return CaseRunner.TryParseHttpUrl(adminUrl.Trim().TrimEnd('/') + AdminRoutes.Health, out probeUri, out problem);
     }
 
     // min(interval, 5 s), but at least 500 ms; the caller further caps it at the time left.

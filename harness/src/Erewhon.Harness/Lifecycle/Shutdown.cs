@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using Erewhon.Contracts.Admin;
+using Erewhon.Harness.Http;
 using Erewhon.Harness.Report;
 
 namespace Erewhon.Harness.Lifecycle;
@@ -25,8 +26,9 @@ public interface IComponentShutdown
 /// <summary>A component the harness shuts down at the end of a run, and its admin listener.</summary>
 /// <remarks>
 /// The constructor and the init accessors reject a blank <see cref="Component"/> and an
-/// <see cref="AdminBaseUrl"/> that is not an absolute <c>http</c> or <c>https</c> URL, so every target
-/// yields a valid <c>CHK-SHUTDOWN:&lt;component&gt;</c> item.
+/// <see cref="AdminBaseUrl"/> that is not an absolute <c>http</c> or <c>https</c> URL without user
+/// information, so every target yields a valid <c>CHK-SHUTDOWN:&lt;component&gt;</c> item and no
+/// shutdown request or detail carries a credential.
 /// </remarks>
 /// <param name="Component">The component label, <see cref="FacadeComponent"/> or <see cref="StandInComponent"/>.</param>
 /// <param name="AdminBaseUrl">The admin listener base URL, for example <c>http://facade:9090</c>.</param>
@@ -49,9 +51,11 @@ public sealed record ShutdownTarget(string Component, Uri AdminBaseUrl)
         init => _component = RequiredComponent(value);
     }
 
-    /// <summary>The admin listener base URL; always an absolute <c>http</c> or <c>https</c> URL.</summary>
+    /// <summary>The admin listener base URL; always an absolute <c>http</c> or <c>https</c> URL without user information.</summary>
     /// <exception cref="ArgumentNullException">The value is null.</exception>
-    /// <exception cref="ArgumentException">The value is not an absolute <c>http</c> or <c>https</c> URL.</exception>
+    /// <exception cref="ArgumentException">
+    /// The value is not an absolute <c>http</c> or <c>https</c> URL, or carries user information.
+    /// </exception>
     public Uri AdminBaseUrl
     {
         get => _adminBaseUrl;
@@ -69,9 +73,10 @@ public sealed record ShutdownTarget(string Component, Uri AdminBaseUrl)
     /// from <c>Target:AdminUrl</c>, then the stand-in from <c>Backend:AdminUrl</c>.
     /// </summary>
     /// <remarks>
-    /// A blank or invalid admin URL omits its component. For the backend that is the point: a blank
-    /// <c>Backend:AdminUrl</c> marks an external backend, which is never shut down. A caller that must
-    /// shut the facade down treats its absence as a stop it cannot confirm.
+    /// A blank or invalid admin URL, one carrying user information included, omits its component. For
+    /// the backend that is the point: a blank <c>Backend:AdminUrl</c> marks an external backend, which is
+    /// never shut down. A caller that must shut the facade down treats its absence as a stop it cannot
+    /// confirm.
     /// </remarks>
     /// <param name="options">The harness settings.</param>
     /// <returns>Zero, one or two targets, in shutdown order.</returns>
@@ -100,15 +105,13 @@ public sealed record ShutdownTarget(string Component, Uri AdminBaseUrl)
     /// <param name="target">The target; null when the method returns false.</param>
     /// <returns>
     /// True when <paramref name="component"/> is non-blank and <paramref name="adminUrl"/> is an
-    /// absolute <c>http</c> or <c>https</c> URL.
+    /// absolute <c>http</c> or <c>https</c> URL without user information.
     /// </returns>
     public static bool TryCreate(string component, string? adminUrl, [NotNullWhen(true)] out ShutdownTarget? target)
     {
         target = null;
         if (string.IsNullOrWhiteSpace(component)
-            || string.IsNullOrWhiteSpace(adminUrl)
-            || !Uri.TryCreate(adminUrl.Trim(), UriKind.Absolute, out var uri)
-            || !IsHttp(uri))
+            || !CaseRunner.TryParseHttpUrl(adminUrl, out var uri, out _))
         {
             return false;
         }
@@ -117,21 +120,20 @@ public sealed record ShutdownTarget(string Component, Uri AdminBaseUrl)
         return true;
     }
 
-    // On Unix an absolute file path parses as an absolute file: URI, so the scheme is checked too.
-    private static bool IsHttp(Uri uri) =>
-        uri.IsAbsoluteUri && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps);
-
     private static string RequiredComponent(string? value) =>
         string.IsNullOrWhiteSpace(value)
             ? throw new ArgumentException("A shutdown target needs a non-blank component label.", nameof(Component))
             : value;
 
+    // The message gives the reason without quoting the URL, which may carry a password.
     private static Uri RequiredAdminUrl(Uri? value)
     {
         ArgumentNullException.ThrowIfNull(value, nameof(AdminBaseUrl));
-        return IsHttp(value)
+        return CaseRunner.IsCredentialFreeHttpUrl(value, out var problem)
             ? value
-            : throw new ArgumentException("A shutdown target needs an absolute http or https admin URL.", nameof(AdminBaseUrl));
+            : throw new ArgumentException(
+                $"A shutdown target needs an absolute http or https admin URL without user information. {problem}",
+                nameof(AdminBaseUrl));
     }
 
     // Any path on the base URL is kept, and its query and fragment are dropped.

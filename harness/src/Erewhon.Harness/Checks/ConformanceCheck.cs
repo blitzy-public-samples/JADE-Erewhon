@@ -115,6 +115,11 @@ public sealed class ConformanceCheck
     private const string XmlElementToken = "element";
     private const string XmlTextToken = "text";
 
+    // Wrong wire-type tokens of a collection's contents: the offending item's own token after the item
+    // prefix, or the local name of an XML item element the array does not name after the item-name prefix.
+    private const string CollectionItemPrefix = "item:";
+    private const string CollectionItemNamePrefix = "item-name:";
+
     // The JSON wire token each JADE primitive must carry in OperationCatalogue.WireTypes.
     private const string StringJsonToken = "string";
     private const string IntegerJsonToken = "integer";
@@ -130,6 +135,13 @@ public sealed class ConformanceCheck
     // facet of XML Schema is collapse, so surrounding whitespace is allowed.
     private const NumberStyles XmlDecimalStyles =
         NumberStyles.AllowLeadingWhite | NumberStyles.AllowTrailingWhite | NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint;
+
+    // A JADE Integer is 32-bit (xsd:int on SOAP), so its magnitude has at most ten decimal digits.
+    private const int MaxIntegerDigits = 10;
+
+    // A JSON exponent is read saturated at this magnitude: a number token is far shorter than it, so
+    // beyond it only the exponent's sign decides whether the value is a whole number in range.
+    private const long ExponentSaturation = 1_000_000_000_000_000;
 
     private static readonly JsonWriterOptions CompactWriterOptions = new()
     {
@@ -151,20 +163,22 @@ public sealed class ConformanceCheck
     private readonly IReadOnlyDictionary<string, IReadOnlyList<string>> _selfAndAncestors;
     private readonly IReadOnlyDictionary<string, IReadOnlyList<DtoProperty>> _soapProperties;
     private readonly IReadOnlySet<string> _resultDtos;
+    private readonly IReadOnlyDictionary<string, WireClass> _itemWires;
 
     /// <summary>Builds the conformance inventory from <paramref name="catalogue"/>.</summary>
     /// <param name="catalogue">The operation catalogue, normally <see cref="OperationCatalogue.Default"/>.</param>
     /// <exception cref="ArgumentNullException"><paramref name="catalogue"/> is null.</exception>
     /// <exception cref="InvalidDataException">
-    /// A catalogue fact the check relies on is inconsistent: a primitive property whose JADE type has no
-    /// wire mapping or a mapping other than its type's, a SOAP property whose XML type disagrees with the
-    /// mapping, a result DTO without an Integer <c>statusCode</c>, or a surface whose operations do not
-    /// share one declaring class.
+    /// A catalogue fact the check relies on is inconsistent: a primitive property or array item type whose
+    /// JADE type has no wire mapping or a mapping other than its type's, a SOAP property whose XML type
+    /// disagrees with the mapping, a result DTO without an Integer <c>statusCode</c>, or a surface whose
+    /// operations do not share one declaring class.
     /// </exception>
     public ConformanceCheck(OperationCatalogue catalogue)
     {
         ArgumentNullException.ThrowIfNull(catalogue);
         _catalogue = catalogue;
+        _itemWires = catalogue.Arrays.ToDictionary(array => array.Name, ItemWireOf, StringComparer.Ordinal);
 
         _selfAndAncestors = catalogue.Dtos.ToDictionary(
             dto => dto.Name,
@@ -185,8 +199,8 @@ public sealed class ConformanceCheck
     }
 
     /// <summary>
-    /// Runs the check over captured records: walks every parseable body by its declared type, records
-    /// each member observation, and decides every member, constant and seed-token assertion.
+    /// Runs the check over captured records: walks every body that parses and decodes by its declared
+    /// type, records each member observation, and decides every member, constant and seed-token assertion.
     /// </summary>
     /// <param name="records">The captured records, in replay order.</param>
     /// <param name="bodyBytes">
@@ -371,6 +385,23 @@ public sealed class ConformanceCheck
                 }
             }
         }
+
+        foreach (var array in _catalogue.Arrays)
+        {
+            var wire = _itemWires[array.Name];
+            if (wire is WireClass.Array or WireClass.Dto)
+            {
+                continue;
+            }
+
+            var expectedJson = ExpectedJsonToken(wire);
+            if (!_catalogue.WireTypes.TryGetValue(array.ItemType, out var mapping)
+                || !string.Equals(mapping.Json, expectedJson, StringComparison.Ordinal))
+            {
+                throw new InvalidDataException(
+                    $"operation-catalogue.json: the items of array '{array.Name}', of type {array.ItemType}, need the JSON wire form '{expectedJson}'.");
+            }
+        }
     }
 
     private WireClass WireOf(DtoProperty property)
@@ -385,18 +416,42 @@ public sealed class ConformanceCheck
             return WireClass.Dto;
         }
 
-        return property.JadeType switch
-        {
-            "String" => WireClass.String,
-            "Integer" => WireClass.Integer,
-            "Decimal" => WireClass.Decimal,
-            "Date" => WireClass.Date,
-            "TimeStamp" => WireClass.TimeStamp,
-            "Binary" => WireClass.Binary,
-            _ => throw new InvalidDataException(
-                $"operation-catalogue.json: property '{property.Name}' declared in {property.DeclaredIn} has JADE type '{property.JadeType}', which is no primitive wire type."),
-        };
+        return PrimitiveWireOf(property.JadeType)
+            ?? throw new InvalidDataException(
+                $"operation-catalogue.json: property '{property.Name}' declared in {property.DeclaredIn} has JADE type '{property.JadeType}', which is no primitive wire type.");
     }
+
+    /// <summary>
+    /// The wire class every item of <paramref name="array"/> must have, mapped from its item type as
+    /// <see cref="WireOf"/> maps a property's JADE type.
+    /// </summary>
+    private WireClass ItemWireOf(ArrayDefinition array)
+    {
+        if (_catalogue.TryGetArray(array.ItemType, out _))
+        {
+            return WireClass.Array;
+        }
+
+        if (_catalogue.TryGetDto(array.ItemType, out _))
+        {
+            return WireClass.Dto;
+        }
+
+        return PrimitiveWireOf(array.ItemType)
+            ?? throw new InvalidDataException(
+                $"operation-catalogue.json: array '{array.Name}' has item type '{array.ItemType}', which is no primitive wire type.");
+    }
+
+    private static WireClass? PrimitiveWireOf(string jadeType) => jadeType switch
+    {
+        "String" => WireClass.String,
+        "Integer" => WireClass.Integer,
+        "Decimal" => WireClass.Decimal,
+        "Date" => WireClass.Date,
+        "TimeStamp" => WireClass.TimeStamp,
+        "Binary" => WireClass.Binary,
+        _ => null,
+    };
 
     private static string ExpectedJsonToken(WireClass wire) => wire switch
     {
@@ -436,6 +491,23 @@ public sealed class ConformanceCheck
             return;
         }
 
+        using var document = TryParseJson(body);
+        if (document is not null && document.RootElement.ValueKind != JsonValueKind.Null)
+        {
+            WalkJson(document.RootElement, rootType, observations);
+        }
+    }
+
+    /// <summary>
+    /// The parsed body, or null when it is no JSON text or holds text that cannot be decoded. A raw
+    /// unpaired surrogate fails transcoding with an <see cref="ArgumentException"/> rather than a
+    /// <see cref="JsonException"/>, and an escaped one such as <c>"\uD800"</c> parses but throws
+    /// <see cref="InvalidOperationException"/> once the name or string holding it is read. Both are
+    /// treated exactly as an unparseable body, decided before anything of the body is read, so such a
+    /// body contributes no observation and the check never aborts part-way.
+    /// </summary>
+    private static JsonDocument? TryParseJson(string body)
+    {
         JsonDocument document;
         try
         {
@@ -443,15 +515,79 @@ public sealed class ConformanceCheck
         }
         catch (JsonException)
         {
-            return;
+            return null;
+        }
+        catch (ArgumentException)
+        {
+            return null;
         }
 
-        using (document)
+        if (IsDecodable(document.RootElement))
         {
-            if (document.RootElement.ValueKind != JsonValueKind.Null)
-            {
-                WalkJson(document.RootElement, rootType, observations);
-            }
+            return document;
+        }
+
+        document.Dispose();
+        return null;
+    }
+
+    /// <summary>True when every property name and string value at or below <paramref name="element"/> decodes.</summary>
+    private static bool IsDecodable(JsonElement element)
+    {
+        RuntimeHelpers.EnsureSufficientExecutionStack();
+
+        switch (element.ValueKind)
+        {
+            case JsonValueKind.String:
+                return Decodes(element);
+            case JsonValueKind.Array:
+                foreach (var item in element.EnumerateArray())
+                {
+                    if (!IsDecodable(item))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            case JsonValueKind.Object:
+                foreach (var member in element.EnumerateObject())
+                {
+                    if (!Decodes(member) || !IsDecodable(member.Value))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            default:
+                return true;
+        }
+    }
+
+    private static bool Decodes(JsonElement text)
+    {
+        try
+        {
+            _ = text.GetString();
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private static bool Decodes(JsonProperty member)
+    {
+        try
+        {
+            _ = member.Name;
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
         }
     }
 
@@ -515,6 +651,15 @@ public sealed class ConformanceCheck
                     continue;
                 }
 
+                // Invalid contents make the collection itself wrong, and none of its items is walked.
+                if (wire == WireClass.Array
+                    && _catalogue.TryGetArray(property.JadeType, out var collection)
+                    && JsonItemsWrongToken(value, collection) is { } itemsWrong)
+                {
+                    Record(observations, Surface.Rest, runtime.Name, property.Name, Outcome.Wrong, itemsWrong);
+                    continue;
+                }
+
                 Record(observations, Surface.Rest, runtime.Name, property.Name, Outcome.Valid, null);
                 if (wire is WireClass.Dto or WireClass.Array)
                 {
@@ -561,7 +706,7 @@ public sealed class ConformanceCheck
     private static bool IsJsonWire(JsonElement value, WireClass wire) => wire switch
     {
         WireClass.String => value.ValueKind == JsonValueKind.String,
-        WireClass.Integer => value.ValueKind == JsonValueKind.Number && IsIntegral(value),
+        WireClass.Integer => value.ValueKind == JsonValueKind.Number && IsJsonInteger(value.GetRawText()),
         WireClass.Decimal => value.ValueKind == JsonValueKind.Number,
         WireClass.Date or WireClass.TimeStamp => JadeWireFormats.IsMicrosoftJsonDate(value),
         WireClass.Binary => JadeWireFormats.TryReadByteArray(value, out _),
@@ -570,19 +715,145 @@ public sealed class ConformanceCheck
         _ => false,
     };
 
-    private static bool IsIntegral(JsonElement number)
+    /// <summary>
+    /// The wrong wire-type token of a JSON array's contents: <c>item:</c> and the token of an item that
+    /// lacks the array's item wire type (an object for a DTO item type, the primitive's own form for a
+    /// primitive one, and the same rule inside an array item), the ordinal-smallest when several do; null
+    /// when every non-null item has it.
+    /// </summary>
+    private string? JsonItemsWrongToken(JsonElement collection, ArrayDefinition array)
     {
-        if (number.TryGetInt64(out _))
+        RuntimeHelpers.EnsureSufficientExecutionStack();
+
+        var itemWire = _itemWires[array.Name];
+        string? wrong = null;
+        foreach (var item in collection.EnumerateArray())
         {
+            if (item.ValueKind == JsonValueKind.Null)
+            {
+                continue;
+            }
+
+            string? token = null;
+            if (!IsJsonWire(item, itemWire))
+            {
+                token = JsonToken(item);
+            }
+            else if (itemWire == WireClass.Array && _catalogue.TryGetArray(array.ItemType, out var nested))
+            {
+                token = JsonItemsWrongToken(item, nested);
+            }
+
+            if (token is not null)
+            {
+                wrong = OrdinalSmallest(wrong, CollectionItemPrefix + token);
+            }
+        }
+
+        return wrong;
+    }
+
+    /// <summary>
+    /// True when a JSON number token is exactly a whole number within the 32-bit JADE Integer range. The
+    /// value is decided from the token's own digits and exponent, never through a decimal or double
+    /// conversion that could round a fraction away: <c>1.0</c>, <c>1e2</c>, <c>10e-1</c> and
+    /// <c>2.147483647e9</c> qualify, while <c>2147483648</c>, <c>1.5</c>, <c>1E-1</c> and
+    /// <c>200.00000000000000000000000000001</c> do not. Exponents of any length are compared without
+    /// overflow.
+    /// </summary>
+    private static bool IsJsonInteger(ReadOnlySpan<char> token)
+    {
+        var index = 0;
+        var negative = index < token.Length && token[index] == '-';
+        if (negative)
+        {
+            index++;
+        }
+
+        var integerStart = index;
+        while (index < token.Length && char.IsAsciiDigit(token[index]))
+        {
+            index++;
+        }
+
+        var integerDigits = token[integerStart..index];
+        var fractionDigits = ReadOnlySpan<char>.Empty;
+        if (index < token.Length && token[index] == '.')
+        {
+            var fractionStart = ++index;
+            while (index < token.Length && char.IsAsciiDigit(token[index]))
+            {
+                index++;
+            }
+
+            fractionDigits = token[fractionStart..index];
+            if (fractionDigits.IsEmpty)
+            {
+                return false;
+            }
+        }
+
+        long exponent = 0;
+        if (index < token.Length && token[index] is 'e' or 'E')
+        {
+            index++;
+            var exponentNegative = false;
+            if (index < token.Length && token[index] is '+' or '-')
+            {
+                exponentNegative = token[index] == '-';
+                index++;
+            }
+
+            var exponentStart = index;
+            while (index < token.Length && char.IsAsciiDigit(token[index]))
+            {
+                exponent = Math.Min(exponent * 10 + (token[index] - '0'), ExponentSaturation);
+                index++;
+            }
+
+            if (index == exponentStart)
+            {
+                return false;
+            }
+
+            exponent = exponentNegative ? -exponent : exponent;
+        }
+
+        if (integerDigits.IsEmpty || index != token.Length)
+        {
+            return false;
+        }
+
+        // The value is digits x 10^(exponent - fraction length), digits being the integer and fraction
+        // digits together. Without its leading zeros and with its trailing zeros moved into the exponent,
+        // the significand ends in a non-zero digit, so the value is whole exactly when that exponent is
+        // not negative.
+        var digits = string.Concat(integerDigits, fractionDigits).AsSpan().TrimStart('0');
+        if (digits.IsEmpty)
+        {
+            // Zero, whatever its sign, fraction or exponent.
             return true;
         }
 
-        if (number.TryGetDecimal(out var exact))
+        var significand = digits.TrimEnd('0');
+        var scale = exponent - fractionDigits.Length + (digits.Length - significand.Length);
+        if (scale < 0 || significand.Length + scale > MaxIntegerDigits)
         {
-            return decimal.Truncate(exact) == exact;
+            return false;
         }
 
-        return number.TryGetDouble(out var approximate) && double.IsFinite(approximate) && Math.Floor(approximate) == approximate;
+        long magnitude = 0;
+        foreach (var digit in significand)
+        {
+            magnitude = magnitude * 10 + (digit - '0');
+        }
+
+        for (var power = 0L; power < scale; power++)
+        {
+            magnitude *= 10;
+        }
+
+        return magnitude <= (negative ? -(long)int.MinValue : int.MaxValue);
     }
 
     private static string JsonToken(JsonElement value) => value.ValueKind switch
@@ -624,7 +895,7 @@ public sealed class ConformanceCheck
             {
                 if (!IsNil(statusCode)
                     && !statusCode.HasElements
-                    && long.TryParse(statusCode.Value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var code))
+                    && TryParseXmlInteger(statusCode.Value, out var code))
                 {
                     observations.SoapStatusCodes.Add(code);
                 }
@@ -638,9 +909,12 @@ public sealed class ConformanceCheck
 
         if (_catalogue.TryGetArray(type, out var array))
         {
+            // Only elements the array names as its items are items; any other child element, and an item
+            // not of the item wire type, gives no observation.
+            var itemWire = _itemWires[array.Name];
             foreach (var item in element.Elements())
             {
-                if (!IsNil(item))
+                if (IsSoapItem(item, array) && !IsNil(item) && IsXmlWire(item, itemWire))
                 {
                     WalkXml(item, array.ItemType, observations);
                 }
@@ -669,6 +943,15 @@ public sealed class ConformanceCheck
                 if (!IsXmlWire(value, wire))
                 {
                     Record(observations, Surface.Soap, runtime.Name, property.Name, Outcome.Wrong, value.HasElements ? XmlElementToken : XmlTextToken);
+                    continue;
+                }
+
+                // Invalid contents make the collection itself wrong, and none of its items is walked.
+                if (wire == WireClass.Array
+                    && _catalogue.TryGetArray(property.JadeType, out var collection)
+                    && XmlItemsWrongToken(value, collection) is { } itemsWrong)
+                {
+                    Record(observations, Surface.Soap, runtime.Name, property.Name, Outcome.Wrong, itemsWrong);
                     continue;
                 }
 
@@ -723,7 +1006,7 @@ public sealed class ConformanceCheck
         return wire switch
         {
             WireClass.String => true,
-            WireClass.Integer => long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out _),
+            WireClass.Integer => TryParseXmlInteger(text, out _),
             WireClass.Decimal => decimal.TryParse(text, XmlDecimalStyles, CultureInfo.InvariantCulture, out _),
             WireClass.Date => JadeWireFormats.IsXsdDate(text),
             WireClass.TimeStamp => JadeWireFormats.IsXsdDateTime(text),
@@ -731,6 +1014,64 @@ public sealed class ConformanceCheck
             _ => false,
         };
     }
+
+    /// <summary>
+    /// Parses XML text as a JADE Integer, whose SOAP form is <c>xsd:int</c>: an optionally signed decimal
+    /// integer within the 32-bit range, surrounding whitespace allowed.
+    /// </summary>
+    private static bool TryParseXmlInteger(string text, out int value) =>
+        int.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value);
+
+    /// <summary>
+    /// The wrong wire-type token of an XML collection's contents, the ordinal-smallest when several items
+    /// offend; null when every child element is named as the array's SOAP item element and is
+    /// <c>xsi:nil</c> or of the item wire type. An item named otherwise, every item when the array has no
+    /// SOAP item element, gives <c>item-name:&lt;local name&gt;</c>; a primitive item holding child
+    /// elements gives <c>item:element</c>; a primitive item whose text is not of the item type, or a DTO or
+    /// array item holding non-whitespace text, gives <c>item:text</c>; an array item whose own contents
+    /// offend gives <c>item:</c> and their token.
+    /// </summary>
+    private string? XmlItemsWrongToken(XElement collection, ArrayDefinition array)
+    {
+        RuntimeHelpers.EnsureSufficientExecutionStack();
+
+        var itemWire = _itemWires[array.Name];
+        string? wrong = null;
+        foreach (var item in collection.Elements())
+        {
+            string? token = null;
+            if (!IsSoapItem(item, array))
+            {
+                token = CollectionItemNamePrefix + item.Name.LocalName;
+            }
+            else if (IsNil(item))
+            {
+                continue;
+            }
+            else if (!IsXmlWire(item, itemWire))
+            {
+                token = CollectionItemPrefix
+                    + (itemWire is not (WireClass.Dto or WireClass.Array) && item.HasElements ? XmlElementToken : XmlTextToken);
+            }
+            else if (itemWire == WireClass.Array
+                && _catalogue.TryGetArray(array.ItemType, out var nested)
+                && XmlItemsWrongToken(item, nested) is { } nestedWrong)
+            {
+                token = CollectionItemPrefix + nestedWrong;
+            }
+
+            if (token is not null)
+            {
+                wrong = OrdinalSmallest(wrong, token);
+            }
+        }
+
+        return wrong;
+    }
+
+    private static bool IsSoapItem(XElement element, ArrayDefinition array) =>
+        array.SoapItemElement is { } itemElement
+        && string.Equals(element.Name.LocalName, itemElement, StringComparison.Ordinal);
 
     private static bool IsNil(XElement element) =>
         element.Attribute(XsiNil)?.Value.Trim() is "true" or "1";
@@ -776,6 +1117,11 @@ public sealed class ConformanceCheck
     }
 
     // Observations and results.
+
+    // The token a collection reports among several offending items, chosen as a Tally chooses among
+    // several wrong values, so it does not depend on item order.
+    private static string OrdinalSmallest(string? current, string candidate) =>
+        current is null || string.CompareOrdinal(candidate, current) < 0 ? candidate : current;
 
     /// <summary>
     /// Records an observation of <paramref name="property"/> on runtime class <paramref name="runtimeClass"/>
@@ -840,19 +1186,7 @@ public sealed class ConformanceCheck
 
     private static List<SeedAssertionResult> RunSeedAssertions(string? body)
     {
-        JsonDocument? document = null;
-        if (body is not null)
-        {
-            try
-            {
-                document = JsonDocument.Parse(body);
-            }
-            catch (JsonException)
-            {
-                document = null;
-            }
-        }
-
+        var document = body is null ? null : TryParseJson(body);
         using (document)
         {
             var results = new List<SeedAssertionResult>(SeedAssertions.Length);
@@ -1026,7 +1360,7 @@ public sealed class ConformanceCheck
 
         public HashSet<int> RestStatuses { get; } = [];
 
-        public HashSet<long> SoapStatusCodes { get; } = [];
+        public HashSet<int> SoapStatusCodes { get; } = [];
     }
 }
 

@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Xml;
 using System.Xml.Linq;
@@ -27,8 +28,22 @@ namespace Erewhon.StandIn.Soap;
 /// labelled, to <c>contracts/wsdl/ErewhonWebService.wsdl</c>, which the facade publishes with only
 /// <c>soap:address/@location</c> rewritten. The output therefore starts with the XML declaration, holds
 /// no comment and exactly one <c>soap:address</c>, and is byte-identical for equal inputs on every call,
-/// reset and restart: it follows catalogue order, uses the invariant culture and reads no clock or state.
-/// The class keeps no state, so it is safe for concurrent use.
+/// reset and restart: it follows catalogue order, uses the invariant culture and reads no clock or
+/// business state.
+/// </para>
+/// <para>
+/// The address is the only input that varies between requests, so each catalogue's document is built,
+/// validated and serialized once, with an empty <c>soap:address/@location</c>, and kept as an immutable
+/// template: the bytes before that value and the bytes after it. Each call writes only the address,
+/// through an <see cref="XmlWriter"/> with the same settings, between the two, which yields the bytes a
+/// single pass over the whole document would write. The templates live in a
+/// <see cref="ConditionalWeakTable{TKey, TValue}"/> keyed by catalogue instance, so the cache holds one
+/// entry per live catalogue, releases it with the catalogue, and holds nothing derived from a request's
+/// <c>Host</c>, which callers control. Each entry has its own lock: concurrent first calls for one
+/// catalogue wait while one of them builds, so each catalogue's template is built once even under
+/// concurrent first use, and later calls read it without locking. A catalogue that cannot be described
+/// is not cached: every call builds it again and throws. Templates are never modified after they are
+/// built, so the class is safe for concurrent use.
 /// </para>
 /// </remarks>
 public static class WsdlGenerator
@@ -62,6 +77,9 @@ public static class WsdlGenerator
     private const string DecimalJadeType = "Decimal";
     private const string DecimalSchemaType = "decimal";
 
+    // The soap:address attribute that carries the endpoint URL, the one value substituted per request.
+    private const string AddressLocationAttribute = "location";
+
     private static readonly XmlWriterSettings Settings = new()
     {
         Encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
@@ -73,6 +91,14 @@ public static class WsdlGenerator
         CheckCharacters = true,
         CloseOutput = false,
     };
+
+    // The empty location attribute as the template's writer emits it. XmlWriter escapes '"' inside
+    // attribute values and the document has no text or comment, so a raw '"' byte is only ever an
+    // attribute delimiter, and every attribute name is a constant of this class: the sequence occurs
+    // once, at soap:address.
+    private static readonly byte[] EmptyAddressLocation = Encoding.UTF8.GetBytes($" {AddressLocationAttribute}=\"\"");
+
+    private static readonly ConditionalWeakTable<OperationCatalogue, TemplateSlot> Templates = new();
 
     /// <summary>
     /// Returns the value of the WSDL's <c>soap:address/@location</c> for a request:
@@ -106,34 +132,57 @@ public static class WsdlGenerator
     /// Builds the WSDL for the catalogue's SOAP operations, with <paramref name="addressLocation"/> as the
     /// value of its single <c>soap:address/@location</c>.
     /// </summary>
+    /// <remarks>
+    /// The catalogue's document is built and validated once per catalogue instance, by the first call for
+    /// it, while concurrent first calls wait for that build; later calls reuse it and write only
+    /// <paramref name="addressLocation"/>. Every call returns the bytes of the whole document written in
+    /// one pass with that address.
+    /// </remarks>
     /// <param name="catalogue">The operation catalogue, normally <see cref="OperationCatalogue.Default"/>.</param>
     /// <param name="addressLocation">The endpoint URL, usually from <see cref="BuildAddressLocation"/>; written XML-escaped.</param>
     /// <returns>
-    /// The UTF-8 document bytes, without a byte-order mark, starting
+    /// A new array of the UTF-8 document bytes, without a byte-order mark, starting
     /// <c>&lt;?xml version="1.0" encoding="utf-8"?&gt;</c> and a line break, then <c>&lt;wsdl:definitions</c>.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="catalogue"/> or <paramref name="addressLocation"/> is null.</exception>
-    /// <exception cref="ArgumentException"><paramref name="addressLocation"/> is empty or whitespace.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="addressLocation"/> is empty or whitespace, or holds a character or unpaired surrogate
+    /// that XML cannot represent.
+    /// </exception>
     /// <exception cref="InvalidOperationException">
     /// The catalogue cannot be described consistently: its SOAP address is not SOAP 1.1 wrapped in
     /// <see cref="SoapEnvelopeWriter.ServiceNamespace"/>, it lacks the <c>wsdl</c> or <c>soap</c>
     /// namespace, its decimal properties disagree on precision or scale, a type it names is undefined or
-    /// lies in an undeclared namespace, or two schema components share a name.
+    /// lies in an undeclared namespace, or two schema components share a name; or the written document
+    /// has no unique <c>soap:address/@location</c> to hold the address.
     /// </exception>
     public static byte[] Generate(OperationCatalogue catalogue, string addressLocation)
     {
         ArgumentNullException.ThrowIfNull(catalogue);
         ArgumentException.ThrowIfNullOrWhiteSpace(addressLocation);
 
-        var model = BuildModel(catalogue);
+        // The table may run the factory more than once when first calls race, but it keeps one slot per
+        // catalogue and hands that slot to every caller; the slot, not the table, builds the template.
+        var template = Templates.GetValue(catalogue, static _ => new TemplateSlot()).GetOrBuild(catalogue);
 
+        // The value is written by an XmlWriter with the document's own settings, so it gets the same
+        // escaping of markup characters, the same entities for tab, carriage return and line feed, and
+        // the same rejection of characters XML cannot hold as when the whole document is written in one pass.
         using var stream = new MemoryStream();
-        using (var writer = XmlWriter.Create(stream, Settings))
-        {
-            WriteDocument(writer, model, addressLocation);
-        }
+        using var writer = XmlWriter.Create(stream, Settings);
+        writer.WriteStartElement("address");
+        writer.WriteStartAttribute(AddressLocationAttribute);
+        writer.Flush();
+        var valueStart = (int)stream.Length;
+        writer.WriteString(addressLocation);
+        writer.Flush();
+        var value = stream.GetBuffer().AsSpan(valueStart, (int)stream.Length - valueStart);
 
-        return stream.ToArray();
+        var document = new byte[template.Prefix.Length + value.Length + template.Suffix.Length];
+        template.Prefix.CopyTo(document, 0);
+        value.CopyTo(document.AsSpan(template.Prefix.Length));
+        template.Suffix.CopyTo(document, template.Prefix.Length + value.Length);
+        return document;
     }
 
     private static string LocalAuthority(ConnectionInfo connection)
@@ -150,6 +199,32 @@ public static class WsdlGenerator
             ? $"[{address.ToString().Replace("%", "%25", StringComparison.Ordinal)}]"
             : address.ToString();
         return string.Create(CultureInfo.InvariantCulture, $"{host}:{connection.LocalPort}");
+    }
+
+    // The catalogue's whole document written with an empty soap:address/@location, split between the
+    // value's two quotes, so that template + written address equals the document written in one pass.
+    private static WsdlTemplate BuildTemplate(OperationCatalogue catalogue)
+    {
+        var model = BuildModel(catalogue);
+
+        using var stream = new MemoryStream();
+        using (var writer = XmlWriter.Create(stream, Settings))
+        {
+            WriteDocument(writer, model, string.Empty);
+        }
+
+        ReadOnlySpan<byte> document = stream.GetBuffer().AsSpan(0, (int)stream.Length);
+        var occurrences = document.Count(EmptyAddressLocation);
+        if (occurrences != 1)
+        {
+            throw new InvalidOperationException(
+                $"The WSDL written with an empty soap:address/@{AddressLocationAttribute} holds {occurrences} empty " +
+                $"'{AddressLocationAttribute}' attributes instead of one, so the endpoint address has no unique place in it.");
+        }
+
+        // The prefix ends with the value's opening quote and the suffix starts with its closing quote.
+        var valueAt = document.IndexOf(EmptyAddressLocation) + EmptyAddressLocation.Length - 1;
+        return new WsdlTemplate(document[..valueAt].ToArray(), document[valueAt..].ToArray());
     }
 
     private static WsdlModel BuildModel(OperationCatalogue catalogue)
@@ -660,7 +735,7 @@ public static class WsdlGenerator
         writer.WriteAttributeString("name", model.PortName);
         writer.WriteAttributeString("binding", model.Qualify(ServiceName(model.PortName)));
         writer.WriteStartElement(SoapBindingPrefix, "address", model.SoapBindingNamespace);
-        writer.WriteAttributeString("location", addressLocation);
+        writer.WriteAttributeString(AddressLocationAttribute, addressLocation);
         writer.WriteEndElement();
         writer.WriteEndElement();
         writer.WriteEndElement();
@@ -710,6 +785,44 @@ public static class WsdlGenerator
             }
 
             throw new InvalidOperationException($"No prefix is declared for the namespace of '{name}'.");
+        }
+    }
+
+    /// <summary>
+    /// A catalogue's serialized document around its <c>soap:address/@location</c> value: <c>Prefix</c> ends
+    /// with the value's opening quote and <c>Suffix</c> starts with its closing quote. Neither array is
+    /// modified or handed out after it is built.
+    /// </summary>
+    private sealed record WsdlTemplate(byte[] Prefix, byte[] Suffix);
+
+    /// <summary>
+    /// One catalogue's entry in <see cref="Templates"/>: empty until that catalogue's template is built,
+    /// then holding it for as long as the catalogue lives. It holds no reference to the catalogue, which
+    /// each call passes in, so the entry never keeps its own key reachable.
+    /// </summary>
+    private sealed class TemplateSlot
+    {
+        private readonly Lock _gate = new();
+        private volatile WsdlTemplate? _template;
+
+        /// <summary>
+        /// Returns the catalogue's template, building it if no call has built it yet. A built template is
+        /// read without locking. Calls that find none take the slot's gate in turn, and each looks again
+        /// before building, so one build serves every concurrent first call. A build that throws publishes
+        /// nothing: its exception reaches its caller and the next call builds again.
+        /// </summary>
+        public WsdlTemplate GetOrBuild(OperationCatalogue catalogue)
+        {
+            var template = _template;
+            if (template is not null)
+            {
+                return template;
+            }
+
+            lock (_gate)
+            {
+                return _template ??= BuildTemplate(catalogue);
+            }
         }
     }
 }

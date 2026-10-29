@@ -21,7 +21,9 @@ namespace Erewhon.Harness.Modes;
 /// and moved over the target, so a failed fetch or write leaves any existing contract untouched. No other
 /// file is written.</para>
 /// <para>The request carries no header of its own: the admin listener is unauthenticated and contained by
-/// network placement. Every outcome is one console line and exit code 0 (written) or 1 (anything else);
+/// network placement. <c>Harness:Target:AdminUrl</c> must therefore be an absolute <c>http</c> or
+/// <c>https</c> URL without user information; it is checked before readiness, and no line quotes the
+/// setting. Every outcome is one console line and exit code 0 (written) or 1 (anything else);
 /// <see cref="RunAsync"/> never throws.</para>
 /// </remarks>
 /// <param name="options">The harness settings: the facade admin URL, the request limit and the contract path.</param>
@@ -54,7 +56,15 @@ public sealed class ExportOpenApiMode(HarnessOptions options, TextWriter stdout)
             catch (Exception writeFailure) when (writeFailure is IOException or ObjectDisposedException)
             {
                 // The mode's own writer is unusable; the failure still has to reach the operator.
-                Console.Error.WriteLine(line);
+                try
+                {
+                    Console.Error.WriteLine(line);
+                }
+                catch (Exception errorFailure) when (errorFailure is IOException or ObjectDisposedException)
+                {
+                    // Standard error is unusable as well. Exit code 1 still reports the failure, and
+                    // RunAsync must not throw.
+                }
             }
 
             return 1;
@@ -73,17 +83,25 @@ public sealed class ExportOpenApiMode(HarnessOptions options, TextWriter stdout)
             return 1;
         }
 
+        // Checked before readiness so that no line ever quotes the setting, which may carry a password;
+        // only the parsed URL, which then holds no user information, is printed.
+        if (!CaseRunner.TryParseHttpUrl(adminUrl, out var adminUri, out var problem))
+        {
+            Print($"Harness:Target:AdminUrl is not usable: {problem} Nothing written.");
+            return 1;
+        }
+
         using (var readiness = new Readiness(_options))
         {
             var notReady = await readiness.WaitAsync(Component, adminUrl, ct).ConfigureAwait(false);
             if (notReady is not null)
             {
-                Print($"facade admin not ready at {adminUrl} ({notReady.ItemId} {notReady.Nature})");
+                Print($"facade admin not ready at {adminUri} ({notReady.ItemId} {notReady.Nature})");
                 return 1;
             }
         }
 
-        var documentUri = CaseRunner.Combine(adminUrl, AdminRoutes.OpenApiDocument);
+        var documentUri = CaseRunner.Combine(adminUri, AdminRoutes.OpenApiDocument);
         CaseResponse response;
         using (var runner = CaseRunner.FromOptions(_options))
         {
