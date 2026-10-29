@@ -72,8 +72,9 @@ public sealed class OpenApiDriftCheck(HarnessOptions options, JsonSemanticCompar
 {
     private const int ExpectedStatus = 200;
 
-    // The JSON root path, in the convention every comparer in Compare/ uses.
-    private const string RootPath = "$";
+    // The body as a whole, in the convention every comparer in Compare/ uses: a document that is not UTF-8 has
+    // no JSON tree, and no JSON path is this one, so its entries never match those JsonSemanticComparer reports.
+    private const string BodyPath = "$body";
 
     private const string ArtifactSubdirectory = "openapi";
     private const string LiveDocumentFileName = "live.json";
@@ -81,9 +82,6 @@ public sealed class OpenApiDriftCheck(HarnessOptions options, JsonSemanticCompar
     // Strict, so two documents that differ only in invalid byte sequences cannot both decode to U+FFFD
     // and compare equal; an undecodable side is reported as malformed instead.
     private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
-
-    // Only for the literal text of an undecodable side, so the discrepancy can still show it.
-    private static readonly UTF8Encoding LenientUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
 
     private readonly HarnessOptions _options = options ?? throw new ArgumentNullException(nameof(options));
     private readonly JsonSemanticComparer _comparer = comparer ?? throw new ArgumentNullException(nameof(comparer));
@@ -183,20 +181,15 @@ public sealed class OpenApiDriftCheck(HarnessOptions options, JsonSemanticCompar
     // The checked-in contract is the baseline side and the live document the observed side.
     private List<Discrepancy> CompareDocuments(byte[] checkedIn, byte[] live)
     {
-        var baselineText = TryDecode(checkedIn);
-        var observedText = TryDecode(live);
+        var baselineBody = WithoutBom(checkedIn);
+        var observedBody = WithoutBom(live);
+        var baselineText = TryDecode(baselineBody);
+        var observedText = TryDecode(observedBody);
 
         List<Discrepancy> discrepancies;
         if (baselineText is null || observedText is null)
         {
-            discrepancies =
-            [
-                new Discrepancy(
-                    RootPath,
-                    DiscrepancyKinds.Malformed,
-                    baselineText is null ? DiscrepancyValue.Literal(LenientUtf8.GetString(WithoutBom(checkedIn))) : DiscrepancyValue.Absent,
-                    observedText is null ? DiscrepancyValue.Literal(LenientUtf8.GetString(WithoutBom(live))) : DiscrepancyValue.Absent),
-            ];
+            discrepancies = UndecodableDiscrepancies(baselineBody, baselineText, observedBody, observedText);
         }
         else
         {
@@ -207,11 +200,56 @@ public sealed class OpenApiDriftCheck(HarnessOptions options, JsonSemanticCompar
         return discrepancies;
     }
 
-    private static string? TryDecode(byte[] bytes)
+    /// <summary>
+    /// The discrepancies at <c>$body</c>, the body as a whole, when at least one document is not valid UTF-8.
+    /// Such a document has no JSON tree, and <c>$body</c> is never a path the JSON comparer reports, so these
+    /// entries cannot equal its <c>malformed</c> entry at <c>$</c> for decodable text that is not JSON, such as
+    /// the text <c>ff</c>. An undecodable document is the lowercase hexadecimal of its bytes after the
+    /// byte-order mark, which keeps every byte where replacement decoding would merge, for example, 0xFF and
+    /// 0xFE into one character. The <c>malformed</c> entry holds that value on each side that does not decode
+    /// and nothing on a side that does, so it names the failing side. When the other document decodes, a
+    /// <c>type</c> entry also holds both documents, the decodable one as its exact text, so a change to either
+    /// document changes the signature.
+    /// </summary>
+    /// <param name="baselineBody">The checked-in bytes after the byte-order mark.</param>
+    /// <param name="baselineText">The decoded checked-in text; null when it is not valid UTF-8.</param>
+    /// <param name="observedBody">The live bytes after the byte-order mark.</param>
+    /// <param name="observedText">The decoded live text; null when it is not valid UTF-8.</param>
+    private static List<Discrepancy> UndecodableDiscrepancies(
+        ReadOnlySpan<byte> baselineBody,
+        string? baselineText,
+        ReadOnlySpan<byte> observedBody,
+        string? observedText)
+    {
+        var baselineHex = baselineText is null ? Convert.ToHexStringLower(baselineBody) : null;
+        var observedHex = observedText is null ? Convert.ToHexStringLower(observedBody) : null;
+
+        List<Discrepancy> discrepancies =
+        [
+            new Discrepancy(
+                BodyPath,
+                DiscrepancyKinds.Malformed,
+                baselineHex is null ? DiscrepancyValue.Absent : DiscrepancyValue.Literal(baselineHex),
+                observedHex is null ? DiscrepancyValue.Absent : DiscrepancyValue.Literal(observedHex)),
+        ];
+
+        if (baselineText is not null || observedText is not null)
+        {
+            discrepancies.Add(new Discrepancy(
+                BodyPath,
+                DiscrepancyKinds.Type,
+                DiscrepancyValue.Literal(baselineText ?? baselineHex),
+                DiscrepancyValue.Literal(observedText ?? observedHex)));
+        }
+
+        return discrepancies;
+    }
+
+    private static string? TryDecode(ReadOnlySpan<byte> body)
     {
         try
         {
-            return StrictUtf8.GetString(WithoutBom(bytes));
+            return StrictUtf8.GetString(body);
         }
         catch (DecoderFallbackException)
         {

@@ -16,9 +16,12 @@ namespace Erewhon.Harness.Tests;
 /// temporary repository root of its own: an unusable admin URL, no response or a status other than 200 is
 /// <c>not-run</c>; an absent checked-in contract is <c>missing</c> and is never created; documents that differ
 /// only in member order, whitespace or a byte order mark pass; changed, missing and extra members and an
-/// undecodable or non-JSON document fail with exactly the discrepancies the signature is computed over; and the
-/// check writes only <c>artifacts/openapi/live.json</c>, byte for byte as served, removing a stale one when
-/// nothing was answered and reporting a failed save in its detail, and never rewrites the contract.
+/// undecodable or non-JSON document fail with exactly the discrepancies the signature is computed over, an
+/// undecodable one at <c>$body</c> and a non-JSON one at <c>$</c>, and undecodable documents that differ in an
+/// invalid byte, in their decodable peer or in which side decodes, or from non-JSON texts that spell their
+/// hexadecimal, give different natures; and the check writes only <c>artifacts/openapi/live.json</c>, byte for
+/// byte as served, removing a stale one when nothing was answered and reporting a failed save in its detail, and
+/// never rewrites the contract.
 /// </summary>
 public sealed class OpenApiDriftCheckTests : IDisposable
 {
@@ -31,6 +34,9 @@ public sealed class OpenApiDriftCheckTests : IDisposable
     private const string VersionPath = "$.info.version";
     private const string SummaryPath = "$.info.summary";
     private const string JsonRootPath = "$";
+
+    // The body as a whole, where the check reports a document that is not UTF-8.
+    private const string BodyPath = "$body";
 
     // The token a test's admin URL holds in place of the authority of the running stub.
     private const string AuthorityToken = "{authority}";
@@ -52,9 +58,16 @@ public sealed class OpenApiDriftCheckTests : IDisposable
     // Which side of the comparison a malformed document is on, and how it is malformed.
     private const string ContractSide = "contract";
     private const string LiveSide = "live";
+    private const string BothSides = "both";
     private const string InvalidUtf8 = "invalid UTF-8";
     private const string NotJson = "not JSON";
     private const string NotJsonBody = "Service Unavailable";
+
+    // How the second of two failing runs with an undecodable document differs from the first.
+    private const string ChangedInvalidByte = "changed invalid byte";
+    private const string ChangedValidPeer = "changed valid peer";
+    private const string SwappedTextAndBytes = "swapped text and bytes";
+    private const string HexLookalikeText = "hex lookalike text";
 
     private static readonly OperationCatalogue Catalogue = OperationCatalogue.Default;
     private static readonly OperationDescriptor GetAgent = Catalogue.GetById("Rest.getAgent");
@@ -297,36 +310,156 @@ public sealed class OpenApiDriftCheckTests : IDisposable
     [Theory]
     [InlineData(ContractSide, InvalidUtf8)]
     [InlineData(LiveSide, InvalidUtf8)]
+    [InlineData(BothSides, InvalidUtf8)]
     [InlineData(ContractSide, NotJson)]
     [InlineData(LiveSide, NotJson)]
-    public async Task MalformedSide_Fails_WithOneMalformedDiscrepancyAtTheRoot(string side, string defect)
+    public async Task MalformedSide_Fails_WithTheExactDiscrepancies(string side, string defect)
     {
-        // An invalid byte inside the title; the literal shows it as U+FFFD, the bytes are kept as they are.
-        var document = side == ContractSide ? ContractDocument() : LiveDocument();
-        var split = document.IndexOf(Title, StringComparison.Ordinal) + Title.Length;
-        byte[] invalidUtf8Body = [.. Encoding.UTF8.GetBytes(document[..split]), 0xFF, .. Encoding.UTF8.GetBytes(document[split..])];
-        var (malformedBytes, malformedText) = defect switch
+        var contractText = ContractDocument();
+        var liveText = LiveDocument();
+
+        // An invalid byte inside the title. An undecodable document is the hex of its bytes after the byte order
+        // mark, which the live side carries when both are undecodable, reported at the body as a whole; the bytes
+        // are saved as served. A decodable document that is not JSON is the comparer's entry at the root.
+        var undecodableContract = WithInvalidByte(contractText, 0xFF);
+        var undecodableLive = WithInvalidByte(liveText, 0xFF);
+        var (contractBytes, served) = (side, defect) switch
         {
-            InvalidUtf8 => (invalidUtf8Body, document[..split] + "\uFFFD" + document[split..]),
-            NotJson => (Encoding.UTF8.GetBytes(NotJsonBody), NotJsonBody),
-            _ => throw new ArgumentOutOfRangeException(nameof(defect), defect, "Unknown defect."),
+            (ContractSide, InvalidUtf8) => (undecodableContract, Encoding.UTF8.GetBytes(liveText)),
+            (LiveSide, InvalidUtf8) => (Encoding.UTF8.GetBytes(contractText), undecodableLive),
+            (BothSides, InvalidUtf8) => (undecodableContract, WithByteOrderMark(undecodableLive)),
+            (ContractSide, NotJson) => (Encoding.UTF8.GetBytes(NotJsonBody), Encoding.UTF8.GetBytes(liveText)),
+            (LiveSide, NotJson) => (Encoding.UTF8.GetBytes(contractText), Encoding.UTF8.GetBytes(NotJsonBody)),
+            _ => throw new ArgumentOutOfRangeException(nameof(side), $"{side}, {defect}", "Unknown malformed side or defect."),
         };
-        var served = side == LiveSide ? malformedBytes : Encoding.UTF8.GetBytes(LiveDocument());
+        Discrepancy[] expected = (side, defect) switch
+        {
+            (ContractSide, InvalidUtf8) =>
+            [
+                new(BodyPath, DiscrepancyKinds.Malformed, Hex(undecodableContract), DiscrepancyValue.Absent),
+                new(BodyPath, DiscrepancyKinds.Type, Hex(undecodableContract), DiscrepancyValue.Literal(liveText)),
+            ],
+            (LiveSide, InvalidUtf8) =>
+            [
+                new(BodyPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, Hex(undecodableLive)),
+                new(BodyPath, DiscrepancyKinds.Type, DiscrepancyValue.Literal(contractText), Hex(undecodableLive)),
+            ],
+            (BothSides, InvalidUtf8) =>
+            [
+                new(BodyPath, DiscrepancyKinds.Malformed, Hex(undecodableContract), Hex(undecodableLive)),
+            ],
+            (ContractSide, NotJson) =>
+            [
+                new(JsonRootPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Literal(NotJsonBody), DiscrepancyValue.Absent),
+            ],
+            (LiveSide, NotJson) =>
+            [
+                new(JsonRootPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, DiscrepancyValue.Literal(NotJsonBody)),
+            ],
+            _ => throw new ArgumentOutOfRangeException(nameof(side), $"{side}, {defect}", "Unknown malformed side or defect."),
+        };
         await using var facade = await ServeAsync(StatusCodes.Status200OK, served);
-        var contract = WriteContract(side == ContractSide ? malformedBytes : Encoding.UTF8.GetBytes(ContractDocument()));
+        var contract = WriteContract(contractBytes);
 
         var result = await RunAsync(facade.BaseUrl);
 
-        AssertDifference(
-            result,
-            [
-                new(
-                    JsonRootPath,
-                    DiscrepancyKinds.Malformed,
-                    side == ContractSide ? DiscrepancyValue.Literal(malformedText) : DiscrepancyValue.Absent,
-                    side == LiveSide ? DiscrepancyValue.Literal(malformedText) : DiscrepancyValue.Absent),
-            ]);
+        AssertDifference(result, expected);
         AssertOnlyFilesWritten(contract, served);
+    }
+
+    [Theory]
+    [InlineData(ChangedInvalidByte)]
+    [InlineData(ChangedValidPeer)]
+    [InlineData(SwappedTextAndBytes)]
+    [InlineData(HexLookalikeText)]
+    public async Task DifferentUndecodableDocuments_GiveDifferentNatures(string change)
+    {
+        var contractText = ContractDocument();
+        var liveText = LiveDocument();
+        var changedLiveText = LiveDocument(operationId: GetAllAgents.JadeMethod);
+        var undecodableContract = WithInvalidByte(contractText, 0xFF);
+        var liveWithFf = WithInvalidByte(liveText, 0xFF);
+        var liveWithFe = WithInvalidByte(liveText, 0xFE);
+        byte[] textFf = "ff"u8.ToArray();
+        byte[] textFe = "fe"u8.ToArray();
+        byte[] text80 = "80"u8.ToArray();
+        byte[] bytesFf = [0xFF];
+        byte[] bytesFe = [0xFE];
+        byte[] bytes80 = [0x80];
+
+        // Two runs per row, each with its own stub and contract; the type entries of the swapped pair are equal,
+        // so only the malformed entry, which names the undecodable side, tells the two apart. The hex lookalike
+        // pair has equal kinds and values, so only the path, the body as a whole against the comparer's root,
+        // tells two undecodable documents from two decodable non-JSON texts that spell their hexadecimal.
+        (byte[] Contract, byte[] Served, Discrepancy[] Expected)[] runs = change switch
+        {
+            ChangedInvalidByte =>
+            [
+                (Encoding.UTF8.GetBytes(contractText), liveWithFf,
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, Hex(liveWithFf)),
+                    new(BodyPath, DiscrepancyKinds.Type, DiscrepancyValue.Literal(contractText), Hex(liveWithFf)),
+                ]),
+                (Encoding.UTF8.GetBytes(contractText), liveWithFe,
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, Hex(liveWithFe)),
+                    new(BodyPath, DiscrepancyKinds.Type, DiscrepancyValue.Literal(contractText), Hex(liveWithFe)),
+                ]),
+            ],
+            ChangedValidPeer =>
+            [
+                (undecodableContract, Encoding.UTF8.GetBytes(liveText),
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, Hex(undecodableContract), DiscrepancyValue.Absent),
+                    new(BodyPath, DiscrepancyKinds.Type, Hex(undecodableContract), DiscrepancyValue.Literal(liveText)),
+                ]),
+                (undecodableContract, Encoding.UTF8.GetBytes(changedLiveText),
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, Hex(undecodableContract), DiscrepancyValue.Absent),
+                    new(BodyPath, DiscrepancyKinds.Type, Hex(undecodableContract), DiscrepancyValue.Literal(changedLiveText)),
+                ]),
+            ],
+            SwappedTextAndBytes =>
+            [
+                (textFf, bytes80,
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, Hex(bytes80)),
+                    new(BodyPath, DiscrepancyKinds.Type, DiscrepancyValue.Literal("ff"), Hex(bytes80)),
+                ]),
+                (bytesFf, text80,
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, Hex(bytesFf), DiscrepancyValue.Absent),
+                    new(BodyPath, DiscrepancyKinds.Type, Hex(bytesFf), DiscrepancyValue.Literal("80")),
+                ]),
+            ],
+            HexLookalikeText =>
+            [
+                (bytesFf, bytesFe,
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, Hex(bytesFf), Hex(bytesFe)),
+                ]),
+                (textFf, textFe,
+                [
+                    new(JsonRootPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Literal("ff"), DiscrepancyValue.Literal("fe")),
+                ]),
+            ],
+            _ => throw new ArgumentOutOfRangeException(nameof(change), change, "Unknown change."),
+        };
+
+        var natures = new List<string>();
+        foreach (var (contractBytes, served, expected) in runs)
+        {
+            await using var facade = await ServeAsync(StatusCodes.Status200OK, served);
+            var contract = WriteContract(contractBytes);
+
+            var result = await RunAsync(facade.BaseUrl);
+
+            AssertDifference(result, expected);
+            AssertOnlyFilesWritten(contract, served);
+            natures.Add(result.Failure!.Nature);
+        }
+
+        Assert.NotEqual(natures[0], natures[1]);
     }
 
     // ---- Helpers -----------------------------------------------------------------------------------
@@ -428,6 +561,16 @@ public sealed class OpenApiDriftCheckTests : IDisposable
     }
 
     private static byte[] WithByteOrderMark(byte[] bytes) => [.. Encoding.UTF8.Preamble, .. bytes];
+
+    /// <summary>The UTF-8 bytes of <paramref name="document"/> with <paramref name="invalid"/>, a byte UTF-8 never uses, right after the title.</summary>
+    private static byte[] WithInvalidByte(string document, byte invalid)
+    {
+        var split = document.IndexOf(Title, StringComparison.Ordinal) + Title.Length;
+        return [.. Encoding.UTF8.GetBytes(document[..split]), invalid, .. Encoding.UTF8.GetBytes(document[split..])];
+    }
+
+    /// <summary>The literal of an undecodable document: the lowercase hexadecimal of <paramref name="bytes"/>.</summary>
+    private static DiscrepancyValue Hex(byte[] bytes) => DiscrepancyValue.Literal(Convert.ToHexStringLower(bytes));
 
     /// <summary>The comparer's literal of a JSON string value: its compact encoding, quotes included.</summary>
     private static DiscrepancyValue JsonString(string value) => DiscrepancyValue.Literal(JsonSerializer.Serialize(value));

@@ -111,6 +111,10 @@ public static class CheckOutcomes
 }
 
 /// <summary>The run facts the report states (AAP 0.8.2).</summary>
+/// <remarks>
+/// The report renders the target and backend URLs without user information, so a URL configured with a
+/// user name or password never reaches <c>RESULTS.md</c> or the console.
+/// </remarks>
 /// <param name="UtcDate">When the run took place.</param>
 /// <param name="ExecutionMode"><c>docker</c> or <c>local-processes</c>.</param>
 /// <param name="FacadeFrameworkDescription">
@@ -940,6 +944,16 @@ public sealed class ResultsReportWriter : IResultsReportWriter
     // strikethrough, code span, link, autolink, raw HTML, entity reference) or escape the next character.
     private const string InlineMarkupCharacters = "\\`*_~<>&[]";
 
+    // The characters that end user information in a URL: '@' and its two compatibility forms, U+FF20
+    // and U+FE6B, which NFKC folds to '@'. No other character folds to it.
+    private const string AtSignCharacters = "@\uFF20\uFE6B";
+
+    // Follows a URL whose user information was removed, outside its code span.
+    private const string UserInformationRemoved = " (user information removed)";
+
+    // Stands for a URL of which nothing is left once its user information is removed.
+    private const string UrlNotShown = "not shown";
+
     private const string DiffNaturePrefix = "d:";
     private const string DiscrepancyArtifactDirectory = "artifacts/discrepancies/";
     private const string DateFormat = "yyyy-MM-dd'T'HH:mm:ss'Z'";
@@ -1021,7 +1035,7 @@ public sealed class ResultsReportWriter : IResultsReportWriter
         var facts = report.Facts;
         if (report.ExternalBackend)
         {
-            md.Line($"> Backend used: external backend at {Code(facts?.BackendRestUrl)} / {Code(facts?.BackendSoapUrl)} (unverified).");
+            md.Line($"> Backend used: external backend at {UrlCode(facts?.BackendRestUrl)} / {UrlCode(facts?.BackendSoapUrl)} (unverified).");
             md.Line(">");
             md.Line($"> Baseline responses are JADE stand-in ({Code(SourceLabels.StandIn)}) output.");
         }
@@ -1058,13 +1072,13 @@ public sealed class ResultsReportWriter : IResultsReportWriter
                 : PlainText(facts.FacadeFrameworkDescription));
         md.Row("SDK pin (`harness/global.json`)", Code(facts?.SdkPin));
         md.Row("Harness version", Code(HarnessOptions.HarnessVersion));
-        md.Row("Target REST URL", Code(facts?.TargetRestUrl));
-        md.Row("Target SOAP URL", Code(facts?.TargetSoapUrl));
-        md.Row("Backend REST URL", Code(facts?.BackendRestUrl));
-        md.Row("Backend SOAP URL", Code(facts?.BackendSoapUrl));
+        md.Row("Target REST URL", UrlCode(facts?.TargetRestUrl));
+        md.Row("Target SOAP URL", UrlCode(facts?.TargetSoapUrl));
+        md.Row("Backend REST URL", UrlCode(facts?.BackendRestUrl));
+        md.Row("Backend SOAP URL", UrlCode(facts?.BackendSoapUrl));
         md.Row(
             "Backend admin URL",
-            string.IsNullOrWhiteSpace(facts?.BackendAdminUrl) ? "none (external backend: no reset)" : Code(facts.BackendAdminUrl));
+            string.IsNullOrWhiteSpace(facts?.BackendAdminUrl) ? "none (external backend: no reset)" : UrlCode(facts.BackendAdminUrl));
         md.Row("Starting commit", Code(facts?.StartingCommit));
         md.Row("Baseline commit", OrNotFound(facts?.BaselineCommit));
         md.Row("First facade commit", OrNotFound(facts?.FacadeCommit));
@@ -1439,6 +1453,36 @@ public sealed class ResultsReportWriter : IResultsReportWriter
             || (text[0] == ' ' && text[^1] == ' ' && text.AsSpan().ContainsAnyExcept(' '));
         var padding = padded ? " " : string.Empty;
         return string.Concat(fence, padding, text, padding, fence);
+    }
+
+    // A configured URL as a code span without its user information. No layer sends credentials, yet a
+    // misconfigured URL can still hold user:password, and RESULTS.md is committed and its text printed to
+    // standard output when the write fails, so user information is never rendered. A value without an
+    // at-sign cannot hold any and renders as Code renders it. An absolute http or https URL renders as the
+    // runtime parses it, without user information; an at-sign the runtime reads as path, query or fragment
+    // is not user information. The runtime reads a compatibility at-sign as part of the host, so a parsed
+    // host holding any at-sign still holds its user information and renders as any other value. Any other
+    // value renders only what follows its last at-sign, so a malformed URL is never echoed with what may be
+    // a password.
+    private static string UrlCode(string? value)
+    {
+        if (string.IsNullOrEmpty(value) || value.AsSpan().IndexOfAny(AtSignCharacters) < 0)
+        {
+            return Code(value);
+        }
+
+        var text = value.Trim();
+        if (Uri.TryCreate(text, UriKind.Absolute, out var uri)
+            && (string.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.Ordinal)
+                || string.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.Ordinal))
+            && uri.Host.AsSpan().IndexOfAny(AtSignCharacters) < 0)
+        {
+            var parsed = Code(uri.GetComponents(UriComponents.HttpRequestUrl | UriComponents.Fragment, UriFormat.UriEscaped));
+            return uri.UserInfo.Length > 0 ? parsed + UserInformationRemoved : parsed;
+        }
+
+        var remainder = text[(text.AsSpan().LastIndexOfAny(AtSignCharacters) + 1)..].Trim();
+        return (remainder.Length > 0 ? Code(remainder) : UrlNotShown) + UserInformationRemoved;
     }
 
     // Register text as one sentence ending in punctuation, so the fixed "Done instead:" and "Attempts:"

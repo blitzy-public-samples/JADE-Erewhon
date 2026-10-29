@@ -21,8 +21,8 @@ namespace Erewhon.Harness.Tests;
 /// the matrix states, and a malformed matrix, built in memory as a mutated copy of the committed one, is
 /// rejected with a message that starts <c>case-matrix: </c> and names the offending case by id, or by
 /// JSON path where the text does not parse. The results report built on the register's decisions is
-/// covered from inline sources and registers, and its rendered text is checked in memory without writing
-/// a file. The committed <c>harness/config/known-limitations.json</c> and
+/// covered from inline sources and registers, and its rendered text is checked in memory; the report is
+/// written only into a temporary directory. The committed <c>harness/config/known-limitations.json</c> and
 /// <c>harness/config/case-matrix.json</c> are only ever read here.
 /// </summary>
 public sealed partial class KnownLimitationsRegisterTests
@@ -1905,6 +1905,111 @@ public sealed partial class KnownLimitationsRegisterTests
         Assert.Contains(TableRow("Backend admin URL", "none (external backend: no reset)"), lines);
     }
 
+    /// <summary>
+    /// A URL run fact, whether the backend is external (the banner then shows the backend REST and SOAP
+    /// URLs), a configured URL holding an at-sign and the report's rendering of it. Every configured user
+    /// name and password holds <see cref="CredentialMark"/>.
+    /// </summary>
+    public static TheoryData<string, bool, string, string> UrlsWithAtSigns { get; } = new()
+    {
+        // An http or https URL renders as the runtime parses it, without user information: a user name and
+        // password, a user name or a password alone, a percent-encoded at-sign, default ports, an IPv6
+        // host, surrounding white space, backslashes the runtime reads as slashes and a compatibility
+        // at-sign in the path, which the runtime escapes.
+        { nameof(RunFacts.TargetRestUrl), false, $"http://{UrlUser}:{UrlPassword}@facade:65000", InlineCode("http://facade:65000/") + UserInformationRemoved },
+        { nameof(RunFacts.TargetSoapUrl), false, $"https://{UrlUser}:{UrlPassword}@facade:443/soap", InlineCode("https://facade/soap") + UserInformationRemoved },
+        { nameof(RunFacts.BackendRestUrl), false, $"http://{UrlUser}@standin:65000", InlineCode("http://standin:65000/") + UserInformationRemoved },
+        { nameof(RunFacts.BackendSoapUrl), false, $"http://:{UrlPassword}@standin:21001", InlineCode("http://standin:21001/") + UserInformationRemoved },
+        { nameof(RunFacts.BackendAdminUrl), false, $"http://{UrlUser}:pass%40{CredentialMark}@standin:9090", InlineCode("http://standin:9090/") + UserInformationRemoved },
+        { nameof(RunFacts.BackendAdminUrl), false, $"http://{UrlUser}:{UrlPassword}@[::1]:80", InlineCode("http://[::1]/") + UserInformationRemoved },
+        { nameof(RunFacts.TargetRestUrl), false, $" http://{UrlUser}:{UrlPassword}@facade:65000\n", InlineCode("http://facade:65000/") + UserInformationRemoved },
+        { nameof(RunFacts.BackendRestUrl), true, $"http:\\\\{UrlUser}:{UrlPassword}@jade-host:65000", InlineCode("http://jade-host:65000/") + UserInformationRemoved },
+        { nameof(RunFacts.BackendSoapUrl), true, $"https://{UrlUser}:{UrlPassword}@jade-host:21001", InlineCode("https://jade-host:21001/") + UserInformationRemoved },
+        { nameof(RunFacts.BackendAdminUrl), false, $"http://{UrlUser}:{UrlPassword}@standin:9090/a\uFF20b", InlineCode("http://standin:9090/a%EF%BC%A0b") + UserInformationRemoved },
+
+        // Any other value shows only what follows its last at-sign: no scheme (the user name parses as the
+        // scheme), several at-signs, the compatibility forms U+FF20 and U+FE6B (failing the parse at an
+        // ASCII colon, or parsed into the host, lowercased), no "//", another scheme, a port out of range,
+        // and nothing after the at-sign.
+        { nameof(RunFacts.BackendRestUrl), true, $"{UrlUser}:{UrlPassword}@jade-host:65000", InlineCode("jade-host:65000") + UserInformationRemoved },
+        { nameof(RunFacts.BackendSoapUrl), true, $"http://{UrlUser}:p@ss{CredentialMark}@jade-host:21001", InlineCode("jade-host:21001") + UserInformationRemoved },
+        { nameof(RunFacts.BackendRestUrl), true, $"http://{UrlUser}:{UrlPassword}\uFF20jade-host:65000", InlineCode("jade-host:65000") + UserInformationRemoved },
+        { nameof(RunFacts.BackendSoapUrl), true, $"http://{UrlUser}:{UrlPassword}\uFE6Bjade-host:21001", InlineCode("jade-host:21001") + UserInformationRemoved },
+        { nameof(RunFacts.BackendRestUrl), true, $"http://{UrlUser}\uFF20jade-host:65000", InlineCode("jade-host:65000") + UserInformationRemoved },
+        { nameof(RunFacts.TargetRestUrl), false, $"http://{UrlUser}\uFE6Bjade-host/x", InlineCode("jade-host/x") + UserInformationRemoved },
+        { nameof(RunFacts.BackendSoapUrl), true, $"http://{UrlUser}\uFF1A{UrlPassword}\uFF20jade-host", InlineCode("jade-host") + UserInformationRemoved },
+        { nameof(RunFacts.TargetSoapUrl), false, $"https://{CredentialMark.ToUpperInvariant()}\uFF20host/", InlineCode("host/") + UserInformationRemoved },
+        { nameof(RunFacts.TargetSoapUrl), false, $"http:{UrlUser}:{UrlPassword}@facade:21001", InlineCode("facade:21001") + UserInformationRemoved },
+        { nameof(RunFacts.BackendAdminUrl), false, $"ftp://{UrlUser}:{UrlPassword}@standin:9090", InlineCode("standin:9090") + UserInformationRemoved },
+        { nameof(RunFacts.TargetRestUrl), false, $"http://{UrlUser}:{UrlPassword}@facade:99999", InlineCode("facade:99999") + UserInformationRemoved },
+        { nameof(RunFacts.TargetSoapUrl), false, $"http://{UrlUser}:{UrlPassword}@", "not shown" + UserInformationRemoved },
+
+        // An at-sign the runtime does not read as user information: the parsed URL, unmarked.
+        { nameof(RunFacts.BackendAdminUrl), false, "http://@standin:9090", InlineCode("http://standin:9090/") },
+        { nameof(RunFacts.BackendAdminUrl), false, "http://standin:9090/a@b", InlineCode("http://standin:9090/a@b") },
+    };
+
+    [Theory]
+    [MemberData(nameof(UrlsWithAtSigns))]
+    public void Render_UrlRunFacts_NeverShowUserInformation(string fact, bool externalBackend, string configured, string expected)
+    {
+        var (facts, label) = WithRunFactUrl(fact, configured);
+        var source = new ReportSourceFixture { ExternalBackend = externalBackend, Facts = facts };
+
+        var text = RenderReport(BuildReport(source));
+
+        Assert.DoesNotContain(CredentialMark, text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(TableRow(label, expected), SectionLines(text, "## Run facts"));
+        if (externalBackend)
+        {
+            var rest = fact == nameof(RunFacts.BackendRestUrl) ? expected : InlineCode(FixtureFacts.BackendRestUrl);
+            var soap = fact == nameof(RunFacts.BackendSoapUrl) ? expected : InlineCode(FixtureFacts.BackendSoapUrl);
+            Assert.Contains($"> Backend used: external backend at {rest} / {soap} (unverified).", Lines(text));
+        }
+    }
+
+    [Fact]
+    public void Write_CredentialedUrls_FileHoldsNoUserInformation()
+    {
+        var writer = new ResultsReportWriter();
+        var report = BuildReport(CredentialedUrlSource());
+        var text = writer.Render(report);
+
+        WithTempDirectory(directory =>
+        {
+            var path = Path.Combine(directory, "RESULTS.md");
+
+            writer.Write(path, text);
+
+            var written = File.ReadAllText(path, Encoding.UTF8);
+            Assert.Equal(text, written);
+            Assert.DoesNotContain(CredentialMark, written, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains(
+                $"> Backend used: external backend at `http://jade-host:65000/`{UserInformationRemoved} / `jade-host:21001`{UserInformationRemoved} (unverified).",
+                Lines(written));
+        });
+    }
+
+    [Fact]
+    public void Write_ToADirectory_FailsAndThePrintedTextHoldsNoUserInformation()
+    {
+        var writer = new ResultsReportWriter();
+        var report = BuildReport(CredentialedUrlSource());
+        var text = writer.Render(report);
+
+        // A report path that is a directory fails the write, and the replay prints the rendered text to
+        // standard output instead (AAP 0.8.4).
+        WithTempDirectory(directory =>
+        {
+            Assert.Throws<IOException>(() => writer.Write(directory, text));
+            Assert.Empty(Directory.EnumerateFileSystemEntries(directory));
+        });
+
+        Assert.DoesNotContain(CredentialMark, text, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal(5, Lines(text).Count(line => line.Contains(UserInformationRemoved, StringComparison.Ordinal) && line.StartsWith('|')));
+        Assert.EndsWith("\n\n" + report.FinalLine + "\n", text, StringComparison.Ordinal);
+    }
+
     [Theory]
     [InlineData(2, "Met: at least 20 of 22 operations equivalent (20 of 22), and every other operation returns the baseline status code with a well-formed payload.")]
     [InlineData(3, "Not met.", "- N = 19, below 20")]
@@ -2456,6 +2561,14 @@ public sealed partial class KnownLimitationsRegisterTests
     private const string CatalogueUnavailableNote =
         "The operation catalogue could not be loaded, so rows are derived from the planned and replayed cases and an operation with neither is not listed.";
 
+    // Held by every user name and password a test configures; the report must never contain it.
+    private const string CredentialMark = "Zq7";
+    private const string UrlUser = "user" + CredentialMark;
+    private const string UrlPassword = "pass" + CredentialMark;
+
+    // The report's text after a URL whose user information it removed.
+    private const string UserInformationRemoved = " (user information removed)";
+
     /// <summary>
     /// Fixed run facts: 2026-01-02T03:04:05Z, Docker mode, the facade and stand-in URLs of the Compose
     /// network, the stand-in admin URL and the starting commit; no baseline or facade commit found.
@@ -2473,6 +2586,37 @@ public sealed partial class KnownLimitationsRegisterTests
         StartingCommit,
         BaselineCommit: null,
         FacadeCommit: null);
+
+    /// <summary>
+    /// <see cref="FixtureFacts"/> with the URL run fact named <paramref name="fact"/> set to
+    /// <paramref name="url"/>, and the label of that fact's row.
+    /// </summary>
+    private static (RunFacts Facts, string Label) WithRunFactUrl(string fact, string url) => fact switch
+    {
+        nameof(RunFacts.TargetRestUrl) => (FixtureFacts with { TargetRestUrl = url }, "Target REST URL"),
+        nameof(RunFacts.TargetSoapUrl) => (FixtureFacts with { TargetSoapUrl = url }, "Target SOAP URL"),
+        nameof(RunFacts.BackendRestUrl) => (FixtureFacts with { BackendRestUrl = url }, "Backend REST URL"),
+        nameof(RunFacts.BackendSoapUrl) => (FixtureFacts with { BackendSoapUrl = url }, "Backend SOAP URL"),
+        nameof(RunFacts.BackendAdminUrl) => (FixtureFacts with { BackendAdminUrl = url }, "Backend admin URL"),
+        _ => throw new ArgumentOutOfRangeException(nameof(fact), fact, "No URL run fact has this name."),
+    };
+
+    /// <summary>
+    /// An external-backend run whose five URL run facts each hold user information with
+    /// <see cref="CredentialMark"/>: parsed and unparsed forms, and both banner URLs.
+    /// </summary>
+    private static ReportSourceFixture CredentialedUrlSource() => new()
+    {
+        ExternalBackend = true,
+        Facts = FixtureFacts with
+        {
+            TargetRestUrl = $"http://{UrlUser}:{UrlPassword}@facade:65000",
+            TargetSoapUrl = $"https://{UrlUser}@facade:21001",
+            BackendRestUrl = $"http://{UrlUser}:pass%40{CredentialMark}@jade-host:65000",
+            BackendSoapUrl = $"http://{UrlUser}:p@ss{CredentialMark}@jade-host:21001",
+            BackendAdminUrl = $"{UrlUser}:{UrlPassword}@jade-host:9090",
+        },
+    };
 
     /// <summary>
     /// Baseline facts of a run whose manifest was read, captured by local processes with the WSDL:

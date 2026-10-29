@@ -26,8 +26,11 @@ namespace Erewhon.Harness.Tests;
 /// <c>not-run</c> with no request sent; documents that differ only in the <c>soap:address/@location</c> value,
 /// comments, indentation or a byte order mark pass; a location or address that is absent on either side or on
 /// both, a changed operation, an unreachable side, a status other than 200 and an undecodable or non-XML body
-/// each fail with exactly the discrepancies the signature is computed over; and the check writes only the two
-/// <c>artifacts/wsdl/**</c> files, removing stale ones and reporting a failed save in its detail, never the contract.
+/// each fail with exactly the discrepancies the signature is computed over, an undecodable body at
+/// <c>$body</c> and a non-XML one at <c>/</c>, and undecodable bodies that differ in an invalid byte, in their
+/// decodable peer or in which side decodes, or from non-XML texts that spell their hexadecimal, give different
+/// natures; and the check writes only the two <c>artifacts/wsdl/**</c> files, removing stale ones and reporting a
+/// failed save in its detail, never the contract.
 /// </summary>
 public sealed class WsdlContractCheckTests : IDisposable
 {
@@ -45,6 +48,9 @@ public sealed class WsdlContractCheckTests : IDisposable
     private const string PortTypeOperationNamePath = "/definitions/portType/operation/@name";
     private const string BindingOperationNamePath = "/definitions/binding/operation/@name";
     private const string XmlRootPath = "/";
+
+    // The body as a whole, where the check reports a body that is not UTF-8.
+    private const string BodyPath = "$body";
 
     // The token a test's base URL holds in place of the authority of that side's running stub.
     private const string AuthorityToken = "{authority}";
@@ -67,9 +73,16 @@ public sealed class WsdlContractCheckTests : IDisposable
     private const string HeaderComment = "declaration and header comment";
     private const string ByteOrderMark = "byte order mark";
 
-    // How a malformed body is malformed.
+    // A malformed body on both sides, and how a malformed body is malformed.
+    private const string BothSides = "both";
     private const string InvalidUtf8 = "invalid UTF-8";
     private const string NotXml = "not XML";
+
+    // How the second of two failing runs with an undecodable body differs from the first.
+    private const string ChangedInvalidByte = "changed invalid byte";
+    private const string ChangedValidPeer = "changed valid peer";
+    private const string SwappedTextAndBytes = "swapped text and bytes";
+    private const string HexLookalikeText = "hex lookalike text";
 
     private const string NotFoundBody = "Not Found";
     private const string NotXmlBody = "Service Unavailable";
@@ -385,43 +398,164 @@ public sealed class WsdlContractCheckTests : IDisposable
     [Theory]
     [InlineData(BackendSide, InvalidUtf8)]
     [InlineData(FacadeSide, InvalidUtf8)]
+    [InlineData(BothSides, InvalidUtf8)]
     [InlineData(BackendSide, NotXml)]
     [InlineData(FacadeSide, NotXml)]
-    public async Task MalformedSide_Fails_WithOneMalformedDiscrepancyAtTheRoot(string side, string defect)
+    public async Task MalformedSide_Fails_WithTheExactDiscrepancies(string side, string defect)
     {
-        // An invalid byte inside the portType name; the literal shows it as U+FFFD, the bytes are kept as served.
-        var document = WsdlDocument(side == BackendSide ? StandInLocation : FacadeLocation);
-        var marker = $"<wsdl:portType name=\"{BindingName}";
-        var split = document.IndexOf(marker, StringComparison.Ordinal) + marker.Length;
-        byte[] invalidUtf8Body = [.. Encoding.UTF8.GetBytes(document[..split]), 0xFF, .. Encoding.UTF8.GetBytes(document[split..])];
-        var (malformedBody, malformedText) = defect switch
-        {
-            InvalidUtf8 => (invalidUtf8Body, document[..split] + "\uFFFD" + document[split..]),
-            NotXml => (Encoding.UTF8.GetBytes(NotXmlBody), NotXmlBody),
-            _ => throw new ArgumentOutOfRangeException(nameof(defect), defect, "Unknown defect."),
-        };
-        var wellFormedBody = Encoding.UTF8.GetBytes(WsdlDocument(side == BackendSide ? FacadeLocation : StandInLocation));
+        var backendText = WsdlDocument(StandInLocation);
+        var facadeText = WsdlDocument(FacadeLocation);
 
-        await using var backend = await LoopbackStub.StartAsync(
-            WsdlPathAndQuery, StatusCodes.Status200OK, side == BackendSide ? malformedBody : wellFormedBody, TestContext.Current.CancellationToken);
-        await using var facade = await LoopbackStub.StartAsync(
-            WsdlPathAndQuery, StatusCodes.Status200OK, side == FacadeSide ? malformedBody : wellFormedBody, TestContext.Current.CancellationToken);
+        // An invalid byte inside the portType name. An undecodable body is the hex of its bytes after the byte order
+        // mark, which the facade side carries when both are undecodable, reported at the body as a whole; the bytes
+        // are kept as served. A decodable body that is not XML is the comparer's entry at the root.
+        var undecodableBackend = WithInvalidByte(backendText, 0xFF);
+        var undecodableFacade = WithInvalidByte(facadeText, 0xFF);
+        byte[] markedUndecodableFacade = [.. Encoding.UTF8.Preamble, .. undecodableFacade];
+        var (backendBody, facadeBody) = (side, defect) switch
+        {
+            (BackendSide, InvalidUtf8) => (undecodableBackend, Encoding.UTF8.GetBytes(facadeText)),
+            (FacadeSide, InvalidUtf8) => (Encoding.UTF8.GetBytes(backendText), undecodableFacade),
+            (BothSides, InvalidUtf8) => (undecodableBackend, markedUndecodableFacade),
+            (BackendSide, NotXml) => (Encoding.UTF8.GetBytes(NotXmlBody), Encoding.UTF8.GetBytes(facadeText)),
+            (FacadeSide, NotXml) => (Encoding.UTF8.GetBytes(backendText), Encoding.UTF8.GetBytes(NotXmlBody)),
+            _ => throw new ArgumentOutOfRangeException(nameof(side), $"{side}, {defect}", "Unknown malformed side or defect."),
+        };
+        Discrepancy[] expected = (side, defect) switch
+        {
+            (BackendSide, InvalidUtf8) =>
+            [
+                new(BodyPath, DiscrepancyKinds.Malformed, Hex(undecodableBackend), DiscrepancyValue.Absent),
+                new(BodyPath, DiscrepancyKinds.Type, Hex(undecodableBackend), DiscrepancyValue.Literal(facadeText)),
+            ],
+            (FacadeSide, InvalidUtf8) =>
+            [
+                new(BodyPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, Hex(undecodableFacade)),
+                new(BodyPath, DiscrepancyKinds.Type, DiscrepancyValue.Literal(backendText), Hex(undecodableFacade)),
+            ],
+            (BothSides, InvalidUtf8) =>
+            [
+                new(BodyPath, DiscrepancyKinds.Malformed, Hex(undecodableBackend), Hex(undecodableFacade)),
+            ],
+            (BackendSide, NotXml) =>
+            [
+                new(XmlRootPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Literal(NotXmlBody), DiscrepancyValue.Absent),
+            ],
+            (FacadeSide, NotXml) =>
+            [
+                new(XmlRootPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, DiscrepancyValue.Literal(NotXmlBody)),
+            ],
+            _ => throw new ArgumentOutOfRangeException(nameof(side), $"{side}, {defect}", "Unknown malformed side or defect."),
+        };
+
+        await using var backend = await LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, backendBody, TestContext.Current.CancellationToken);
+        await using var facade = await LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, facadeBody, TestContext.Current.CancellationToken);
         var contract = WriteContract();
 
         var result = await RunAsync(backend.BaseUrl, facade.BaseUrl);
 
-        AssertDifference(
-            result,
-            [
-                new(
-                    XmlRootPath,
-                    DiscrepancyKinds.Malformed,
-                    side == BackendSide ? DiscrepancyValue.Literal(malformedText) : DiscrepancyValue.Absent,
-                    side == FacadeSide ? DiscrepancyValue.Literal(malformedText) : DiscrepancyValue.Absent),
-            ]);
-        Assert.Equal(side == BackendSide ? malformedBody : wellFormedBody, File.ReadAllBytes(ArtifactPath(BackendSide)));
-        Assert.Equal(side == FacadeSide ? malformedBody : wellFormedBody, File.ReadAllBytes(ArtifactPath(FacadeSide)));
+        AssertDifference(result, expected);
+        Assert.Equal(backendBody, File.ReadAllBytes(ArtifactPath(BackendSide)));
+        Assert.Equal(facadeBody, File.ReadAllBytes(ArtifactPath(FacadeSide)));
         AssertOnlyArtifactsWritten(contract, BackendSide, FacadeSide);
+    }
+
+    [Theory]
+    [InlineData(ChangedInvalidByte)]
+    [InlineData(ChangedValidPeer)]
+    [InlineData(SwappedTextAndBytes)]
+    [InlineData(HexLookalikeText)]
+    public async Task DifferentUndecodableDocuments_GiveDifferentNatures(string change)
+    {
+        var backendText = WsdlDocument(StandInLocation);
+        var facadeText = WsdlDocument(FacadeLocation);
+        var changedFacadeText = WsdlDocument(FacadeLocation, operationName: GetAgentNames.JadeMethod);
+        var undecodableBackend = WithInvalidByte(backendText, 0xFF);
+        var facadeWithFf = WithInvalidByte(facadeText, 0xFF);
+        var facadeWithFe = WithInvalidByte(facadeText, 0xFE);
+        byte[] textFf = "ff"u8.ToArray();
+        byte[] textFe = "fe"u8.ToArray();
+        byte[] text80 = "80"u8.ToArray();
+        byte[] bytesFf = [0xFF];
+        byte[] bytesFe = [0xFE];
+        byte[] bytes80 = [0x80];
+
+        // Two runs per row, each with its own stubs and contract; the type entries of the swapped pair are equal,
+        // so only the malformed entry, which names the undecodable side, tells the two apart. The hex lookalike
+        // pair has equal kinds and values, so only the path, the body as a whole against the comparer's root,
+        // tells two undecodable bodies from two decodable non-XML texts that spell their hexadecimal.
+        (byte[] Backend, byte[] Facade, Discrepancy[] Expected)[] runs = change switch
+        {
+            ChangedInvalidByte =>
+            [
+                (Encoding.UTF8.GetBytes(backendText), facadeWithFf,
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, Hex(facadeWithFf)),
+                    new(BodyPath, DiscrepancyKinds.Type, DiscrepancyValue.Literal(backendText), Hex(facadeWithFf)),
+                ]),
+                (Encoding.UTF8.GetBytes(backendText), facadeWithFe,
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, Hex(facadeWithFe)),
+                    new(BodyPath, DiscrepancyKinds.Type, DiscrepancyValue.Literal(backendText), Hex(facadeWithFe)),
+                ]),
+            ],
+            ChangedValidPeer =>
+            [
+                (undecodableBackend, Encoding.UTF8.GetBytes(facadeText),
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, Hex(undecodableBackend), DiscrepancyValue.Absent),
+                    new(BodyPath, DiscrepancyKinds.Type, Hex(undecodableBackend), DiscrepancyValue.Literal(facadeText)),
+                ]),
+                (undecodableBackend, Encoding.UTF8.GetBytes(changedFacadeText),
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, Hex(undecodableBackend), DiscrepancyValue.Absent),
+                    new(BodyPath, DiscrepancyKinds.Type, Hex(undecodableBackend), DiscrepancyValue.Literal(changedFacadeText)),
+                ]),
+            ],
+            SwappedTextAndBytes =>
+            [
+                (textFf, bytes80,
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Absent, Hex(bytes80)),
+                    new(BodyPath, DiscrepancyKinds.Type, DiscrepancyValue.Literal("ff"), Hex(bytes80)),
+                ]),
+                (bytesFf, text80,
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, Hex(bytesFf), DiscrepancyValue.Absent),
+                    new(BodyPath, DiscrepancyKinds.Type, Hex(bytesFf), DiscrepancyValue.Literal("80")),
+                ]),
+            ],
+            HexLookalikeText =>
+            [
+                (bytesFf, bytesFe,
+                [
+                    new(BodyPath, DiscrepancyKinds.Malformed, Hex(bytesFf), Hex(bytesFe)),
+                ]),
+                (textFf, textFe,
+                [
+                    new(XmlRootPath, DiscrepancyKinds.Malformed, DiscrepancyValue.Literal("ff"), DiscrepancyValue.Literal("fe")),
+                ]),
+            ],
+            _ => throw new ArgumentOutOfRangeException(nameof(change), change, "Unknown change."),
+        };
+
+        var natures = new List<string>();
+        foreach (var (backendBody, facadeBody, expected) in runs)
+        {
+            await using var backend = await LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, backendBody, TestContext.Current.CancellationToken);
+            await using var facade = await LoopbackStub.StartAsync(WsdlPathAndQuery, StatusCodes.Status200OK, facadeBody, TestContext.Current.CancellationToken);
+            var contract = WriteContract();
+
+            var result = await RunAsync(backend.BaseUrl, facade.BaseUrl);
+
+            AssertDifference(result, expected);
+            Assert.Equal(backendBody, File.ReadAllBytes(ArtifactPath(BackendSide)));
+            Assert.Equal(facadeBody, File.ReadAllBytes(ArtifactPath(FacadeSide)));
+            AssertOnlyArtifactsWritten(contract, BackendSide, FacadeSide);
+            natures.Add(result.Failure!.Nature);
+        }
+
+        Assert.NotEqual(natures[0], natures[1]);
     }
 
     // ---- Helpers ---------------------------------------------------------------------------------------
@@ -510,6 +644,17 @@ public sealed class WsdlContractCheckTests : IDisposable
     /// <summary>The XML declaration and the stand-in's label comment above <paramref name="document"/>, as the contracts WSDL carries them.</summary>
     private static string WithHeaderComment(string document) =>
         $"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n{StandInHeaderComment}\n{document}";
+
+    /// <summary>The UTF-8 bytes of <paramref name="document"/> with <paramref name="invalid"/>, a byte UTF-8 never uses, inside the portType name.</summary>
+    private static byte[] WithInvalidByte(string document, byte invalid)
+    {
+        var marker = $"<wsdl:portType name=\"{BindingName}";
+        var split = document.IndexOf(marker, StringComparison.Ordinal) + marker.Length;
+        return [.. Encoding.UTF8.GetBytes(document[..split]), invalid, .. Encoding.UTF8.GetBytes(document[split..])];
+    }
+
+    /// <summary>The literal of an undecodable body: the lowercase hexadecimal of <paramref name="bytes"/>.</summary>
+    private static DiscrepancyValue Hex(byte[] bytes) => DiscrepancyValue.Literal(Convert.ToHexStringLower(bytes));
 
     /// <summary>The literal of a <c>soap:address</c> reported on one side only: the element as written on its own, namespace declared.</summary>
     private static DiscrepancyValue AddressMarkup(string location) =>

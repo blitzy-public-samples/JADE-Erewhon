@@ -58,8 +58,9 @@ public sealed class WsdlContractCheck(
     private const string ResponsePath = "$response";
     private const string StatusPath = "$status";
 
-    // The XML root path, in the convention of XmlSemanticComparer.
-    private const string XmlRootPath = "/";
+    // The body as a whole, in the convention every comparer in Compare/ uses: a body that is not UTF-8 has no XML
+    // tree, and no XML path is this one, so its entries never match those XmlSemanticComparer reports.
+    private const string BodyPath = "$body";
 
     // The baseline token of a no-response discrepancy: a response was expected on that side.
     private const string ExpectedResponse = "response";
@@ -70,9 +71,6 @@ public sealed class WsdlContractCheck(
     // Strict, so two documents that differ only in invalid byte sequences cannot both decode to U+FFFD
     // and compare equal; an undecodable side is reported as malformed instead.
     private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
-
-    // Only for the literal text of an undecodable side, so the discrepancy can still show it.
-    private static readonly UTF8Encoding LenientUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: false);
 
     private static readonly WsdlSide Backend = new("backend", "Harness:Backend:SoapBaseUrl", "backend.wsdl");
     private static readonly WsdlSide Facade = new("facade", "Harness:Target:SoapBaseUrl", "facade.wsdl");
@@ -232,29 +230,69 @@ public sealed class WsdlContractCheck(
     // The backend WSDL is the baseline side and the facade WSDL the observed side.
     private IReadOnlyList<Discrepancy> CompareDocuments(byte[] backendBody, byte[] facadeBody)
     {
-        var baselineText = TryDecode(backendBody);
-        var observedText = TryDecode(facadeBody);
+        var baselineBody = WithoutBom(backendBody);
+        var observedBody = WithoutBom(facadeBody);
+        var baselineText = TryDecode(baselineBody);
+        var observedText = TryDecode(observedBody);
 
         if (baselineText is null || observedText is null)
         {
-            return
-            [
-                new Discrepancy(
-                    XmlRootPath,
-                    DiscrepancyKinds.Malformed,
-                    baselineText is null ? DiscrepancyValue.Literal(LenientUtf8.GetString(WithoutBom(backendBody))) : DiscrepancyValue.Absent,
-                    observedText is null ? DiscrepancyValue.Literal(LenientUtf8.GetString(WithoutBom(facadeBody))) : DiscrepancyValue.Absent),
-            ];
+            return UndecodableDiscrepancies(baselineBody, baselineText, observedBody, observedText);
         }
 
         return _comparer.Compare(baselineText, observedText, XmlComparisonContext.Wsdl(excludeSoapAddressLocation: true));
     }
 
-    private static string? TryDecode(byte[] bytes)
+    /// <summary>
+    /// The discrepancies at <c>$body</c>, the body as a whole, when at least one document is not valid UTF-8.
+    /// Such a document has no XML tree, and <c>$body</c> is never a path the XML comparer or a fetch
+    /// discrepancy reports, so these entries cannot equal the comparer's <c>malformed</c> entry at <c>/</c>
+    /// for decodable text that is not XML, such as the text <c>ff</c>. An undecodable document is the
+    /// lowercase hexadecimal of its bytes after the byte-order mark, which keeps every byte where replacement
+    /// decoding would merge, for example, 0xFF and 0xFE into one character. The <c>malformed</c> entry holds
+    /// that value on each side that does not decode and nothing on a side that does, so it names the failing
+    /// side. When the other document decodes, a <c>type</c> entry also holds both documents, the decodable one
+    /// as its exact text, so a change to either document changes the signature.
+    /// </summary>
+    /// <param name="baselineBody">The backend bytes after the byte-order mark.</param>
+    /// <param name="baselineText">The decoded backend text; null when it is not valid UTF-8.</param>
+    /// <param name="observedBody">The facade bytes after the byte-order mark.</param>
+    /// <param name="observedText">The decoded facade text; null when it is not valid UTF-8.</param>
+    private static IReadOnlyList<Discrepancy> UndecodableDiscrepancies(
+        ReadOnlySpan<byte> baselineBody,
+        string? baselineText,
+        ReadOnlySpan<byte> observedBody,
+        string? observedText)
+    {
+        var baselineHex = baselineText is null ? Convert.ToHexStringLower(baselineBody) : null;
+        var observedHex = observedText is null ? Convert.ToHexStringLower(observedBody) : null;
+
+        List<Discrepancy> discrepancies =
+        [
+            new Discrepancy(
+                BodyPath,
+                DiscrepancyKinds.Malformed,
+                baselineHex is null ? DiscrepancyValue.Absent : DiscrepancyValue.Literal(baselineHex),
+                observedHex is null ? DiscrepancyValue.Absent : DiscrepancyValue.Literal(observedHex)),
+        ];
+
+        if (baselineText is not null || observedText is not null)
+        {
+            discrepancies.Add(new Discrepancy(
+                BodyPath,
+                DiscrepancyKinds.Type,
+                DiscrepancyValue.Literal(baselineText ?? baselineHex),
+                DiscrepancyValue.Literal(observedText ?? observedHex)));
+        }
+
+        return discrepancies;
+    }
+
+    private static string? TryDecode(ReadOnlySpan<byte> body)
     {
         try
         {
-            return StrictUtf8.GetString(WithoutBom(bytes));
+            return StrictUtf8.GetString(body);
         }
         catch (DecoderFallbackException)
         {

@@ -474,8 +474,9 @@ public sealed partial class StandInState
     /// reset that throws leaves the previous state, generation and mutation count as they were, and a
     /// reset that swaps always returns its <see cref="StandInInfo"/>. Every reset prints
     /// <see cref="SourceLabels.Banner"/>, a summary line and, for <see cref="ResetKind.Seed"/>, the
-    /// load description; they are composed before the swap and written after it, and a console that
-    /// cannot be written is logged as a warning without failing the reset.
+    /// load description; they are composed before the swap and written after it as best-effort
+    /// output, so a console or logger failure never fails the reset: a console that cannot be written
+    /// is logged as a warning when the logger works, and the warning is dropped when it does not.
     /// </remarks>
     /// <param name="kind">The state to build.</param>
     /// <returns>The <see cref="StandInInfo"/> of the new state.</returns>
@@ -555,7 +556,9 @@ public sealed partial class StandInState
     /// <summary>
     /// Builds the new state, then swaps it in and prints the reset lines; callers hold the reset
     /// gate. Every exception, a cancellation included, is thrown before the swap; from the swap on
-    /// nothing throws.
+    /// nothing throws, and the captured info is always returned. A console or logger failure while
+    /// printing never fails the reset: the warning is logged when the logger works and dropped
+    /// otherwise (<see cref="WriteResetLines(long, string, string?)"/>).
     /// </summary>
     private StandInInfo BuildAndPublish(ResetKind kind, string kindText, CancellationToken cancellationToken)
     {
@@ -616,9 +619,12 @@ public sealed partial class StandInState
 
     /// <summary>
     /// Prints <see cref="SourceLabels.Banner"/>, the reset summary and, when present, the load
-    /// description, after the new state is published. The reset has then already happened, so a
-    /// console that cannot be written (a full disk, a file-size limit, a closed or redirected stream
-    /// that rejects writes) is logged as a warning instead of failing the reset.
+    /// description, after the new state is published. The reset has then already happened, so the
+    /// output is best-effort and never throws: a console that cannot be written (a full disk, a
+    /// file-size limit, a closed stream, or a writer installed with
+    /// <see cref="Console.SetOut(TextWriter)"/> that rejects writes with any exception) is logged as
+    /// a warning, and when the logger fails as well the warning is dropped
+    /// (<see cref="TryLogResetOutputFailed(Exception, long)"/>).
     /// </summary>
     private void WriteResetLines(long generation, string summary, string? description)
     {
@@ -631,10 +637,28 @@ public sealed partial class StandInState
                 Console.WriteLine(description);
             }
         }
-        catch (Exception ex) when (ex is IOException or ArgumentException or ObjectDisposedException
-            or UnauthorizedAccessException or NotSupportedException)
+        catch (Exception ex)
         {
-            LogResetOutputFailed(_logger, ex, generation);
+            TryLogResetOutputFailed(ex, generation);
+        }
+    }
+
+    /// <summary>
+    /// Logs that the console lines of published reset <paramref name="generation"/> could not be
+    /// written. The logging framework rethrows a provider's failure, so the call is guarded: when the
+    /// logger cannot write either, the warning is dropped, because no sink is left to report it and
+    /// the reset is already committed.
+    /// </summary>
+    private void TryLogResetOutputFailed(Exception exception, long generation)
+    {
+        try
+        {
+            LogResetOutputFailed(_logger, exception, generation);
+        }
+        catch (Exception)
+        {
+            // Neither the console nor the logger accepts output, and the new state is already live,
+            // so the warning is dropped rather than turning a committed reset into a failure.
         }
     }
 
