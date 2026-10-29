@@ -1,5 +1,8 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.IO.Pipes;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
@@ -10,6 +13,7 @@ using Erewhon.Contracts.Catalogue;
 using Erewhon.Harness.Cases;
 using Erewhon.Harness.Checks;
 using Erewhon.Harness.Compare;
+using Erewhon.Harness.Modes;
 using Erewhon.Harness.Report;
 
 namespace Erewhon.Harness.Tests;
@@ -28,9 +32,12 @@ namespace Erewhon.Harness.Tests;
 /// written only into a temporary directory. It also covers the checks whose failure items the register
 /// matches: reading the facade tests' TRX file and <c>exit-code</c>, the JADE-unchanged check and the
 /// ordering-evidence check, driven by scripted git runners and confirmed against throwaway repositories in
-/// a temporary directory of the test's own, so git never runs in the harness's own repository. The
-/// committed <c>harness/config/known-limitations.json</c> and <c>harness/config/case-matrix.json</c> are
-/// only ever read here.
+/// a temporary directory of the test's own, so git never runs in the harness's own repository. It also
+/// covers the summary mode, which prints the results report's final line: how it writes that line to the
+/// descriptor behind standard output (pipes, sockets, files and a standard output closed at start), from a
+/// <c>RESULTS.md</c> in a temporary directory of its own. The committed
+/// <c>harness/config/known-limitations.json</c> and <c>harness/config/case-matrix.json</c> are only ever
+/// read here.
 /// </summary>
 public sealed partial class KnownLimitationsRegisterTests : IDisposable
 {
@@ -102,8 +109,17 @@ public sealed partial class KnownLimitationsRegisterTests : IDisposable
     /// <summary>This test's own temporary directory, created on first use.</summary>
     private TempDirectory Temp => _temp ??= new TempDirectory();
 
-    /// <summary>Deletes the temporary directory and any repository in it, if this test created one.</summary>
-    public void Dispose() => _temp?.Dispose();
+    /// <summary>
+    /// Deletes the temporary directory and any repository in it, if this test created one, and disposes the
+    /// console and deletes the report directory, where a summary mode test created them.
+    /// </summary>
+    public void Dispose()
+    {
+        _temp?.Dispose();
+        _summaryConsole?.Dispose();
+        _summaryConsoleBytes?.Dispose();
+        _summaryRepoRoot?.Dispose();
+    }
 
     // ---- Matching -------------------------------------------------------------------------------
 
@@ -5904,11 +5920,308 @@ public sealed partial class KnownLimitationsRegisterTests
     }
 }
 
+// ---- The summary mode ---------------------------------------------------------------------------
+// How the summary mode prints to the descriptor behind standard output: a pipe whose reader has gone
+// fails the write and exits 1 instead of counting as printed; a pipe with a reader receives exactly the
+// final line and its line terminator; a seekable descriptor keeps the console writer; a full non-blocking
+// descriptor is waited for and never handed to the console writer, so the outcome follows what its reader
+// does. A pipe end the runtime opened reads as carrying close-on-exec, which no inherited standard output
+// does, and a file opened by path cannot tell. The report is a RESULTS.md in a temporary directory of the
+// test's own. These members live in this class because the harness test project keeps its fixed set of
+// test classes, and the summary mode prints the final line of the results report this class covers.
+public sealed partial class KnownLimitationsRegisterTests
+{
+    private const string FinalLine = "22 of 22 operations equivalent, 0 documented differences";
+    private const string AfterMarker = "after\n";
+
+    // Each one-byte send is charged a whole buffer of some hundred bytes, so a send buffer of the default
+    // size fills after a few hundred sends; the bound ends the test if the socket never fills.
+    private const int MaxFillBytes = 1024 * 1024;
+
+    private const char FillByte = 'x';
+
+    private static readonly UTF8Encoding Utf8 = new(encoderShouldEmitUTF8Identifier: false);
+
+    // Gives the mode time to reach its first write. Whether it has or not, the mode cannot return before the
+    // test acts, because nothing else frees the descriptor.
+    private static readonly TimeSpan WaitBeforeActing = TimeSpan.FromMilliseconds(100);
+
+    // Bounds every wait on the mode and on the reader, so a mode that never returns fails the test.
+    private static readonly TimeSpan WaitLimit = TimeSpan.FromSeconds(30);
+
+    // Created on first use, so only the summary mode tests create the report directory or the console;
+    // released in Dispose. The report directory is a TempDirectory of its own, apart from Temp.
+    private TempDirectory? _summaryRepoRoot;
+    private MemoryStream? _summaryConsoleBytes;
+    private StreamWriter? _summaryConsole;
+
+    /// <summary>What a test does with the reading end of a full non-blocking socket while the mode waits.</summary>
+    public enum ReaderAction
+    {
+        /// <summary>Closes the reading end without reading from it.</summary>
+        CloseWithoutDraining,
+
+        /// <summary>Reads everything sent to the socket.</summary>
+        Drain,
+
+        /// <summary>Leaves the reading end unread and cancels the run.</summary>
+        CancelRun,
+    }
+
+    /// <summary>The summary mode test's own repository root, created on first use with the report written in it.</summary>
+    private TempDirectory SummaryRepoRoot
+    {
+        get
+        {
+            if (_summaryRepoRoot is null)
+            {
+                // Assigned before the write, so Dispose deletes the directory even if the write fails.
+                _summaryRepoRoot = new TempDirectory();
+                _summaryRepoRoot.Write("RESULTS.md", $"# Results\n\nDetail line\n{FinalLine}\n\n");
+            }
+
+            return _summaryRepoRoot;
+        }
+    }
+
+    /// <summary>The bytes the summary mode's console writer has written.</summary>
+    private MemoryStream SummaryConsoleBytes => _summaryConsoleBytes ??= new MemoryStream();
+
+    /// <summary>A console writer that encodes as Console.Out does on Linux, over <see cref="SummaryConsoleBytes"/>.</summary>
+    private StreamWriter SummaryConsole => _summaryConsole ??= new StreamWriter(SummaryConsoleBytes, Utf8, leaveOpen: true) { NewLine = "\n" };
+
+    [Fact]
+    public async Task PipeWithoutReader_Exits1_AndPrintsNothing()
+    {
+        using var pipe = new AnonymousPipeServerStream(PipeDirection.Out);
+        pipe.ClientSafePipeHandle.Dispose();
+
+        var exitCode = await NewMode(pipe).RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, exitCode);
+        Assert.Equal(0, SummaryConsoleBytes.Length);
+    }
+
+    [Fact]
+    public async Task PipeWithReader_Exits0_AndReceivesExactlyTheFinalLine()
+    {
+        using var pipe = new AnonymousPipeServerStream(PipeDirection.Out);
+        using var reader = new AnonymousPipeClientStream(PipeDirection.In, pipe.ClientSafePipeHandle);
+
+        var exitCode = await NewMode(pipe).RunAsync(TestContext.Current.CancellationToken);
+
+        // The descriptor is still open after the mode, so the marker follows the mode's bytes; closing the
+        // write end then ends the reader's stream.
+        pipe.Write(Utf8.GetBytes(AfterMarker));
+        pipe.Dispose();
+        using var received = new MemoryStream();
+        await reader.CopyToAsync(received, TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal(FinalLine + "\n" + AfterMarker, Utf8.GetString(received.ToArray()));
+        Assert.Equal(0, SummaryConsoleBytes.Length);
+    }
+
+    // A write at the stream's own offset would leave the offset shared with the shell unmoved, so a
+    // regular file is printed to through the console writer and the descriptor is not written.
+    [Fact]
+    public async Task SeekableDescriptor_Exits0_AndPrintsThroughTheConsoleWriter()
+    {
+        using var file = File.OpenHandle(SummaryRepoRoot.PathOf("stdout.txt"), FileMode.CreateNew, FileAccess.Write);
+
+        var exitCode = await NewMode(file.DangerousGetHandle()).RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal(FinalLine + "\n", Utf8.GetString(SummaryConsoleBytes.ToArray()));
+        Assert.Equal(0, RandomAccess.GetLength(file));
+    }
+
+    // A non-blocking descriptor that cannot take the line fails each direct write with EAGAIN, which is not a
+    // failure to print: the mode waits and writes again, and never hands the line to the console writer, which
+    // would count EPIPE as printed. A reader that goes fails the write (exit 1), a reader that drains receives
+    // exactly the line after the fill bytes (exit 0), and a run cancelled while waiting exits 1 having written
+    // nothing. A Unix stream socket whose reader never reads stays full, because only a read frees its send
+    // buffer, so the mode is still waiting when the test acts, whatever the timing.
+    [Theory]
+    [InlineData(ReaderAction.CloseWithoutDraining, 1)]
+    [InlineData(ReaderAction.Drain, 0)]
+    [InlineData(ReaderAction.CancelRun, 1)]
+    public async Task FullNonBlockingDescriptor_WaitsForTheReader_AndNeverPrintsThroughTheConsoleWriter(
+        ReaderAction action,
+        int expectedExitCode)
+    {
+        Assert.SkipUnless(
+            !OperatingSystem.IsWindows(),
+            "the mode writes to a descriptor directly only on systems other than Windows");
+        var ct = TestContext.Current.CancellationToken;
+        var endPoint = new UnixDomainSocketEndPoint(SummaryRepoRoot.PathOf("stdout.sock"));
+        using var listener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        listener.Bind(endPoint);
+        listener.Listen(1);
+        using var writer = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+        await writer.ConnectAsync(endPoint, ct);
+        using var reader = await listener.AcceptAsync(ct);
+        writer.Blocking = false;
+        var filled = FillSendBuffer(writer);
+        using var run = CancellationTokenSource.CreateLinkedTokenSource(ct);
+
+        var running = NewMode(writer.Handle).RunAsync(run.Token);
+        await Task.Delay(WaitBeforeActing, ct);
+        Assert.False(running.IsCompleted, "the mode returned while the descriptor was still full");
+
+        Task<byte[]>? received = null;
+        switch (action)
+        {
+            case ReaderAction.CloseWithoutDraining:
+                reader.Dispose();
+                break;
+            case ReaderAction.Drain:
+                received = ReadToEndAsync(reader, ct);
+                break;
+            case ReaderAction.CancelRun:
+                await run.CancelAsync();
+                break;
+        }
+
+        var exitCode = await running.WaitAsync(WaitLimit, ct);
+
+        Assert.Equal(expectedExitCode, exitCode);
+        Assert.Equal(0, SummaryConsoleBytes.Length);
+        if (action is not ReaderAction.CloseWithoutDraining)
+        {
+            // The mode has returned, so ending the sending side ends the reader's stream after the mode's bytes.
+            writer.Shutdown(SocketShutdown.Send);
+            var bytes = await (received ?? ReadToEndAsync(reader, ct)).WaitAsync(WaitLimit, ct);
+            var expected = new string(FillByte, filled) + (expectedExitCode == 0 ? FinalLine + "\n" : string.Empty);
+            Assert.Equal(expected, Utf8.GetString(bytes));
+        }
+    }
+
+    // The runtime opens every descriptor of its own with close-on-exec, as it does the descriptor that takes
+    // the number of a standard output closed at start. Only a pipe end made inheritable for a child process
+    // is open without close-on-exec, as every descriptor inherited across exec is.
+    [Theory]
+    [InlineData(HandleInheritability.None, false)]
+    [InlineData(HandleInheritability.Inheritable, true)]
+    public void RuntimePipe_IsOpenWithoutCloseOnExec_OnlyAtAnInheritableClientEnd(
+        HandleInheritability inheritability,
+        bool clientEndWithoutCloseOnExec)
+    {
+        SkipUnlessFdInfo();
+        using var pipe = new AnonymousPipeServerStream(PipeDirection.Out, inheritability);
+
+        // Once exposed, the client end is not closed with the server stream.
+        using var clientEnd = pipe.ClientSafePipeHandle;
+
+        Assert.False(SummaryMode.IsOpenWithoutCloseOnExec(DescriptorOf(pipe.SafePipeHandle)));
+        Assert.Equal(clientEndWithoutCloseOnExec, SummaryMode.IsOpenWithoutCloseOnExec(DescriptorOf(clientEnd)));
+    }
+
+    // No descriptor can have this number, because the kernel caps descriptor numbers far below it, so it reads
+    // as not open, as descriptor 1 does when standard output was closed at start and the number is still free.
+    [Fact]
+    public void DescriptorThatIsNotOpen_IsNotOpenWithoutCloseOnExec()
+    {
+        SkipUnlessFdInfo();
+
+        Assert.False(SummaryMode.IsOpenWithoutCloseOnExec(int.MaxValue));
+    }
+
+    // The runtime opened this file with close-on-exec, but a file opened by path can also keep O_CLOEXEC among
+    // its open flags, as the terminal of `docker run -t` does, so the flags line cannot tell the two apart.
+    [Fact]
+    public void FileOpenedByPath_WithCloseOnExec_CannotTell()
+    {
+        SkipUnlessFdInfo();
+        using var file = File.OpenHandle(SummaryRepoRoot.PathOf("descriptor.txt"), FileMode.CreateNew, FileAccess.Write);
+
+        Assert.Null(SummaryMode.IsOpenWithoutCloseOnExec(DescriptorOf(file)));
+    }
+
+    // The links /proc/self/fd shows for each kind of file; only the first four kinds get open flags without
+    // O_CLOEXEC from the kernel.
+    [Theory]
+    [InlineData("pipe:[640008469]", true)]
+    [InlineData("socket:[4026]", true)]
+    [InlineData("anon_inode:[eventpoll]", true)]
+    [InlineData("/memfd:doublemapper (deleted)", true)]
+    [InlineData("/dev/pts/0", false)]
+    [InlineData("/dev/null", false)]
+    [InlineData("/var/tmp/out.txt", false)]
+    [InlineData("/var/tmp/fifo", false)]
+    [InlineData("", false)]
+    [InlineData(null, false)]
+    public void OpenFlagsNeverHoldCloseOnExec_OnlyForPipesSocketsAnonymousInodesAndMemfdFiles(
+        string? linkTarget,
+        bool expected)
+    {
+        Assert.Equal(expected, SummaryMode.OpenFlagsNeverHoldCloseOnExec(linkTarget));
+    }
+
+    // The flags line is octal and O_CLOEXEC is 02000000: a runtime pipe end shows 02000000 or 02000001, and a
+    // /dev/null or terminal a shell opened read-write shows 0100002. 32 bits of flags take at most 12 octal
+    // digits with the leading 0. Text without a flags line of such digits cannot tell, so the check is skipped.
+    [Theory]
+    [InlineData("pos:\t0\nflags:\t02000000\nmnt_id:\t15\nino:\t1\n", true)]
+    [InlineData("pos:\t0\nflags:\t02000001\nmnt_id:\t15\nino:\t1\n", true)]
+    [InlineData("pos:\t0\nflags:\t037777777777\nmnt_id:\t15\n", true)]
+    [InlineData("pos:\t0\nflags:\t0100002\nmnt_id:\t26\nino:\t5\n", false)]
+    [InlineData("pos:\t0\nflags:\t01\nmnt_id:\t15\nino:\t1\n", false)]
+    [InlineData("pos:\t0\nflags:\t02000008\nmnt_id:\t15\n", null)]
+    [InlineData("pos:\t0\nflags:\t-2000000\nmnt_id:\t15\n", null)]
+    [InlineData("pos:\t0\nflags:\t0377777777777\nmnt_id:\t15\n", null)]
+    [InlineData("pos:\t0\nflags:\t\nmnt_id:\t15\n", null)]
+    [InlineData("pos:\t0\nmnt_id:\t15\nino:\t1\n", null)]
+    [InlineData("", null)]
+    public void CarriesCloseOnExec_ReadsTheOctalFlagsLine(string fdInfo, bool? expected)
+    {
+        Assert.Equal(expected, SummaryMode.CarriesCloseOnExec(fdInfo));
+    }
+
+    private static void SkipUnlessFdInfo() =>
+        Assert.SkipUnless(
+            OperatingSystem.IsLinux() && Directory.Exists("/proc/self/fdinfo"),
+            "close-on-exec is read from /proc/self/fdinfo, which only Linux with procfs mounted has");
+
+    private static int DescriptorOf(SafeHandle handle) => (int)handle.DangerousGetHandle();
+
+    // One byte per send, so the socket is full only when it cannot take even one more byte. Returns the number
+    // of bytes sent, each of them FillByte.
+    private static int FillSendBuffer(Socket socket)
+    {
+        byte[] oneByte = [(byte)FillByte];
+        for (var sent = 0; ; sent++)
+        {
+            Assert.True(sent < MaxFillBytes, "the socket still accepted data after the fill limit");
+            socket.Send(oneByte, 0, 1, SocketFlags.None, out var error);
+            if (error == SocketError.WouldBlock)
+            {
+                return sent;
+            }
+
+            Assert.Equal(SocketError.Success, error);
+        }
+    }
+
+    private static async Task<byte[]> ReadToEndAsync(Socket socket, CancellationToken ct)
+    {
+        using var stream = new NetworkStream(socket, ownsSocket: false);
+        using var received = new MemoryStream();
+        await stream.CopyToAsync(received, ct);
+        return received.ToArray();
+    }
+
+    private SummaryMode NewMode(AnonymousPipeServerStream pipe) => NewMode(pipe.SafePipeHandle.DangerousGetHandle());
+
+    private SummaryMode NewMode(nint descriptor) =>
+        new(new HarnessOptions { RepoRoot = SummaryRepoRoot.Root }, SummaryConsole, descriptor);
+}
+
 // ---- Support types of the facade TRX, JADE-unchanged and ordering-evidence tests ----------------
 // Top-level support types rather than test classes: a scripted git runner, a temporary directory
-// and the git command line for throwaway repositories. TempDirectory also serves the replay
-// lifecycle tests. They live in this file because the harness test project keeps its fixed set of
-// test source files.
+// and the git command line for throwaway repositories. TempDirectory also serves the summary mode
+// and replay lifecycle tests. They live in this file because the harness test project keeps its
+// fixed set of test source files.
 
 /// <summary>One invocation a <see cref="ScriptedGit"/> received.</summary>
 /// <param name="RepoRoot">The repository root the check passed.</param>

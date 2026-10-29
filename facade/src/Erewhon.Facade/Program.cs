@@ -99,8 +99,17 @@ try
         kestrel.Limits.MaxRequestBodySize = null;
 
         // Plain HTTP/1.1 on every listener, as the JADE applications serve (_webIsSecure false).
-        kestrel.Listen(address, ListenerPort(facade.RestPort, nameof(FacadeOptions.RestPort)), listen => listen.Protocols = HttpProtocols.Http1);
-        kestrel.Listen(address, ListenerPort(facade.SoapPort, nameof(FacadeOptions.SoapPort)), listen => listen.Protocols = HttpProtocols.Http1);
+        // The forwarding REST and SOAP listeners also capture each request's Connection lines as sent.
+        kestrel.Listen(address, ListenerPort(facade.RestPort, nameof(FacadeOptions.RestPort)), listen =>
+        {
+            listen.Protocols = HttpProtocols.Http1;
+            listen.UseRawConnectionHeaderCapture();
+        });
+        kestrel.Listen(address, ListenerPort(facade.SoapPort, nameof(FacadeOptions.SoapPort)), listen =>
+        {
+            listen.Protocols = HttpProtocols.Http1;
+            listen.UseRawConnectionHeaderCapture();
+        });
         kestrel.Listen(address, ListenerPort(facade.AdminPort, nameof(FacadeOptions.AdminPort)), listen => listen.Protocols = HttpProtocols.Http1);
     });
 

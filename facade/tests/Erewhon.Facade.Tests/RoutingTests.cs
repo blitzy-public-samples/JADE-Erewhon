@@ -26,6 +26,12 @@
 // reaches a message, which is also why no Assert.Single, Assert.Empty or Assert.Equal is applied to a
 // recorded StubRequest: its dump would print the Host header and with it a port.
 
+using System.Diagnostics;
+using System.Globalization;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Sockets;
+using System.Text;
 using Erewhon.Contracts.Catalogue;
 using Erewhon.Facade.Admin;
 using Erewhon.Facade.Routing;
@@ -472,6 +478,784 @@ public sealed class RequestLinePassThroughTests
         }
     }
 
+}
+
+// Header pass-through (class PassThroughTransformerTests) sits here, beside the request-line
+// pass-through, as a class of its own: the results report counts test classes by the name suffixes
+// "RoutingTests", "FailureBehaviourTests" and "ListenerIsolationTests", and this name matches none.
+//
+// Hop-by-hop handling and response timing of the facade's pass-through transform, through the facade's
+// real REST and SOAP sockets. A field that a Connection header nominates belongs to one hop (RFC 9110,
+// section 7.6.1), so neither the caller's nominated request fields nor the backend's nominated response
+// fields may cross the facade, while every other end-to-end field, the Content-Length framing and the
+// body bytes pass unchanged. That holds when the caller's Connection list also holds close, keep-alive
+// or upgrade, to which Kestrel reduces its own copy of the header, and for every request of a
+// keep-alive connection, whatever the framing of the request before it. The backend's status line and
+// headers reach the caller as soon as the backend sends them, before its first body byte; once they
+// have, a deadline that passes before the body ends aborts the response instead of re-heading it.
+//
+// The caller's request is written on a raw socket, because HttpClient joins repeated header lines into
+// one, and the backend's responses come from a raw listener, because Kestrel would not write a response
+// head with Connection lines naming other fields or send a head before its body is released.
+//
+// Facade test failures are identified across runs by a signature over the exception type, the failing
+// line and the assertion message, so every message here is a fixed literal: no port, URL or elapsed
+// time. The order check is deterministic: the backend withholds its body until the test releases it,
+// and the 10 s bound only ends the wait of a facade that holds the head back.
+/// <summary>
+/// Shows that fields nominated by a <c>Connection</c> header are dropped on the request and the response
+/// hop while the other end-to-end fields pass, mixed lists and keep-alive connections included, that the
+/// response head is not held until the body, and that a deadline passing after the head aborts the
+/// response.
+/// </summary>
+public sealed class PassThroughTransformerTests
+{
+    private const string BackendStubId = "A";
+    private const string EndToEndHeader = "X-End-To-End";
+    private const string EndToEndValue = "kept";
+    private const string ContentTypeHeader = "Content-Type";
+    private const string ContentLengthHeader = "Content-Length";
+    private const string TransferEncodingHeader = "Transfer-Encoding";
+    private const string SoapActionHeader = "SOAPAction";
+    private const string CrLf = "\r\n";
+
+    // The custom field the mixed-list and keep-alive requests carry, nominated or not.
+    private const string HopField = "X-Hop-One";
+    private const string HopValue = "one";
+
+    // A request field line that nominates the custom field next to keep-alive, as one Connection line.
+    private const string KeepAliveNominatingLine = "Connection: X-Hop-One, keep-alive";
+
+    // The largest message head the raw reader accepts, as Kestrel's default request header limit.
+    private const int MaxMessageHeadBytes = 32 * 1024;
+
+    // Backend:TimeoutSeconds for the call whose body never follows its head.
+    private const int MidBodyDeadlineSeconds = 2;
+
+    // The blank line that ends a message head.
+    private static readonly byte[] HeadTerminator = "\r\n\r\n"u8.ToArray();
+
+    // The caller's request names these fields in two Connection lines, in another case than their own
+    // field lines: two custom fields, a request field (Accept) and a content field of the body.
+    private static readonly string[] NominatedRequestFields = ["X-Hop-One", "X-Hop-Two", "Accept", "Content-Language"];
+
+    // The backend's response names these fields in two Connection lines, likewise.
+    private static readonly string[] NominatedResponseFields = ["X-Hop-One", "X-Hop-Two", "Content-Language"];
+
+    // A JSON null: four bytes, the body of every raw backend response.
+    private static readonly byte[] BackendBody = "null"u8.ToArray();
+
+    // The second Connection line of each direction also holds an empty element, a token that is not a
+    // valid field name, and Content-Length, which frames the body and must survive.
+    private static readonly byte[] NominatingResponse = Encoding.ASCII.GetBytes(
+        "HTTP/1.1 200 OK" + CrLf
+        + "Content-Type: application/json; charset=utf-8" + CrLf
+        + "Connection: X-HOP-ONE, x-hop-two, close" + CrLf
+        + "X-Hop-One: one" + CrLf
+        + "x-Hop-Two: two" + CrLf
+        + EndToEndHeader + ": " + EndToEndValue + CrLf
+        + "Connection: content-language ,, bad token\t, Content-Length" + CrLf
+        + "Content-Language: en" + CrLf
+        + "Content-Length: 4" + CrLf
+        + CrLf
+        + "null");
+
+    private static readonly byte[] HeldBodyResponseHead = Encoding.ASCII.GetBytes(
+        "HTTP/1.1 200 OK" + CrLf
+        + "Content-Type: application/json; charset=utf-8" + CrLf
+        + EndToEndHeader + ": " + EndToEndValue + CrLf
+        + "Content-Length: 4" + CrLf
+        + "Connection: close" + CrLf
+        + CrLf);
+
+    // How long a raw backend withholds its body when the test never releases it.
+    private static readonly TimeSpan BodyWithheldBound = TimeSpan.FromSeconds(10);
+
+    // How long a raw exchange with the facade may take before it fails the test, as the raw client's.
+    private static readonly TimeSpan RawExchangeTimeout = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Sends a request with a body whose two <c>Connection</c> lines nominate custom, request and content
+    /// fields, and asserts that none of them reaches the backend while an unrelated custom field, the
+    /// content type, the <c>Content-Length</c> framing and the body bytes arrive unchanged.
+    /// </summary>
+    /// <param name="operationId">A catalogue operation whose request carries a body.</param>
+    [Theory]
+    [InlineData("Rest.postCreateAgent")]
+    [InlineData("Soap.updateAgentWithDTO")]
+    public async Task ConnectionNominatedRequestFieldsDoNotReachBackend(string operationId)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await using StubBackend backend = await StubBackend.StartAsync(BackendStubId, null, ct);
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(
+            new FacadeTestSettings { BackendRestBaseUrl = backend.RestBaseUrl, BackendSoapBaseUrl = backend.SoapBaseUrl }, ct);
+
+        OperationDescriptor operation = OperationCatalogue.Default.GetById(operationId);
+        PreparedRequest prepared = OperationRequests.For(operation);
+        byte[] body = prepared.Body ?? throw new InvalidOperationException("operation request carries no body");
+        string contentLength = body.Length.ToString(CultureInfo.InvariantCulture);
+        Uri socket = SocketFor(facade, operation);
+
+        var head = new StringBuilder()
+            .Append(prepared.Method.Method).Append(' ').Append(prepared.PathAndQuery).Append(" HTTP/1.1").Append(CrLf)
+            .Append("Host: ").Append(socket.Authority).Append(CrLf)
+            .Append("Connection: X-HOP-ONE, x-hop-two, accept").Append(CrLf)
+            .Append("X-Hop-One: one").Append(CrLf)
+            .Append("x-Hop-Two: two").Append(CrLf)
+            .Append("Accept: application/json").Append(CrLf)
+            .Append(EndToEndHeader).Append(": ").Append(EndToEndValue).Append(CrLf)
+            .Append("Connection: content-language ,, bad token\t, Content-Length").Append(CrLf)
+            .Append("Content-Language: en").Append(CrLf)
+            .Append(ContentTypeHeader).Append(": ").Append(prepared.ContentType).Append(CrLf);
+        if (prepared.SoapAction is not null)
+        {
+            head.Append(SoapActionHeader).Append(": ").Append(prepared.SoapAction).Append(CrLf);
+        }
+
+        head.Append(ContentLengthHeader).Append(": ").Append(contentLength).Append(CrLf).Append(CrLf);
+
+        int status = await SendRawAsync(socket, [.. Encoding.ASCII.GetBytes(head.ToString()), .. body], ct);
+
+        Assert.Equal(200, status);
+        IReadOnlyList<StubRequest> received = backend.Received;
+        Assert.True(received.Count == 1, "backend did not receive exactly one request");
+        StubRequest forwarded = received[0];
+        foreach (string field in NominatedRequestFields)
+        {
+            Assert.True(forwarded.Header(field) is null, "Connection-nominated request field " + field + " reached the backend");
+        }
+
+        Assert.Equal(EndToEndValue, forwarded.Header(EndToEndHeader));
+        Assert.Equal(prepared.ContentType, forwarded.Header(ContentTypeHeader));
+        Assert.Equal(prepared.SoapAction, forwarded.Header(SoapActionHeader));
+        Assert.Equal(contentLength, forwarded.Header(ContentLengthHeader));
+        Assert.True(forwarded.Header(TransferEncodingHeader) is null, "request reached the backend re-framed with Transfer-Encoding");
+        Assert.Equal(body, forwarded.Body);
+    }
+
+    /// <summary>
+    /// Sends a request with a body whose <c>Connection</c> list nominates a custom field next to exactly
+    /// one of the options <c>close</c>, <c>keep-alive</c> and <c>upgrade</c>, in one line or in two, and
+    /// asserts that the custom field does not reach the backend while an unrelated custom field, the
+    /// content type, the <c>Content-Length</c> framing and the body bytes arrive unchanged. Kestrel
+    /// reduces its own copy of such a header to the option alone.
+    /// </summary>
+    /// <param name="operationId">A catalogue operation whose request carries a body.</param>
+    /// <param name="connectionValues">The value of each <c>Connection</c> line, in sending order.</param>
+    [Theory]
+    [InlineData("Rest.postCreateAgent", new[] { "X-Hop-One, close" })]
+    [InlineData("Rest.postCreateAgent", new[] { "X-Hop-One, keep-alive" })]
+    [InlineData("Rest.postCreateAgent", new[] { "X-Hop-One, upgrade" })]
+    [InlineData("Rest.postCreateAgent", new[] { "keep-alive", "X-Hop-One" })]
+    [InlineData("Soap.updateAgentWithDTO", new[] { "X-Hop-One, close" })]
+    [InlineData("Soap.updateAgentWithDTO", new[] { "X-Hop-One, keep-alive" })]
+    [InlineData("Soap.updateAgentWithDTO", new[] { "X-Hop-One, upgrade" })]
+    [InlineData("Soap.updateAgentWithDTO", new[] { "keep-alive", "X-Hop-One" })]
+    public async Task FieldNominatedNextToConnectionOptionDoesNotReachBackend(string operationId, string[] connectionValues)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await using StubBackend backend = await StubBackend.StartAsync(BackendStubId, null, ct);
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(
+            new FacadeTestSettings { BackendRestBaseUrl = backend.RestBaseUrl, BackendSoapBaseUrl = backend.SoapBaseUrl }, ct);
+
+        OperationDescriptor operation = OperationCatalogue.Default.GetById(operationId);
+        PreparedRequest prepared = OperationRequests.For(operation);
+        byte[] body = prepared.Body ?? throw new InvalidOperationException("operation request carries no body");
+        Uri socket = SocketFor(facade, operation);
+        string[] fieldLines = [.. connectionValues.Select(value => "Connection: " + value), HopField + ": " + HopValue];
+
+        int status = await SendRawAsync(socket, ContentLengthRequest(prepared, body, socket, fieldLines), ct);
+
+        Assert.Equal(200, status);
+        IReadOnlyList<StubRequest> received = backend.Received;
+        Assert.True(received.Count == 1, "backend did not receive exactly one request");
+        AssertForwardedWithContentLength(received[0], prepared, body);
+        Assert.True(received[0].Header(HopField) is null, "custom field nominated next to a connection option reached the backend");
+    }
+
+    /// <summary>
+    /// Sends requests on one keep-alive connection, alike but for their <c>Connection</c> lines: every
+    /// other request, the first included, nominates a custom field next to <c>keep-alive</c>, and the rest
+    /// carry the same field without nominating it. Asserts that the field is dropped from exactly the
+    /// requests that nominate it, whether each request follows the previous response or all are
+    /// pipelined, more of them than the facade frames ahead of dispatch included.
+    /// </summary>
+    /// <param name="operationId">A catalogue operation whose request carries a body.</param>
+    /// <param name="requestCount">The number of requests sent on the connection.</param>
+    /// <param name="pipelined">Whether all requests are written before any response is read.</param>
+    [Theory]
+    [InlineData("Rest.postCreateAgent", 2, false)]
+    [InlineData("Rest.postCreateAgent", 2, true)]
+    [InlineData("Rest.postCreateAgent", 40, true)]
+    [InlineData("Soap.updateAgentWithDTO", 2, false)]
+    [InlineData("Soap.updateAgentWithDTO", 2, true)]
+    [InlineData("Soap.updateAgentWithDTO", 40, true)]
+    public async Task EachKeepAliveRequestDropsOnlyFieldsItsOwnConnectionLinesNominate(
+        string operationId,
+        int requestCount,
+        bool pipelined)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await using StubBackend backend = await StubBackend.StartAsync(BackendStubId, null, ct);
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(
+            new FacadeTestSettings { BackendRestBaseUrl = backend.RestBaseUrl, BackendSoapBaseUrl = backend.SoapBaseUrl }, ct);
+
+        OperationDescriptor operation = OperationCatalogue.Default.GetById(operationId);
+        PreparedRequest prepared = OperationRequests.For(operation);
+        byte[] body = prepared.Body ?? throw new InvalidOperationException("operation request carries no body");
+        Uri socket = SocketFor(facade, operation);
+        string hopLine = HopField + ": " + HopValue;
+        byte[][] requests =
+        [
+            .. Enumerable.Range(0, requestCount).Select(index => ContentLengthRequest(
+                prepared, body, socket, index % 2 == 0 ? new[] { KeepAliveNominatingLine, hopLine } : new[] { hopLine })),
+        ];
+
+        IReadOnlyList<int> statuses = await SendRawOnOneConnectionAsync(socket, requests, pipelined, ct);
+
+        Assert.True(statuses.Count == requestCount && statuses.All(status => status == 200), "a keep-alive request was not answered with 200");
+        IReadOnlyList<StubRequest> received = backend.Received;
+        Assert.True(received.Count == requestCount, "backend did not receive every keep-alive request");
+        for (int index = 0; index < requestCount; index++)
+        {
+            AssertForwardedWithContentLength(received[index], prepared, body);
+            if (index % 2 == 0)
+            {
+                Assert.True(received[index].Header(HopField) is null, "custom field nominated by its own request reached the backend");
+            }
+            else
+            {
+                Assert.True(received[index].Header(HopField) == HopValue, "un-nominated custom field of a keep-alive request did not reach the backend");
+            }
+        }
+    }
+
+    /// <summary>
+    /// Sends, on one keep-alive connection, a request whose body is chunked with a chunk extension and a
+    /// trailer field, then a request whose <c>Connection</c> line nominates a custom field next to
+    /// <c>keep-alive</c>. Asserts that the chunked body arrives whole and that the field is dropped from
+    /// the second request, which is only found by following the first request's chunked framing.
+    /// </summary>
+    /// <param name="operationId">A catalogue operation whose request carries a body.</param>
+    /// <param name="pipelined">Whether both requests are written before either response is read.</param>
+    [Theory]
+    [InlineData("Rest.postCreateAgent", false)]
+    [InlineData("Rest.postCreateAgent", true)]
+    [InlineData("Soap.updateAgentWithDTO", false)]
+    [InlineData("Soap.updateAgentWithDTO", true)]
+    public async Task NominatedFieldIsDroppedFromRequestAfterChunkedRequest(string operationId, bool pipelined)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await using StubBackend backend = await StubBackend.StartAsync(BackendStubId, null, ct);
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(
+            new FacadeTestSettings { BackendRestBaseUrl = backend.RestBaseUrl, BackendSoapBaseUrl = backend.SoapBaseUrl }, ct);
+
+        OperationDescriptor operation = OperationCatalogue.Default.GetById(operationId);
+        PreparedRequest prepared = OperationRequests.For(operation);
+        byte[] body = prepared.Body ?? throw new InvalidOperationException("operation request carries no body");
+        Uri socket = SocketFor(facade, operation);
+        string hopLine = HopField + ": " + HopValue;
+
+        IReadOnlyList<int> statuses = await SendRawOnOneConnectionAsync(
+            socket,
+            [
+                ChunkedRequest(prepared, body, socket, [hopLine]),
+                ContentLengthRequest(prepared, body, socket, [KeepAliveNominatingLine, hopLine]),
+            ],
+            pipelined,
+            ct);
+
+        Assert.Equal([200, 200], statuses);
+        IReadOnlyList<StubRequest> received = backend.Received;
+        Assert.True(received.Count == 2, "backend did not receive exactly two requests");
+        Assert.Equal(body, received[0].Body);
+        Assert.True(received[0].Header(HopField) == HopValue, "un-nominated custom field of the chunked request did not reach the backend");
+        Assert.Equal(EndToEndValue, received[0].Header(EndToEndHeader));
+        AssertForwardedWithContentLength(received[1], prepared, body);
+        Assert.True(received[1].Header(HopField) is null, "custom field nominated after a chunked request reached the backend");
+    }
+
+    /// <summary>
+    /// Has the backend answer with two <c>Connection</c> lines that nominate custom and content fields,
+    /// and asserts that none of them reaches the caller while an unrelated custom field, the
+    /// <c>Content-Length</c> framing and the body bytes arrive unchanged.
+    /// </summary>
+    /// <param name="operationId">The catalogue operation called at its normal address.</param>
+    [Theory]
+    [InlineData("Rest.getCompany")]
+    [InlineData("Soap.getAgentNames")]
+    public async Task ConnectionNominatedResponseFieldsDoNotReachCaller(string operationId)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await using RawBackend backend = RawBackend.Start((stream, token) => stream.WriteAsync(NominatingResponse, token).AsTask());
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(
+            new FacadeTestSettings { BackendRestBaseUrl = backend.BaseUrl, BackendSoapBaseUrl = backend.BaseUrl }, ct);
+
+        OperationDescriptor operation = OperationCatalogue.Default.GetById(operationId);
+        using HttpClient client = facade.CreateRawClient();
+        RawResponse response = await FacadeFactory.SendAsync(
+            client, OperationRequests.For(operation).ToMessage(SocketFor(facade, operation)), ct);
+
+        Assert.Equal(200, response.Status);
+        foreach (string field in NominatedResponseFields)
+        {
+            Assert.True(response.Header(field) is null, "Connection-nominated response field " + field + " reached the caller");
+        }
+
+        Assert.Equal(EndToEndValue, response.Header(EndToEndHeader));
+        Assert.Equal("4", response.Header(ContentLengthHeader));
+        Assert.True(response.Header(TransferEncodingHeader) is null, "response reached the caller re-framed with Transfer-Encoding");
+        Assert.Equal(BackendBody, response.Body);
+        Assert.True(backend.RequestCount == 1, "backend did not receive exactly one request");
+    }
+
+    /// <summary>
+    /// Has the backend send its status line and headers and then withhold the body until the test has
+    /// received the facade's response head, and asserts that the head arrived first and the full body
+    /// after it.
+    /// </summary>
+    /// <param name="operationId">The catalogue operation called at its normal address.</param>
+    [Theory]
+    [InlineData("Rest.getCompany")]
+    [InlineData("Soap.getAgentNames")]
+    public async Task ResponseHeadReachesCallerBeforeBackendSendsBody(string operationId)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var bodySent = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        await using RawBackend backend = RawBackend.Start(async (stream, token) =>
+        {
+            await stream.WriteAsync(HeldBodyResponseHead, token);
+            await stream.FlushAsync(token);
+            try
+            {
+                await release.Task.WaitAsync(BodyWithheldBound, token);
+            }
+            catch (TimeoutException)
+            {
+                // The facade held the head back: the body is sent anyway, so the call completes and the
+                // test fails on the order it observed instead of hanging.
+            }
+
+            bodySent.TrySetResult();
+            await stream.WriteAsync(BackendBody, token);
+        });
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(
+            new FacadeTestSettings { BackendRestBaseUrl = backend.BaseUrl, BackendSoapBaseUrl = backend.BaseUrl }, ct);
+
+        OperationDescriptor operation = OperationCatalogue.Default.GetById(operationId);
+        using HttpClient client = facade.CreateRawClient();
+        using HttpRequestMessage request = OperationRequests.For(operation).ToMessage(SocketFor(facade, operation));
+
+        byte[] body;
+        bool headBeforeBody;
+        string? endToEnd;
+        long? contentLength;
+        int status;
+        try
+        {
+            using HttpResponseMessage response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+            headBeforeBody = !bodySent.Task.IsCompleted;
+            release.TrySetResult();
+
+            status = (int)response.StatusCode;
+            endToEnd = response.Headers.NonValidated.TryGetValues(EndToEndHeader, out HeaderStringValues values)
+                ? values.ToString()
+                : null;
+            contentLength = response.Content.Headers.ContentLength;
+            body = await response.Content.ReadAsByteArrayAsync(ct);
+        }
+        catch (Exception exception) when (IsTransportFailure(exception, ct))
+        {
+            Assert.Fail("facade request failed at the transport level (" + exception.GetType().Name + ")");
+            throw new UnreachableException();
+        }
+
+        Assert.True(headBeforeBody, "response head reached the caller only with the backend's body");
+        Assert.Equal(200, status);
+        Assert.Equal(EndToEndValue, endToEnd);
+        Assert.Equal((long?)BackendBody.Length, contentLength);
+        Assert.Equal(BackendBody, body);
+        Assert.True(backend.RequestCount == 1, "backend did not receive exactly one request");
+    }
+
+    /// <summary>
+    /// Has the backend send its status line and headers and then never send the body, with a 2 s
+    /// deadline, and asserts that the caller receives the backend's head and then an aborted body:
+    /// the response the backend started is never re-headed with the facade's timeout response.
+    /// </summary>
+    /// <param name="operationId">The catalogue operation called at its normal address.</param>
+    [Theory]
+    [InlineData("Rest.getCompany")]
+    [InlineData("Soap.getAgentNames")]
+    public async Task DeadlineAfterResponseHeadAbortsResponse(string operationId)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await using RawBackend backend = RawBackend.Start(async (stream, token) =>
+        {
+            await stream.WriteAsync(HeldBodyResponseHead, token);
+            await stream.FlushAsync(token);
+
+            // The body never follows: the facade's deadline passes first, and disposal ends the wait.
+            await Task.Delay(Timeout.InfiniteTimeSpan, token);
+        });
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(
+            new FacadeTestSettings
+            {
+                BackendRestBaseUrl = backend.BaseUrl,
+                BackendSoapBaseUrl = backend.BaseUrl,
+                BackendTimeoutSeconds = MidBodyDeadlineSeconds,
+            },
+            ct);
+
+        OperationDescriptor operation = OperationCatalogue.Default.GetById(operationId);
+        using HttpClient client = facade.CreateRawClient();
+        using HttpRequestMessage request = OperationRequests.For(operation).ToMessage(SocketFor(facade, operation));
+
+        int status;
+        bool bodyAborted;
+        try
+        {
+            using HttpResponseMessage response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
+            status = (int)response.StatusCode;
+            try
+            {
+                await response.Content.ReadAsByteArrayAsync(ct);
+                bodyAborted = false;
+            }
+            catch (Exception exception) when (exception is HttpRequestException or IOException)
+            {
+                bodyAborted = true;
+            }
+        }
+        catch (Exception exception) when (IsTransportFailure(exception, ct))
+        {
+            Assert.Fail("facade request failed at the transport level (" + exception.GetType().Name + ")");
+            throw new UnreachableException();
+        }
+
+        Assert.Equal(200, status);
+        Assert.True(bodyAborted, "response body was not aborted after the deadline passed");
+        Assert.True(backend.RequestCount == 1, "backend did not receive exactly one request");
+    }
+
+    private static Uri SocketFor(FacadeFactory facade, OperationDescriptor operation) =>
+        operation.Surface == Surface.Rest ? facade.RestBaseAddress : facade.SoapBaseAddress;
+
+    // Asserts that a request sent with a Content-Length body reached the backend with its unrelated
+    // end-to-end field, content type, SOAPAction, Content-Length framing and body bytes unchanged.
+    private static void AssertForwardedWithContentLength(StubRequest forwarded, PreparedRequest prepared, byte[] body)
+    {
+        Assert.Equal(EndToEndValue, forwarded.Header(EndToEndHeader));
+        Assert.Equal(prepared.ContentType, forwarded.Header(ContentTypeHeader));
+        Assert.Equal(prepared.SoapAction, forwarded.Header(SoapActionHeader));
+        Assert.Equal(body.Length.ToString(CultureInfo.InvariantCulture), forwarded.Header(ContentLengthHeader));
+        Assert.True(forwarded.Header(TransferEncodingHeader) is null, "request reached the backend re-framed with Transfer-Encoding");
+        Assert.Equal(body, forwarded.Body);
+    }
+
+    // The head of a raw request for the prepared operation without its framing line and final blank
+    // line: the request line, Host, the given field lines, an unrelated end-to-end field, the content
+    // type and any SOAPAction.
+    private static StringBuilder RequestHeadStart(PreparedRequest prepared, Uri socket, IEnumerable<string> fieldLines)
+    {
+        var head = new StringBuilder()
+            .Append(prepared.Method.Method).Append(' ').Append(prepared.PathAndQuery).Append(" HTTP/1.1").Append(CrLf)
+            .Append("Host: ").Append(socket.Authority).Append(CrLf);
+        foreach (string line in fieldLines)
+        {
+            head.Append(line).Append(CrLf);
+        }
+
+        head.Append(EndToEndHeader).Append(": ").Append(EndToEndValue).Append(CrLf)
+            .Append(ContentTypeHeader).Append(": ").Append(prepared.ContentType).Append(CrLf);
+        if (prepared.SoapAction is not null)
+        {
+            head.Append(SoapActionHeader).Append(": ").Append(prepared.SoapAction).Append(CrLf);
+        }
+
+        return head;
+    }
+
+    // A raw request for the prepared operation whose body is framed by Content-Length.
+    private static byte[] ContentLengthRequest(PreparedRequest prepared, byte[] body, Uri socket, IEnumerable<string> fieldLines)
+    {
+        StringBuilder head = RequestHeadStart(prepared, socket, fieldLines)
+            .Append(ContentLengthHeader).Append(": ").Append(body.Length.ToString(CultureInfo.InvariantCulture)).Append(CrLf)
+            .Append(CrLf);
+        return [.. Encoding.ASCII.GetBytes(head.ToString()), .. body];
+    }
+
+    // A raw request for the prepared operation whose body is sent chunked: its first half as a chunk with
+    // a chunk extension, the rest as a second chunk, then the last chunk and one trailer field.
+    private static byte[] ChunkedRequest(PreparedRequest prepared, byte[] body, Uri socket, IEnumerable<string> fieldLines)
+    {
+        if (body.Length < 2)
+        {
+            throw new InvalidOperationException("operation request body is too short for two chunks");
+        }
+
+        int split = body.Length / 2;
+        StringBuilder head = RequestHeadStart(prepared, socket, fieldLines)
+            .Append(TransferEncodingHeader).Append(": chunked").Append(CrLf)
+            .Append(CrLf);
+        string firstChunkLine = split.ToString("x", CultureInfo.InvariantCulture) + ";ext=one" + CrLf;
+        string secondChunkLine = (body.Length - split).ToString("x", CultureInfo.InvariantCulture) + CrLf;
+        string lastChunkAndTrailer = "0" + CrLf + "X-Trailer: t" + CrLf + CrLf;
+        return
+        [
+            .. Encoding.ASCII.GetBytes(head.ToString() + firstChunkLine),
+            .. body.AsSpan(0, split),
+            .. Encoding.ASCII.GetBytes(CrLf + secondChunkLine),
+            .. body.AsSpan(split),
+            .. Encoding.ASCII.GetBytes(CrLf + lastChunkAndTrailer),
+        ];
+    }
+
+    // Writes the request bytes as they are on a new connection to the facade socket, reads the
+    // response head and its Content-Length body, and returns the status code.
+    private static async Task<int> SendRawAsync(Uri socket, byte[] request, CancellationToken ct) =>
+        (await SendRawOnOneConnectionAsync(socket, [request], pipelined: false, ct))[0];
+
+    // Writes each request's bytes as they are on one new connection to the facade socket, and returns
+    // the status code of each response in order, each read with its Content-Length body. Pipelined, all
+    // requests are written at once before any response is read; otherwise each is written only once the
+    // response to the one before has been read.
+    private static async Task<IReadOnlyList<int>> SendRawOnOneConnectionAsync(
+        Uri socket,
+        IReadOnlyList<byte[]> requests,
+        bool pipelined,
+        CancellationToken ct)
+    {
+        using var exchange = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        exchange.CancelAfter(RawExchangeTimeout);
+        using var client = new TcpClient(AddressFamily.InterNetwork);
+        var heads = new List<string>(requests.Count);
+        try
+        {
+            await client.ConnectAsync(IPAddress.Loopback, socket.Port, exchange.Token);
+            NetworkStream stream = client.GetStream();
+            if (pipelined)
+            {
+                await stream.WriteAsync(requests.SelectMany(request => request).ToArray(), exchange.Token);
+            }
+
+            foreach (byte[] request in requests)
+            {
+                if (!pipelined)
+                {
+                    await stream.WriteAsync(request, exchange.Token);
+                }
+
+                heads.Add(await ReadMessageAsync(stream, exchange.Token));
+            }
+        }
+        catch (Exception exception) when (IsTransportFailure(exception, ct) || exception is InvalidDataException)
+        {
+            Assert.Fail("raw facade request failed at the transport level (" + exception.GetType().Name + ")");
+            throw new UnreachableException();
+        }
+
+        return [.. heads.Select(StatusOf)];
+    }
+
+    // The status code of a raw response head.
+    private static int StatusOf(string head)
+    {
+        // "HTTP/1.1 200 OK": the status code is the second element of the status line.
+        int lineEnd = head.IndexOf(CrLf, StringComparison.Ordinal);
+        string[] statusLine = (lineEnd < 0 ? head : head[..lineEnd]).Split(' ');
+        Assert.True(
+            statusLine.Length >= 2
+                && statusLine[0] == "HTTP/1.1"
+                && int.TryParse(statusLine[1], NumberStyles.None, CultureInfo.InvariantCulture, out _),
+            "raw facade response has no HTTP/1.1 status line");
+        return int.Parse(statusLine[1], NumberStyles.None, CultureInfo.InvariantCulture);
+    }
+
+    private static bool IsTransportFailure(Exception exception, CancellationToken ct) =>
+        exception is HttpRequestException or IOException or SocketException
+        || (exception is OperationCanceledException && !ct.IsCancellationRequested);
+
+    // Reads one HTTP/1.1 message from the stream: its head, then as many body bytes as its
+    // Content-Length declares, which are discarded. Returns the head without its final blank line.
+    // The head is read one byte at a time, so no byte of a message that follows it on the connection,
+    // as pipelined responses do, is taken with it.
+    private static async Task<string> ReadMessageAsync(Stream stream, CancellationToken ct)
+    {
+        byte[] buffer = new byte[MaxMessageHeadBytes];
+        int filled = 0;
+        while (!buffer.AsSpan(0, filled).EndsWith(HeadTerminator))
+        {
+            if (filled == buffer.Length)
+            {
+                throw new InvalidDataException("message head exceeds the raw reader's bound");
+            }
+
+            int read = await stream.ReadAsync(buffer.AsMemory(filled, 1), ct);
+            if (read == 0)
+            {
+                throw new InvalidDataException("connection closed before the message head ended");
+            }
+
+            filled += read;
+        }
+
+        string head = Encoding.ASCII.GetString(buffer, 0, filled - HeadTerminator.Length);
+        long remaining = BodyLengthOf(head);
+        while (remaining > 0)
+        {
+            int read = await stream.ReadAsync(buffer.AsMemory(0, (int)Math.Min(buffer.Length, remaining)), ct);
+            if (read == 0)
+            {
+                throw new InvalidDataException("connection closed before the message body ended");
+            }
+
+            remaining -= read;
+        }
+
+        return head;
+    }
+
+    // The declared body length of a message head; 0 without Content-Length. A chunked body is not
+    // read here, so such a message is refused rather than treated as ending at its head.
+    private static long BodyLengthOf(string head)
+    {
+        long length = 0;
+        foreach (string line in head.Split(CrLf))
+        {
+            int colon = line.IndexOf(':', StringComparison.Ordinal);
+            if (colon <= 0)
+            {
+                continue;
+            }
+
+            ReadOnlySpan<char> name = line.AsSpan(0, colon).Trim();
+            ReadOnlySpan<char> value = line.AsSpan(colon + 1).Trim();
+            if (name.Equals(TransferEncodingHeader, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException("raw reader does not read chunked bodies");
+            }
+
+            if (name.Equals(ContentLengthHeader, StringComparison.OrdinalIgnoreCase)
+                && !long.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out length))
+            {
+                throw new InvalidDataException("message Content-Length is not a number");
+            }
+        }
+
+        return length;
+    }
+
+    /// <summary>
+    /// A backend on one ephemeral loopback port that answers each connection's single request with bytes
+    /// the test writes, for response heads Kestrel would not produce. The request is read in full before
+    /// the answer: its head, then as many body bytes as its <c>Content-Length</c> declares; a chunked
+    /// request is closed without an answer.
+    /// </summary>
+    private sealed class RawBackend : IAsyncDisposable
+    {
+        private readonly TcpListener _listener;
+        private readonly Func<NetworkStream, CancellationToken, Task> _answer;
+        private readonly CancellationTokenSource _stopping = new();
+        private readonly Lock _gate = new();
+        private readonly List<Task> _connections = [];
+        private readonly Task _accepting;
+        private int _requests;
+        private int _disposed;
+
+        private RawBackend(TcpListener listener, Func<NetworkStream, CancellationToken, Task> answer)
+        {
+            _listener = listener;
+            _answer = answer;
+            BaseUrl = string.Create(CultureInfo.InvariantCulture, $"http://127.0.0.1:{((IPEndPoint)listener.LocalEndpoint).Port}");
+            _accepting = AcceptAsync();
+        }
+
+        /// <summary>The listener's base URL, <c>http://127.0.0.1:&lt;port&gt;</c>, with no trailing slash.</summary>
+        public string BaseUrl { get; }
+
+        /// <summary>The number of requests read in full so far.</summary>
+        public int RequestCount => Volatile.Read(ref _requests);
+
+        /// <summary>Starts listening; every request is answered by <paramref name="answer"/>.</summary>
+        /// <param name="answer">Writes the whole response to the connection; the backend then closes it.</param>
+        /// <returns>The started backend; the caller disposes it.</returns>
+        public static RawBackend Start(Func<NetworkStream, CancellationToken, Task> answer)
+        {
+            ArgumentNullException.ThrowIfNull(answer);
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            return new RawBackend(listener, answer);
+        }
+
+        /// <summary>Stops listening, cancels every answer in progress and waits for each connection to close.</summary>
+        public async ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            await _stopping.CancelAsync();
+            _listener.Stop();
+            await _accepting;
+
+            Task[] connections;
+            lock (_gate)
+            {
+                connections = [.. _connections];
+            }
+
+            await Task.WhenAll(connections);
+            _stopping.Dispose();
+        }
+
+        private async Task AcceptAsync()
+        {
+            while (true)
+            {
+                TcpClient client;
+                try
+                {
+                    client = await _listener.AcceptTcpClientAsync(_stopping.Token);
+                }
+                catch (Exception exception)
+                    when (exception is OperationCanceledException or SocketException or ObjectDisposedException)
+                {
+                    // The backend is stopping.
+                    return;
+                }
+
+                lock (_gate)
+                {
+                    _connections.Add(ServeAsync(client));
+                }
+            }
+        }
+
+        private async Task ServeAsync(TcpClient client)
+        {
+            using (client)
+            {
+                try
+                {
+                    NetworkStream stream = client.GetStream();
+                    await ReadMessageAsync(stream, _stopping.Token);
+                    Interlocked.Increment(ref _requests);
+                    await _answer(stream, _stopping.Token);
+                    await stream.FlushAsync(_stopping.Token);
+                    client.Client.Shutdown(SocketShutdown.Send);
+                }
+                catch (Exception exception) when (exception is IOException or SocketException or OperationCanceledException
+                    or InvalidDataException or ObjectDisposedException)
+                {
+                    // The facade closed the connection, the request was not one this backend reads, or the
+                    // backend is stopping; the connection is closed without an answer.
+                }
+            }
+        }
+    }
 }
 
 // Credential handling of the routing table's target base URLs. The facade carries and adds no

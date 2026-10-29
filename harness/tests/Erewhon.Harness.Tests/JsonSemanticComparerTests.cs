@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Text;
@@ -7,8 +9,17 @@ using Erewhon.Contracts.Catalogue;
 using Erewhon.Harness.Checks;
 using Erewhon.Harness.Compare;
 using Erewhon.Harness.Http;
+using Erewhon.Harness.Modes;
 using Erewhon.Harness.Report;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.Features;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 namespace Erewhon.Harness.Tests;
 
@@ -23,7 +34,9 @@ namespace Erewhon.Harness.Tests;
 /// malformed bodies and strict UTF-8 decoding, each with its complete discrepancy list and flags.
 /// It also covers the OpenAPI drift check, which compares the live OpenAPI document with the checked-in
 /// contract under this JSON semantic comparison, against an in-process loopback stub in a temporary
-/// repository root of its own.
+/// repository root of its own. It also covers the <c>export-openapi</c> mode, which writes that checked-in
+/// contract: its repository-root guard, the creation of only the <c>contracts/openapi</c> leaf, and the
+/// served document written byte for byte, in a temporary directory of its own.
 /// </summary>
 public sealed partial class JsonSemanticComparerTests : IDisposable
 {
@@ -1381,7 +1394,7 @@ public sealed partial class JsonSemanticComparerTests
 
     private static readonly byte[] StaleLiveDocument = Encoding.UTF8.GetBytes("stale live document of an earlier run");
 
-    // Created on first use, so only the drift check tests touch the file system or hold a runner; removed in
+    // Created on first use, so only the drift check tests create this root or hold a runner; removed in
     // Dispose. The check compares with the class's _comparer, built on the same catalogue and rules.
     private string? _root;
     private HarnessOptions? _options;
@@ -1397,13 +1410,22 @@ public sealed partial class JsonSemanticComparerTests
     /// <summary>The runner the check fetches the live document with.</summary>
     private CaseRunner Http => _http ??= new(TimeSpan.FromSeconds(RequestLimitSeconds));
 
-    /// <summary>Disposes the runner and deletes the repository root, where a drift check test created them.</summary>
+    /// <summary>
+    /// Disposes the runner and deletes the repository root, where a drift check test created them, and disposes
+    /// the console and deletes the directory, where an <c>export-openapi</c> test created them.
+    /// </summary>
     public void Dispose()
     {
         _http?.Dispose();
         if (_root is not null && Directory.Exists(_root))
         {
             Directory.Delete(_root, recursive: true);
+        }
+
+        _exportConsole?.Dispose();
+        if (_exportScratch is not null && Directory.Exists(_exportScratch))
+        {
+            Directory.Delete(_exportScratch, recursive: true);
         }
     }
 
@@ -1924,5 +1946,229 @@ public sealed partial class JsonSemanticComparerTests
         return $"{{\"paths\":{{{Quote(rest.PathTemplate)}:{{{Quote(rest.Verb.ToLowerInvariant())}:{{"
             + $"\"responses\":{{\"200\":{{\"description\":{Quote(OkDescription)}}}}},\"operationId\":{Quote(operationId ?? GetAgent.JadeMethod)}}}}}}},"
             + $"\"info\":{{{summaryMember}{version}\"title\":{Quote(Title)}}},\"openapi\":{Quote(OpenApiVersion)}}}";
+    }
+}
+
+// ---- The export-openapi mode --------------------------------------------------------------------
+// The export-openapi mode's repository-root guard, in a temporary directory of its own: a root with no
+// contracts directory, because the root is absent or contracts is a regular file, is refused with exit code 1
+// before readiness, creating nothing; a root with contracts/ but no contracts/openapi gets only that leaf,
+// holding the served document byte for byte; and a contracts directory removed after the check is never
+// recreated. The facade admin listener is a loopback port nothing listens on, or a stub the test owns.
+// These members live in this class because the harness test project keeps its fixed set of test classes,
+// and the export writes the checked-in contract that the OpenAPI drift check above compares under the JSON
+// semantic comparison this class covers.
+public sealed partial class JsonSemanticComparerTests
+{
+    private const string LinePrefix = "export-openapi: ";
+    private const string Refusal = "Harness:RepoRoot does not name the repository root. Nothing written.";
+
+    // A refusal made after readiness would wait the whole limit; one made before returns at once. The request
+    // limit is RequestLimitSeconds, which the drift check tests above declare with the same value.
+    private const int ReadinessLimitSeconds = 30;
+
+    // Well inside the readiness limit, and generous for a loaded host.
+    private static readonly TimeSpan RefusalLimit = TimeSpan.FromSeconds(10);
+
+    // Compact, with irregular spacing and a trailing newline, so a re-serialised write would differ.
+    private static readonly byte[] Document =
+        Encoding.UTF8.GetBytes("{\"openapi\":\"3.1.1\",  \"info\":{\"version\":\"v1\",\"title\":\"Erewhon REST\"},\"paths\":{}}\n");
+
+    private static readonly byte[] ContractsFile = Encoding.UTF8.GetBytes("a file where the contracts directory belongs");
+
+    // Created on first use, so only the export-openapi tests create this directory or console; released in
+    // Dispose.
+    private string? _exportScratch;
+    private StringWriter? _exportConsole;
+
+    /// <summary>How the configured repository root lacks a <c>contracts</c> directory.</summary>
+    public enum NotRepository
+    {
+        /// <summary>The root and its parent do not exist.</summary>
+        AbsentRoot,
+
+        /// <summary>The root exists and its <c>contracts</c> entry is a regular file.</summary>
+        ContractsIsAFile,
+    }
+
+    /// <summary>The export-openapi test's own directory, which every repository root of the test sits inside.</summary>
+    private string ExportScratch => _exportScratch ??=
+        Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), $"erewhon-export-openapi-{Guid.NewGuid():N}")).FullName;
+
+    /// <summary>The console the export-openapi mode writes its line to.</summary>
+    private StringWriter ExportConsole => _exportConsole ??= new(CultureInfo.InvariantCulture);
+
+    [Theory]
+    [InlineData(NotRepository.AbsentRoot)]
+    [InlineData(NotRepository.ContractsIsAFile)]
+    public async Task RootWithoutContractsDirectory_IsRefusedBeforeReadiness_AndCreatesNothing(NotRepository root)
+    {
+        var repoRoot = Path.Combine(ExportScratch, "absent", "root");
+        if (root == NotRepository.ContractsIsAFile)
+        {
+            repoRoot = Directory.CreateDirectory(Path.Combine(ExportScratch, "root")).FullName;
+            File.WriteAllBytes(Path.Combine(repoRoot, "contracts"), ContractsFile);
+        }
+
+        var before = Entries();
+        var options = ExportOptions(repoRoot, string.Create(CultureInfo.InvariantCulture, $"http://{IPAddress.Loopback}:{ClosedPorts.Take(1).Single()}"));
+
+        var stopwatch = Stopwatch.StartNew();
+        var exitCode = await new ExportOpenApiMode(options, ExportConsole).RunAsync(TestContext.Current.CancellationToken);
+        stopwatch.Stop();
+
+        Assert.Equal(1, exitCode);
+        Assert.Equal(
+            $"{LinePrefix}no contracts directory at {Path.Combine(repoRoot, "contracts")}; {Refusal}{Environment.NewLine}",
+            ExportConsole.ToString());
+        Assert.True(stopwatch.Elapsed < RefusalLimit, "The refusal must come before the readiness wait.");
+        Assert.Equal(before, Entries());
+        if (root == NotRepository.ContractsIsAFile)
+        {
+            Assert.Equal(ContractsFile, File.ReadAllBytes(Path.Combine(repoRoot, "contracts")));
+        }
+    }
+
+    [Fact]
+    public async Task RootWithContractsButNoOpenApiDirectory_CreatesOnlyTheLeaf_AndWritesTheServedBytes()
+    {
+        var repoRoot = Directory.CreateDirectory(Path.Combine(ExportScratch, "root")).FullName;
+        Directory.CreateDirectory(Path.Combine(repoRoot, "contracts"));
+        var target = Path.Combine(repoRoot, "contracts", "openapi", "erewhon-rest.openapi.json");
+        await using var facade = await FacadeAdminStub.StartAsync(Document, beforeDocument: null, TestContext.Current.CancellationToken);
+
+        var exitCode = await new ExportOpenApiMode(ExportOptions(repoRoot, facade.BaseUrl), ExportConsole)
+            .RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal(
+            string.Create(CultureInfo.InvariantCulture, $"{LinePrefix}wrote {Document.Length} bytes to {target}{Environment.NewLine}"),
+            ExportConsole.ToString());
+        string[] created = [repoRoot, Path.Combine(repoRoot, "contracts"), Path.GetDirectoryName(target)!, target];
+        Assert.Equal(created, Entries());
+        Assert.Equal(Document, File.ReadAllBytes(target));
+        Assert.Equal(AdminRoutes.OpenApiDocument, facade.Requests[^1]);
+        Assert.All(facade.Requests.SkipLast(1), request => Assert.Equal(AdminRoutes.Health, request));
+    }
+
+    [Fact]
+    public async Task ContractsDirectoryRemovedBeforeTheWrite_FailsWithExitOne_AndIsNotRecreated()
+    {
+        var repoRoot = Directory.CreateDirectory(Path.Combine(ExportScratch, "root")).FullName;
+        var contracts = Directory.CreateDirectory(Path.Combine(repoRoot, "contracts")).FullName;
+        var openApiDirectory = Path.Combine(contracts, "openapi");
+        await using var facade = await FacadeAdminStub.StartAsync(
+            Document,
+            beforeDocument: () => Directory.Delete(contracts, recursive: true),
+            TestContext.Current.CancellationToken);
+
+        var exitCode = await new ExportOpenApiMode(ExportOptions(repoRoot, facade.BaseUrl), ExportConsole)
+            .RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, exitCode);
+        Assert.Equal(
+            $"{LinePrefix}failed: {typeof(IOException).FullName}: The contract directory '{openApiDirectory}' cannot be created: "
+                + $"its parent '{contracts}' is not a directory.{Environment.NewLine}",
+            ExportConsole.ToString());
+        Assert.Equal(new[] { repoRoot }, Entries());
+    }
+
+    private static HarnessOptions ExportOptions(string repoRoot, string adminUrl) => new()
+    {
+        RepoRoot = repoRoot,
+        Target = new HarnessEndpoints { AdminUrl = adminUrl },
+        ReadinessTimeoutSeconds = ReadinessLimitSeconds,
+        ReadinessPollIntervalSeconds = 1,
+        RequestTimeoutSeconds = RequestLimitSeconds,
+    };
+
+    /// <summary>Every file and directory under the export-openapi test's directory, in ordinal order.</summary>
+    private string[] Entries() =>
+        [.. Directory.EnumerateFileSystemEntries(ExportScratch, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal)];
+
+    /// <summary>
+    /// An in-process facade admin listener on 127.0.0.1 and an ephemeral port: <c>GET /health</c> answers 200, and
+    /// <c>GET /openapi/v1.json</c> runs an optional action and then answers 200 with the exact document bytes; anything else
+    /// answers 404. It records every request target it receives, before answering.
+    /// </summary>
+    private sealed class FacadeAdminStub : IAsyncDisposable
+    {
+        // Bounds the graceful stop; idle keep-alive connections close at once, so it is never reached.
+        private static readonly TimeSpan ShutdownLimit = TimeSpan.FromSeconds(5);
+
+        private readonly WebApplication _app;
+        private readonly ConcurrentQueue<string> _requests;
+
+        private FacadeAdminStub(WebApplication app, ConcurrentQueue<string> requests, Uri baseUrl)
+        {
+            _app = app;
+            _requests = requests;
+            BaseUrl = baseUrl.GetLeftPart(UriPartial.Authority);
+        }
+
+        /// <summary>The stub's base URL, <c>http://127.0.0.1:&lt;port&gt;</c>.</summary>
+        public string BaseUrl { get; }
+
+        /// <summary>Every request target received so far, raw and in arrival order.</summary>
+        public IReadOnlyList<string> Requests => [.. _requests];
+
+        /// <summary>Starts a stub that serves <paramref name="document"/>, after running <paramref name="beforeDocument"/> when given.</summary>
+        public static async Task<FacadeAdminStub> StartAsync(byte[] document, Action? beforeDocument, CancellationToken ct)
+        {
+            var builder = WebApplication.CreateSlimBuilder();
+            builder.Logging.ClearProviders();
+            builder.Services.Configure<HostOptions>(options => options.ShutdownTimeout = ShutdownLimit);
+            builder.WebHost.ConfigureKestrel(kestrel => kestrel.Listen(IPAddress.Loopback, 0));
+
+            var app = builder.Build();
+            var requests = new ConcurrentQueue<string>();
+            app.Run(async context =>
+            {
+                var target = context.Features.GetRequiredFeature<IHttpRequestFeature>().RawTarget;
+                requests.Enqueue(target);
+                if (!HttpMethods.IsGet(context.Request.Method))
+                {
+                    context.Response.StatusCode = StatusCodes.Status404NotFound;
+                    return;
+                }
+
+                if (string.Equals(target, AdminRoutes.Health, StringComparison.Ordinal))
+                {
+                    context.Response.StatusCode = StatusCodes.Status200OK;
+                    return;
+                }
+
+                if (!string.Equals(target, AdminRoutes.OpenApiDocument, StringComparison.Ordinal))
+                {
+                    context.Response.StatusCode = StatusCodes.Status404NotFound;
+                    return;
+                }
+
+                beforeDocument?.Invoke();
+                context.Response.StatusCode = StatusCodes.Status200OK;
+                context.Response.ContentType = "application/json";
+                context.Response.ContentLength = document.Length;
+                await context.Response.Body.WriteAsync(document, context.RequestAborted);
+            });
+
+            try
+            {
+                await app.StartAsync(ct);
+                var address = app.Services.GetRequiredService<IServer>().Features.GetRequiredFeature<IServerAddressesFeature>().Addresses.Single();
+                return new FacadeAdminStub(app, requests, new Uri(address));
+            }
+            catch
+            {
+                await app.DisposeAsync();
+                throw;
+            }
+        }
+
+        /// <summary>Stops the server and releases its port.</summary>
+        public async ValueTask DisposeAsync()
+        {
+            await _app.StopAsync(CancellationToken.None);
+            await _app.DisposeAsync();
+        }
     }
 }

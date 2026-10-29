@@ -839,7 +839,7 @@ public sealed class ReplayBody(
         ArgumentNullException.ThrowIfNull(options);
         return new RunFacts(
             utcDate,
-            string.IsNullOrWhiteSpace(options.ExecutionMode) ? Unknown : options.ExecutionMode,
+            options.RecognisedExecutionMode ?? Unknown,
             frameworkDescription,
             RunFacts.TryReadSdkPin(),
             options.Target?.RestBaseUrl ?? "",

@@ -19,14 +19,17 @@ namespace Erewhon.Harness.Modes;
 /// <para>The document is written exactly as received, never reformatted or re-serialised, so the
 /// checked-in file is what the facade serves. It is written to a temporary file in the target directory
 /// and moved over the target, so a failed fetch or write leaves any existing contract untouched. No other
-/// file is written.</para>
+/// file is written, and no directory is created except <c>contracts/openapi</c> itself.</para>
+/// <para><c>Harness:RepoRoot</c> must name the repository: a root with no <c>contracts</c> directory, for
+/// example a mistyped root or the default <c>/repo</c> outside a container, is refused with exit code 1
+/// before readiness, so no request is sent and nothing is created.</para>
 /// <para>The request carries no header of its own: the admin listener is unauthenticated and contained by
 /// network placement. <c>Harness:Target:AdminUrl</c> must therefore be an absolute <c>http</c> or
 /// <c>https</c> URL without user information; it is checked before readiness, and no line quotes the
 /// setting. Every outcome is one console line and exit code 0 (written) or 1 (anything else);
 /// <see cref="RunAsync"/> never throws.</para>
 /// </remarks>
-/// <param name="options">The harness settings: the facade admin URL, the request limit and the contract path.</param>
+/// <param name="options">The harness settings: the repository root, the facade admin URL, the request limit and the contract path.</param>
 /// <param name="stdout">Where the mode's console lines go.</param>
 /// <exception cref="ArgumentNullException"><paramref name="options"/> or <paramref name="stdout"/> is null.</exception>
 public sealed class ExportOpenApiMode(HarnessOptions options, TextWriter stdout)
@@ -88,6 +91,16 @@ public sealed class ExportOpenApiMode(HarnessOptions options, TextWriter stdout)
         if (!CaseRunner.TryParseHttpUrl(adminUrl, out var adminUri, out var problem))
         {
             Print($"Harness:Target:AdminUrl is not usable: {problem} Nothing written.");
+            return 1;
+        }
+
+        // A root without contracts/ is not the repository: a mistyped Harness:RepoRoot, or the default /repo
+        // outside a container. Refused before readiness, so it fails at once, sends no request and builds no
+        // contracts tree outside the repository.
+        var contractsDirectory = _options.ResolvePath("contracts");
+        if (!Directory.Exists(contractsDirectory))
+        {
+            Print($"no contracts directory at {contractsDirectory}; Harness:RepoRoot does not name the repository root. Nothing written.");
             return 1;
         }
 
@@ -166,7 +179,20 @@ public sealed class ExportOpenApiMode(HarnessOptions options, TextWriter stdout)
     {
         var directory = Path.GetDirectoryName(target)
             ?? throw new IOException($"The contract path '{target}' has no directory.");
-        Directory.CreateDirectory(directory);
+        if (!Directory.Exists(directory))
+        {
+            // Only the openapi/ leaf is ever created. Directory.CreateDirectory also creates missing
+            // ancestors, so it is called only once the parent, contracts/, is known to exist; a parent that
+            // has gone since the repository check means the root is no longer the repository.
+            var parent = Path.GetDirectoryName(directory);
+            if (parent is null || !Directory.Exists(parent))
+            {
+                throw new IOException(
+                    $"The contract directory '{directory}' cannot be created: its parent '{parent}' is not a directory.");
+            }
+
+            Directory.CreateDirectory(directory);
+        }
 
         var temporary = Path.Combine(
             directory,

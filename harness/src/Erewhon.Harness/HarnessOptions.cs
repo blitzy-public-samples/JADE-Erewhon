@@ -1,4 +1,5 @@
 using Erewhon.Contracts.Admin;
+using Erewhon.Harness.Baseline;
 
 namespace Erewhon.Harness;
 
@@ -90,7 +91,11 @@ public sealed class HarnessOptions
     /// </summary>
     public string? ReportPath { get; set; }
 
-    /// <summary><c>docker</c> or <c>local-processes</c>, as stated in the report's run facts.</summary>
+    /// <summary>
+    /// <c>docker</c> or <c>local-processes</c>, as stated in the report's run facts, which read it through
+    /// <see cref="RecognisedExecutionMode"/>. Capture refuses any other value; replay records it as a startup
+    /// failure and reports the mode as unknown.
+    /// </summary>
     public string ExecutionMode { get; set; } = DefaultExecutionMode;
 
     /// <summary>
@@ -132,6 +137,20 @@ public sealed class HarnessOptions
     /// never shuts the backend down, and the report records the substitution KL-SUB-NORESET.
     /// </summary>
     public bool IsExternalBackend => string.IsNullOrWhiteSpace(Backend.AdminUrl);
+
+    /// <summary>
+    /// <see cref="ExecutionMode"/> trimmed when it is one of the two ways a run is executed,
+    /// <see cref="CaptureExecutionValues.Docker"/> or <see cref="CaptureExecutionValues.LocalProcesses"/>
+    /// (compared ordinally, as capture compares it); null for any other value, blank included.
+    /// </summary>
+    public string? RecognisedExecutionMode
+    {
+        get
+        {
+            var mode = ExecutionMode?.Trim();
+            return mode is CaptureExecutionValues.Docker or CaptureExecutionValues.LocalProcesses ? mode : null;
+        }
+    }
 
     /// <summary>Report path: <see cref="ReportPath"/> resolved, or <c>&lt;RepoRoot&gt;/RESULTS.md</c>.</summary>
     public string EffectiveReportPath =>

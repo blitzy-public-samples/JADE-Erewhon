@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -23,6 +24,7 @@ using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
@@ -42,7 +44,12 @@ namespace Erewhon.Harness.Tests;
 /// admin replies, state-reset confirmation against scripted admin responses, and the lifecycle console
 /// sink, which escapes every printed line and never lets a writer that throws replace a computed result;
 /// and the capture mode against a loopback stand-in stub, which refuses or stops with exit code 1 whenever
-/// the seed facts cannot be confirmed, and otherwise publishes them in the manifest it writes last.
+/// the seed facts cannot be confirmed, and otherwise publishes them in the manifest it writes last. It also
+/// covers the start-up and exit of the harness process itself: the entry point, which refuses an argument
+/// that is not a setting before any mode runs and loads its settings strictly or leniently, so a replay
+/// whose settings are partly unusable still writes its report to the configured path; and the cancellation
+/// Main hands SIGTERM and SIGINT to, whose completion passes the mode's exit code through or gives exit
+/// code 1 within its bound.
 /// </summary>
 /// <remarks>
 /// Assertions on the console and the report text use fixed messages, because both hold the per-test
@@ -66,7 +73,7 @@ public sealed partial class ReplayLifecycleTests : IDisposable
     // The only exit codes the harness may return (AAP 0.7.7).
     private static readonly int[] ExitCodes = [0, 1];
 
-    // Created on first use, so only the exit-path tests touch the file system; removed in Dispose.
+    // Created on first use, so only the exit-path and entry-point tests touch the file system; removed in Dispose.
     private TempDirectory? _repoRoot;
     private readonly StringWriter _stdout = new(CultureInfo.InvariantCulture);
 
@@ -100,6 +107,7 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         _console.Dispose();
         _captureConsole.Dispose();
         _repoRoot?.Dispose();
+        _cancellationSource?.Dispose();
         if (_seedDirectory is not null)
         {
             Directory.Delete(_seedDirectory, recursive: true);
@@ -2639,6 +2647,559 @@ public sealed partial class ReplayLifecycleTests
             return Task.FromResult(step.Respond());
         }
     }
+}
+
+// ---- Harness entry point ------------------------------------------------------------------------
+// The harness entry point: the argument check that runs before any mode, the strict and lenient
+// settings loaders, and a replay whose settings are partly unusable. An argument after the mode that is
+// not a --Harness:Key=value setting is refused before anything is read. The lenient loader keeps every
+// setting that can be read and converted, so a replay with an unreadable harness.json or an unknown
+// execution mode still writes its report to the configured path and treats an empty backend admin URL
+// as an external backend. Each setting binds as binding the whole section would, an explicit null in
+// harness.json included.
+// Every setting is passed as a --Harness:... argument, which overrides the environment, or written to
+// the tree's own harness.json, so no test sets a process environment variable. Every tree is a
+// TempDirectory, never the committed one, and no assertion reads standard error. URLs name loopback
+// ports that nothing listens on.
+// These members live in this class because the harness test project keeps its fixed set of test
+// classes, and the entry point starts every mode, the replay whose exit path is covered above
+// included. The tree is the exit-path members' repository root, created on first use, and standard
+// output is theirs too.
+public sealed partial class ReplayLifecycleTests
+{
+    private const string RootToken = "{root}";
+    private const string FinalLine = "3 of 22 operations equivalent, 1 documented differences";
+    private const string HarnessJson = "harness/config/harness.json";
+    private const string MalformedHarnessJson = "{ \"Harness\": { \"ReadinessTimeoutSeconds\": 6, ";
+    private const string TargetAdminUrl = "http://127.0.0.1:1";
+
+    // A refused argument returns at once; a mode that ran instead would wait on its default hosts far longer.
+    private static readonly TimeSpan RejectBound = TimeSpan.FromSeconds(5);
+
+    // Hard limits for one call: the token is cancelled and the wait ends, so a hang fails the test.
+    private static readonly TimeSpan CallLimit = TimeSpan.FromSeconds(30);
+    private static readonly TimeSpan ReplayLimit = TimeSpan.FromSeconds(60);
+
+    // Each list holds one argument that is not a setting; a bare key or "--help" would otherwise take the
+    // argument after it as its value, and a bare word would be ignored.
+    [Theory]
+    [InlineData("capture --Harness:RepoRoot={root} --help")]
+    [InlineData("summary --Harness:RepoRoot={root} extra junk")]
+    [InlineData("summary --Harness:RepoRoot={root} -x")]
+    [InlineData("summary --Harness:RepoRoot={root} -x=1")]
+    [InlineData("summary --Harness:RepoRoot={root} /x")]
+    [InlineData("summary --Harness:RepoRoot={root} --")]
+    [InlineData("summary --Harness:RepoRoot={root} --=1")]
+    [InlineData("summary --Harness:RepoRoot={root} capture")]
+    [InlineData("summary --Harness:RepoRoot={root} --Harness:Typo=1")]
+    [InlineData("summary --Harness:RepoRoot={root} --Harness:Target=x")]
+    [InlineData("summary --Harness:RepoRoot {root}")]
+    [InlineData("export-openapi --Harness:RepoRoot={root} --help --Harness:Target:AdminUrl=")]
+    public async Task ArgumentThatIsNotASetting_IsRefusedBeforeTheModeRuns(string commandLine)
+    {
+        // summary would print this report's line and exit 0 had the argument been ignored.
+        RepoRootDirectory.Write("RESULTS.md", $"# Results\n\n{FinalLine}\n");
+        var elapsed = Stopwatch.StartNew();
+
+        var exitCode = await RunProgramAsync(Args(commandLine), CallLimit);
+
+        Assert.Equal(1, exitCode);
+        Assert.True(elapsed.Elapsed < RejectBound, "the argument is refused before any setting, file or network is read");
+        Assert.Empty(_stdout.ToString());
+        Assert.False(Directory.Exists(RepoRootDirectory.PathOf("baseline")), "no mode ran, so nothing wrote baseline/");
+        Assert.False(Directory.Exists(RepoRootDirectory.PathOf("contracts")), "no mode ran, so nothing wrote contracts/");
+    }
+
+    // Keys match case-insensitively, as configuration keys do, and an empty value is a value.
+    [Theory]
+    [InlineData("summary --Harness:RepoRoot={root} --harness:reportpath={root}/R.md")]
+    [InlineData("summary --Harness:RepoRoot={root} --Harness:ReportPath={root}/R.md --Harness:Backend:AdminUrl=")]
+    public async Task SettingArguments_AreAccepted(string commandLine)
+    {
+        RepoRootDirectory.Write("R.md", $"# Results\n\n{FinalLine}\n");
+
+        var exitCode = await RunProgramAsync(Args(commandLine), CallLimit);
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal([FinalLine], _stdout.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries));
+    }
+
+    [Fact]
+    public void UnreadableHarnessJson_LenientKeepsEveryOtherSetting_StrictThrows()
+    {
+        RepoRootDirectory.Write(HarnessJson, MalformedHarnessJson);
+        var args = DestinationArgs("--Harness:ShutdownTimeoutSeconds=7");
+        var problems = new List<Program.OptionsProblem>();
+
+        var options = Program.LoadOptions(args, problems);
+
+        AssertConfiguredDestinations(options);
+        Assert.Equal(7, options.ShutdownTimeoutSeconds);
+        var problem = Assert.Single(problems);
+        Assert.IsType<InvalidDataException>(problem.Exception);
+        Assert.Contains("harness.json", problem.Context, StringComparison.Ordinal);
+        Assert.Throws<InvalidDataException>(() => Program.LoadOptions(args));
+    }
+
+    [Fact]
+    public void UnconvertibleSetting_LenientKeepsItsDefaultAndEveryOtherValue_StrictThrows()
+    {
+        RepoRootDirectory.Write(HarnessJson, """{ "Harness": { "ReadinessTimeoutSeconds": 6 } }""");
+        var args = DestinationArgs("--Harness:RequestTimeoutSeconds=abc");
+        var problems = new List<Program.OptionsProblem>();
+        var defaults = new HarnessOptions();
+
+        var options = Program.LoadOptions(args, problems);
+
+        AssertConfiguredDestinations(options);
+        Assert.Equal(6, options.ReadinessTimeoutSeconds);
+        Assert.Equal(defaults.RequestTimeoutSeconds, options.RequestTimeoutSeconds);
+
+        // Setting one endpoint key keeps the defaults of the others.
+        Assert.Equal(defaults.Target.RestBaseUrl, options.Target.RestBaseUrl);
+
+        var problem = Assert.Single(problems);
+        var conversion = Assert.IsType<InvalidOperationException>(problem.Exception);
+        Assert.Contains("Harness:RequestTimeoutSeconds", conversion.Message, StringComparison.Ordinal);
+        var thrown = Assert.Throws<InvalidOperationException>(() => Program.LoadOptions(args));
+        Assert.Equal(conversion.Message, thrown.Message);
+    }
+
+    // Each setting is bound on its own, yet ends as binding the whole section of one configuration over the
+    // same sources leaves it, whatever harness.json holds: a missing key, an explicit null, "", a value, a key
+    // holding only nested entries, or a null endpoints object. An argument outranks harness.json both ways: a
+    // URL replaces a null, and "" replaces a URL.
+    [Theory]
+    [InlineData("""{ "Harness": { } }""", null, "http://standin:9090", false)]
+    [InlineData("""{ "Harness": { "Backend": { "AdminUrl": null } } }""", null, null, true)]
+    [InlineData("""{ "Harness": { "Backend": { "AdminUrl": "" } } }""", null, "", true)]
+    [InlineData("""{ "Harness": { "Backend": { "AdminUrl": "http://127.0.0.1:2" } } }""", null, "http://127.0.0.1:2", false)]
+    [InlineData("""{ "Harness": { "Backend": { "AdminUrl": { "Nested": "x" } } } }""", null, "http://standin:9090", false)]
+    [InlineData("""{ "Harness": { "Backend": null } }""", null, "http://standin:9090", false)]
+    [InlineData("""{ "Harness": { "ReadinessTimeoutSeconds": null } }""", null, "http://standin:9090", false)]
+    [InlineData("""{ "Harness": { "ReportPath": null, "SeedDirectory": null } }""", null, "http://standin:9090", false)]
+    [InlineData("""{ "Harness": { "Backend": { "AdminUrl": null } } }""", "--Harness:Backend:AdminUrl=http://127.0.0.1:1", "http://127.0.0.1:1", false)]
+    [InlineData("""{ "Harness": { "Backend": { "AdminUrl": "http://127.0.0.1:2" } } }""", "--Harness:Backend:AdminUrl=", "", true)]
+    public void EachSetting_BindsAsTheWholeSectionWould(
+        string harnessJson, string? argument, string? expectedAdminUrl, bool expectedExternal)
+    {
+        var path = RepoRootDirectory.Write(HarnessJson, harnessJson);
+        string[] args = argument is null
+            ? [$"--Harness:RepoRoot={RepoRootDirectory.Root}"]
+            : [$"--Harness:RepoRoot={RepoRootDirectory.Root}", argument];
+        var problems = new List<Program.OptionsProblem>();
+
+        var strict = Program.LoadOptions(args);
+        var lenient = Program.LoadOptions(args, problems);
+        var whole = BindWholeSection(path, args);
+
+        Assert.Empty(problems);
+        Assert.Equal(expectedAdminUrl, whole.Backend.AdminUrl);
+        Assert.Equal(expectedExternal, whole.IsExternalBackend);
+        foreach (var options in new[] { strict, lenient })
+        {
+            Assert.Equal(whole.Backend.AdminUrl, options.Backend.AdminUrl);
+            Assert.Equal(whole.IsExternalBackend, options.IsExternalBackend);
+            Assert.Equal(whole.ReadinessTimeoutSeconds, options.ReadinessTimeoutSeconds);
+            Assert.Equal(whole.ReportPath, options.ReportPath);
+            Assert.Equal(whole.SeedDirectory, options.SeedDirectory);
+            Assert.Equal(RepoRootDirectory.Root, options.RepoRoot);
+        }
+    }
+
+    [Fact]
+    public async Task Replay_WithUnreadableHarnessJsonAndUnknownMode_ReportsBoth_AtTheConfiguredReportPath()
+    {
+        RepoRootDirectory.Write(HarnessJson, MalformedHarnessJson);
+        var reportPath = RepoRootDirectory.PathOf("custom.md");
+        var ports = ClosedPorts.Take(5);
+        string[] args =
+        [
+            "replay",
+            $"--Harness:RepoRoot={RepoRootDirectory.Root}",
+            $"--Harness:ReportPath={reportPath}",
+            "--Harness:ExecutionMode=kubernetes",
+            $"--Harness:Target:RestBaseUrl=http://127.0.0.1:{ports[0]}",
+            $"--Harness:Target:SoapBaseUrl=http://127.0.0.1:{ports[1]}",
+            $"--Harness:Target:AdminUrl=http://127.0.0.1:{ports[2]}",
+            $"--Harness:Backend:RestBaseUrl=http://127.0.0.1:{ports[3]}",
+            $"--Harness:Backend:SoapBaseUrl=http://127.0.0.1:{ports[4]}",
+            "--Harness:Backend:AdminUrl=",
+            "--Harness:ReadinessTimeoutSeconds=1",
+            "--Harness:RequestTimeoutSeconds=1",
+            "--Harness:ShutdownTimeoutSeconds=1",
+            "--Harness:ShutdownRequestTimeoutSeconds=1",
+        ];
+
+        var exitCode = await RunProgramAsync(args, ReplayLimit);
+
+        Assert.Equal(1, exitCode);
+        Assert.True(File.Exists(reportPath), "the report is written to Harness:ReportPath");
+        Assert.False(File.Exists(RepoRootDirectory.PathOf("RESULTS.md")), "the default report path is never written");
+
+        var report = await File.ReadAllTextAsync(reportPath, TestContext.Current.CancellationToken);
+        Assert.Contains(typeof(InvalidDataException).FullName!, report, StringComparison.Ordinal);
+        Assert.Contains("harness.json could not be read, so its settings are not applied", report, StringComparison.Ordinal);
+        Assert.Contains("Harness:ExecutionMode 'kubernetes' is neither 'local-processes' nor 'docker'", report, StringComparison.Ordinal);
+        Assert.Contains("| Execution mode | `unknown` |", report, StringComparison.Ordinal);
+
+        // The empty backend admin URL survived, so the backend counts as external and is left running.
+        Assert.Contains("cleanup: the backend is external and is never shut down", _stdout.ToString(), StringComparison.Ordinal);
+    }
+
+    // Runs the entry point with a hard limit that cancels the run's token and also ends the wait.
+    private async Task<int> RunProgramAsync(string[] args, TimeSpan limit)
+    {
+        using var run = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        run.CancelAfter(limit);
+        return await Program.RunAsync(args, _stdout, run.Token).WaitAsync(run.Token);
+    }
+
+    private string[] Args(string commandLine) =>
+        [.. commandLine.Split(' ').Select(argument => argument.Replace(RootToken, RepoRootDirectory.Root, StringComparison.Ordinal))];
+
+    // The settings as binding the whole section gives them: one configuration over harness.json, the
+    // environment and the arguments, bound at once; no section at all means every default.
+    private static HarnessOptions BindWholeSection(string harnessJsonPath, string[] args)
+    {
+        var configuration = new ConfigurationBuilder()
+            .AddJsonFile(harnessJsonPath, optional: false, reloadOnChange: false)
+            .AddEnvironmentVariables()
+            .AddCommandLine(args)
+            .Build();
+        try
+        {
+            return configuration.GetSection(HarnessOptions.SectionName).Get<HarnessOptions>() ?? new HarnessOptions();
+        }
+        finally
+        {
+            (configuration as IDisposable)?.Dispose();
+        }
+    }
+
+    private string ReportPath => RepoRootDirectory.PathOf("custom.md");
+
+    // The settings that decide where the report goes and what cleanup shuts down, then the case's own.
+    private string[] DestinationArgs(params string[] more) =>
+    [
+        $"--Harness:RepoRoot={RepoRootDirectory.Root}",
+        $"--Harness:ReportPath={ReportPath}",
+        $"--Harness:Target:AdminUrl={TargetAdminUrl}",
+        "--Harness:Backend:AdminUrl=",
+        .. more,
+    ];
+
+    private void AssertConfiguredDestinations(HarnessOptions options)
+    {
+        Assert.Equal(RepoRootDirectory.Root, options.RepoRoot);
+        Assert.Equal(ReportPath, options.EffectiveReportPath);
+        Assert.Equal(TargetAdminUrl, options.Target.AdminUrl);
+        Assert.Equal("", options.Backend.AdminUrl);
+        Assert.True(options.IsExternalBackend, "an empty backend admin URL marks an external backend");
+    }
+}
+
+// ---- Signal cancellation ------------------------------------------------------------------------
+// The cancellation Main hands SIGTERM and SIGINT to, driven directly on a token source: requests are
+// made the way the signal handler makes them, and no signal is raised. Only the first request starts
+// the token's callbacks, and its task is the one retained. Completion passes the mode's exit code
+// through when no request was made or the callbacks finished; a callback that throws, or one still
+// running at the bound, gives one standard-error line and exit code 1, and a thrown fault is observed
+// rather than left for the finaliser.
+// These members live in this class because the harness test project keeps its fixed set of test
+// classes, and this completion is the last step of the harness process's exit path, after its mode,
+// the replay included, has returned its exit code. RunLimit, ExitCodes and AssertExitCode come from
+// the exit-path members, and Slack from the shutdown members.
+public sealed partial class ReplayLifecycleTests
+{
+    private const string FailedPrefix = "cancellation callbacks failed: ";
+
+    // Short, so the still-running case ends quickly; a completion that ignored it would wait for RunLimit.
+    private static readonly TimeSpan TestBound = TimeSpan.FromMilliseconds(200);
+
+    // The early wake-up a timer may show; Slack is the headroom over a bound for scheduling on a loaded host.
+    private static readonly TimeSpan TimerTolerance = TimeSpan.FromMilliseconds(50);
+    private static readonly TimeSpan CollectRetryDelay = TimeSpan.FromMilliseconds(20);
+
+    // Created on first use, so only the signal-cancellation tests make them; the source is disposed in Dispose.
+    private CancellationTokenSource? _cancellationSource;
+    private ConcurrentQueue<string>? _cancellationErrors;
+
+    /// <summary>When a request arrives too late to cancel anything.</summary>
+    public enum LateRequest
+    {
+        /// <summary>After completion has begun, as from a handler dispatched before its registration was disposed.</summary>
+        AfterCompletion,
+
+        /// <summary>After the token source was disposed.</summary>
+        AfterSourceDisposed,
+    }
+
+    /// <summary>The token source the cancellation under test cancels, created on first use.</summary>
+    private CancellationTokenSource CancellationSource => _cancellationSource ??= new CancellationTokenSource();
+
+    /// <summary>The standard-error lines the cancellation under test writes, created on first use.</summary>
+    private ConcurrentQueue<string> CancellationErrors => _cancellationErrors ??= new ConcurrentQueue<string>();
+
+    [Theory]
+    [InlineData(0, false)]
+    [InlineData(1, false)]
+    [InlineData(0, true)]
+    [InlineData(1, true)]
+    public async Task NoRequestOrCompletedCallbacks_PassExitCodeThrough(int exitCode, bool requested)
+    {
+        var ran = 0;
+        using var registration = CancellationSource.Token.Register(() => Interlocked.Increment(ref ran));
+        var cancellation = NewCancellation();
+        if (requested)
+        {
+            cancellation.Request();
+        }
+
+        var result = await CompleteAsync(cancellation, exitCode, Program.SignalCancellation.CompletionLimit);
+
+        AssertExitCode(exitCode, result);
+        Assert.Empty(CancellationErrors);
+        Assert.Equal(requested, CancellationSource.IsCancellationRequested);
+        Assert.Equal(requested ? 1 : 0, Volatile.Read(ref ran));
+        Assert.Equal(requested, cancellation.Callbacks is { IsCompletedSuccessfully: true });
+    }
+
+    [Theory]
+    [InlineData(0, 1)]
+    [InlineData(1, 2)]
+    public async Task ThrowingCallbacks_AreObservedAndReported_Exit1(int exitCode, int throwing)
+    {
+        var marker = Guid.NewGuid().ToString("N");
+        var messages = Enumerable.Range(1, throwing).Select(index => $"callback {index} failed {marker}").ToArray();
+        var unobserved = new ConcurrentQueue<Exception>();
+        void OnUnobserved(object? sender, UnobservedTaskExceptionEventArgs e)
+        {
+            if (e.Exception.Flatten().InnerExceptions.Any(ex => ex.Message.Contains(marker, StringComparison.Ordinal)))
+            {
+                unobserved.Enqueue(e.Exception);
+            }
+        }
+
+        TaskScheduler.UnobservedTaskException += OnUnobserved;
+        try
+        {
+            var (result, callbacks) = await RunThrowingAsync(exitCode, messages);
+
+            AssertExitCode(1, result);
+            var line = Assert.Single(CancellationErrors);
+            Assert.StartsWith(FailedPrefix, line, StringComparison.Ordinal);
+            Assert.DoesNotContain("\n", line, StringComparison.Ordinal);
+            foreach (var message in messages)
+            {
+                Assert.Contains($"{typeof(InvalidOperationException).FullName}: {message}", line, StringComparison.Ordinal);
+            }
+
+            // Once the task is collected, the finaliser has run that would publish a fault nobody observed.
+            Assert.True(await CollectedAsync(callbacks), "the callbacks' task was collected, so its finaliser has run");
+            Assert.Empty(unobserved);
+        }
+        finally
+        {
+            TaskScheduler.UnobservedTaskException -= OnUnobserved;
+        }
+    }
+
+    [Fact]
+    public async Task CallbackStillRunningAtBound_IsReported_Exits1WithinBound()
+    {
+        using var release = new ManualResetEventSlim();
+        using var registration = CancellationSource.Token.Register(() => release.Wait(RunLimit));
+        var cancellation = NewCancellation();
+        cancellation.Request();
+        var callbacks = cancellation.Callbacks;
+        Assert.NotNull(callbacks);
+
+        int result;
+        TimeSpan elapsed;
+        try
+        {
+            var stopwatch = Stopwatch.StartNew();
+            result = await CompleteAsync(cancellation, 0, TestBound);
+            elapsed = stopwatch.Elapsed;
+            Assert.False(callbacks.IsCompleted, "the callback is still held when completion returns");
+        }
+        finally
+        {
+            await ReleaseAsync(release, callbacks);
+        }
+
+        AssertExitCode(1, result);
+        Assert.InRange(elapsed, TestBound - TimerTolerance, TestBound + Slack);
+        Assert.Equal("cancellation callbacks were still running after 0.2 s", Assert.Single(CancellationErrors));
+        Assert.True(callbacks.IsCompletedSuccessfully, "the released callback finishes");
+    }
+
+    [Theory]
+    [InlineData(2, false)]
+    [InlineData(16, true)]
+    public async Task RepeatedRequests_StartOneCancellation_RetainFirstTask(int requests, bool concurrent)
+    {
+        using var release = new ManualResetEventSlim();
+        var ran = 0;
+        using var registration = CancellationSource.Token.Register(() =>
+        {
+            Interlocked.Increment(ref ran);
+            release.Wait(RunLimit);
+        });
+        var cancellation = NewCancellation();
+        var ct = TestContext.Current.CancellationToken;
+
+        Task? callbacks = null;
+        int result;
+        try
+        {
+            // On pool threads, so a request that waited for the held callback fails at RunLimit instead of hanging.
+            var requesting = concurrent
+                ? Task.WhenAll(Enumerable.Range(0, requests).Select(_ => Task.Run(cancellation.Request, ct)))
+                : Task.Run(
+                    () =>
+                    {
+                        for (var request = 0; request < requests; request++)
+                        {
+                            cancellation.Request();
+                        }
+                    },
+                    ct);
+            await requesting.WaitAsync(RunLimit, ct);
+
+            callbacks = cancellation.Callbacks;
+            Assert.NotNull(callbacks);
+            Assert.True(CancellationSource.IsCancellationRequested);
+
+            // A request on a source already cancelled gets a task that has already completed, so a retained
+            // task still running while the only callback is held is the first request's.
+            Assert.False(callbacks.IsCompleted, "the retained task is the one running the held callback");
+            cancellation.Request();
+            Assert.Same(callbacks, cancellation.Callbacks);
+
+            release.Set();
+            result = await CompleteAsync(cancellation, 0, Program.SignalCancellation.CompletionLimit);
+        }
+        finally
+        {
+            await ReleaseAsync(release, callbacks);
+        }
+
+        AssertExitCode(0, result);
+        Assert.Same(callbacks, cancellation.Callbacks);
+        Assert.True(callbacks.IsCompletedSuccessfully);
+        Assert.Equal(1, Volatile.Read(ref ran));
+        Assert.Empty(CancellationErrors);
+    }
+
+    [Theory]
+    [InlineData(LateRequest.AfterCompletion)]
+    [InlineData(LateRequest.AfterSourceDisposed)]
+    public async Task LateRequest_StartsNothing(LateRequest late)
+    {
+        var ran = 0;
+        using var registration = CancellationSource.Token.Register(() => Interlocked.Increment(ref ran));
+        var cancellation = NewCancellation();
+        if (late == LateRequest.AfterCompletion)
+        {
+            AssertExitCode(0, await CompleteAsync(cancellation, 0, Program.SignalCancellation.CompletionLimit));
+        }
+        else
+        {
+            CancellationSource.Dispose();
+        }
+
+        cancellation.Request();
+
+        Assert.Null(cancellation.Callbacks);
+        Assert.Equal(0, Volatile.Read(ref ran));
+        AssertExitCode(1, await CompleteAsync(cancellation, 1, Program.SignalCancellation.CompletionLimit));
+        Assert.Empty(CancellationErrors);
+    }
+
+    [Theory]
+    [InlineData(-1)]
+    [InlineData(-1000)]
+    public async Task NegativeBound_IsRejected(int boundMilliseconds)
+    {
+        var cancellation = NewCancellation();
+        cancellation.Request();
+
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(
+            () => cancellation.CompleteAsync(0, TimeSpan.FromMilliseconds(boundMilliseconds)));
+        Assert.Empty(CancellationErrors);
+    }
+
+    // The wait is limited independently of the bound under test, so a completion that ignores it still ends.
+    private static Task<int> CompleteAsync(Program.SignalCancellation cancellation, int exitCode, TimeSpan bound) =>
+        cancellation.CompleteAsync(exitCode, bound).WaitAsync(RunLimit, TestContext.Current.CancellationToken);
+
+    // The continuations that completed the run can still be on the stack of the thread that finished the task,
+    // their state machines holding it, so collection is retried from a later timer callback until the limit.
+    private static async Task<bool> CollectedAsync(WeakReference target)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        while (true)
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+            GC.Collect();
+            if (!target.IsAlive)
+            {
+                return true;
+            }
+
+            if (stopwatch.Elapsed >= Slack)
+            {
+                return false;
+            }
+
+            await Task.Delay(CollectRetryDelay, TestContext.Current.CancellationToken);
+        }
+    }
+
+    // Releases a held callback and waits for it, so the event is never disposed under a waiting callback.
+    private static async Task ReleaseAsync(ManualResetEventSlim release, Task? callbacks)
+    {
+        release.Set();
+        if (callbacks is not null)
+        {
+            await callbacks.WaitAsync(RunLimit, TestContext.Current.CancellationToken);
+        }
+    }
+
+    // Runs on a source and a cancellation of its own and hands back only a weak reference to the callbacks'
+    // task, so that once it returns nothing holds the task and the caller can let the finaliser judge it.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private async Task<(int Result, WeakReference Callbacks)> RunThrowingAsync(int exitCode, string[] messages)
+    {
+        using var source = new CancellationTokenSource();
+        var registrations = messages
+            .Select(message => source.Token.Register(() => throw new InvalidOperationException(message)))
+            .ToArray();
+        try
+        {
+            var cancellation = new Program.SignalCancellation(source, CancellationErrors.Enqueue);
+            cancellation.Request();
+            var callbacks = cancellation.Callbacks;
+            Assert.NotNull(callbacks);
+
+            var result = await CompleteAsync(cancellation, exitCode, Program.SignalCancellation.CompletionLimit);
+
+            Assert.True(callbacks.IsFaulted, "every callback ran and the task holds their faults");
+            return (result, new WeakReference(callbacks));
+        }
+        finally
+        {
+            foreach (var registration in registrations)
+            {
+                registration.Dispose();
+            }
+        }
+    }
+
+    private Program.SignalCancellation NewCancellation() => new(CancellationSource, CancellationErrors.Enqueue);
 }
 
 // ---- Support types of the capture mode tests ----------------------------------------------------
