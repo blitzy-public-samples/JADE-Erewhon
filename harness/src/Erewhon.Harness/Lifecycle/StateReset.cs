@@ -8,6 +8,7 @@ using System.Text.Json;
 using Erewhon.Contracts;
 using Erewhon.Contracts.Admin;
 using Erewhon.Contracts.Seed;
+using Erewhon.Contracts.Wire;
 using Erewhon.Harness.Http;
 using Erewhon.Harness.Report;
 
@@ -49,7 +50,11 @@ public sealed record AdminInfo(
     /// each member is looked up by its exact camel-case name first, then case-insensitively.
     /// </summary>
     /// <param name="json">The response body.</param>
-    /// <returns>The parsed values, or null when the body is not JSON or its root is not an object.</returns>
+    /// <returns>
+    /// The parsed values, or null when the body is not JSON, its root is not an object, or it holds a string
+    /// that cannot be decoded: a value the reader decodes, or a member name, holding an unpaired surrogate
+    /// escape such as <c>"\uD800"</c>.
+    /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="json"/> is null.</exception>
     public static AdminInfo? Parse(string json)
     {
@@ -74,6 +79,13 @@ public sealed record AdminInfo(
         }
         catch (JsonException)
         {
+            return null;
+        }
+        catch (InvalidOperationException exception) when (exception is not ObjectDisposedException)
+        {
+            // A member value or member name holding an unpaired surrogate escape such as \uD800 parses, but
+            // throws when it is decoded, so the info cannot be read as a whole. A disposed document would be
+            // a defect here rather than a bad body, so it still throws.
             return null;
         }
     }
@@ -138,14 +150,15 @@ public sealed record AdminInfo(
 }
 
 /// <summary>
-/// The seed facts a seed reset is confirmed against. A null member is not checked. Both are checked only
-/// after a reset to <see cref="AdminRoutes.ResetStateSeed"/>; the generation, mutation count and source
-/// are checked after every reset.
+/// The seed facts every reset is confirmed against, alongside the generation, mutation count and source.
+/// A null member is not checked. Both apply after a reset to <see cref="AdminRoutes.ResetStateEmpty"/> as
+/// well as to <see cref="AdminRoutes.ResetStateSeed"/>, because the stand-in fingerprints its seed
+/// directory and reports its reference date whichever state it builds.
 /// </summary>
 /// <remarks>Which factory applies is the caller's choice: <see cref="FirstCapture(HarnessOptions)"/> when no
 /// <c>baseline/manifest.json</c> exists, <see cref="FromManifest"/> for a re-capture or a replay, and
 /// <see cref="None"/> for a manifest recording <c>captureExecution: "not-run"</c>, which holds no seed
-/// facts.</remarks>
+/// facts, so only the generation, mutation count and source are checked.</remarks>
 /// <param name="SeedSha256">The expected <c>seedSha256</c>; null when not checked.</param>
 /// <param name="ReferenceDate">The expected <c>referenceDate</c>; null when not checked.</param>
 public sealed record ResetExpectations(string? SeedSha256, string? ReferenceDate)
@@ -180,7 +193,7 @@ public sealed record ResetExpectations(string? SeedSha256, string? ReferenceDate
     /// <remarks>Settings problems never throw; each prints one <c>[jade-standin]</c> console line. A blank
     /// reference date expects the default <c>2026-01-01</c>. A seed directory that cannot be fingerprinted,
     /// or a reference date that is not a <c>yyyy-MM-dd</c> date, becomes an expectation no stand-in
-    /// meets, so the seed reset records a <c>seedSha256</c> or <c>referenceDate</c> mismatch.</remarks>
+    /// meets, so every reset records a <c>seedSha256</c> or <c>referenceDate</c> mismatch.</remarks>
     /// <param name="options">The harness settings.</param>
     /// <returns>The expectations; both members are always set, so both facts are always checked.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="options"/> is null.</exception>
@@ -208,7 +221,8 @@ public sealed record ResetExpectations(string? SeedSha256, string? ReferenceDate
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException
                                        or NotSupportedException or SecurityException)
         {
-            output.WriteLine(
+            LifecycleConsole.WriteLine(
+                output,
                 $"{SourceLabels.ConsolePrefix} seed fingerprint of '{directory}' unavailable: {ex.GetType().Name}");
             seedSha256 = UnavailableSeedSha256;
         }
@@ -232,7 +246,8 @@ public sealed record ResetExpectations(string? SeedSha256, string? ReferenceDate
         var date = options.EffectiveExpectedReferenceDate;
         if (string.IsNullOrWhiteSpace(options.ExpectedReferenceDate))
         {
-            output.WriteLine(
+            LifecycleConsole.WriteLine(
+                output,
                 $"{SourceLabels.ConsolePrefix} {ExpectedReferenceDateKey} is blank; expecting the default reference date {date}");
             return date;
         }
@@ -242,9 +257,10 @@ public sealed record ResetExpectations(string? SeedSha256, string? ReferenceDate
             return date;
         }
 
-        output.WriteLine(
+        LifecycleConsole.WriteLine(
+            output,
             $"{SourceLabels.ConsolePrefix} {ExpectedReferenceDateKey} '{date}' is not a {ReferenceDateFormat} date; "
-            + "the seed reset records a referenceDate mismatch");
+            + "every reset records a referenceDate mismatch");
         return InvalidExpectedReferenceDate;
     }
 }
@@ -301,8 +317,9 @@ public static class ResetPoints
 /// <summary>
 /// Resets the stand-in through <c>POST /admin/reset</c> on its admin listener and confirms the new state
 /// through <c>GET /admin/info</c>: the generation must have increased, the mutation count must be 0, the
-/// source must be <see cref="SourceLabels.StandIn"/>, and after a seed reset the seed fingerprint and
-/// reference date must equal the expectations. Also reads any component's <c>/admin/info</c> tolerantly.
+/// source must be <see cref="SourceLabels.StandIn"/>, and the seed fingerprint and reference date must
+/// equal the expectations, after a seed and an empty reset alike. Also reads any component's
+/// <c>/admin/info</c> tolerantly.
 /// </summary>
 /// <remarks>
 /// <para>Backend state is reached only through these admin endpoints. They are unauthenticated, so no
@@ -376,7 +393,7 @@ public sealed class StateReset : IDisposable
     /// <returns>
     /// The parsed info, or null when the URL is blank, is not an absolute <c>http</c>/<c>https</c> URL
     /// or carries user information, the request fails, the status is not 2xx or the body is not a JSON
-    /// object.
+    /// object or holds a string that cannot be decoded.
     /// </returns>
     /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
     public async Task<AdminInfo?> ReadInfoAsync(string? adminUrl, CancellationToken ct = default)
@@ -395,7 +412,9 @@ public sealed class StateReset : IDisposable
     /// </summary>
     /// <param name="point">The point in the run, from <see cref="ResetPoints"/>; it names the failure items.</param>
     /// <param name="state"><see cref="AdminRoutes.ResetStateSeed"/> or <see cref="AdminRoutes.ResetStateEmpty"/>.</param>
-    /// <param name="expected">The seed facts to confirm; they apply only to a seed reset.</param>
+    /// <param name="expected">
+    /// The seed facts to confirm, after either reset state; <see cref="ResetExpectations.None"/> confirms none.
+    /// </param>
     /// <param name="ct">Cancels the reset; its cancellation is the only exception thrown for I/O.</param>
     /// <returns>
     /// Every mismatch, and the info read after the reset. A reset request that fails yields the single
@@ -430,7 +449,7 @@ public sealed class StateReset : IDisposable
         var adminUrl = _options.Backend.AdminUrl;
         if (string.IsNullOrWhiteSpace(adminUrl))
         {
-            _output.WriteLine($"{SourceLabels.ConsolePrefix} reset {state} at {point}: skipped (no backend admin URL)");
+            LifecycleConsole.WriteLine(_output, $"{SourceLabels.ConsolePrefix} reset {state} at {point}: skipped (no backend admin URL)");
             return StateResetResult.Skipped;
         }
 
@@ -473,7 +492,7 @@ public sealed class StateReset : IDisposable
 
         if (failures.Count == 0)
         {
-            _output.WriteLine($"{SourceLabels.ConsolePrefix} reset {state} at {point}: generation {after.Generation}");
+            LifecycleConsole.WriteLine(_output, $"{SourceLabels.ConsolePrefix} reset {state} at {point}: generation {after.Generation}");
         }
 
         return new StateResetResult(failures.AsReadOnly(), after);
@@ -540,12 +559,6 @@ public sealed class StateReset : IDisposable
             AddMismatch(failures, point, state, SourceField, after.Source ?? NullObserved, $"expected {SourceLabels.StandIn}");
         }
 
-        // An empty state is built without the seed files, so seed facts describe only a seed reset.
-        if (!string.Equals(state, AdminRoutes.ResetStateSeed, StringComparison.Ordinal))
-        {
-            return;
-        }
-
         if (expected.SeedSha256 is { } expectedSeed
             && !string.Equals(after.SeedSha256?.Trim(), expectedSeed.Trim(), StringComparison.OrdinalIgnoreCase))
         {
@@ -564,7 +577,10 @@ public sealed class StateReset : IDisposable
         }
         else if (expected.ReferenceDate is { } expectedDate && !DatesMatch(expectedDate, after.ReferenceDate))
         {
-            AddMismatch(failures, point, state, ReferenceDateField, after.ReferenceDate ?? NullObserved, $"expected {expectedDate}");
+            var detail = JadeWireFormats.IsXsdDate(expectedDate)
+                ? $"expected {expectedDate}"
+                : $"expected {expectedDate}, which is not a {DateFormat} date, so the reference date cannot be confirmed";
+            AddMismatch(failures, point, state, ReferenceDateField, after.ReferenceDate ?? NullObserved, detail);
         }
     }
 
@@ -577,7 +593,7 @@ public sealed class StateReset : IDisposable
         string detail)
     {
         failures.Add(new FailureItem(FailureItemIds.Reset(point), FailureItemIds.Mismatch(field, observed), Detail: detail));
-        _output.WriteLine($"{SourceLabels.ConsolePrefix} reset {state} at {point}: mismatch {field} observed {observed}");
+        LifecycleConsole.WriteLine(_output, $"{SourceLabels.ConsolePrefix} reset {state} at {point}: mismatch {field} observed {observed}");
     }
 
     private async Task<InfoRead> ReadInfoCoreAsync(Uri infoUri, CancellationToken ct)
@@ -590,7 +606,7 @@ public sealed class StateReset : IDisposable
 
         var info = AdminInfo.Parse(call.Body ?? string.Empty);
         return info is null
-            ? new InfoRead(null, InvalidBodyFailure, $"GET {infoUri}: body is not a JSON object")
+            ? new InfoRead(null, InvalidBodyFailure, $"GET {infoUri}: body is not a JSON object whose strings can be decoded")
             : new InfoRead(info, null, null);
     }
 
@@ -681,35 +697,15 @@ public sealed class StateReset : IDisposable
         return CaseRunner.TryParseHttpUrl(baseUrl.Trim().TrimEnd('/') + pathAndQuery, out uri, out problem);
     }
 
-    private static bool DatesMatch(string expected, string? observed)
-    {
-        if (observed is null)
-        {
-            return false;
-        }
-
-        return TryParseDate(expected, out var expectedDate) && TryParseDate(observed, out var observedDate)
-            ? expectedDate == observedDate
-            : string.Equals(expected.Trim(), observed.Trim(), StringComparison.Ordinal);
-    }
-
-    private static bool TryParseDate(string value, out DateOnly date)
-    {
-        var text = value.Trim();
-        if (DateOnly.TryParseExact(text, DateFormat, CultureInfo.InvariantCulture, DateTimeStyles.None, out date))
-        {
-            return true;
-        }
-
-        if (DateTime.TryParse(text, CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var timestamp))
-        {
-            date = DateOnly.FromDateTime(timestamp);
-            return true;
-        }
-
-        date = default;
-        return false;
-    }
+    // Both values must be xsd:dates as the shared wire helper defines them, and name the same calendar
+    // date. The stand-in writes yyyy-MM-dd; an xsd:date timezone does not change the date, so the result
+    // never depends on the host's timezone. Surrounding whitespace, unpadded parts, impossible dates,
+    // dateTimes and other forms never match, and a null or unparsable value on either side is a mismatch:
+    // the texts are never compared as strings.
+    private static bool DatesMatch(string expected, string? observed) =>
+        JadeWireFormats.TryParseXsdDate(expected, out var expectedDate)
+        && JadeWireFormats.TryParseXsdDate(observed, out var observedDate)
+        && expectedDate == observedDate;
 
     private static string Text(long? value) =>
         value?.ToString(CultureInfo.InvariantCulture) ?? NullObserved;

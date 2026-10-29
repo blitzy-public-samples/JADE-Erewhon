@@ -211,13 +211,28 @@ public static class ComponentShutdownExtensions
 /// </summary>
 /// <remarks>
 /// <para>The shutdown call is bounded by <see cref="HarnessOptions.ShutdownRequestTimeout"/> and by the
-/// time left; each probe by one second and the time left, with about 250 ms between probes. A stop is
-/// confirmed by a refused connection, an unresolvable host (a stopped Compose container's name
-/// disappears) or an unreachable host (a removed container's address is no longer routable). Any HTTP
-/// answer means the component is still running; a probe timeout or reset proves nothing either way.</para>
-/// <para>A component is reported stopped only when the stop was confirmed and the shutdown call was not
-/// answered with a non-success status. A timeout, reset or refused connection on the shutdown call is
-/// tolerated, because the process may exit while answering or may already have stopped.</para>
+/// time left; each probe, and each opening of the watch connection described below, by one second and the
+/// time left, with about 250 ms between probes outside the bursts described below.</para>
+/// <para>A component is reported stopped only when the shutdown call was answered with a 2xx status and
+/// health polling then confirmed the stop. Every other outcome of the call (a non-2xx answer, a timeout,
+/// a reset, a refused connection, a failed name lookup, an unreachable host or any other error) is a
+/// failed shutdown call, and the component is reported still running. Health is still polled within the
+/// limit after a failed call, so the detail says what it showed.</para>
+/// <para>A stop is confirmed only by a health probe whose connection is refused after an accepted call:
+/// nothing listens on the admin port any more. Any HTTP answer means the component is still running. A
+/// probe timeout or reset, an unreachable host or network and every failed name lookup, a host name that
+/// is not found included, prove nothing either way: a container's name and address can be withdrawn while
+/// its process still runs, and a resolver outage or a network partition produces the same outcomes. A
+/// component whose connection is not refused by the limit is reported still running.</para>
+/// <para>A stopped container's port can refuse connections for only tens of milliseconds before the
+/// container engine withdraws its address and name, and a probe every 250 ms can miss that window. So
+/// the harness's own socket handler first opens an idle watch connection to the admin port, before the
+/// shutdown call, and sends nothing on it. A stopping server unbinds its listeners and then closes its
+/// idle connections, so the watch ends at about the moment the port starts refusing. The client then
+/// probes at once and about every 10 ms for a second, in case the server closed its idle connections
+/// shortly before it stopped listening, and opens a new watch if the component still answers after that.
+/// The watch only times the probes: it never confirms a stop, and a watch that cannot be opened, ends
+/// early or never ends leaves the result to the probes alone.</para>
 /// <para><see cref="ShutdownAsync"/> never throws and never waits beyond the limit. Every request asks
 /// for the connection to be closed and no connection is pooled, so a kept-alive socket cannot report a
 /// reset where a new connection would be refused. No credential is sent: the admin listeners are
@@ -228,6 +243,14 @@ public sealed class HttpComponentShutdown : IComponentShutdown, IDisposable
     private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(1);
     private static readonly TimeSpan ProbeSpacing = TimeSpan.FromMilliseconds(250);
 
+    // Once the watch connection ends, probes follow each other this closely for this long, so that a
+    // refusal lasting only tens of milliseconds is still met.
+    private static readonly TimeSpan FastProbeSpacing = TimeSpan.FromMilliseconds(10);
+    private static readonly TimeSpan FastProbeBurst = TimeSpan.FromSeconds(1);
+
+    // Opening the watch connection is bounded by this and by the time left.
+    private static readonly TimeSpan WatchConnectTimeout = TimeSpan.FromSeconds(1);
+
     // CancelAfter needs a positive delay even when almost no time is left.
     private static readonly TimeSpan MinimumWait = TimeSpan.FromMilliseconds(1);
 
@@ -235,6 +258,9 @@ public sealed class HttpComponentShutdown : IComponentShutdown, IDisposable
     private readonly TextWriter _output;
     private readonly TimeSpan _shutdownLimit;
     private readonly TimeSpan _requestLimit;
+
+    // Only the client's own socket handler reaches the network, so only then is a watch connection opened.
+    private readonly bool _opensWatch;
 
     /// <summary>Creates a shutdown client with the limits of <paramref name="options"/>.</summary>
     /// <param name="options">The harness settings.</param>
@@ -256,6 +282,7 @@ public sealed class HttpComponentShutdown : IComponentShutdown, IDisposable
         _shutdownLimit = options.ShutdownTimeout;
         _requestLimit = options.ShutdownRequestTimeout;
         _output = output ?? Console.Out;
+        _opensWatch = handler is null;
         _client = handler is null
             ? new HttpClient(CreateHandler(), disposeHandler: true)
             : new HttpClient(handler, disposeHandler: false);
@@ -266,7 +293,14 @@ public sealed class HttpComponentShutdown : IComponentShutdown, IDisposable
     {
         Answered,
         Refused,
-        NameNotResolved,
+
+        // The resolver answered that the name has no address: HostNotFound or NoData. A name can be
+        // withdrawn while its process still runs, as when its container leaves the network, so this
+        // proves nothing either; it is kept apart from the other lookup failures only for the detail.
+        NameNotFound,
+
+        // Any other name lookup failure (TryAgain, NoRecovery, or no definite answer), which proves nothing.
+        NameLookupFailed,
         Unreachable,
         TimedOut,
         Reset,
@@ -275,8 +309,10 @@ public sealed class HttpComponentShutdown : IComponentShutdown, IDisposable
     }
 
     /// <inheritdoc />
-    /// <remarks>Prints one line: <c>shutdown: &lt;component&gt; stopped (&lt;detail&gt;)</c> or
-    /// <c>shutdown: &lt;component&gt; still running (&lt;detail&gt;)</c>.</remarks>
+    /// <remarks>Prints one line through <see cref="LifecycleConsole"/>, after the outcome is computed:
+    /// <c>shutdown: &lt;component&gt; stopped (&lt;detail&gt;)</c> or
+    /// <c>shutdown: &lt;component&gt; still running (&lt;detail&gt;)</c>. A writer that fails loses only
+    /// the line, never the outcome.</remarks>
     public async Task<ShutdownOutcome> ShutdownAsync(ShutdownTarget target, CancellationToken ct)
     {
         ShutdownOutcome outcome;
@@ -291,9 +327,11 @@ public sealed class HttpComponentShutdown : IComponentShutdown, IDisposable
             outcome = ShutdownOutcome.FromException(target?.Component ?? ShutdownOutcome.UnknownComponent, ex);
         }
 
-        _output.WriteLine(outcome.Stopped
-            ? $"shutdown: {outcome.Component} stopped ({outcome.Detail})"
-            : $"shutdown: {outcome.Component} still running ({outcome.Detail})");
+        LifecycleConsole.WriteLine(
+            _output,
+            outcome.Stopped
+                ? $"shutdown: {outcome.Component} stopped ({outcome.Detail})"
+                : $"shutdown: {outcome.Component} still running ({outcome.Detail})");
         return outcome;
     }
 
@@ -313,6 +351,11 @@ public sealed class HttpComponentShutdown : IComponentShutdown, IDisposable
     {
         var clock = Stopwatch.StartNew();
 
+        // Opened before the shutdown call, while the component still accepts connections, and closed on
+        // every way out of this method.
+        using var watch = new WatchConnection(_opensWatch ? target.AdminBaseUrl : null);
+        await watch.OpenAsync(Bound(WatchConnectTimeout, Remaining(clock)), ct).ConfigureAwait(false);
+
         var post = await SendAsync(HttpMethod.Post, target.ShutdownUrl, Bound(_requestLimit, Remaining(clock)), ct)
             .ConfigureAwait(false);
         if (post.Kind == ProbeKind.Cancelled)
@@ -321,30 +364,59 @@ public sealed class HttpComponentShutdown : IComponentShutdown, IDisposable
         }
 
         var postText = DescribePost(post);
-        var postRejected = post.Kind == ProbeKind.Answered && post.Status is < 200 or > 299;
-        var rejectedNote = postRejected ? " (shutdown rejected)" : string.Empty;
+
+        // Only a 2xx answer shows that the component took the request. Any other outcome is a failed
+        // shutdown call, so the component is reported still running whatever health shows next.
+        var postAccepted = post.Kind == ProbeKind.Answered && post.Status is >= 200 and <= 299;
+        var failedNote = postAccepted
+            ? string.Empty
+            : post.Kind == ProbeKind.Answered ? " (shutdown rejected)" : " (shutdown call failed)";
 
         int? lastStatus = null;
         ProbeResult? lastProbe = null;
+        TimeSpan? burstEnd = null;
         while (Remaining(clock) > TimeSpan.Zero)
         {
-            var probe = await SendAsync(HttpMethod.Get, target.HealthUrl, Bound(ProbeTimeout, Remaining(clock)), ct)
+            var probeLimit = Bound(ProbeTimeout, Remaining(clock));
+            var probe = await SendAsync(HttpMethod.Get, target.HealthUrl, probeLimit, ct)
                 .ConfigureAwait(false);
             switch (probe.Kind)
             {
                 case ProbeKind.Cancelled:
                     return Cancelled(target, postText, clock);
-                case ProbeKind.Refused or ProbeKind.NameNotResolved or ProbeKind.Unreachable:
+
+                // The only stop evidence: nothing listens on the admin port any more.
+                case ProbeKind.Refused:
                     return new ShutdownOutcome(
                         target.Component,
-                        !postRejected,
-                        Invariant($"{postText}; {DescribeStop(probe.Kind)} after {clock.ElapsedMilliseconds} ms{rejectedNote}"));
+                        postAccepted,
+                        Invariant($"{postText}; refused after {clock.ElapsedMilliseconds} ms{failedNote}"));
                 case ProbeKind.Answered:
                     lastStatus = probe.Status;
                     break;
             }
 
-            lastProbe = probe;
+            // A probe that the shutdown limit cut below its own timeout can end in that cut-off whatever the
+            // component does, and the client then reports any failure arriving with it as a timeout. Such a
+            // timeout shows only that time ran out, so it never replaces an earlier observation in the detail;
+            // a component that only ever times out still reports its timeout.
+            var cutOffAtLimit = probe.Kind == ProbeKind.TimedOut && probeLimit < ProbeTimeout;
+            if (!cutOffAtLimit || lastProbe is null)
+            {
+                lastProbe = probe;
+            }
+
+            // A burst that met no refusal while the component still answers means its server closed the
+            // watch early, so a new watch keeps the trigger for the rest of the wait.
+            if (burstEnd is { } end && clock.Elapsed >= end)
+            {
+                burstEnd = null;
+                if (probe.Kind == ProbeKind.Answered)
+                {
+                    await watch.OpenAsync(Bound(WatchConnectTimeout, Remaining(clock)), ct).ConfigureAwait(false);
+                }
+            }
+
             var remaining = Remaining(clock);
             if (remaining <= TimeSpan.Zero)
             {
@@ -353,7 +425,14 @@ public sealed class HttpComponentShutdown : IComponentShutdown, IDisposable
 
             try
             {
-                await Task.Delay(Bound(ProbeSpacing, remaining), ct).ConfigureAwait(false);
+                var spacing = burstEnd is null ? ProbeSpacing : FastProbeSpacing;
+                if (await WaitAsync(Bound(spacing, remaining), watch.Closed, ct).ConfigureAwait(false))
+                {
+                    // The server closed the watch, as it does once it has stopped listening: probe at once,
+                    // then closely for a while.
+                    watch.Close();
+                    burstEnd = clock.Elapsed + FastProbeBurst;
+                }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -368,7 +447,7 @@ public sealed class HttpComponentShutdown : IComponentShutdown, IDisposable
             (null, { } probe) => $"not refused by {limit} s (last {DescribeInconclusive(probe)})",
             _ => $"no health probe by {limit} s",
         };
-        return new ShutdownOutcome(target.Component, false, $"{postText}; {unconfirmed}{rejectedNote}");
+        return new ShutdownOutcome(target.Component, false, $"{postText}; {unconfirmed}{failedNote}");
     }
 
     private async Task<ProbeResult> SendAsync(HttpMethod method, Uri url, TimeSpan timeout, CancellationToken ct)
@@ -409,12 +488,13 @@ public sealed class HttpComponentShutdown : IComponentShutdown, IDisposable
         var kind = FindInner<SocketException>(ex)?.SocketErrorCode switch
         {
             SocketError.ConnectionRefused => ProbeKind.Refused,
-            SocketError.HostNotFound or SocketError.NoData or SocketError.TryAgain => ProbeKind.NameNotResolved,
+            SocketError.HostNotFound or SocketError.NoData => ProbeKind.NameNotFound,
+            SocketError.TryAgain or SocketError.NoRecovery => ProbeKind.NameLookupFailed,
             SocketError.HostUnreachable or SocketError.NetworkUnreachable => ProbeKind.Unreachable,
             SocketError.TimedOut => ProbeKind.TimedOut,
             SocketError.ConnectionReset or SocketError.ConnectionAborted or SocketError.Shutdown => ProbeKind.Reset,
             _ when ex is HttpRequestException { HttpRequestError: HttpRequestError.NameResolutionError } =>
-                ProbeKind.NameNotResolved,
+                ProbeKind.NameLookupFailed,
             _ when ex is HttpRequestException { HttpRequestError: HttpRequestError.ResponseEnded }
                 || FindInner<IOException>(ex) is not null => ProbeKind.Reset,
             _ => ProbeKind.Failed,
@@ -445,22 +525,19 @@ public sealed class HttpComponentShutdown : IComponentShutdown, IDisposable
     {
         ProbeKind.Answered => Invariant($"POST {post.Status}"),
         ProbeKind.Refused => "POST connect",
-        ProbeKind.NameNotResolved => "POST connect (host not resolved)",
+        ProbeKind.NameNotFound => "POST connect (host not found)",
+        ProbeKind.NameLookupFailed => "POST connect (name lookup failed)",
         ProbeKind.Unreachable => "POST connect (host unreachable)",
         ProbeKind.TimedOut => "POST timeout",
         ProbeKind.Reset => "POST reset",
         _ => $"POST error {post.Note}",
     };
 
-    private static string DescribeStop(ProbeKind kind) => kind switch
-    {
-        ProbeKind.Refused => "refused",
-        ProbeKind.NameNotResolved => "host not resolved",
-        _ => "host unreachable",
-    };
-
     private static string DescribeInconclusive(ProbeResult probe) => probe.Kind switch
     {
+        ProbeKind.NameNotFound => "host not found",
+        ProbeKind.NameLookupFailed => "name lookup failed",
+        ProbeKind.Unreachable => "host unreachable",
         ProbeKind.TimedOut => "timeout",
         ProbeKind.Reset => "reset",
         _ => $"error {probe.Note}",
@@ -475,9 +552,112 @@ public sealed class HttpComponentShutdown : IComponentShutdown, IDisposable
         return wait > MinimumWait ? wait : MinimumWait;
     }
 
+    // Waits for the spacing to pass or the watch to end, whichever comes first, and returns true when the
+    // watch ended. The caller's cancellation ends the wait with an OperationCanceledException.
+    private static async Task<bool> WaitAsync(TimeSpan spacing, Task? watchClosed, CancellationToken ct)
+    {
+        if (watchClosed is null)
+        {
+            await Task.Delay(spacing, ct).ConfigureAwait(false);
+            return false;
+        }
+
+        using var delayEnd = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var delay = Task.Delay(spacing, delayEnd.Token);
+        var first = await Task.WhenAny(delay, watchClosed).ConfigureAwait(false);
+
+        // Releases the timer of a delay that lost to the watch.
+        delayEnd.Cancel();
+        ct.ThrowIfCancellationRequested();
+        return first == watchClosed;
+    }
+
     private static string Invariant(FormattableString text) => FormattableString.Invariant(text);
 
     private TimeSpan Remaining(Stopwatch clock) => _shutdownLimit - clock.Elapsed;
 
     private readonly record struct ProbeResult(ProbeKind Kind, int? Status, string? Note);
+
+    /// <summary>
+    /// The watch connection of one shutdown: a TCP connection to the admin port that sends nothing and
+    /// only waits for the server to close it. At most one is open at a time; disposal closes it.
+    /// </summary>
+    private sealed class WatchConnection : IDisposable
+    {
+        private readonly Uri? _adminUrl;
+        private Socket? _socket;
+
+        /// <summary>Creates a watch for <paramref name="adminUrl"/>, or one that never opens when it is null.</summary>
+        public WatchConnection(Uri? adminUrl) => _adminUrl = adminUrl;
+
+        /// <summary>
+        /// Completes, and never faults, once the server closes or resets the open connection; null while no
+        /// connection is open.
+        /// </summary>
+        public Task? Closed { get; private set; }
+
+        /// <summary>Closes any open connection and opens a new one, best-effort, within <paramref name="timeout"/>.</summary>
+        public async Task OpenAsync(TimeSpan timeout, CancellationToken ct)
+        {
+            Close();
+            if (_adminUrl is null)
+            {
+                return;
+            }
+
+            Socket? socket = null;
+            try
+            {
+                using var bound = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                bound.CancelAfter(timeout);
+                socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+                var host = _adminUrl.IdnHost;
+                EndPoint endPoint = IPAddress.TryParse(host, out var address)
+                    ? new IPEndPoint(address, _adminUrl.Port)
+                    : new DnsEndPoint(host, _adminUrl.Port);
+                await socket.ConnectAsync(endPoint, bound.Token).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                // The watch only times the probes, so whatever keeps it from opening leaves the probes as they are.
+                socket?.Dispose();
+                return;
+            }
+
+            _socket = socket;
+            Closed = WaitForCloseAsync(socket);
+        }
+
+        /// <summary>Closes the open connection, if any.</summary>
+        public void Close()
+        {
+            _socket?.Dispose();
+            _socket = null;
+            Closed = null;
+        }
+
+        /// <inheritdoc />
+        public void Dispose() => Close();
+
+        // Ends when a receive yields no data, an orderly close, or fails: a reset, an abort or this watch's own
+        // disposal. The connection never carried a request, so whatever a server sends on it is dropped.
+        private static async Task WaitForCloseAsync(Socket socket)
+        {
+            var buffer = new byte[64];
+            var open = true;
+            while (open)
+            {
+                try
+                {
+                    open = await socket.ReceiveAsync(buffer.AsMemory(), SocketFlags.None, CancellationToken.None)
+                        .ConfigureAwait(false) > 0;
+                }
+                catch (Exception)
+                {
+                    // A failed receive ends the connection as surely as an orderly close.
+                    open = false;
+                }
+            }
+        }
+    }
 }

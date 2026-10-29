@@ -3,6 +3,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
+using System.Text;
 using Erewhon.Contracts.Admin;
 using Erewhon.Harness.Http;
 using Erewhon.Harness.Report;
@@ -23,7 +24,8 @@ namespace Erewhon.Harness.Lifecycle;
 /// placement. An admin URL carrying user information is therefore rejected before any probe.</para>
 /// <para>Network conditions and caller cancellation never throw: they end in the timeout item, so
 /// replay's report and shutdown steps always run. Instances are thread-safe, so one instance can wait on
-/// the facade and the stand-in concurrently. One line is printed per wait, never one per probe.</para>
+/// the facade and the stand-in concurrently. One line is printed per wait, never one per probe, through
+/// <see cref="LifecycleConsole"/>, so a console that cannot take it never changes the result.</para>
 /// </remarks>
 /// <param name="options">The harness settings that own the readiness limit and poll interval.</param>
 /// <exception cref="ArgumentNullException"><paramref name="options"/> is null.</exception>
@@ -37,7 +39,22 @@ public sealed class Readiness(HarnessOptions options) : IDisposable
     // The first initializer has already rejected a null options, so the parameter is non-null here.
     private readonly HttpClient client = CreateClient(ProbeTimeoutFor(options.ReadinessPollInterval));
 
+    // Null writes to Console.Out as it stands when the line is printed.
+    private readonly TextWriter? output;
+
     private volatile bool disposed;
+
+    /// <summary>Creates a readiness client whose console line goes to <paramref name="output"/>.</summary>
+    /// <param name="options">The harness settings that own the readiness limit and poll interval.</param>
+    /// <param name="output">Where the line of each wait goes, for example a test's writer; null means <see cref="Console.Out"/>.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="options"/> is null.</exception>
+    internal Readiness(HarnessOptions options, TextWriter? output)
+        : this(options)
+    {
+        this.output = output;
+    }
+
+    private TextWriter Output => output ?? Console.Out;
 
     /// <summary>
     /// Polls <c>GET &lt;adminUrl&gt;/health</c> until it answers 200, the readiness limit passes or
@@ -98,7 +115,8 @@ public sealed class Readiness(HarnessOptions options) : IDisposable
             var outcome = await ProbeAsync(probeUri, probeTimeout < remaining ? probeTimeout : remaining, ct);
             if (outcome.Ready)
             {
-                Console.Out.WriteLine(
+                LifecycleConsole.WriteLine(
+                    Output,
                     string.Create(CultureInfo.InvariantCulture, $"ready: {component} ({watch.ElapsedMilliseconds} ms)"));
                 return null;
             }
@@ -191,12 +209,15 @@ public sealed class Readiness(HarnessOptions options) : IDisposable
         }
     }
 
-    private static FailureItem NotReady(string component, string detail, TimeSpan? limit)
+    private FailureItem NotReady(string component, string detail, TimeSpan? limit)
     {
-        Console.Out.WriteLine(limit is { } l
-            ? string.Create(CultureInfo.InvariantCulture, $"not ready: {component} after {l.TotalSeconds:0} s ({detail})")
-            : $"not ready: {component} ({detail})");
-        return new FailureItem(FailureItemIds.Ready(component), FailureItemIds.Timeout, Detail: detail);
+        var item = new FailureItem(FailureItemIds.Ready(component), FailureItemIds.Timeout, Detail: detail);
+        LifecycleConsole.WriteLine(
+            Output,
+            limit is { } l
+                ? string.Create(CultureInfo.InvariantCulture, $"not ready: {component} after {l.TotalSeconds:0} s ({detail})")
+                : $"not ready: {component} ({detail})");
+        return item;
     }
 
     // The admin URL is an opaque base whose path is kept, and /health is appended to it. Only an absolute
@@ -242,4 +263,87 @@ public sealed class Readiness(HarnessOptions options) : IDisposable
         };
 
     private readonly record struct ProbeOutcome(bool Ready, string Observation);
+}
+
+/// <summary>
+/// The one console sink of the lifecycle clients (readiness, state reset and shutdown): every line is
+/// made printable by <see cref="Display"/> and written best-effort.
+/// </summary>
+/// <remarks>
+/// <para>A line is written only after the readiness item, reset result or shutdown outcome it reports
+/// has been computed, so a console that cannot take it never replaces that result.</para>
+/// <para>Lines quote values the harness does not control: admin responses, settings, URLs and
+/// exception messages. Escaping them keeps each call to exactly one console line, so such a value can
+/// neither forge another <c>[jade-standin]</c> lifecycle line nor drive the terminal. Failure items
+/// keep the exact values; only what is printed is escaped.</para>
+/// </remarks>
+internal static class LifecycleConsole
+{
+    /// <summary>Writes <see cref="Display"/> of <paramref name="line"/> to <paramref name="output"/>, best-effort.</summary>
+    /// <param name="output">The console writer.</param>
+    /// <param name="line">The line, without its terminator.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="output"/> or <paramref name="line"/> is null.</exception>
+    internal static void WriteLine(TextWriter output, string line)
+    {
+        ArgumentNullException.ThrowIfNull(output);
+        ArgumentNullException.ThrowIfNull(line);
+
+        var display = Display(line);
+        try
+        {
+            output.WriteLine(display);
+        }
+        catch (Exception)
+        {
+            // Deliberately empty: the line only reports a result the caller has already computed, so a
+            // closed, full or disposed writer (or any other fault a writer raises) drops the line rather
+            // than replace that result. No other sink is tried, because none is safer than this one.
+        }
+    }
+
+    /// <summary>
+    /// Returns <paramref name="text"/> with every character that could break or disguise a console line
+    /// written as <c>\uXXXX</c> (uppercase hexadecimal): control characters (U+0000 to U+001F and U+007F
+    /// to U+009F, NEL included), the line and paragraph separators U+2028 and U+2029, the bidirectional
+    /// marks, embeddings, overrides and isolates (U+200E, U+200F, U+202A to U+202E, U+2066 to U+2069)
+    /// and every surrogate that is not half of a pair. Every other character, backslashes included, is
+    /// kept unchanged.
+    /// </summary>
+    /// <param name="text">The text to print.</param>
+    /// <returns>The printable text; <paramref name="text"/> itself when nothing needed escaping.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="text"/> is null.</exception>
+    internal static string Display(string text)
+    {
+        ArgumentNullException.ThrowIfNull(text);
+
+        StringBuilder? display = null;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var c = text[i];
+            if (char.IsHighSurrogate(c) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]))
+            {
+                display?.Append(c).Append(text[i + 1]);
+                i++;
+            }
+            else if (MustEscape(c))
+            {
+                display ??= new StringBuilder(text.Length + 16).Append(text, 0, i);
+                display.Append("\\u").Append(((int)c).ToString("X4", CultureInfo.InvariantCulture));
+            }
+            else
+            {
+                display?.Append(c);
+            }
+        }
+
+        return display?.ToString() ?? text;
+    }
+
+    // A surrogate reaching this test is unpaired: Display keeps whole pairs before asking.
+    private static bool MustEscape(char c) =>
+        char.IsControl(c)
+        || char.IsSurrogate(c)
+        || c is '\u2028' or '\u2029' or '\u200E' or '\u200F'
+            or (>= '\u202A' and <= '\u202E')
+            or (>= '\u2066' and <= '\u2069');
 }

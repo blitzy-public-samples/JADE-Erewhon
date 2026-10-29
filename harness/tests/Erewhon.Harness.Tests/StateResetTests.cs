@@ -25,6 +25,7 @@ public sealed class StateResetTests : IDisposable
     private const string GenerationField = "generation";
     private const string MutationsField = "mutations";
     private const string ReferenceDateField = "referenceDate";
+    private const string SeedSha256Field = "seedSha256";
     private const string ExpectedReferenceDateKey = "Harness:ExpectedReferenceDate";
 
     private const string DefaultReferenceDate = "2026-01-01";
@@ -34,6 +35,8 @@ public sealed class StateResetTests : IDisposable
     private const string InfoRequest = "GET " + AdminRoutes.Info;
     private const string SeedResetRequest =
         "POST " + AdminRoutes.Reset + "?" + AdminRoutes.ResetStateQueryKey + "=" + AdminRoutes.ResetStateSeed;
+    private const string EmptyResetRequest =
+        "POST " + AdminRoutes.Reset + "?" + AdminRoutes.ResetStateQueryKey + "=" + AdminRoutes.ResetStateEmpty;
 
     private readonly string _seedDirectory;
     private readonly string _seedSha256;
@@ -178,6 +181,72 @@ public sealed class StateResetTests : IDisposable
             StringComparison.Ordinal);
     }
 
+    // ---- Seed facts after every reset -----------------------------------------------------------
+
+    // The stand-in fingerprints its seed directory and reports its reference date whichever state it
+    // builds, so an empty reset confirms both facts exactly as a seed reset does, in the same order;
+    // only an expectation without seed facts leaves them unchecked.
+    [Theory]
+    [InlineData(AdminRoutes.ResetStateSeed, false, false, true)]
+    [InlineData(AdminRoutes.ResetStateSeed, true, false, true)]
+    [InlineData(AdminRoutes.ResetStateSeed, false, true, true)]
+    [InlineData(AdminRoutes.ResetStateSeed, true, true, true)]
+    [InlineData(AdminRoutes.ResetStateSeed, true, true, false)]
+    [InlineData(AdminRoutes.ResetStateEmpty, false, false, true)]
+    [InlineData(AdminRoutes.ResetStateEmpty, true, false, true)]
+    [InlineData(AdminRoutes.ResetStateEmpty, false, true, true)]
+    [InlineData(AdminRoutes.ResetStateEmpty, true, true, true)]
+    [InlineData(AdminRoutes.ResetStateEmpty, true, true, false)]
+    public async Task SeedFacts_AreConfirmedAfterEveryReset(
+        string state,
+        bool seedChanged,
+        bool dateChanged,
+        bool factsExpected)
+    {
+        var observedSeed = seedChanged ? new string('0', 64) : _seedSha256;
+        var observedDate = dateChanged ? OtherReferenceDate : DefaultReferenceDate;
+        var resetRequest = string.Equals(state, AdminRoutes.ResetStateEmpty, StringComparison.Ordinal)
+            ? EmptyResetRequest
+            : SeedResetRequest;
+        var admin = new ScriptedAdmin()
+            .Then(InfoRequest, () => Json(Info(PreviousGeneration)))
+            .Then(resetRequest, ResetAccepted)
+            .Then(InfoRequest, () => Json(Info(PreviousGeneration + 1, observedDate, observedSeed)));
+        var expected = factsExpected
+            ? ResetExpectations.FromManifest(_seedSha256, DefaultReferenceDate)
+            : ResetExpectations.None;
+
+        var result = await ResetToStateAsync(admin, state, expected);
+
+        var natures = new List<string>();
+        if (factsExpected && seedChanged)
+        {
+            natures.Add(FailureItemIds.Mismatch(SeedSha256Field, observedSeed));
+        }
+
+        if (factsExpected && dateChanged)
+        {
+            natures.Add(FailureItemIds.Mismatch(ReferenceDateField, OtherReferenceDate));
+        }
+
+        var itemId = FailureItemIds.Reset(ResetPoints.ReplayStart);
+        Assert.Equal(
+            natures.Select(nature => (itemId, nature)),
+            result.Failures.Select(failure => (failure.ItemId, failure.Nature)));
+        Assert.Equal(natures.Count == 0, result.Succeeded);
+        Assert.Equal(new[] { InfoRequest, resetRequest, InfoRequest }, admin.Requests);
+        Assert.Equal(PreviousGeneration + 1, result.After?.Generation);
+    }
+
+    private async Task<StateResetResult> ResetToStateAsync(
+        ScriptedAdmin admin,
+        string state,
+        ResetExpectations expected)
+    {
+        using var reset = new StateReset(Options(), admin, _console);
+        return await reset.ResetAsync(ResetPoints.ReplayStart, state, expected, TestContext.Current.CancellationToken);
+    }
+
     // ---- First-capture reference date -----------------------------------------------------------
 
     [Theory]
@@ -298,6 +367,82 @@ public sealed class StateResetTests : IDisposable
         Assert.Empty(result.Failures);
     }
 
+    // ---- Reference date parsing -----------------------------------------------------------------
+
+    // An xsd:date timezone, up to the 14:00 bound either way, does not change the reported date.
+    [Theory]
+    [InlineData(DefaultReferenceDate)]
+    [InlineData("2026-01-01Z")]
+    [InlineData("2026-01-01+14:00")]
+    [InlineData("2026-01-01-14:00")]
+    public async Task ReportedXsdDate_OnTheExpectedDate_Passes(string reported)
+    {
+        var admin = new ScriptedAdmin()
+            .Then(InfoRequest, () => Json(Info(PreviousGeneration)))
+            .Then(SeedResetRequest, ResetAccepted)
+            .Then(InfoRequest, () => Json(Info(PreviousGeneration + 1, reported)));
+
+        var result = await ResetAsync(admin, ResetExpectations.FromManifest(_seedSha256, DefaultReferenceDate));
+
+        Assert.True(result.Succeeded);
+        Assert.Empty(result.Failures);
+    }
+
+    // Both sides must be exact xsd:dates naming the same day, whatever the host's timezone: surrounding
+    // whitespace, unpadded parts, dateTimes, offsets past 14:00 or with 60+ minutes, impossible dates,
+    // other notations, non-ASCII (fullwidth) digits and a missing member never match, and two equal texts
+    // that are not dates are not compared as strings. A null reported value removes the member.
+    [Theory]
+    [InlineData(DefaultReferenceDate, "2026-1-1")]
+    [InlineData(DefaultReferenceDate, " 2026-01-01")]
+    [InlineData(DefaultReferenceDate, "2026-01-01 ")]
+    [InlineData(DefaultReferenceDate, "2026-01-01T00:30:00+14:00")]
+    [InlineData(DefaultReferenceDate, "2026-01-01T00:00:00Z")]
+    [InlineData(DefaultReferenceDate, "2026-01-01+14:01")]
+    [InlineData(DefaultReferenceDate, "2026-01-01+15:00")]
+    [InlineData(DefaultReferenceDate, "2026-01-01+13:60")]
+    [InlineData(DefaultReferenceDate, "2026-02-30")]
+    [InlineData(DefaultReferenceDate, "01/01/2026")]
+    [InlineData(DefaultReferenceDate, "\uFF12\uFF10\uFF12\uFF16-01-01")]
+    [InlineData(DefaultReferenceDate, null)]
+    [InlineData("2026-1-1", "2026-1-1")]
+    [InlineData("2026-02-30", "2026-02-30")]
+    public async Task ReportedDateNotTheExpectedXsdDate_RecordsTheRawReportedText(string expectedDate, string? reported)
+    {
+        var after = Info(PreviousGeneration + 1);
+        if (reported is null)
+        {
+            after.Remove(ReferenceDateField);
+        }
+        else
+        {
+            after[ReferenceDateField] = reported;
+        }
+
+        var admin = new ScriptedAdmin()
+            .Then(InfoRequest, () => Json(Info(PreviousGeneration)))
+            .Then(SeedResetRequest, ResetAccepted)
+            .Then(InfoRequest, () => Json(after));
+
+        var result = await ResetAsync(admin, ResetExpectations.FromManifest(_seedSha256, expectedDate));
+
+        var item = Assert.Single(result.Failures);
+        Assert.Equal(FailureItemIds.Reset(ResetPoints.ReplayStart), item.ItemId);
+        Assert.Equal(FailureItemIds.Mismatch(ReferenceDateField, reported ?? "null"), item.Nature);
+        Assert.Contains($"expected {expectedDate}", item.Detail, StringComparison.Ordinal);
+        if (string.Equals(expectedDate, DefaultReferenceDate, StringComparison.Ordinal))
+        {
+            Assert.DoesNotContain("is not a yyyy-MM-dd date", item.Detail, StringComparison.Ordinal);
+        }
+        else
+        {
+            Assert.Contains(
+                $"expected {expectedDate}, which is not a yyyy-MM-dd date",
+                item.Detail,
+                StringComparison.Ordinal);
+        }
+    }
+
     // ---- Admin URL ------------------------------------------------------------------------------
 
     // The second URL has no scheme, so it parses with the user name as its scheme.
@@ -332,6 +477,108 @@ public sealed class StateResetTests : IDisposable
             Assert.DoesNotContain(credential, item.Detail, StringComparison.Ordinal);
             Assert.DoesNotContain(credential, _console.ToString(), StringComparison.Ordinal);
         }
+    }
+
+    // ---- Undecodable info strings ---------------------------------------------------------------
+
+    // JSON escapes as raw text: an unpaired high and low surrogate, which parse but throw when decoded,
+    // and a decodable letter that takes their place in the control body.
+    private const string LoneHighSurrogate = "\\uD800";
+    private const string LoneLowSurrogate = "\\uDC00";
+    private const string DecodableEscape = "\\u0041";
+
+    // Each row puts an unpaired surrogate in one member the reader decodes. The last row puts it in a
+    // member name, which the case-insensitive lookup of an absent member (frameworkDescription) decodes.
+    [Theory]
+    [InlineData("source", "\"" + LoneHighSurrogate + "\"")]
+    [InlineData("source", "\"jade-" + LoneLowSurrogate + "standin\"")]
+    [InlineData("seedSha256", "\"" + LoneHighSurrogate + "\"")]
+    [InlineData("referenceDate", "\"" + LoneHighSurrogate + "\"")]
+    [InlineData("frameworkDescription", "\"" + LoneHighSurrogate + "\"")]
+    [InlineData("framework", "\"" + LoneHighSurrogate + "\"")]
+    [InlineData("generation", "\"" + LoneHighSurrogate + "\"")]
+    [InlineData("mutations", "\"" + LoneHighSurrogate + "\"")]
+    [InlineData(LoneHighSurrogate, "1")]
+    public async Task UndecodableInfoString_MakesTheWholeInfoInvalid_WithoutThrowing(string member, string valueJson)
+    {
+        var body = RawInfo(PreviousGeneration + 1, member, valueJson);
+        var expected = ResetExpectations.FromManifest(_seedSha256, DefaultReferenceDate);
+        var itemId = FailureItemIds.Reset(ResetPoints.ReplayStart);
+
+        // With a decodable escape in place of the surrogate the body is a valid info, so the surrogate
+        // alone makes it invalid.
+        Assert.NotNull(AdminInfo.Parse(Decodable(body)));
+        Assert.Null(AdminInfo.Parse(body));
+
+        var postReset = new ScriptedAdmin()
+            .Then(InfoRequest, () => Json(Info(PreviousGeneration)))
+            .Then(SeedResetRequest, ResetAccepted)
+            .Then(InfoRequest, () => RawJson(body));
+
+        var postResult = await ResetAsync(postReset, expected);
+
+        var postItem = Assert.Single(postResult.Failures);
+        Assert.Equal(
+            (itemId, FailureItemIds.Mismatch("http", "info-invalid")),
+            (postItem.ItemId, postItem.Nature));
+        Assert.Null(postResult.After);
+        Assert.Equal(new[] { InfoRequest, SeedResetRequest, InfoRequest }, postReset.Requests);
+
+        var preReset = new ScriptedAdmin()
+            .Then(InfoRequest, () => RawJson(body))
+            .Then(SeedResetRequest, ResetAccepted)
+            .Then(InfoRequest, () => Json(Info(PreviousGeneration + 1)));
+
+        var preResult = await ResetAsync(preReset, expected);
+
+        var preItem = Assert.Single(preResult.Failures);
+        Assert.Equal(
+            (itemId, FailureItemIds.Mismatch(GenerationField, "before-invalid")),
+            (preItem.ItemId, preItem.Nature));
+        Assert.Equal(PreviousGeneration + 1, preResult.After?.Generation);
+
+        var reader = new ScriptedAdmin().Then(InfoRequest, () => RawJson(body));
+        using (var reset = new StateReset(Options(), reader, _console))
+        {
+            Assert.Null(await reset.ReadInfoAsync(AdminUrl, TestContext.Current.CancellationToken));
+        }
+
+        Assert.Equal(new[] { InfoRequest }, reader.Requests);
+    }
+
+    private static string Decodable(string json) => json
+        .Replace(LoneHighSurrogate, DecodableEscape, StringComparison.Ordinal)
+        .Replace(LoneLowSurrogate, DecodableEscape, StringComparison.Ordinal);
+
+    private static HttpResponseMessage RawJson(string body) => new(HttpStatusCode.OK)
+    {
+        Content = new StringContent(body, Encoding.UTF8, "application/json"),
+    };
+
+    // The stand-in's /admin/info written as raw JSON text, because a JsonObject cannot hold an unpaired
+    // surrogate escape. The value of member is replaced by valueJson, or member is appended when the
+    // stand-in's info has none; member is written as raw text too, so it may hold an escape.
+    private string RawInfo(long generation, string member, string valueJson)
+    {
+        var members = new List<(string Name, string ValueJson)>
+        {
+            ("source", $"\"{SourceLabels.StandIn}\""),
+            ("seedSha256", $"\"{_seedSha256}\""),
+            ("referenceDate", $"\"{DefaultReferenceDate}\""),
+            ("generation", generation.ToString(CultureInfo.InvariantCulture)),
+            ("mutations", "0"),
+        };
+        var index = members.FindIndex(existing => string.Equals(existing.Name, member, StringComparison.Ordinal));
+        if (index >= 0)
+        {
+            members[index] = (member, valueJson);
+        }
+        else
+        {
+            members.Add((member, valueJson));
+        }
+
+        return "{" + string.Join(",", members.Select(pair => $"\"{pair.Name}\":{pair.ValueJson}")) + "}";
     }
 
     // ---- Helpers --------------------------------------------------------------------------------
