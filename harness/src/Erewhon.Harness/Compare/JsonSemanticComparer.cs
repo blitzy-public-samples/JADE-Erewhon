@@ -29,8 +29,20 @@ namespace Erewhon.Harness.Compare;
 /// <para>
 /// Discrepancy paths start at <c>$</c>: <c>.name</c> for an identifier member, <c>['x y']</c> for any
 /// other member name and <c>[i]</c> for a 0-based array index, for example <c>$[3].item.agent.name</c>.
-/// Literal values are the compact, deterministic re-encoding of the JSON value (strings keep their
+/// When an object repeats a member name, or the object it is compared with does, each occurrence's path
+/// adds <c>#n</c> to the member's, n the occurrence's 1-based position among that name's occurrences on
+/// its side, for example <c>$.name#2</c>, <c>$[1].a#2.x</c> or <c>$['x y']#2</c>; the name's
+/// <c>length</c> discrepancy stays at the member path, and a name neither side repeats keeps its plain
+/// path. An identifier step never holds <c>#</c> and a bracketed name is quoted, so the step is
+/// unambiguous, and the canonical sort of a list by path can never move evidence from one occurrence to
+/// another. Literal values are the compact, deterministic re-encoding of the JSON value (strings keep their
 /// quotes and JSON <c>null</c> is <c>null</c>), so identical input always yields an identical list.
+/// </para>
+/// <para>
+/// The list is the complete evidence of every difference outside normalised positions. When one array is
+/// longer than the other, or one side repeats a member name more often, each unmatched item or occurrence
+/// is recorded in full after the <c>length</c> discrepancy, typed as it would be compared, so two
+/// observations with the same count difference but different unmatched content give different lists.
 /// </para>
 /// <para>
 /// The instance holds only its two immutable constructor arguments and performs no I/O, so concurrent
@@ -49,7 +61,8 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
     /// <summary>
     /// Compares <paramref name="observed"/> with <paramref name="baseline"/> and returns every difference
     /// in walk order: baseline members in document order, then observed-only members in document order,
-    /// array items by index.
+    /// array items by index, with the unmatched items of a longer array, and the unmatched occurrences of a
+    /// member name one side repeats more often, recorded in full after the common ones.
     /// </summary>
     /// <param name="baseline">The baseline body text.</param>
     /// <param name="observed">The observed body text.</param>
@@ -215,8 +228,12 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
 
     /// <summary>
     /// Compares the occurrences of one member name. A count difference between two sides that both hold
-    /// the name is a <c>length</c> discrepancy, followed by the comparison of the common occurrences; a
-    /// name only one side holds gives one <c>missing</c> or <c>extra</c> discrepancy per occurrence.
+    /// the name is a <c>length</c> discrepancy, followed by the comparison of the common occurrences and
+    /// then by the complete one-sided evidence of each unmatched occurrence of the longer side, as
+    /// <see cref="AddOneSided"/> records it; a name only one side holds gives one <c>missing</c> or
+    /// <c>extra</c> discrepancy per occurrence. When either side holds the name more than once, every
+    /// occurrence, paired or unmatched, is reported at its own path, the member path followed by <c>#n</c>
+    /// for its 1-based position on its side, while the <c>length</c> discrepancy stays at the member path.
     /// </summary>
     private void CompareMember(
         string objectPath,
@@ -228,17 +245,26 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
     {
         var path = MemberPath(objectPath, name);
         var rule = runtimeDto is null ? null : _normaliser.RuleFor(runtimeDto.Name, name);
+        var numbered = baselineValues.Count > 1 || observedValues.Count > 1;
 
         if (baselineValues.Count == 0 || observedValues.Count == 0)
         {
-            foreach (var value in baselineValues)
+            for (var index = 0; index < baselineValues.Count; index++)
             {
-                discrepancies.Add(new Discrepancy(path, DiscrepancyKinds.Missing, MemberValue(rule, value), DiscrepancyValue.Absent));
+                discrepancies.Add(new Discrepancy(
+                    OccurrencePath(path, index, numbered),
+                    DiscrepancyKinds.Missing,
+                    MemberValue(rule, baselineValues[index]),
+                    DiscrepancyValue.Absent));
             }
 
-            foreach (var value in observedValues)
+            for (var index = 0; index < observedValues.Count; index++)
             {
-                discrepancies.Add(new Discrepancy(path, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, MemberValue(rule, value)));
+                discrepancies.Add(new Discrepancy(
+                    OccurrencePath(path, index, numbered),
+                    DiscrepancyKinds.Extra,
+                    DiscrepancyValue.Absent,
+                    MemberValue(rule, observedValues[index])));
             }
 
             return;
@@ -253,14 +279,25 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
         var common = Math.Min(baselineValues.Count, observedValues.Count);
         for (var index = 0; index < common; index++)
         {
+            var occurrencePath = OccurrencePath(path, index, numbered);
             if (rule is null)
             {
-                Walk(path, baselineValues[index], observedValues[index], memberType, discrepancies);
+                Walk(occurrencePath, baselineValues[index], observedValues[index], memberType, discrepancies);
             }
             else
             {
-                CompareNormalised(path, rule, baselineValues[index], observedValues[index], discrepancies);
+                CompareNormalised(occurrencePath, rule, baselineValues[index], observedValues[index], discrepancies);
             }
+        }
+
+        for (var index = common; index < baselineValues.Count; index++)
+        {
+            AddOneSided(OccurrencePath(path, index, numbered), DiscrepancyKinds.Missing, baselineValues[index], memberType, rule, discrepancies);
+        }
+
+        for (var index = common; index < observedValues.Count; index++)
+        {
+            AddOneSided(OccurrencePath(path, index, numbered), DiscrepancyKinds.Extra, observedValues[index], memberType, rule, discrepancies);
         }
     }
 
@@ -306,7 +343,11 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
         discrepancies.Add(new Discrepancy(path, DiscrepancyKinds.Type, MemberValue(rule, baseline), MemberValue(rule, observed)));
     }
 
-    /// <summary>Compares two arrays: a count difference first, then the common prefix item by item, in order.</summary>
+    /// <summary>
+    /// Compares two arrays: a count difference first, then the common prefix item by item, in order, and
+    /// then each unmatched item of the longer array at its own index, as the complete one-sided evidence
+    /// <see cref="AddOneSided"/> records, typed by the array's item type.
+    /// </summary>
     /// <remarks>
     /// The two arrays are enumerated in lockstep rather than indexed: a <see cref="JsonElement"/> index
     /// lookup rescans every preceding item of an array that holds objects or arrays, which would make
@@ -325,11 +366,120 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
 
         using var baselineItems = baseline.EnumerateArray();
         using var observedItems = observed.EnumerateArray();
-        for (var index = 0; baselineItems.MoveNext() && observedItems.MoveNext(); index++)
+        var index = 0;
+        var baselineHasItem = baselineItems.MoveNext();
+        var observedHasItem = observedItems.MoveNext();
+        while (baselineHasItem && observedHasItem)
         {
             Walk(IndexPath(path, index), baselineItems.Current, observedItems.Current, itemType, discrepancies);
+            index++;
+            baselineHasItem = baselineItems.MoveNext();
+            observedHasItem = observedItems.MoveNext();
+        }
+
+        // At most one of the two arrays still holds items: the unmatched tail of the longer one.
+        while (baselineHasItem)
+        {
+            AddOneSided(IndexPath(path, index), DiscrepancyKinds.Missing, baselineItems.Current, itemType, rule: null, discrepancies);
+            index++;
+            baselineHasItem = baselineItems.MoveNext();
+        }
+
+        while (observedHasItem)
+        {
+            AddOneSided(IndexPath(path, index), DiscrepancyKinds.Extra, observedItems.Current, itemType, rule: null, discrepancies);
+            index++;
+            observedHasItem = observedItems.MoveNext();
         }
     }
+
+    /// <summary>
+    /// Records the complete evidence of a value that only one side holds at <paramref name="path"/>, an
+    /// unmatched array item or member occurrence, as <c>missing</c> discrepancies for a baseline value or
+    /// <c>extra</c> ones for an observed value, the other side absent. The entries record the whole value,
+    /// so two values that differ anywhere outside a normalised position never give the same evidence,
+    /// while a normalised value contributes only its rule's token.
+    /// </summary>
+    /// <remarks>
+    /// A string or null at a position <paramref name="rule"/> targets is one entry holding its normalised
+    /// value, so a valid one is <c>{"valid":"N1"}</c> or <c>{"valid":"N2"}</c> whatever its content; any
+    /// other kind there is never valid and is recorded untyped, as <see cref="CompareNormalised"/> compares
+    /// it. An object is an entry holding <c>{}</c> followed by every member occurrence in document order at
+    /// its member path, followed by <c>#n</c> for its 1-based position when the object holds the name more
+    /// than once, typed as <see cref="WalkObject"/> types the members of an object of
+    /// <paramref name="type"/>: the runtime class from the object's own <c>__type</c>, the class's rule for
+    /// each member, and the declared type of each member no rule targets. An array is an entry holding
+    /// <c>[]</c> followed by every item at its index, typed by the array's item type. Any other value is one
+    /// entry holding its compact literal.
+    /// </remarks>
+    /// <param name="path">The path of the value.</param>
+    /// <param name="kind"><see cref="DiscrepancyKinds.Missing"/> for a baseline value, <see cref="DiscrepancyKinds.Extra"/> for an observed one.</param>
+    /// <param name="value">The value.</param>
+    /// <param name="type">The catalogue DTO or array name the value is declared as; null for an untyped value.</param>
+    /// <param name="rule">The normalisation rule that targets the value's position; null when none does.</param>
+    /// <param name="discrepancies">The list the entries are added to.</param>
+    private void AddOneSided(string path, string kind, JsonElement value, string? type, string? rule, List<Discrepancy> discrepancies)
+    {
+        if (rule is not null && value.ValueKind is JsonValueKind.String or JsonValueKind.Null)
+        {
+            discrepancies.Add(OneSided(path, kind, MemberValue(rule, value)));
+            return;
+        }
+
+        // Any other kind at a targeted position is never valid, and is recorded untyped.
+        var walkType = rule is null ? type : null;
+        switch (value.ValueKind)
+        {
+            case JsonValueKind.Object:
+                discrepancies.Add(OneSided(path, kind, DiscrepancyValue.Literal("{}")));
+                var members = MemberGroups.Of(value);
+                var runtimeDto = ResolveRuntimeDto(members, walkType);
+                foreach (var name in members.Names)
+                {
+                    var memberPath = MemberPath(path, name);
+                    var memberRule = runtimeDto is null ? null : _normaliser.RuleFor(runtimeDto.Name, name);
+                    var memberType = memberRule is null ? MemberType(runtimeDto, name) : null;
+                    var occurrences = members.ValuesOf(name);
+                    for (var occurrence = 0; occurrence < occurrences.Count; occurrence++)
+                    {
+                        AddOneSided(
+                            OccurrencePath(memberPath, occurrence, numbered: occurrences.Count > 1),
+                            kind,
+                            occurrences[occurrence],
+                            memberType,
+                            memberRule,
+                            discrepancies);
+                    }
+                }
+
+                break;
+
+            case JsonValueKind.Array:
+                discrepancies.Add(OneSided(path, kind, DiscrepancyValue.Literal("[]")));
+                var itemType = walkType is not null && _catalogue.TryGetArray(walkType, out var array) ? array.ItemType : null;
+                var index = 0;
+                foreach (var item in value.EnumerateArray())
+                {
+                    AddOneSided(IndexPath(path, index), kind, item, itemType, rule: null, discrepancies);
+                    index++;
+                }
+
+                break;
+
+            default:
+                discrepancies.Add(OneSided(path, kind, Compact(value)));
+                break;
+        }
+    }
+
+    /// <summary>
+    /// A discrepancy of <paramref name="kind"/> at <paramref name="path"/> whose one side is
+    /// <paramref name="value"/>: the baseline side for <c>missing</c>, the observed side for <c>extra</c>.
+    /// </summary>
+    private static Discrepancy OneSided(string path, string kind, DiscrepancyValue value) =>
+        string.Equals(kind, DiscrepancyKinds.Missing, StringComparison.Ordinal)
+            ? new Discrepancy(path, kind, value, DiscrepancyValue.Absent)
+            : new Discrepancy(path, kind, DiscrepancyValue.Absent, value);
 
     /// <summary>
     /// The DTO an object is walked as: null when <paramref name="type"/> is not a catalogue DTO; otherwise
@@ -431,6 +581,14 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
 
     private static string IndexPath(string arrayPath, int index) =>
         arrayPath + "[" + index.ToString(CultureInfo.InvariantCulture) + "]";
+
+    /// <summary>
+    /// The path of the occurrence at the 0-based <paramref name="index"/> among one side's occurrences of a
+    /// member name: <paramref name="memberPath"/> itself when the name is not <paramref name="numbered"/>,
+    /// otherwise <paramref name="memberPath"/> followed by <c>#n</c>, n the occurrence's 1-based position.
+    /// </summary>
+    private static string OccurrencePath(string memberPath, int index, bool numbered) =>
+        numbered ? memberPath + "#" + (index + 1).ToString(CultureInfo.InvariantCulture) : memberPath;
 
     /// <summary>True when <paramref name="name"/> matches <c>^[A-Za-z_][A-Za-z0-9_]*$</c>.</summary>
     private static bool IsIdentifier(string name)

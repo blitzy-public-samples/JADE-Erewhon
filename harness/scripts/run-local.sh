@@ -145,9 +145,12 @@ readonly FACADE_DLL="src/Erewhon.Facade/bin/$CONFIGURATION/$TFM/Erewhon.Facade.d
 readonly HARNESS_DLL="src/Erewhon.Harness/bin/$CONFIGURATION/$TFM/Erewhon.Harness.dll"
 
 # Grace before SIGKILL for the stand-in and the facade, and for the harness when the run is interrupted.
-# The harness bound covers its own exit path: report, then up to 15 s of shutdown per component.
+# Once SIGTERM has cancelled it, the harness reaches its final line within 105 s whatever harness.json or
+# Harness__* configure: a seed restoration in flight 15 s, two report writes 30 s each and two component
+# shutdowns 15 s each. Its Main then waits at most 5 s for its signal callbacks, so 120 s leaves a margin
+# before SIGKILL.
 readonly STOP_SECONDS=10
-readonly HARNESS_STOP_SECONDS=45
+readonly HARNESS_STOP_SECONDS=120
 # Bound on how long a started stand-in or facade may take to bind its ports (await_listeners).
 readonly LISTEN_SECONDS=60
 # Bound on the whole facade-test run. At the limit the tests are stopped like an interrupted job, exit-code

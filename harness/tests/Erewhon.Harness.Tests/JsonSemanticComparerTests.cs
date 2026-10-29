@@ -130,29 +130,32 @@ public sealed partial class JsonSemanticComparerTests : IDisposable
         AssertEquivalent($"[{AgentJson(ValidGuidA)}]", $"[{AgentJson(ValidGuidB)}]", DtoAgentArray);
     }
 
+    // A missing item is recorded in full after the count, typed as a DTOAgent: its generated guid as the
+    // rule's token, every other member as its literal.
     [Fact]
-    public void MissingArrayItem_IsALengthDifference()
+    public void MissingArrayItem_IsALengthDifference_ThenTheWholeMissingItem()
     {
         var hank = AgentJson(ValidGuidA);
         var peter = AgentJson(ValidGuidB, name: "Peter Smallsmith");
 
-        var discrepancy = Assert.Single(Compare($"[{hank},{peter}]", $"[{hank}]", DtoAgentArray));
-
-        Assert.Equal(
-            new Discrepancy("$", DiscrepancyKinds.Length, DiscrepancyValue.Literal("2"), DiscrepancyValue.Literal("1")),
-            discrepancy);
+        Discrepancy[] expected =
+        [
+            new("$", DiscrepancyKinds.Length, DiscrepancyValue.Literal("2"), DiscrepancyValue.Literal("1")),
+            .. AgentEvidence("$[1]", DiscrepancyKinds.Missing, name: "Peter Smallsmith"),
+        ];
+        Assert.Equal(expected, Compare($"[{hank},{peter}]", $"[{hank}]", DtoAgentArray));
     }
 
     [Fact]
-    public void ExtraArrayItem_IsALengthDifference_ThenCommonItemsCompareByIndex()
+    public void ExtraArrayItem_IsALengthDifference_ThenCommonItemsByIndex_ThenTheWholeExtraItem()
     {
         var hank = AgentJson(ValidGuidA);
         var mary = AgentJson(ValidGuidA, name: "Mary Jones");
         var baseline = $"[{hank},{AgentJson(ValidGuidA, name: "Peter Smallsmith")},{mary}]";
 
         // Every common item is walked as a DTOAgent at its own index: the second agent's regenerated guid
-        // compares equal, the third agent's changed website is reported after the count, and the extra
-        // fourth agent is not compared item by item.
+        // compares equal, and the third agent's changed website is reported after the count. The extra
+        // fourth agent is then recorded in full at its own index.
         var observed =
             $"[{hank},{AgentJson(ValidGuidB, name: "Peter Smallsmith")},{AgentJson(ValidGuidA, website: "www.mary.example", name: "Mary Jones")},{hank}]";
 
@@ -160,8 +163,112 @@ public sealed partial class JsonSemanticComparerTests : IDisposable
         [
             new("$", DiscrepancyKinds.Length, DiscrepancyValue.Literal("3"), DiscrepancyValue.Literal("4")),
             new("$[2].website", DiscrepancyKinds.Value, DiscrepancyValue.Literal(Quoted("www.example.com")), DiscrepancyValue.Literal(Quoted("www.mary.example"))),
+            .. AgentEvidence("$[3]", DiscrepancyKinds.Extra),
         ];
         Assert.Equal(expected, Compare(baseline, observed, DtoAgentArray));
+    }
+
+    // The report's example: the same count difference with different unmatched items gives different lists.
+    [Theory]
+    [InlineData("[1,2]", "2")]
+    [InlineData("[1,3]", "3")]
+    public void ExtraArrayItem_IsRecordedWithItsValue(string observed, string expectedExtraLiteral)
+    {
+        Discrepancy[] expected =
+        [
+            LiteralDiscrepancy("$", DiscrepancyKinds.Length, "1", "2"),
+            LiteralDiscrepancy("$[1]", DiscrepancyKinds.Extra, null, expectedExtraLiteral),
+        ];
+        Assert.Equal(expected, Compare("[1]", observed, declaredType: null));
+    }
+
+    /// <summary>
+    /// A baseline and two observations that share their count difference, but not their unmatched
+    /// content outside normalised positions, with the declared type the bodies are compared as.
+    /// </summary>
+    public static TheoryData<string, string, string, string?> SameCountDifferenceOtherUnmatchedContent() => new()
+    {
+        { "[1]", "[1,2]", "[1,3]", null },
+        { "[1]", "[1,[2]]", "[1,[3]]", null },
+        { "[1]", """[1,{"a":2}]""", """[1,{"b":2}]""", null },
+        { "[1]", "[1,{}]", "[1,[]]", null },
+        {
+            $"[{AgentJson(ValidGuidA)}]",
+            $"[{AgentJson(ValidGuidA)},{AgentJson(ValidGuidB, name: "Peter Smallsmith")}]",
+            $"[{AgentJson(ValidGuidA)},{AgentJson(ValidGuidB, name: "Mary Jones")}]",
+            DtoAgentArray
+        },
+        {
+            ResultJson(null, 400, Errors("Street is required")),
+            ResultJson(null, 400, Errors("Street is required", "City is required")),
+            ResultJson(null, 400, Errors("Street is required", "Country is required")),
+            DtoResult
+        },
+        { """{"name":"a"}""", """{"name":"a","name":"b"}""", """{"name":"a","name":"c"}""", DtoAgent },
+    };
+
+    // A changed unmatched item or occurrence is a different nature, so a documented difference never covers it.
+    [Theory]
+    [MemberData(nameof(SameCountDifferenceOtherUnmatchedContent))]
+    public void SameCountDifference_WithOtherUnmatchedContent_GivesAnotherSignature(string baseline, string first, string second, string? declaredType)
+    {
+        var firstDiscrepancies = Compare(baseline, first, declaredType);
+        var secondDiscrepancies = Compare(baseline, second, declaredType);
+
+        Assert.Equal(firstDiscrepancies[0], secondDiscrepancies[0]);
+        Assert.Equal(DiscrepancyKinds.Length, firstDiscrepancies[0].Kind);
+        Assert.NotEqual(DiscrepancySignature.Compute(firstDiscrepancies), DiscrepancySignature.Compute(secondDiscrepancies));
+        Assert.NotEqual(DiscrepancySignature.Compute(Compare(first, baseline, declaredType)), DiscrepancySignature.Compute(Compare(second, baseline, declaredType)));
+    }
+
+    /// <summary>
+    /// Unmatched array items of the declared array type, extra and missing: an item, the same item with
+    /// other valid N1 and N2 values, and the same item with an exactly compared member also changed.
+    /// </summary>
+    public static TheoryData<string, string, string, string, bool> UnmatchedItemVariants()
+    {
+        (string Item, string SameUnderRules, string Changed, string ArrayType)[] variants =
+        [
+            (
+                AgentJson(ValidGuidA, name: "Peter Smallsmith"),
+                AgentJson(ValidGuidB, name: "Peter Smallsmith"),
+                AgentJson(ValidGuidB, website: "www.peter.example", name: "Peter Smallsmith"),
+                DtoAgentArray),
+            (
+                SaleJson(DtoRetailSale, ValidGuidA, TimestampA),
+                SaleJson(DtoRetailSale, ValidGuidB, TimestampB),
+                SaleJson(DtoRetailSale, ValidGuidB, TimestampLookalike),
+                DtoSaleArray),
+        ];
+
+        var data = new TheoryData<string, string, string, string, bool>();
+        foreach (var (item, sameUnderRules, changed, arrayType) in variants)
+        {
+            data.Add(item, sameUnderRules, changed, arrayType, true);
+            data.Add(item, sameUnderRules, changed, arrayType, false);
+        }
+
+        return data;
+    }
+
+    // An unmatched item is typed by the array's item type, so its valid generated guids and timestamps
+    // contribute only their rule's token: they never make a new nature, while any other change does.
+    [Theory]
+    [MemberData(nameof(UnmatchedItemVariants))]
+    public void UnmatchedItem_HonoursTheRules_AndRecordsEveryOtherMember(string item, string sameUnderRules, string changed, string arrayType, bool observedIsLonger)
+    {
+        IReadOnlyList<Discrepancy> Unmatched(string tail) =>
+            observedIsLonger
+                ? Compare($"[{item}]", $"[{item},{tail}]", arrayType)
+                : Compare($"[{item},{tail}]", $"[{item}]", arrayType);
+
+        var original = Unmatched(item);
+
+        Assert.Equal(original, Unmatched(sameUnderRules));
+        Assert.NotEqual(DiscrepancySignature.Compute(original), DiscrepancySignature.Compute(Unmatched(changed)));
+        Assert.Contains(
+            OneSidedEvidence("$[1].guid", observedIsLonger ? DiscrepancyKinds.Extra : DiscrepancyKinds.Missing, DiscrepancyValue.Valid(N1)),
+            original);
     }
 
     [Theory]
@@ -570,7 +677,6 @@ public sealed partial class JsonSemanticComparerTests : IDisposable
 
             // Two values of one non-string kind are compared exactly by the untyped walk, below the position.
             ("""{"a":1}""", """{"a":2}""", ".a", DiscrepancyKinds.Value, "1", "2"),
-            ("[1]", "[1,2]", "", DiscrepancyKinds.Length, "1", "2"),
         ];
 
         var data = new TheoryData<string, string?, string?, string, string, string?, string?>();
@@ -594,6 +700,44 @@ public sealed partial class JsonSemanticComparerTests : IDisposable
 
         Discrepancy[] expected = [LiteralDiscrepancy(position.Path + subPath, expectedKind, expectedBaselineLiteral, expectedObservedLiteral)];
         Assert.Equal(expected, Compare(position.Body(baselineValue), position.Body(observedValue), position.DeclaredType));
+    }
+
+    /// <summary>Every targeted position, with the longer of two arrays on the observed side and on the baseline side.</summary>
+    public static TheoryData<string, bool> TargetedArraysOfDifferentLengths()
+    {
+        var data = new TheoryData<string, bool>();
+        foreach (var position in TargetedPositions)
+        {
+            data.Add(position.Name, true);
+            data.Add(position.Name, false);
+        }
+
+        return data;
+    }
+
+    // Two arrays at a targeted position are compared by the untyped walk, so the unmatched items of the
+    // longer one are recorded in full and untyped: a valid GUID inside them is an ordinary literal.
+    [Theory]
+    [MemberData(nameof(TargetedArraysOfDifferentLengths))]
+    public void TargetedArraysOfDifferentLengths_RecordTheUnmatchedItemsUntyped(string target, bool observedIsLonger)
+    {
+        var position = Targeted(target);
+        const string Shorter = "[1]";
+        var longer = $$"""[1,2,{"guid":"{{ValidGuidA}}"}]""";
+        var kind = observedIsLonger ? DiscrepancyKinds.Extra : DiscrepancyKinds.Missing;
+
+        Discrepancy[] expected =
+        [
+            LiteralDiscrepancy(position.Path, DiscrepancyKinds.Length, observedIsLonger ? "1" : "3", observedIsLonger ? "3" : "1"),
+            OneSidedEvidence(position.Path + "[1]", kind, DiscrepancyValue.Literal("2")),
+            OneSidedEvidence(position.Path + "[2]", kind, DiscrepancyValue.Literal("{}")),
+            OneSidedEvidence(position.Path + "[2].guid", kind, DiscrepancyValue.Literal(Quoted(ValidGuidA))),
+        ];
+        Assert.Equal(
+            expected,
+            observedIsLonger
+                ? Compare(position.Body(Shorter), position.Body(longer), position.DeclaredType)
+                : Compare(position.Body(longer), position.Body(Shorter), position.DeclaredType));
     }
 
     // Numbers compare by exact value: digits beyond double or decimal precision, and magnitudes beyond
@@ -659,65 +803,158 @@ public sealed partial class JsonSemanticComparerTests : IDisposable
             """{"name":"a","name":"b"}""",
             """{"name":"b","name":"a"}""",
             [
-                LiteralDiscrepancy("$.name", DiscrepancyKinds.Value, Quoted("a"), Quoted("b")),
-                LiteralDiscrepancy("$.name", DiscrepancyKinds.Value, Quoted("b"), Quoted("a")),
+                LiteralDiscrepancy("$.name#1", DiscrepancyKinds.Value, Quoted("a"), Quoted("b")),
+                LiteralDiscrepancy("$.name#2", DiscrepancyKinds.Value, Quoted("b"), Quoted("a")),
             ]
         },
-        { """{"name":"a","name":"b"}""", """{"name":"a"}""", [LiteralDiscrepancy("$.name", DiscrepancyKinds.Length, "2", "1")] },
-        { """{"name":"a"}""", """{"name":"a","name":"b"}""", [LiteralDiscrepancy("$.name", DiscrepancyKinds.Length, "1", "2")] },
+        {
+            """{"name":"a","name":"b"}""",
+            """{"name":"a"}""",
+            [
+                LiteralDiscrepancy("$.name", DiscrepancyKinds.Length, "2", "1"),
+                LiteralDiscrepancy("$.name#2", DiscrepancyKinds.Missing, Quoted("b"), null),
+            ]
+        },
+        {
+            """{"name":"a"}""",
+            """{"name":"a","name":"b"}""",
+            [
+                LiteralDiscrepancy("$.name", DiscrepancyKinds.Length, "1", "2"),
+                LiteralDiscrepancy("$.name#2", DiscrepancyKinds.Extra, null, Quoted("b")),
+            ]
+        },
+        {
+            """{"name":"a"}""",
+            """{"name":"a","name":"c"}""",
+            [
+                LiteralDiscrepancy("$.name", DiscrepancyKinds.Length, "1", "2"),
+                LiteralDiscrepancy("$.name#2", DiscrepancyKinds.Extra, null, Quoted("c")),
+            ]
+        },
         {
             """{"name":"a","name":"b"}""",
             """{"name":"c"}""",
             [
                 LiteralDiscrepancy("$.name", DiscrepancyKinds.Length, "2", "1"),
-                LiteralDiscrepancy("$.name", DiscrepancyKinds.Value, Quoted("a"), Quoted("c")),
+                LiteralDiscrepancy("$.name#1", DiscrepancyKinds.Value, Quoted("a"), Quoted("c")),
+                LiteralDiscrepancy("$.name#2", DiscrepancyKinds.Missing, Quoted("b"), null),
+            ]
+        },
+        {
+            """{"name":"a"}""",
+            """{"name":"a","name":{"x":[1]}}""",
+            [
+                LiteralDiscrepancy("$.name", DiscrepancyKinds.Length, "1", "2"),
+                LiteralDiscrepancy("$.name#2", DiscrepancyKinds.Extra, null, "{}"),
+                LiteralDiscrepancy("$.name#2.x", DiscrepancyKinds.Extra, null, "[]"),
+                LiteralDiscrepancy("$.name#2.x[0]", DiscrepancyKinds.Extra, null, "1"),
+            ]
+        },
+        {
+            """{"name":"a"}""",
+            """{"name":"a","name":{"x":1,"y":2,"x":3}}""",
+            [
+                LiteralDiscrepancy("$.name", DiscrepancyKinds.Length, "1", "2"),
+                LiteralDiscrepancy("$.name#2", DiscrepancyKinds.Extra, null, "{}"),
+                LiteralDiscrepancy("$.name#2.x#1", DiscrepancyKinds.Extra, null, "1"),
+                LiteralDiscrepancy("$.name#2.x#2", DiscrepancyKinds.Extra, null, "3"),
+                LiteralDiscrepancy("$.name#2.y", DiscrepancyKinds.Extra, null, "2"),
             ]
         },
         {
             """{"nickname":"a","nickname":"b"}""",
             "{}",
             [
-                LiteralDiscrepancy("$.nickname", DiscrepancyKinds.Missing, Quoted("a"), null),
-                LiteralDiscrepancy("$.nickname", DiscrepancyKinds.Missing, Quoted("b"), null),
+                LiteralDiscrepancy("$.nickname#1", DiscrepancyKinds.Missing, Quoted("a"), null),
+                LiteralDiscrepancy("$.nickname#2", DiscrepancyKinds.Missing, Quoted("b"), null),
             ]
         },
         {
             "{}",
             """{"nickname":1,"nickname":[2]}""",
             [
-                LiteralDiscrepancy("$.nickname", DiscrepancyKinds.Extra, null, "1"),
-                LiteralDiscrepancy("$.nickname", DiscrepancyKinds.Extra, null, "[2]"),
+                LiteralDiscrepancy("$.nickname#1", DiscrepancyKinds.Extra, null, "1"),
+                LiteralDiscrepancy("$.nickname#2", DiscrepancyKinds.Extra, null, "[2]"),
             ]
+        },
+        {
+            """{"x y":1,"x y":2}""",
+            """{"x y":1,"x y":3}""",
+            [LiteralDiscrepancy("$['x y']#2", DiscrepancyKinds.Value, "2", "3")]
         },
         {
             $$"""{"guid":"{{ValidGuidA}}","guid":"{{ValidGuidA}}"}""",
             $$"""{"guid":"{{ValidGuidB}}"}""",
-            [LiteralDiscrepancy("$.guid", DiscrepancyKinds.Length, "2", "1")]
+            [
+                LiteralDiscrepancy("$.guid", DiscrepancyKinds.Length, "2", "1"),
+                new Discrepancy("$.guid#2", DiscrepancyKinds.Missing, DiscrepancyValue.Valid(N1), DiscrepancyValue.Absent),
+            ]
+        },
+        {
+            $$"""{"guid":"{{ValidGuidA}}"}""",
+            $$$"""{"guid":"{{{ValidGuidB}}}","guid":"{{{GuidLookalike}}}","guid":null,"guid":{"guid":"{{{ValidGuidA}}}"}}""",
+            [
+                LiteralDiscrepancy("$.guid", DiscrepancyKinds.Length, "1", "4"),
+                LiteralDiscrepancy("$.guid#2", DiscrepancyKinds.Extra, null, Quoted(GuidLookalike)),
+                LiteralDiscrepancy("$.guid#3", DiscrepancyKinds.Extra, null, "null"),
+                LiteralDiscrepancy("$.guid#4", DiscrepancyKinds.Extra, null, "{}"),
+                LiteralDiscrepancy("$.guid#4.guid", DiscrepancyKinds.Extra, null, Quoted(ValidGuidA)),
+            ]
         },
         {
             $$"""{"guid":"{{ValidGuidA}}","guid":"{{ValidGuidA}}"}""",
             $$"""{"guid":"{{ValidGuidB}}","guid":"{{GuidLookalike}}"}""",
-            [new Discrepancy("$.guid", DiscrepancyKinds.Value, DiscrepancyValue.Valid(N1), DiscrepancyValue.Literal(Quoted(GuidLookalike)))]
+            [new Discrepancy("$.guid#2", DiscrepancyKinds.Value, DiscrepancyValue.Valid(N1), DiscrepancyValue.Literal(Quoted(GuidLookalike)))]
         },
         {
             $$"""{"guid":"{{ValidGuidA}}","guid":null}""",
             "{}",
             [
-                new Discrepancy("$.guid", DiscrepancyKinds.Missing, DiscrepancyValue.Valid(N1), DiscrepancyValue.Absent),
-                LiteralDiscrepancy("$.guid", DiscrepancyKinds.Missing, "null", null),
+                new Discrepancy("$.guid#1", DiscrepancyKinds.Missing, DiscrepancyValue.Valid(N1), DiscrepancyValue.Absent),
+                LiteralDiscrepancy("$.guid#2", DiscrepancyKinds.Missing, "null", null),
             ]
         },
     };
 
     // A name repeated within one object is compared occurrence by occurrence in document order: a count
-    // difference is a length discrepancy followed by the common occurrences, a name only one side holds
-    // gives one missing or extra discrepancy per occurrence, and at a targeted position every occurrence
-    // follows the rule.
+    // difference is a length discrepancy followed by the common occurrences and then by each unmatched
+    // occurrence in full, a name only one side holds gives one missing or extra discrepancy per occurrence,
+    // and at a targeted position every occurrence follows the rule, an object or array there untyped. Once
+    // either side repeats the name, each occurrence is reported at the member path with #n, its 1-based
+    // position on its side, and only the length stays at the member path.
     [Theory]
     [MemberData(nameof(RepeatedMemberNames))]
     public void RepeatedMemberNames_CompareOccurrenceByOccurrence(string baseline, string observed, Discrepancy[] expected)
     {
         Assert.Equal(expected, Compare(baseline, observed, DtoAgent));
+    }
+
+    /// <summary>
+    /// A baseline and two observations that hold the same occurrences of a repeated member name, or the
+    /// same entries below them, in another order, so the comparison of the two observations differs.
+    /// </summary>
+    public static TheoryData<string, string, string> ReorderedOccurrences() => new()
+    {
+        { "[1]", """[1,{"a":1,"a":2}]""", """[1,{"a":2,"a":1}]""" },
+        { "[1]", """[1,{"a":{"x":1},"a":{"y":2}}]""", """[1,{"a":{"y":2},"a":{"x":1}}]""" },
+        { """{"a":1,"a":1}""", """{"a":2,"a":3}""", """{"a":3,"a":2}""" },
+        { "{}", """{"a":{"x":1},"a":{"y":2}}""", """{"a":{"y":2},"a":{"x":1}}""" },
+        { """{"a":1}""", """{"a":1,"a":{"x":1},"a":{"y":2}}""", """{"a":1,"a":{"y":2},"a":{"x":1}}""" },
+    };
+
+    // Which occurrence a value or a nested entry belongs to is part of the evidence: reordered occurrences
+    // give another signature, whether paired, unmatched or held by one side only, in either direction.
+    [Theory]
+    [MemberData(nameof(ReorderedOccurrences))]
+    public void ReorderedOccurrences_GiveAnotherSignature(string baseline, string first, string second)
+    {
+        Assert.NotEmpty(Compare(first, second, declaredType: null));
+        Assert.NotEqual(
+            DiscrepancySignature.Compute(Compare(baseline, first, declaredType: null)),
+            DiscrepancySignature.Compute(Compare(baseline, second, declaredType: null)));
+        Assert.NotEqual(
+            DiscrepancySignature.Compute(Compare(first, baseline, declaredType: null)),
+            DiscrepancySignature.Compute(Compare(second, baseline, declaredType: null)));
     }
 
     // An identifier member name is a dotted step; any other name is bracketed and single-quoted, with
@@ -1290,6 +1527,42 @@ public sealed partial class JsonSemanticComparerTests : IDisposable
     /// <summary>A discrepancy whose two sides are literals; a null literal is the absent side.</summary>
     private static Discrepancy LiteralDiscrepancy(string path, string kind, string? baselineLiteral, string? observedLiteral) =>
         new(path, kind, DiscrepancyValue.Literal(baselineLiteral), DiscrepancyValue.Literal(observedLiteral));
+
+    /// <summary>
+    /// A <c>missing</c> or <c>extra</c> discrepancy whose one side is <paramref name="value"/>: the baseline
+    /// side for missing, the observed side for extra, the other side absent.
+    /// </summary>
+    private static Discrepancy OneSidedEvidence(string path, string kind, DiscrepancyValue value) =>
+        kind == DiscrepancyKinds.Missing
+            ? new(path, kind, value, DiscrepancyValue.Absent)
+            : new(path, kind, DiscrepancyValue.Absent, value);
+
+    /// <summary>
+    /// The evidence of an <see cref="AgentJson"/> agent with a valid generated guid that only one side holds
+    /// at <paramref name="path"/>, in walk order: the object, then each member in document order, the guid
+    /// as the N1 token and every other member as its literal.
+    /// </summary>
+    private static Discrepancy[] AgentEvidence(string path, string kind, string website = "www.example.com", string name = "Hank Williams")
+    {
+        (string Member, DiscrepancyValue Value)[] members =
+        [
+            ("guid", DiscrepancyValue.Valid(N1)),
+            ("name", DiscrepancyValue.Literal(Quoted(name))),
+            ("street", DiscrepancyValue.Literal(Quoted("12 Music Row"))),
+            ("city", DiscrepancyValue.Literal(Quoted("Nashville"))),
+            ("country", DiscrepancyValue.Literal(Quoted("United States of America"))),
+            ("email", DiscrepancyValue.Literal(Quoted("hank@example.com"))),
+            ("fax", DiscrepancyValue.Literal(Quoted(HankFax))),
+            ("phone", DiscrepancyValue.Literal(Quoted("1 8 2938 4756"))),
+            ("website", DiscrepancyValue.Literal(Quoted(website))),
+        ];
+
+        return
+        [
+            OneSidedEvidence(path, kind, DiscrepancyValue.Literal("{}")),
+            .. members.Select(member => OneSidedEvidence($"{path}.{member.Member}", kind, member.Value)),
+        ];
+    }
 
     /// <summary>A <c>DTOAgent</c>; <paramref name="guidMember"/> is the guid's raw JSON value, or null to omit the member.</summary>
     private static string AgentJsonWithRawGuid(string? guidMember)

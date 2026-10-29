@@ -7,6 +7,7 @@ using Erewhon.Contracts;
 using Erewhon.Contracts.Catalogue;
 using Erewhon.Harness.Baseline;
 using Erewhon.Harness.Compare;
+using Erewhon.Harness.Report;
 
 namespace Erewhon.Harness.Tests;
 
@@ -134,67 +135,132 @@ public sealed partial class BinaryComparerTests : IDisposable
         Assert.Equal(Convert.ToHexStringLower(observed, offset, 1), discrepancy.Observed.Text);
     }
 
-    [Fact]
-    public void TwoChangedBytes_ReportFirstDifferingOffset()
+    /// <summary>
+    /// Changes to the <see cref="Jpeg"/> body, each a new byte at an offset, with the complete discrepancy list
+    /// they give: one value entry per maximal run of changed bytes, holding every byte of the run.
+    /// </summary>
+    public static TheoryData<int[], byte[], Discrepancy[]> ChangedByteRuns() => new()
+    {
+        // Changes separated by unchanged bytes are separate runs, each at its own offset.
+        { [3, 7], [0xE1, 0x00], [Run(3, "e0", "e1"), Run(7, "46", "00")] },
+
+        // Adjacent changes are one run.
+        { [3, 4], [0xE1, 0x01], [Run(3, "e000", "e101")] },
+
+        // One unchanged byte between two changes ends the first run.
+        { [3, 5], [0xE1, 0x11], [Run(3, "e0", "e1"), Run(5, "10", "11")] },
+
+        // Runs at both ends of the body.
+        { [0, 1, JpegLength - 1], [0x00, 0x00, 0x00], [Run(0, "ffd8", "0000"), Run(JpegLength - 1, "d9", "00")] },
+    };
+
+    [Theory]
+    [MemberData(nameof(ChangedByteRuns))]
+    public void ChangedBytes_AreReportedAsMaximalRuns(int[] offsets, byte[] values, Discrepancy[] expected)
     {
         var observed = Jpeg();
-        observed[3] = 0xE1;
-        observed[7] = 0x00;
+        for (var index = 0; index < offsets.Length; index++)
+        {
+            observed[offsets[index]] = values[index];
+        }
 
-        var discrepancy = Assert.Single(BinaryComparer.Compare(Jpeg(), observed));
+        var discrepancies = BinaryComparer.Compare(Jpeg(), observed);
 
-        Assert.Equal(
-            new Discrepancy("$body[3]", DiscrepancyKinds.Value, DiscrepancyValue.Literal("e0"), DiscrepancyValue.Literal("e1")),
-            discrepancy);
+        Assert.Equal(expected, discrepancies);
+        AssertCompleteEvidence(Jpeg(), observed, discrepancies);
     }
 
-    // BinaryComparer documents that a body which is a prefix of the other yields the length
-    // discrepancy only, so a single entry is asserted.
+    // Each run holds all of its bytes, so two observations that share their first changed byte give
+    // different lists; the unchanged last byte ends the run.
+    [Theory]
+    [InlineData("01020300", "010203")]
+    [InlineData("01090800", "010908")]
+    public void ChangedRun_HoldsEveryByteOfTheRun(string observedHex, string expectedObservedRun)
+    {
+        byte[] baseline = [0x00, 0x00, 0x00, 0x00];
+
+        Discrepancy[] expected = [Run(0, "000000", expectedObservedRun)];
+        Assert.Equal(expected, BinaryComparer.Compare(baseline, Convert.FromHexString(observedHex)));
+    }
+
+    // A later change, or a different extra byte, is a different discrepancy list and therefore a different
+    // failure signature, even when the two observations share their first change and their length.
+    [Theory]
+    [InlineData("000000", "010203", "010908")]
+    [InlineData("0000000000", "0100000002", "0100000003")]
+    [InlineData("0000000000", "0100000002", "0100000200")]
+    [InlineData("0000", "010000", "010001")]
+    [InlineData("0000", "0000ff", "0000fe")]
+    public void ObservationsSharingTheirFirstChange_GiveDifferentSignatures(string baselineHex, string firstHex, string secondHex)
+    {
+        var baseline = Convert.FromHexString(baselineHex);
+        var first = Convert.FromHexString(firstHex);
+        var second = Convert.FromHexString(secondHex);
+
+        var firstDiscrepancies = BinaryComparer.Compare(baseline, first);
+        var secondDiscrepancies = BinaryComparer.Compare(baseline, second);
+
+        Assert.NotEqual(firstDiscrepancies, secondDiscrepancies);
+        Assert.NotEqual(DiscrepancySignature.Compute(firstDiscrepancies), DiscrepancySignature.Compute(secondDiscrepancies));
+        AssertCompleteEvidence(baseline, first, firstDiscrepancies);
+        AssertCompleteEvidence(baseline, second, secondDiscrepancies);
+    }
+
+    // A body that is a prefix of the other gives the length entry and the baseline's bytes past the
+    // observed end as one missing entry at that end.
     [Theory]
     [InlineData(2)]
     [InlineData(JpegLength)]
-    public void Truncation_GivesLengthDiscrepancyAtBody(int removedBytes)
+    public void Truncation_GivesLengthAndMissingTail(int removedBytes)
     {
         var baseline = Jpeg();
+        var kept = JpegLength - removedBytes;
 
-        var discrepancy = Assert.Single(BinaryComparer.Compare(baseline, baseline.AsSpan(0, JpegLength - removedBytes)));
-
-        Assert.Equal(
-            new Discrepancy(
+        Discrepancy[] expected =
+        [
+            new(
                 "$body",
                 DiscrepancyKinds.Length,
                 DiscrepancyValue.Literal(JpegLength.ToString(CultureInfo.InvariantCulture)),
-                DiscrepancyValue.Literal((JpegLength - removedBytes).ToString(CultureInfo.InvariantCulture))),
-            discrepancy);
+                DiscrepancyValue.Literal(kept.ToString(CultureInfo.InvariantCulture))),
+            new(
+                string.Create(CultureInfo.InvariantCulture, $"$body[{kept}]"),
+                DiscrepancyKinds.Missing,
+                DiscrepancyValue.Literal(Convert.ToHexStringLower(baseline, kept, removedBytes)),
+                DiscrepancyValue.Absent),
+        ];
+        Assert.Equal(expected, BinaryComparer.Compare(baseline, baseline.AsSpan(0, kept)));
     }
 
     [Fact]
-    public void Extension_GivesLengthDiscrepancyAtBody()
+    public void Extension_GivesLengthAndExtraTail()
     {
-        byte[] observed = [.. Jpeg(), 0x00];
+        byte[] observed = [.. Jpeg(), 0x00, 0x7F];
 
-        var discrepancy = Assert.Single(BinaryComparer.Compare(Jpeg(), observed));
-
-        Assert.Equal(
-            new Discrepancy("$body", DiscrepancyKinds.Length, DiscrepancyValue.Literal("22"), DiscrepancyValue.Literal("23")),
-            discrepancy);
+        Discrepancy[] expected =
+        [
+            new("$body", DiscrepancyKinds.Length, DiscrepancyValue.Literal("22"), DiscrepancyValue.Literal("24")),
+            new("$body[22]", DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal("007f")),
+        ];
+        Assert.Equal(expected, BinaryComparer.Compare(Jpeg(), observed));
     }
 
     [Fact]
-    public void LengthAndByteDifference_ReportBoth()
+    public void LengthAndByteDifference_ReportLengthRunAndTail()
     {
         var observed = Jpeg().AsSpan(0, JpegLength - 1).ToArray();
         observed[2] = 0x00;
 
         var discrepancies = BinaryComparer.Compare(Jpeg(), observed);
 
-        Assert.Equal(2, discrepancies.Count);
-        Assert.Contains(
-            new Discrepancy("$body", DiscrepancyKinds.Length, DiscrepancyValue.Literal("22"), DiscrepancyValue.Literal("21")),
-            discrepancies);
-        Assert.Contains(
-            new Discrepancy("$body[2]", DiscrepancyKinds.Value, DiscrepancyValue.Literal("ff"), DiscrepancyValue.Literal("00")),
-            discrepancies);
+        Discrepancy[] expected =
+        [
+            new("$body", DiscrepancyKinds.Length, DiscrepancyValue.Literal("22"), DiscrepancyValue.Literal("21")),
+            Run(2, "ff", "00"),
+            new("$body[21]", DiscrepancyKinds.Missing, DiscrepancyValue.Literal("d9"), DiscrepancyValue.Absent),
+        ];
+        Assert.Equal(expected, discrepancies);
+        AssertCompleteEvidence(Jpeg(), observed, discrepancies);
     }
 
     [Fact]
@@ -212,39 +278,30 @@ public sealed partial class BinaryComparerTests : IDisposable
 
     // Indentation between elements, namespace-declaration order and ordinary attribute order are what
     // XML canonicalisation ignores, yet they change the bytes, so envelopes differing only in them must
-    // still be reported different.
+    // still be reported different: from the first byte they change, with every later differing byte too.
     [Theory]
     [InlineData("indentation")]
     [InlineData("namespace-declaration-order")]
     [InlineData("ordinary-attribute-order")]
     public void XmlFormattingDifference_IsNotCanonicalised(string variant)
     {
-        var (baseline, observed, expected) = variant switch
+        var (baselineText, observedText, firstRunOffset, firstBaselineByte, firstObservedByte) = variant switch
         {
-            "indentation" => (CompactPhotoEnvelope, IndentedPhotoEnvelope, new[]
-            {
-                new Discrepancy("$body", DiscrepancyKinds.Length, DiscrepancyValue.Literal("407"), DiscrepancyValue.Literal("447")),
-                new Discrepancy("$body[207]", DiscrepancyKinds.Value, DiscrepancyValue.Literal("3c"), DiscrepancyValue.Literal("0a")),
-            }),
-            "namespace-declaration-order" => (CompactPhotoEnvelope, SwappedAttributesPhotoEnvelope, new[]
-            {
-                new Discrepancy("$body[116]", DiscrepancyKinds.Value, DiscrepancyValue.Literal("69"), DiscrepancyValue.Literal("64")),
-            }),
-            "ordinary-attribute-order" => (TypedPhotoEnvelope, ReorderedTypedPhotoEnvelope, new[]
-            {
-                new Discrepancy("$body[307]", DiscrepancyKinds.Value, DiscrepancyValue.Literal("74"), DiscrepancyValue.Literal("6e")),
-            }),
+            "indentation" => (CompactPhotoEnvelope, IndentedPhotoEnvelope, 207, "3c", "0a"),
+            "namespace-declaration-order" => (CompactPhotoEnvelope, SwappedAttributesPhotoEnvelope, 116, "69", "64"),
+            "ordinary-attribute-order" => (TypedPhotoEnvelope, ReorderedTypedPhotoEnvelope, 307, "74", "6e"),
             _ => throw new ArgumentOutOfRangeException(nameof(variant), variant, "Unknown XML formatting variant."),
         };
+        var baseline = Encoding.UTF8.GetBytes(baselineText);
+        var observed = Encoding.UTF8.GetBytes(observedText);
 
-        var discrepancies = BinaryComparer.Compare(
-            Encoding.UTF8.GetBytes(baseline), Encoding.UTF8.GetBytes(observed));
+        var discrepancies = BinaryComparer.Compare(baseline, observed);
 
-        Assert.Equal(expected.Length, discrepancies.Count);
-        foreach (var discrepancy in expected)
-        {
-            Assert.Contains(discrepancy, discrepancies);
-        }
+        var firstRun = discrepancies.First(discrepancy => discrepancy.Kind == DiscrepancyKinds.Value);
+        Assert.Equal(string.Create(CultureInfo.InvariantCulture, $"$body[{firstRunOffset}]"), firstRun.Path);
+        Assert.StartsWith(firstBaselineByte, firstRun.Baseline.Text, StringComparison.Ordinal);
+        Assert.StartsWith(firstObservedByte, firstRun.Observed.Text, StringComparison.Ordinal);
+        AssertCompleteEvidence(baseline, observed, discrepancies);
     }
 
     // ---- Response level: getPhoto dispatch ---------------------------------------------------------
@@ -258,37 +315,49 @@ public sealed partial class BinaryComparerTests : IDisposable
         var indented = NilResultEnvelope(GetPhoto, indent: true);
         var firstDifference = compact.IndexOf("<soap:Body>", StringComparison.Ordinal);
         Assert.Equal(compact[..firstDifference], indented[..firstDifference]);
+        var compactBytes = Encoding.UTF8.GetBytes(compact);
+        var indentedBytes = Encoding.UTF8.GetBytes(indented);
+
+        var comparison = _responses.Compare(GetPhoto, SoapSnapshot(compactBytes), SoapSnapshot(indentedBytes));
 
         AssertResponse(
-            _responses.Compare(GetPhoto, SoapSnapshot(compact), SoapSnapshot(indented)),
-            [
-                new("$body", DiscrepancyKinds.Length, CountLiteral(compact.Length), CountLiteral(indented.Length)),
-                new(
-                    string.Create(CultureInfo.InvariantCulture, $"$body[{firstDifference}]"),
-                    DiscrepancyKinds.Value,
-                    DiscrepancyValue.Literal("3c"),
-                    DiscrepancyValue.Literal("0a")),
-            ],
+            comparison,
+            [.. BinaryComparer.Compare(compactBytes, indentedBytes).Order(Discrepancy.CanonicalOrder)],
             wellFormed: true,
             statusMatched: true);
+        Assert.Contains(
+            new Discrepancy("$body", DiscrepancyKinds.Length, CountLiteral(compact.Length), CountLiteral(indented.Length)),
+            comparison.Discrepancies);
+        var firstRun = Assert.Single(
+            comparison.Discrepancies,
+            discrepancy => discrepancy.Path == string.Create(CultureInfo.InvariantCulture, $"$body[{firstDifference}]"));
+        Assert.StartsWith("3c", firstRun.Baseline.Text, StringComparison.Ordinal);
+        Assert.StartsWith("0a", firstRun.Observed.Text, StringComparison.Ordinal);
+        AssertCompleteEvidence(compactBytes, indentedBytes, comparison.Discrepancies);
         AssertResponse(_responses.Compare(GetAgent, SoapSnapshot(compact), SoapSnapshot(indented)), [], wellFormed: true, statusMatched: true);
     }
 
-    // A getPhoto body keeps its byte-order mark as an ordinary leading byte; an XML-compared body drops it.
+    // A getPhoto body keeps its byte-order mark as ordinary leading bytes; an XML-compared body drops it.
     [Fact]
     public void GetPhoto_ByteOrderMark_IsNotStripped()
     {
         var plain = Encoding.UTF8.GetBytes(NilResultEnvelope(GetPhoto, indent: false));
         byte[] marked = [0xEF, 0xBB, 0xBF, .. plain];
 
+        var comparison = _responses.Compare(GetPhoto, SoapSnapshot(plain), SoapSnapshot(marked));
+
         AssertResponse(
-            _responses.Compare(GetPhoto, SoapSnapshot(plain), SoapSnapshot(marked)),
-            [
-                new("$body", DiscrepancyKinds.Length, CountLiteral(plain.Length), CountLiteral(marked.Length)),
-                new("$body[0]", DiscrepancyKinds.Value, DiscrepancyValue.Literal("3c"), DiscrepancyValue.Literal("ef")),
-            ],
+            comparison,
+            [.. BinaryComparer.Compare(plain, marked).Order(Discrepancy.CanonicalOrder)],
             wellFormed: true,
             statusMatched: true);
+        Assert.Contains(
+            new Discrepancy("$body", DiscrepancyKinds.Length, CountLiteral(plain.Length), CountLiteral(marked.Length)),
+            comparison.Discrepancies);
+        var firstRun = Assert.Single(comparison.Discrepancies, discrepancy => discrepancy.Path == "$body[0]");
+        Assert.StartsWith("3c", firstRun.Baseline.Text, StringComparison.Ordinal);
+        Assert.StartsWith("efbbbf", firstRun.Observed.Text, StringComparison.Ordinal);
+        AssertCompleteEvidence(plain, marked, comparison.Discrepancies);
         AssertResponse(_responses.Compare(GetAgent, SoapSnapshot(plain), SoapSnapshot(marked)), [], wellFormed: true, statusMatched: true);
     }
 
@@ -350,6 +419,98 @@ public sealed partial class BinaryComparerTests : IDisposable
         Assert.Equal(expected.Length == 0, comparison.Equivalent);
         Assert.Equal(wellFormed, comparison.WellFormed);
         Assert.Equal(statusMatched, comparison.StatusMatched);
+    }
+
+    /// <summary>The <c>value</c> discrepancy of a run of differing bytes at <paramref name="offset"/>, each side as lowercase hex.</summary>
+    private static Discrepancy Run(int offset, string baselineHex, string observedHex) =>
+        new(
+            string.Create(CultureInfo.InvariantCulture, $"$body[{offset}]"),
+            DiscrepancyKinds.Value,
+            DiscrepancyValue.Literal(baselineHex),
+            DiscrepancyValue.Literal(observedHex));
+
+    /// <summary>
+    /// Asserts that <paramref name="discrepancies"/>, in any order, are the complete byte evidence of the two
+    /// bodies, which only one list can be: the length entry exactly when the lengths differ; value runs inside
+    /// the shorter body in which every byte differs, no two of which touch, so each run is maximal; one
+    /// missing or extra entry at the shorter body's end exactly when the lengths differ; and nothing else.
+    /// Applied to either body, the runs and the tail rebuild the other.
+    /// </summary>
+    private static void AssertCompleteEvidence(byte[] baseline, byte[] observed, IReadOnlyList<Discrepancy> discrepancies)
+    {
+        var common = Math.Min(baseline.Length, observed.Length);
+        var rebuiltBaseline = observed.AsSpan(0, common).ToArray();
+        var rebuiltObserved = baseline.AsSpan(0, common).ToArray();
+        var tails = new List<Discrepancy>();
+        var runs = new List<(int Offset, byte[] Baseline, byte[] Observed)>();
+
+        foreach (var discrepancy in discrepancies)
+        {
+            if (discrepancy.Path == "$body")
+            {
+                Assert.Equal(
+                    new Discrepancy("$body", DiscrepancyKinds.Length, CountLiteral(baseline.Length), CountLiteral(observed.Length)),
+                    discrepancy);
+                continue;
+            }
+
+            Assert.StartsWith("$body[", discrepancy.Path, StringComparison.Ordinal);
+            Assert.EndsWith("]", discrepancy.Path, StringComparison.Ordinal);
+            var offset = int.Parse(discrepancy.Path.AsSpan(6, discrepancy.Path.Length - 7), NumberStyles.None, CultureInfo.InvariantCulture);
+            if (discrepancy.Kind == DiscrepancyKinds.Value)
+            {
+                runs.Add((offset, Convert.FromHexString(discrepancy.Baseline.Text!), Convert.FromHexString(discrepancy.Observed.Text!)));
+                continue;
+            }
+
+            Assert.Equal(common, offset);
+            tails.Add(discrepancy);
+        }
+
+        Assert.Equal(baseline.Length != observed.Length, discrepancies.Any(discrepancy => discrepancy.Path == "$body"));
+
+        var previousEnd = -1;
+        foreach (var (offset, baselineRun, observedRun) in runs.OrderBy(run => run.Offset))
+        {
+            Assert.NotEmpty(baselineRun);
+            Assert.Equal(baselineRun.Length, observedRun.Length);
+            Assert.True(offset > previousEnd, "Two runs must be separated by at least one equal byte.");
+            Assert.True(offset + baselineRun.Length <= common, "A run must lie inside the shorter body.");
+            for (var index = 0; index < baselineRun.Length; index++)
+            {
+                Assert.NotEqual(baselineRun[index], observedRun[index]);
+            }
+
+            baselineRun.CopyTo(rebuiltBaseline, offset);
+            observedRun.CopyTo(rebuiltObserved, offset);
+            previousEnd = offset + baselineRun.Length;
+        }
+
+        if (baseline.Length == observed.Length)
+        {
+            Assert.Empty(tails);
+            Assert.Equal(baseline, rebuiltBaseline);
+            Assert.Equal(observed, rebuiltObserved);
+            return;
+        }
+
+        var tail = Assert.Single(tails);
+        if (baseline.Length > observed.Length)
+        {
+            Assert.Equal(DiscrepancyKinds.Missing, tail.Kind);
+            Assert.True(tail.Observed.IsAbsent);
+            byte[] baselineWithTail = [.. rebuiltBaseline, .. Convert.FromHexString(tail.Baseline.Text!)];
+            Assert.Equal(baseline, baselineWithTail);
+            Assert.Equal(observed, rebuiltObserved);
+        }
+        else
+        {
+            Assert.Equal(DiscrepancyKinds.Extra, tail.Kind);
+            Assert.True(tail.Baseline.IsAbsent);
+            byte[] observedWithTail = [.. rebuiltObserved, .. Convert.FromHexString(tail.Observed.Text!)];
+            Assert.Equal(baseline, rebuiltBaseline);
+            Assert.Equal(observed, observedWithTail);
+        }
     }
 
     /// <summary>

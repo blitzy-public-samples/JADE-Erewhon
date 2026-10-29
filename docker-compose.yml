@@ -111,6 +111,10 @@ services:
   harness:
     build: *harness-build
     command: ["replay"]
+    # SIGTERM (Ctrl-C, docker compose stop or down) cancels replay, which still writes its report, shuts the
+    # facade and the stand-in down and prints its final line within its 105 s cancelled exit budget; Main
+    # then waits at most 5 s for its signal callbacks. 120 s therefore passes before Docker's SIGKILL.
+    stop_grace_period: 120s
     environment:
       Harness__RepoRoot: /repo
       # HARNESS_REPORT_PATH must name a path under /repo, the bind mount of the checkout: replay refuses any

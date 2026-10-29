@@ -129,6 +129,9 @@ public sealed partial class XmlSemanticComparerTests : IDisposable
     private const string MonthThirteen = "2026-13-01T12:00:00Z";
     private const string NilLiteral = "xsi:nil=\"true\"";
 
+    // What a discrepancy shows before the raw text of a QName-valued attribute that does not resolve.
+    private const string UnresolvedTag = "(unresolved) ";
+
     // Every SOAP outcome of getAgent shares one HTTP status; business errors travel in the result.
     private static readonly int SoapStatus = GetAgent.Statuses.Select(status => status.HttpStatus).Distinct().Single();
     private static readonly string SoapContentType = SoapAddressing.ContentType;
@@ -317,26 +320,37 @@ public sealed partial class XmlSemanticComparerTests : IDisposable
         Assert.Equal(expected, _comparer.Compare(baseline, swapped, AgentNamesResponse));
     }
 
-    // With an equal common prefix, one item fewer or more is a single length entry at the item group.
+    // With an equal common prefix, one item fewer or more is a length entry at the item group followed by
+    // the unmatched item in full at its own index: its expanded name, its children and their text.
     [Theory]
-    [InlineData("1", "Airi Hamada")]
-    [InlineData("3", "Airi Hamada", "Hank Williams", "Peter Smallsmith")]
-    public void RepeatedItems_CountDiffers_IsOneLengthDifference(string observedCount, params string[] observedNames)
+    [InlineData("1", 2, "Hank Williams", "Airi Hamada")]
+    [InlineData("3", 3, "Peter Smallsmith", "Airi Hamada", "Hank Williams", "Peter Smallsmith")]
+    public void RepeatedItems_CountDiffers_IsALengthDifferenceThenTheWholeUnmatchedItem(
+        string observedCount, int unmatchedPosition, string unmatchedName, params string[] observedNames)
     {
         var baseline = Envelope(GetAgentNames, Names(indent: true, "Airi Hamada", "Hank Williams"));
         var observed = Envelope(GetAgentNames, Names(indent: true, observedNames));
         var groupPath = $"{AgentNamesResultPath}/{NameItem}";
+        var itemPath = string.Create(CultureInfo.InvariantCulture, $"{groupPath}[{unmatchedPosition}]");
+        var observedIsLonger = observedNames.Length > 2;
 
-        Assert.Equal(
-            new Discrepancy(groupPath, DiscrepancyKinds.Length, DiscrepancyValue.Literal("2"), DiscrepancyValue.Literal(observedCount)),
-            Assert.Single(_comparer.Compare(baseline, observed, AgentNamesResponse)));
-        Assert.Equal(
-            new Discrepancy(groupPath, DiscrepancyKinds.Length, DiscrepancyValue.Literal(observedCount), DiscrepancyValue.Literal("2")),
-            Assert.Single(_comparer.Compare(observed, baseline, AgentNamesResponse)));
+        Discrepancy[] forward =
+        [
+            new(groupPath, DiscrepancyKinds.Length, DiscrepancyValue.Literal("2"), DiscrepancyValue.Literal(observedCount)),
+            .. NameItemEvidence(itemPath, observedIsLonger ? DiscrepancyKinds.Extra : DiscrepancyKinds.Missing, unmatchedName),
+        ];
+        Assert.Equal(forward, _comparer.Compare(baseline, observed, AgentNamesResponse));
+
+        Discrepancy[] reverse =
+        [
+            new(groupPath, DiscrepancyKinds.Length, DiscrepancyValue.Literal(observedCount), DiscrepancyValue.Literal("2")),
+            .. NameItemEvidence(itemPath, observedIsLonger ? DiscrepancyKinds.Missing : DiscrepancyKinds.Extra, unmatchedName),
+        ];
+        Assert.Equal(reverse, _comparer.Compare(observed, baseline, AgentNamesResponse));
     }
 
     [Fact]
-    public void RepeatedItems_CountAndPrefixDiffer_ReportLengthAndItemValue()
+    public void RepeatedItems_CountAndPrefixDiffer_ReportLengthItemValueAndUnmatchedItem()
     {
         var two = Envelope(GetAgentNames, Names(indent: true, "Airi Hamada", "Hank Williams"));
         var one = Envelope(GetAgentNames, Names(indent: true, "Hank Williams"));
@@ -346,6 +360,7 @@ public sealed partial class XmlSemanticComparerTests : IDisposable
         [
             new(groupPath, DiscrepancyKinds.Length, DiscrepancyValue.Literal("2"), DiscrepancyValue.Literal("1")),
             new($"{groupPath}[1]/{NameProperty}/text()", DiscrepancyKinds.Value, DiscrepancyValue.Literal("Airi Hamada"), DiscrepancyValue.Literal("Hank Williams")),
+            .. NameItemEvidence($"{groupPath}[2]", DiscrepancyKinds.Missing, "Hank Williams"),
         ];
         Assert.Equal(twoThenOne, _comparer.Compare(two, one, AgentNamesResponse));
 
@@ -353,8 +368,104 @@ public sealed partial class XmlSemanticComparerTests : IDisposable
         [
             new(groupPath, DiscrepancyKinds.Length, DiscrepancyValue.Literal("1"), DiscrepancyValue.Literal("2")),
             new($"{groupPath}[1]/{NameProperty}/text()", DiscrepancyKinds.Value, DiscrepancyValue.Literal("Hank Williams"), DiscrepancyValue.Literal("Airi Hamada")),
+            .. NameItemEvidence($"{groupPath}[2]", DiscrepancyKinds.Extra, "Hank Williams"),
         ];
         Assert.Equal(oneThenTwo, _comparer.Compare(one, two, AgentNamesResponse));
+    }
+
+    // The same count difference with another unmatched item is another discrepancy list, and so another
+    // failure nature, in either direction.
+    [Theory]
+    [InlineData("Hank Williams", "Peter Smallsmith")]
+    [InlineData("Hank Williams", "Hank Williams ")]
+    [InlineData("Hank Williams", "")]
+    public void RepeatedItems_SameCountDifference_OtherUnmatchedItem_GivesAnotherSignature(string firstName, string secondName)
+    {
+        var baseline = Envelope(GetAgentNames, Names(indent: true, "Airi Hamada"));
+        var first = Envelope(GetAgentNames, Names(indent: true, "Airi Hamada", firstName));
+        var second = Envelope(GetAgentNames, Names(indent: true, "Airi Hamada", secondName));
+
+        Assert.NotEqual(
+            DiscrepancySignature.Compute(_comparer.Compare(baseline, first, AgentNamesResponse)),
+            DiscrepancySignature.Compute(_comparer.Compare(baseline, second, AgentNamesResponse)));
+        Assert.NotEqual(
+            DiscrepancySignature.Compute(_comparer.Compare(first, baseline, AgentNamesResponse)),
+            DiscrepancySignature.Compute(_comparer.Compare(second, baseline, AgentNamesResponse)));
+    }
+
+    // An unmatched item is recorded semantically, never as markup: written with other prefixes, an extra
+    // namespace declaration, another attribute order and other indentation inside its element-only DTO
+    // element, it gives the same list, attributes and QName values by expanded name; a changed leaf text,
+    // attribute value or QName in it gives another.
+    [Fact]
+    public void UnmatchedItem_IsRecordedByExpandedNamesAndKeptText_NotByMarkup()
+    {
+        var itemType = NameArray.ItemType;
+        var baseline = Envelope(GetAgentNames, Names(indent: false, "Airi Hamada"), indent: false);
+        string Observed(string extraItem) =>
+            Envelope(GetAgentNames, Names(indent: false, "Airi Hamada") + extraItem, indent: false);
+
+        var plain = Observed(
+            $"<{NameItem} xsi:type=\"{itemType}\" x:flag=\"1\" xmlns:x=\"urn:test\">"
+            + $"\n      <{NameProperty}>Hank Williams</{NameProperty}>\n    </{NameItem}>");
+        var reprefixed = Observed(
+            $"<p:{NameItem} xmlns:p=\"{TargetNamespace}\" xmlns:t=\"{TargetNamespace}\" xmlns:unused=\"urn:unused\" y:flag=\"1\" xmlns:y=\"urn:test\" xsi:type=\"t:{itemType}\">"
+            + $"<p:{NameProperty}>Hank Williams</p:{NameProperty}>\t</p:{NameItem}>");
+        var groupPath = $"{AgentNamesResultPath}/{NameItem}";
+        var itemPath = $"{groupPath}[2]";
+
+        Discrepancy[] expected =
+        [
+            new(groupPath, DiscrepancyKinds.Length, DiscrepancyValue.Literal("1"), DiscrepancyValue.Literal("2")),
+            new(itemPath, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal($"{{{TargetNamespace}}}{NameItem}")),
+            new($"{itemPath}/@{{{XsiNamespace}}}type", DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal($"{{{TargetNamespace}}}{itemType}")),
+            new($"{itemPath}/@{{urn:test}}flag", DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal("1")),
+            new($"{itemPath}/{NameProperty}", DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal($"{{{TargetNamespace}}}{NameProperty}")),
+            new($"{itemPath}/{NameProperty}/text()", DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal("Hank Williams")),
+        ];
+        Assert.Equal(expected, _comparer.Compare(baseline, plain, AgentNamesResponse));
+        Assert.Equal(expected, _comparer.Compare(baseline, reprefixed, AgentNamesResponse));
+
+        var signature = DiscrepancySignature.Compute(expected);
+        string[] changed =
+        [
+            Observed($"<{NameItem} xsi:type=\"{itemType}\" x:flag=\"1\" xmlns:x=\"urn:test\"><{NameProperty}>Hank Williams </{NameProperty}></{NameItem}>"),
+            Observed($"<{NameItem} xsi:type=\"{itemType}\" x:flag=\"2\" xmlns:x=\"urn:test\"><{NameProperty}>Hank Williams</{NameProperty}></{NameItem}>"),
+            Observed($"<{NameItem} xsi:type=\"x:{itemType}\" x:flag=\"1\" xmlns:x=\"urn:test\"><{NameProperty}>Hank Williams</{NameProperty}></{NameItem}>"),
+            Observed($"<{NameItem} xsi:type=\"{itemType}\" x:flag=\"1\" xmlns:x=\"urn:test\"><x:{NameProperty}>Hank Williams</x:{NameProperty}></{NameItem}>"),
+        ];
+        foreach (var observed in changed)
+        {
+            Assert.NotEqual(signature, DiscrepancySignature.Compute(_comparer.Compare(baseline, observed, AgentNamesResponse)));
+        }
+    }
+
+    // An unmatched element at a position a normalisation rule targets follows the rule: any valid timestamp
+    // there is the rule's token, so the list does not depend on its content, while an invalid one is its text.
+    [Theory]
+    [InlineData(ByXsiType)]
+    [InlineData(ByDeclaredType)]
+    public void UnmatchedTargetedElement_HonoursTheRule(string route)
+    {
+        var baseline = SaleEnvelope(route, Stamp(StampA));
+        var stampPath = $"{SaleTimestampPath}[2]";
+
+        Discrepancy[] expected =
+        [
+            new(SaleTimestampPath, DiscrepancyKinds.Length, DiscrepancyValue.Literal("1"), DiscrepancyValue.Literal("2")),
+            new(stampPath, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal($"{{{TargetNamespace}}}{SaleTimestamp}")),
+            new($"{stampPath}/text()", DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Valid(NormalisationRuleIds.N2)),
+        ];
+        Assert.Equal(expected, _comparer.Compare(baseline, SaleEnvelope(route, Stamp(StampA) + Stamp(StampB)), SaleContext(route)));
+        Assert.Equal(expected, _comparer.Compare(baseline, SaleEnvelope(route, Stamp(StampB) + Stamp(StampA)), SaleContext(route)));
+
+        Discrepancy[] invalid =
+        [
+            new(SaleTimestampPath, DiscrepancyKinds.Length, DiscrepancyValue.Literal("1"), DiscrepancyValue.Literal("2")),
+            new(stampPath, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal($"{{{TargetNamespace}}}{SaleTimestamp}")),
+            new($"{stampPath}/text()", DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal(SpacedStamp)),
+        ];
+        Assert.Equal(invalid, _comparer.Compare(baseline, SaleEnvelope(route, Stamp(StampA) + Stamp(SpacedStamp)), SaleContext(route)));
     }
 
     // Against a result with no items, each item is missing or extra on its own, at its index.
@@ -921,7 +1032,8 @@ public sealed partial class XmlSemanticComparerTests : IDisposable
     }
 
     // A QName with an unbound prefix, or text that is not a QName, is raw text: it never switches the class and
-    // never equals a resolved name, even one that reads the same.
+    // never equals a resolved name, even one that reads the same, and its literal is tagged as unresolved, so
+    // the two never show the same value either.
     [Fact]
     public void UnresolvedXsiType_IsRawText_AndKeepsTheDeclaredClass()
     {
@@ -940,18 +1052,73 @@ public sealed partial class XmlSemanticComparerTests : IDisposable
             Assert.Single(_comparer.Compare(Sale(unbound, StampA), Sale(unbound, StampB), AgentResponse)));
 
         Assert.Equal(
-            new Discrepancy(typePath, DiscrepancyKinds.Value, DiscrepancyValue.Literal($"u:{RetailSale.Name}"), DiscrepancyValue.Literal(resolvedText)),
+            new Discrepancy(typePath, DiscrepancyKinds.Value, DiscrepancyValue.Literal($"{UnresolvedTag}u:{RetailSale.Name}"), DiscrepancyValue.Literal(resolvedText)),
             Assert.Single(_comparer.Compare(Sale(unbound, StampA), Sale(bound, StampA), AgentResponse)));
         Assert.Equal(
-            new Discrepancy(typePath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(resolvedText), DiscrepancyValue.Literal($"u:{RetailSale.Name}")),
+            new Discrepancy(typePath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(resolvedText), DiscrepancyValue.Literal($"{UnresolvedTag}u:{RetailSale.Name}")),
             Assert.Single(_comparer.Compare(Sale(bound, StampA), Sale(unbound, StampA), AgentResponse)));
 
         // Text in expanded-name form is not a QName: it differs from the resolved name although both read the same.
         var expandedText = $" xsi:type=\"{resolvedText}\"";
         AssertEquivalent(Sale(expandedText, StampA), Sale(expandedText, StampA), AgentResponse);
         Assert.Equal(
-            new Discrepancy(typePath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(resolvedText), DiscrepancyValue.Literal(resolvedText)),
+            new Discrepancy(typePath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(UnresolvedTag + resolvedText), DiscrepancyValue.Literal(resolvedText)),
             Assert.Single(_comparer.Compare(Sale(expandedText, StampA), Sale(bound, StampA), AgentResponse)));
+    }
+
+    /// <summary>
+    /// Bodies in which only one side holds an <c>xsi:type</c>: on an unmatched repeated child of an untyped body,
+    /// on an unmatched getAgentNames item, and on a paired element or item whose other side lacks it. Each row is
+    /// the baseline, the body whose attribute is <c>p:T</c> with <c>p</c> bound to <c>urn:t</c>, the body whose
+    /// attribute is the raw text <c>{urn:t}T</c>, which reads like that resolved name, whether the bodies are
+    /// getAgentNames responses, and the attribute's path.
+    /// </summary>
+    public static TheoryData<string, string, string, bool, string> OneSidedResolvedQNameAndLookalike()
+    {
+        const string Resolved = " xmlns:p=\"urn:t\" xsi:type=\"p:T\"";
+        const string Lookalike = " xsi:type=\"{urn:t}T\"";
+        var typeStep = $"/@{{{XsiNamespace}}}type";
+        var itemPath = $"{AgentNamesResultPath}/{NameItem}";
+
+        static string Untyped(string children) => $"<r xmlns:xsi=\"{XsiNamespace}\">{children}</r>";
+        static string AgentNames(string items) => Envelope(GetAgentNames, items, indent: false);
+        static string Item(string attributes) => $"<{NameItem}{attributes}><{NameProperty}>Airi Hamada</{NameProperty}></{NameItem}>";
+
+        return new()
+        {
+            { Untyped("<e/>"), Untyped($"<e/><e{Resolved}/>"), Untyped($"<e/><e{Lookalike}/>"), false, "/r/e[2]" + typeStep },
+            { AgentNames(Item("")), AgentNames(Item("") + $"<{NameItem}{Resolved}/>"), AgentNames(Item("") + $"<{NameItem}{Lookalike}/>"), true, $"{itemPath}[2]{typeStep}" },
+            { Untyped("<e/>"), Untyped($"<e{Resolved}/>"), Untyped($"<e{Lookalike}/>"), false, "/r/e" + typeStep },
+            { AgentNames(Item("")), AgentNames(Item(Resolved)), AgentNames(Item(Lookalike)), true, itemPath + typeStep },
+        };
+    }
+
+    // A one-sided xsi:type is evidence as its resolved name, or as its tagged raw text when it does not resolve,
+    // so a prefixed name and raw text that reads like it, which never compare equal, give different literals and
+    // so different natures, whether the attribute is extra or missing, on its own or inside an unmatched element.
+    [Theory]
+    [MemberData(nameof(OneSidedResolvedQNameAndLookalike))]
+    public void OneSidedQName_ResolvedAndLookalike_GiveAnotherSignature(string baseline, string resolved, string lookalike, bool agentNames, string attributePath)
+    {
+        var context = agentNames ? AgentNamesResponse : XmlComparisonContext.Untyped;
+        var resolvedName = DiscrepancyValue.Literal("{urn:t}T");
+        var taggedText = DiscrepancyValue.Literal(UnresolvedTag + "{urn:t}T");
+
+        Assert.Equal(
+            new Discrepancy(attributePath, DiscrepancyKinds.Value, resolvedName, taggedText),
+            Assert.Single(_comparer.Compare(resolved, lookalike, context)));
+
+        var extraResolved = _comparer.Compare(baseline, resolved, context);
+        var extraLookalike = _comparer.Compare(baseline, lookalike, context);
+        Assert.Contains(new Discrepancy(attributePath, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, resolvedName), extraResolved);
+        Assert.Contains(new Discrepancy(attributePath, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, taggedText), extraLookalike);
+        Assert.NotEqual(DiscrepancySignature.Compute(extraResolved), DiscrepancySignature.Compute(extraLookalike));
+
+        var missingResolved = _comparer.Compare(resolved, baseline, context);
+        var missingLookalike = _comparer.Compare(lookalike, baseline, context);
+        Assert.Contains(new Discrepancy(attributePath, DiscrepancyKinds.Missing, resolvedName, DiscrepancyValue.Absent), missingResolved);
+        Assert.Contains(new Discrepancy(attributePath, DiscrepancyKinds.Missing, taggedText, DiscrepancyValue.Absent), missingLookalike);
+        Assert.NotEqual(DiscrepancySignature.Compute(missingResolved), DiscrepancySignature.Compute(missingLookalike));
     }
 
     // Only space, tab, carriage return and line feed are XML white space; a no-break space in a DTO element is text.
@@ -1053,6 +1220,16 @@ public sealed partial class XmlSemanticComparerTests : IDisposable
                 DiscrepancyValue.Literal($"{{{TargetNamespace}}}{BindingName}"),
                 DiscrepancyValue.Literal($"{{{OtherNamespace}}}{BindingName}")),
             discrepancy);
+
+        // Raw text that reads like the resolved name is not a QName, and its literal is tagged as unresolved.
+        var resolvedName = $"{{{TargetNamespace}}}{BindingName}";
+        Assert.Equal(
+            new Discrepancy(
+                "/definitions/service/port/@binding",
+                DiscrepancyKinds.Value,
+                DiscrepancyValue.Literal(resolvedName),
+                DiscrepancyValue.Literal(UnresolvedTag + resolvedName)),
+            Assert.Single(_comparer.Compare(baseline, WsdlDocument(StandInLocation, bindingQName: resolvedName), context)));
     }
 
     [Fact]
@@ -1279,7 +1456,7 @@ public sealed partial class XmlSemanticComparerTests : IDisposable
     }
 
     // getPhoto compares raw bytes, so the same envelope in UTF-16 is well formed but differs from its UTF-8
-    // baseline in length and from the first byte, its byte-order mark.
+    // baseline in length and from the first byte, its byte-order mark, with every differing byte reported.
     [Theory]
     [InlineData(Utf16LittleEndian, "ff")]
     [InlineData(Utf16BigEndian, "fe")]
@@ -1290,14 +1467,27 @@ public sealed partial class XmlSemanticComparerTests : IDisposable
         var baseline = Encoded(envelope, Utf8);
         var observed = Encoded(envelope, observedEncoding);
 
+        var comparison = _responses.Compare(GetPhoto, SoapSnapshot(baseline), SoapSnapshot(observed));
+
         AssertResponse(
-            _responses.Compare(GetPhoto, SoapSnapshot(baseline), SoapSnapshot(observed)),
-            [
-                new("$body", DiscrepancyKinds.Length, CountLiteral(baseline.Length), CountLiteral(observed.Length)),
-                new("$body[0]", DiscrepancyKinds.Value, DiscrepancyValue.Literal("3c"), DiscrepancyValue.Literal(observedFirstByte)),
-            ],
+            comparison,
+            [.. BinaryComparer.Compare(baseline, observed).Order(Discrepancy.CanonicalOrder)],
             wellFormed: true,
             statusMatched: true);
+        Assert.Contains(
+            new Discrepancy("$body", DiscrepancyKinds.Length, CountLiteral(baseline.Length), CountLiteral(observed.Length)),
+            comparison.Discrepancies);
+        var firstRun = Assert.Single(comparison.Discrepancies, discrepancy => discrepancy.Path == "$body[0]");
+        Assert.Equal(DiscrepancyKinds.Value, firstRun.Kind);
+        Assert.StartsWith("3c", firstRun.Baseline.Text, StringComparison.Ordinal);
+        Assert.StartsWith(observedFirstByte, firstRun.Observed.Text, StringComparison.Ordinal);
+        Assert.Contains(
+            new Discrepancy(
+                string.Create(CultureInfo.InvariantCulture, $"$body[{baseline.Length}]"),
+                DiscrepancyKinds.Extra,
+                DiscrepancyValue.Absent,
+                DiscrepancyValue.Literal(Convert.ToHexStringLower(observed, baseline.Length, observed.Length - baseline.Length))),
+            comparison.Discrepancies);
     }
 
     // A SOAP body that does not decode losslessly in the encoding XML detection reads does not load, and
@@ -1483,6 +1673,27 @@ public sealed partial class XmlSemanticComparerTests : IDisposable
             names.Select(name =>
                 $"<{NameItem}>{Break(ResultChildDepth + 1, indent)}<{NameProperty}>{name}</{NameProperty}>{Break(ResultChildDepth, indent)}</{NameItem}>"),
             indent);
+
+    /// <summary>
+    /// The evidence, in canonical order, of a <see cref="Names"/> item holding <paramref name="name"/> that only
+    /// one side holds at <paramref name="itemPath"/>: the item's expanded name, its property element's expanded
+    /// name and, unless <paramref name="name"/> is empty, the property's text.
+    /// </summary>
+    private static Discrepancy[] NameItemEvidence(string itemPath, string kind, string name)
+    {
+        Discrepancy OneSided(string path, string value) =>
+            kind == DiscrepancyKinds.Missing
+                ? new(path, kind, DiscrepancyValue.Literal(value), DiscrepancyValue.Absent)
+                : new(path, kind, DiscrepancyValue.Absent, DiscrepancyValue.Literal(value));
+
+        Discrepancy[] structure =
+        [
+            OneSided(itemPath, $"{{{TargetNamespace}}}{NameItem}"),
+            OneSided($"{itemPath}/{NameProperty}", $"{{{TargetNamespace}}}{NameProperty}"),
+        ];
+
+        return name.Length == 0 ? structure : [.. structure, OneSided($"{itemPath}/{NameProperty}/text()", name)];
+    }
 
     /// <summary>The one SOAP-exposed property of <paramref name="dto"/> that rule N2 targets.</summary>
     private static string TimestampProperty(DtoDefinition dto) =>

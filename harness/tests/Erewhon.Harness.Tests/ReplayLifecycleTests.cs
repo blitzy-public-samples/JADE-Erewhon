@@ -51,13 +51,16 @@ namespace Erewhon.Harness.Tests;
 /// the capture mode against a loopback stand-in stub, which refuses or stops with exit code 1 whenever
 /// the seed facts cannot be confirmed, and otherwise publishes them in the manifest it writes last;
 /// the modes' console diagnostics, which classify an unreadable SOAP <c>statusCode</c> without quoting the
-/// response and keep each <c>export-openapi</c>, <c>summary</c> and entry-point line one inert line; and
+/// response and keep each <c>export-openapi</c>, <c>summary</c> and entry-point line one inert line;
 /// the empty-state reset bracket of replay and capture, whose seed restore still runs and is confirmed
-/// when the run is cancelled inside it. It also covers the start-up and exit of the harness process
+/// when the run is cancelled inside it, and is abandoned at the cancelled-run limit when it is itself held;
+/// and a cancelled replay's shutdowns, each cut to the cancelled-run limit when the configured limit is
+/// longer. It also covers the start-up and exit of the harness process
 /// itself: the entry point, which refuses an argument that is not a setting before any mode runs and loads
 /// its settings strictly or leniently, so a replay whose settings are partly unusable still writes its
-/// report to the configured path; and the cancellation Main hands SIGTERM and SIGINT to, whose completion
-/// passes the mode's exit code through or gives exit code 1 within its bound.
+/// report to the configured path; the cancellation Main hands SIGTERM and SIGINT to, whose completion
+/// passes the mode's exit code through or gives exit code 1 within its bound; and the supervisors that
+/// send SIGTERM, which wait longer than the cancelled exit budget and that bound before they kill it.
 /// </summary>
 /// <remarks>
 /// Assertions on the console and the report text use fixed messages, because both hold the per-test
@@ -81,6 +84,15 @@ public sealed partial class ReplayLifecycleTests : IDisposable
     // The report-write limit of the refused-destination tests: below the run limit, so a write that blocked
     // instead of being refused would be abandoned and fail the refusal assertion rather than hang the run.
     private static readonly TimeSpan RefusalReportWriteLimit = TimeSpan.FromSeconds(10);
+
+    // The cancelled-run shutdown limit of the cancelled-shutdown tests, and a configured shutdown limit longer
+    // than both it and the run limit, so only the cancelled-run limit can end a shutdown that confirms nothing.
+    private const int ShortCancelledShutdownLimitSeconds = 1;
+    private const int LongShutdownLimitSeconds = 60;
+    private static readonly TimeSpan ShortCancelledShutdownLimit = TimeSpan.FromSeconds(ShortCancelledShutdownLimitSeconds);
+
+    // How long the facade's shutdown has run when a test cancels the run during it.
+    private static readonly TimeSpan ShutdownBeforeCancellation = TimeSpan.FromMilliseconds(500);
 
     private static readonly Regex FinalLinePattern = new(
         @"^\d+ of 22 operations equivalent, \d+ documented differences$",
@@ -378,13 +390,131 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         Assert.Equal(FailureItemIds.Exception, item.ItemId);
         Assert.Equal(FailureItemIds.ExceptionNature(thrown), item.Nature);
 
-        // Cleanup never inherits the run's token, so a cancelled run still shuts its components down.
+        // Cleanup never inherits the run's token, and a shutdown limit within the cancelled-run limit runs on a
+        // token nothing cancels, so a cancelled run still shuts its components down.
         Assert.Equal(BothComponents, shutdown.Components);
         Assert.All(shutdown.Calls, call => Assert.False(call.TokenCancelled));
 
         Assert.Equal(1, writer.WriteCount);
         Assert.True(writer.Written[^1].Contains(FailureItemIds.Exception, StringComparison.Ordinal), "the written report lists the CHK-EXCEPTION item");
         AssertFinalLineLast();
+    }
+
+    // A cancelled run whose configured shutdown limit is longer than the cancelled-run limit, against a client
+    // that confirms no stop until its token is cancelled. The run is cancelled before the body, as on SIGTERM
+    // during the replay, or while the facade's shutdown waits. Each component is still shut down, and each call
+    // ends at the cancelled-run limit counted from the later of the cancellation and its own start, so the
+    // stand-in keeps a whole slice of its own. Both become CHK-SHUTDOWN (still-running), the report is rewritten
+    // with them, the final line is the last line and the exit code is 1, all within the two slices.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task CancelledRun_ShutdownBeyondTheCancelledLimit_EachComponentEndsAtTheLimit_ReportRewritten_Exits1(
+        bool cancelledDuringShutdown)
+    {
+        var options = Options();
+        options.ShutdownTimeoutSeconds = LongShutdownLimitSeconds;
+        var writer = new RecordingReportWriter();
+        var shutdown = new UnconfirmedShutdown();
+        Assert.Equal(
+            TimeSpan.FromSeconds(ReplayMode.CancelledShutdownLimitSeconds),
+            NewMode(FakeBody.NoOp(), writer, shutdown, KnownLimitationsRegister.Empty).CancelledShutdownLimit);
+        var body = cancelledDuringShutdown
+            ? FakeBody.NoOp()
+            : new FakeBody((_, ct) =>
+            {
+                ct.ThrowIfCancellationRequested();
+                return Task.CompletedTask;
+            });
+        var mode = new ReplayMode(options, body, writer, shutdown, KnownLimitationsRegister.Empty, _stdout)
+        {
+            CancelledShutdownLimit = ShortCancelledShutdownLimit,
+        };
+
+        // The limit ends the wait, so a shutdown that the cancellation never reaches fails the test.
+        using var limit = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        limit.CancelAfter(RunLimit);
+        using var run = new CancellationTokenSource();
+        var cancelledAt = Stopwatch.GetTimestamp();
+        if (!cancelledDuringShutdown)
+        {
+            await run.CancelAsync();
+        }
+
+        var exiting = mode.RunAsync(run.Token);
+        if (cancelledDuringShutdown)
+        {
+            await shutdown.FirstCallStarted.WaitAsync(limit.Token);
+            await Task.Delay(ShutdownBeforeCancellation, limit.Token);
+            cancelledAt = Stopwatch.GetTimestamp();
+            await run.CancelAsync();
+        }
+
+        var exitCode = await exiting.WaitAsync(limit.Token);
+        var sinceCancellation = Stopwatch.GetElapsedTime(cancelledAt);
+
+        AssertExitCode(1, exitCode);
+        var calls = shutdown.Calls;
+        Assert.Equal(BothComponents, calls.Select(call => call.Component));
+        foreach (var call in calls)
+        {
+            Assert.False(call.CancelledAtStart, "a shutdown's token was already cancelled when the shutdown started");
+            Assert.True(call.CancelledAtEnd, "a shutdown ended before its token was cancelled");
+            var slice = Stopwatch.GetElapsedTime(Math.Max(cancelledAt, call.Started), call.Ended);
+            Assert.True(slice >= ShortCancelledShutdownLimit - TimerTolerance, "a shutdown was abandoned before the cancelled-run limit");
+            Assert.True(slice < ShortCancelledShutdownLimit + Slack, "a shutdown outlasted the cancelled-run limit");
+        }
+
+        if (cancelledDuringShutdown)
+        {
+            Assert.True(
+                Stopwatch.GetElapsedTime(calls[0].Started, calls[0].Ended) >= ShutdownBeforeCancellation + ShortCancelledShutdownLimit - TimerTolerance,
+                "the facade's limit counted from its start rather than from the cancellation");
+        }
+
+        var abandoned = $"; abandoned at the cancelled run's {ShortCancelledShutdownLimitSeconds} s shutdown limit";
+        var shutdownItems = mode.State.Failures.Where(IsShutdownItem).ToList();
+        Assert.Equal(BothComponents.Select(FailureItemIds.Shutdown), shutdownItems.Select(item => item.ItemId));
+        Assert.All(shutdownItems, item =>
+        {
+            Assert.Equal(FailureItemIds.StillRunning, item.Nature);
+            Assert.True(item.Detail?.EndsWith(abandoned, StringComparison.Ordinal) == true, "a CHK-SHUTDOWN item does not say its shutdown was abandoned");
+        });
+        Assert.Equal(cancelledDuringShutdown ? 0 : 1, mode.State.Failures.Count(item => item.ItemId == FailureItemIds.Exception));
+
+        // The first write precedes cleanup; the rewrite after cleanup shows both items cleanup added.
+        Assert.Equal(2, writer.WriteCount);
+        foreach (var component in BothComponents)
+        {
+            var itemId = FailureItemIds.Shutdown(component);
+            Assert.False(writer.Written[0].Contains(itemId, StringComparison.Ordinal), "the first report is written before cleanup");
+            Assert.True(writer.Written[^1].Contains(itemId, StringComparison.Ordinal), "the rewritten report lists every CHK-SHUTDOWN item");
+        }
+
+        Assert.True(sinceCancellation < (2 * ShortCancelledShutdownLimit) + Slack, "the cancelled exit path outlasted its two shutdown slices");
+        AssertFinalLineLast();
+    }
+
+    [Theory]
+    [InlineData(0L)]
+    [InlineData(-1L)]
+    [InlineData(int.MaxValue + 1L)]
+    public void CancelledRunLimits_NotPositiveOrNotFinite_AreRefused(long milliseconds)
+    {
+        var limit = TimeSpan.FromMilliseconds(milliseconds);
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ReplayMode(
+            Options(), FakeBody.NoOp(), new RecordingReportWriter(), new RecordingShutdown(), KnownLimitationsRegister.Empty, _stdout)
+        {
+            CancelledShutdownLimit = limit,
+        });
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ReplayBody(Options(), OperationCatalogue.Default, KnownLimitationsRegister.Empty, _stdout)
+        {
+            CancelledRestorationLimit = limit,
+        });
+        Assert.Throws<ArgumentOutOfRangeException>(() => new CaptureMode(Options(), OperationCatalogue.Default, _stdout)
+        {
+            CancelledRestorationLimit = limit,
+        });
     }
 
     [Theory]
@@ -1128,6 +1258,54 @@ public sealed partial class ReplayLifecycleTests : IDisposable
 
             var stopped = !(first && failFirstCall == ShutdownFailure.ReturnsNotStopped);
             return Task.FromResult(new ShutdownOutcome(target.Component, stopped, stopped ? "stopped" : "refused"));
+        }
+    }
+
+    /// <summary>
+    /// One call of <see cref="UnconfirmedShutdown"/>: its component, its start and end as
+    /// <see cref="Stopwatch"/> timestamps, and whether its token was cancelled at each.
+    /// </summary>
+    private sealed record UnconfirmedShutdownCall(string Component, long Started, long Ended, bool CancelledAtStart, bool CancelledAtEnd);
+
+    /// <summary>
+    /// A shutdown client that confirms no stop: each call waits until its token is cancelled, or at most the
+    /// run limit, then reports its component still running. Each call is recorded as it ends.
+    /// </summary>
+    private sealed class UnconfirmedShutdown : IComponentShutdown
+    {
+        private readonly Lock _gate = new();
+        private readonly List<UnconfirmedShutdownCall> _calls = [];
+        private readonly TaskCompletionSource _firstCallStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>Completes when the first call starts.</summary>
+        public Task FirstCallStarted => _firstCallStarted.Task;
+
+        public IReadOnlyList<UnconfirmedShutdownCall> Calls
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _calls.ToArray();
+                }
+            }
+        }
+
+        public async Task<ShutdownOutcome> ShutdownAsync(ShutdownTarget target, CancellationToken ct)
+        {
+            var started = Stopwatch.GetTimestamp();
+            var cancelledAtStart = ct.IsCancellationRequested;
+            _firstCallStarted.TrySetResult();
+
+            // Ends at the token's cancellation; the run limit only bounds a token nothing cancels.
+            await Task.Delay(RunLimit, ct).ConfigureAwait(ConfigureAwaitOptions.ContinueOnCapturedContext | ConfigureAwaitOptions.SuppressThrowing);
+            var cancelledAtEnd = ct.IsCancellationRequested;
+            lock (_gate)
+            {
+                _calls.Add(new UnconfirmedShutdownCall(target.Component, started, Stopwatch.GetTimestamp(), cancelledAtStart, cancelledAtEnd));
+            }
+
+            return new ShutdownOutcome(target.Component, false, cancelledAtEnd ? "cancelled" : "never cancelled");
         }
     }
 }
@@ -2886,14 +3064,16 @@ public sealed partial class ReplayLifecycleTests
 // POST /admin/reset?state=empty has been sent for the getCompany empty-state case, a run cancelled while
 // that reset's confirmation read or the case's own request is outstanding still sends
 // POST /admin/reset?state=seed and has it confirmed, and the cancellation still ends the run: replay's
-// body throws it, capture exits 1. Each run works in a temporary repository root of its own holding
-// copies of the committed case matrix and harness settings (and, for replay, the committed empty-state
-// record), against one in-process loopback stub that serves the stand-in's admin endpoints and answers
-// every other request at once with 404.
+// body throws it, capture exits 1. A run cancelled while that seed reset itself is outstanding abandons it
+// at the cancelled-run limit, records that it did and still ends. Each run works in a temporary repository
+// root of its own holding copies of the committed case matrix and harness settings (and, for replay, the
+// committed empty-state record), against one in-process loopback stub that serves the stand-in's admin
+// endpoints and answers every other request at once with 404.
 // These members live in this class because the harness test project keeps its fixed set of test
 // classes, and the bracket is the reset that replay and capture run around their one empty-state case.
 // The admin requests come from the shutdown and state-reset members, ReferenceDate from the console-sink
-// members and FindRepoRoot from the exit-path members.
+// members, FindRepoRoot from the exit-path members, Slack from the shutdown members and TimerTolerance
+// from the signal-cancellation members.
 public sealed partial class ReplayLifecycleTests
 {
     private const string EmptyStateCaseId = "REST-getCompany-03";
@@ -2909,6 +3089,11 @@ public sealed partial class ReplayLifecycleTests
     private const int BracketTestTimeoutMilliseconds = 120_000;
     private static readonly TimeSpan HangLimit = TimeSpan.FromSeconds(90);
 
+    // The cancelled-run limit of the held-restoration test: far below the request limit, so a restoration the
+    // cancellation did not bound would outlast the test's bound on the run.
+    private const int ShortRestorationLimitSeconds = 2;
+    private static readonly TimeSpan ShortRestorationLimit = TimeSpan.FromSeconds(ShortRestorationLimitSeconds);
+
     // Created on first use, so only the bracket tests touch the file system; removed in Dispose.
     private TempDirectory? _bracketRoot;
     private string? _bracketSeedSha256;
@@ -2921,6 +3106,19 @@ public sealed partial class ReplayLifecycleTests
 
         /// <summary>The case's own <c>GET /company</c> against the empty state.</summary>
         CaseRequest,
+
+        /// <summary>The <c>POST /admin/reset?state=seed</c> that restores the seed state after the case.</summary>
+        SeedRestoration,
+    }
+
+    /// <summary>The mode whose empty-state bracket a test runs.</summary>
+    public enum BracketMode
+    {
+        /// <summary>The real <see cref="ReplayBody"/>, whose cancellation is thrown.</summary>
+        Replay,
+
+        /// <summary>The real <see cref="CaptureMode"/>, which exits 1.</summary>
+        Capture,
     }
 
     /// <summary>
@@ -3021,6 +3219,95 @@ public sealed partial class ReplayLifecycleTests
         Assert.False(
             lines.Any(line => line.Contains(SeedRestorationLabel, StringComparison.Ordinal)),
             "the seed restoration after the empty-state case threw");
+    }
+
+    // The seed restoration itself is held: the stub never answers the POST /admin/reset?state=seed that follows
+    // the empty-state case, and the run is cancelled while it waits. The restoration still runs after the
+    // cancellation, but only for the cancelled-run limit (15 s, shortened here), so the run ends at that limit
+    // rather than at the request limit, its cancellation still ends it (replay's body throws it, capture exits 1
+    // and writes no manifest) and the abandoned restoration is recorded.
+    [Theory(Timeout = BracketTestTimeoutMilliseconds)]
+    [InlineData(BracketMode.Replay)]
+    [InlineData(BracketMode.Capture)]
+    public async Task CancelledWhileTheSeedRestorationIsHeld_AbandonsItAtTheLimit_AndTheRunStillEnds(BracketMode mode)
+    {
+        if (mode == BracketMode.Replay)
+        {
+            CopyCommitted(BracketRoot, EmptyStateRecordFile);
+        }
+
+        await using var stub = await BracketStandInStub.StartAsync(HangPoint.SeedRestoration, BracketSeedSha256, TestContext.Current.CancellationToken);
+        var options = BracketOptions(stub.BaseUrl);
+        var state = new ReplayRunState();
+        using var console = new StringWriter(CultureInfo.InvariantCulture);
+
+        // Readiness writes from two probes at once.
+        using var output = TextWriter.Synchronized(console);
+        using var run = new CancellationTokenSource();
+
+        var productionLimit = TimeSpan.FromSeconds(ReplayMode.CancelledRestorationLimitSeconds);
+        Task execution;
+        if (mode == BracketMode.Replay)
+        {
+            Assert.Equal(productionLimit, new ReplayBody(options, OperationCatalogue.Default, KnownLimitationsRegister.Empty, output).CancelledRestorationLimit);
+            execution = new ReplayBody(options, OperationCatalogue.Default, KnownLimitationsRegister.Empty, output)
+            {
+                CancelledRestorationLimit = ShortRestorationLimit,
+            }.ExecuteAsync(state, run.Token);
+        }
+        else
+        {
+            Assert.Equal(productionLimit, new CaptureMode(options, OperationCatalogue.Default, output).CancelledRestorationLimit);
+            execution = new CaptureMode(options, OperationCatalogue.Default, output)
+            {
+                CancelledRestorationLimit = ShortRestorationLimit,
+            }.RunAsync(run.Token);
+        }
+
+        var held = await HoldsHungRequestAsync(stub, execution);
+        var cancelledAt = Stopwatch.GetTimestamp();
+        await run.CancelAsync();
+        var outcome = await Record.ExceptionAsync(() => execution);
+        var sinceCancellation = Stopwatch.GetElapsedTime(cancelledAt);
+
+        Assert.True(held, "the run ended before the stub held the seed restoration");
+        Assert.True(sinceCancellation >= ShortRestorationLimit - TimerTolerance, "the seed restoration was abandoned before its limit");
+        Assert.True(sinceCancellation < ShortRestorationLimit + Slack, "the seed restoration outlasted its limit");
+
+        // The bracket as the stub saw it: one empty reset, then the seed reset it held, and nothing after it.
+        var requests = stub.Requests;
+        var empty = IndexOf(requests, EmptyResetRequest, start: 0);
+        Assert.True(empty >= 0, "the stub received no empty reset");
+        var seed = IndexOf(requests, SeedResetRequest, empty + 1);
+        Assert.True(seed > empty, "the stub received no seed reset after the empty reset");
+        Assert.True(requests.Count <= seed + 1, "a request followed the abandoned seed restoration");
+
+        var lines = console.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (mode == BracketMode.Replay)
+        {
+            Assert.IsAssignableFrom<OperationCanceledException>(outcome);
+            var abandoned = $"{SeedRestorationLabel} was abandoned {ShortRestorationLimitSeconds} s after the run was cancelled";
+            var item = Assert.Single(state.Failures, item => item.Detail?.StartsWith(SeedRestorationLabel, StringComparison.Ordinal) == true);
+            Assert.Equal(FailureItemIds.Exception, item.ItemId);
+            Assert.Equal(abandoned, item.Detail);
+            Assert.Contains($"replay: {abandoned}", lines);
+            var restoreItem = FailureItemIds.Reset(ResetPoints.After(EmptyStateCaseId));
+            Assert.False(
+                state.Failures.Any(failure => string.Equals(failure.ItemId, restoreItem, StringComparison.Ordinal)),
+                "the abandoned seed restoration was also recorded as a reset mismatch");
+        }
+        else
+        {
+            Assert.Null(outcome);
+            Assert.Equal(1, await (Task<int>)execution);
+            Assert.Contains(
+                $"{SourceLabels.ConsolePrefix} WARN {SeedRestorationLabel} was abandoned {ShortRestorationLimitSeconds} s after the capture was cancelled",
+                lines);
+            Assert.True(
+                lines.Any(line => line.StartsWith($"{SourceLabels.ConsolePrefix} reset bracket of {EmptyStateCaseId} not confirmed", StringComparison.Ordinal)),
+                "the capture did not stop at the unconfirmed bracket");
+            Assert.False(File.Exists(BracketRoot.PathOf("baseline/manifest.json")), "the capture wrote a manifest after an abandoned seed restoration");
+        }
     }
 
     // The bracket's order as the stub saw it: one empty reset, then a seed reset, then the read that
@@ -3190,6 +3477,12 @@ public sealed partial class ReplayLifecycleTests
             {
                 case HealthRequest:
                     context.Response.StatusCode = StatusCodes.Status200OK;
+                    return;
+
+                // Held before it changes the state, so the stub stays empty, as a stand-in that never
+                // answers the restoration would.
+                case SeedResetRequest when TakeHang(HangPoint.SeedRestoration):
+                    await HoldAsync(context);
                     return;
 
                 case EmptyResetRequest or SeedResetRequest:
@@ -4084,11 +4377,12 @@ public sealed partial class ReplayLifecycleTests
 // the token's callbacks, and its task is the one retained. Completion passes the mode's exit code
 // through when no request was made or the callbacks finished; a callback that throws, or one still
 // running at the bound, gives one standard-error line and exit code 1, and a thrown fault is observed
-// rather than left for the finaliser.
+// rather than left for the finaliser. The supervisors that send SIGTERM, run-local.sh and the Compose
+// harness service, wait longer than replay's cancelled exit budget plus this bound before they kill it.
 // These members live in this class because the harness test project keeps its fixed set of test
 // classes, and this completion is the last step of the harness process's exit path, after its mode,
-// the replay included, has returned its exit code. RunLimit, ExitCodes and AssertExitCode come from
-// the exit-path members, and Slack from the shutdown members.
+// the replay included, has returned its exit code. RunLimit, ExitCodes, AssertExitCode and FindRepoRoot
+// come from the exit-path members, and Slack from the shutdown members.
 public sealed partial class ReplayLifecycleTests
 {
     private const string FailedPrefix = "cancellation callbacks failed: ";
@@ -4379,6 +4673,71 @@ public sealed partial class ReplayLifecycleTests
     }
 
     private Program.SignalCancellation NewCancellation() => new(CancellationSource, CancellationErrors.Enqueue);
+
+    // The two supervisors that SIGTERM the harness, run-local.sh and the Compose harness service, each wait
+    // longer than replay's cancelled exit budget plus this completion wait before they kill it, so a SIGTERM
+    // always leaves the cancelled run time for its report, both shutdowns and its final line. The budget is
+    // the 105 s both files describe.
+    [Fact]
+    public void Supervisors_WaitLongerThanTheCancelledExitBudgetAndTheCompletionWait()
+    {
+        var root = FindRepoRoot();
+        var needed = ReplayMode.CancelledExitBudget + Program.SignalCancellation.CompletionLimit;
+
+        Assert.Equal(TimeSpan.FromSeconds(105), ReplayMode.CancelledExitBudget);
+        Assert.True(
+            HarnessStopSeconds(File.ReadAllText(Path.Combine(root, "harness", "scripts", "run-local.sh"))) > needed,
+            "run-local.sh HARNESS_STOP_SECONDS does not exceed the cancelled exit budget plus the completion wait");
+        Assert.True(
+            HarnessStopGracePeriod(File.ReadAllText(Path.Combine(root, "docker-compose.yml"))) > needed,
+            "the harness service's stop_grace_period does not exceed the cancelled exit budget plus the completion wait");
+    }
+
+    // The value of run-local.sh's one `readonly HARNESS_STOP_SECONDS=<seconds>` line.
+    private static TimeSpan HarnessStopSeconds(string script)
+    {
+        var setting = Assert.Single(Regex.Matches(
+            script, @"^readonly HARNESS_STOP_SECONDS=(?<seconds>[0-9]+)[ \t]*$", RegexOptions.Multiline | RegexOptions.CultureInvariant));
+        return TimeSpan.FromSeconds(int.Parse(setting.Groups["seconds"].Value, NumberStyles.None, CultureInfo.InvariantCulture));
+    }
+
+    // The stop_grace_period of docker-compose.yml's harness service: the one key of that name indented as a
+    // service key between `  harness:` and the next line indented less, in the h/m/s form the file uses.
+    private static TimeSpan HarnessStopGracePeriod(string compose)
+    {
+        var lines = compose.Split('\n').Select(line => line.TrimEnd('\r')).ToArray();
+        var service = Array.IndexOf(lines, "  harness:");
+        Assert.True(service >= 0, "docker-compose.yml has no harness service");
+
+        var periods = new List<string>();
+        for (var index = service + 1; index < lines.Length; index++)
+        {
+            var line = lines[index];
+            if (line.Trim().Length == 0 || line.TrimStart().StartsWith('#'))
+            {
+                continue;
+            }
+
+            if (!line.StartsWith("    ", StringComparison.Ordinal))
+            {
+                break;
+            }
+
+            var period = Regex.Match(line, @"^    stop_grace_period:[ \t]*(?<value>[0-9hms]+)[ \t]*$", RegexOptions.CultureInvariant);
+            if (period.Success)
+            {
+                periods.Add(period.Groups["value"].Value);
+            }
+        }
+
+        var parts = Regex.Match(Assert.Single(periods), @"^(?:(?<h>[0-9]+)h)?(?:(?<m>[0-9]+)m)?(?:(?<s>[0-9]+)s)?$", RegexOptions.CultureInvariant);
+        Assert.True(parts.Success, "the harness service's stop_grace_period is not a duration of whole hours, minutes and seconds");
+        return TimeSpan.FromHours(Part("h")) + TimeSpan.FromMinutes(Part("m")) + TimeSpan.FromSeconds(Part("s"));
+
+        int Part(string unit) => parts.Groups[unit].Success
+            ? int.Parse(parts.Groups[unit].Value, NumberStyles.None, CultureInfo.InvariantCulture)
+            : 0;
+    }
 }
 
 // ---- Mode diagnostics ---------------------------------------------------------------------------

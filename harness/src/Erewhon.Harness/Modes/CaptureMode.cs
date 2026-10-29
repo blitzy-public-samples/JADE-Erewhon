@@ -100,6 +100,19 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
     private readonly HarnessOptions _options = options ?? throw new ArgumentNullException(nameof(options));
     private readonly OperationCatalogue _catalogue = catalogue ?? throw new ArgumentNullException(nameof(catalogue));
     private readonly TextWriter _stdout = stdout ?? throw new ArgumentNullException(nameof(stdout));
+    private readonly TimeSpan _cancelledRestorationLimit = TimeSpan.FromSeconds(ReplayMode.CancelledRestorationLimitSeconds);
+
+    /// <summary>
+    /// How long the seed restoration closing the empty-state bracket may still run once the capture is
+    /// cancelled, counted from the later of the cancellation and the restoration's start, before it is
+    /// abandoned as unconfirmed; 15 s unless a test shortens it.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is not positive or is longer than a finite delay allows.</exception>
+    internal TimeSpan CancelledRestorationLimit
+    {
+        get => _cancelledRestorationLimit;
+        init => _cancelledRestorationLimit = CancellationGrace.RequireLimit(value);
+    }
 
     /// <summary>
     /// Waits for the stand-in, resets it to seed, runs every case, and writes the baseline.
@@ -384,28 +397,42 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
         }
         finally
         {
-            await RestoreSeedAsync(reset, expectations, definition.Id, unconfirmed).ConfigureAwait(false);
+            await RestoreSeedAsync(reset, expectations, definition.Id, unconfirmed, ct).ConfigureAwait(false);
         }
     }
 
-    // The seed reset closing the empty-state bracket. It takes CancellationToken.None rather than the
-    // capture's token, so it still runs after a cancellation; it stays bounded because StateReset bounds
-    // each of its at most three admin requests by HarnessOptions.RequestTimeout. It never throws, so the
-    // case's own failure or the cancellation propagates unchanged: a mismatch is logged like every other
-    // reset's, and any other failure of the restore on a line of its own. Either way the restore is not
-    // confirmed, so it is added to unconfirmed and ends the capture.
+    // The seed reset closing the empty-state bracket. Its token is not the capture's: nothing cancels it
+    // while the capture runs, so it still runs after a cancellation, and StateReset bounds each of its at
+    // most three admin requests by HarnessOptions.RequestTimeout. Once the capture is cancelled it is
+    // cancelled CancelledRestorationLimit after the later of the cancellation and the restoration's start, so
+    // a cancelled capture never waits on it for longer, whatever the configured request limit. It never
+    // throws, so the case's own failure or the cancellation propagates unchanged: a mismatch is logged like
+    // every other reset's, and an abandoned restoration or any other failure of the restore on a line of its
+    // own. Either way the restore is not confirmed, so it is added to unconfirmed and ends the capture.
     private async Task RestoreSeedAsync(
         StateReset reset,
         ResetExpectations expectations,
         string caseId,
-        ICollection<StateResetResult> unconfirmed)
+        ICollection<StateResetResult> unconfirmed,
+        CancellationToken ct)
     {
         var point = ResetPoints.After(caseId);
+        using var grace = new CancellationGrace(ct, _cancelledRestorationLimit);
         try
         {
             LogResetFailures(await reset
-                .ResetAsync(point, AdminRoutes.ResetStateSeed, expectations, CancellationToken.None)
+                .ResetAsync(point, AdminRoutes.ResetStateSeed, expectations, grace.Token)
                 .ConfigureAwait(false), unconfirmed);
+        }
+        catch (OperationCanceledException ex) when (grace.Token.IsCancellationRequested)
+        {
+            var detail = string.Create(
+                CultureInfo.InvariantCulture,
+                $"seed restoration after {caseId} was abandoned {_cancelledRestorationLimit.TotalSeconds:0.###} s after the capture was cancelled");
+            Log($"WARN {detail}");
+            unconfirmed.Add(new StateResetResult(
+                [new FailureItem(FailureItemIds.Reset(point), FailureItemIds.ExceptionNature(ex), Detail: detail)],
+                After: null));
         }
         catch (Exception ex)
         {

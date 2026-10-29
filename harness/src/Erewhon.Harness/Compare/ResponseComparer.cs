@@ -201,7 +201,8 @@ public sealed record DiscrepancyValue
 ///   <item><c>$status</c>: the HTTP status code.</item>
 ///   <item><c>$content-type</c>: the <c>Content-Type</c> header, compared by media type and charset.</item>
 ///   <item><c>$body</c>: the body as a whole (exact text, well-formedness or byte length), and
-///   <c>$body[&lt;offset&gt;]</c> for the first differing byte of a binary comparison.</item>
+///   <c>$body[&lt;offset&gt;]</c> for the first byte of a run of differing bytes, or of the bytes past the
+///   shorter body's end, in a binary comparison.</item>
 ///   <item>JSON body paths start with <c>$</c>, for example <c>$.guid</c> or <c>$[3].item.agent.name</c>.</item>
 ///   <item>XML body paths start with <c>/</c>, for example <c>/Envelope/Body/getAgentResponse/getAgentResult/name/text()</c>.</item>
 /// </list>

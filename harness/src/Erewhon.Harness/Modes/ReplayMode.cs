@@ -373,8 +373,10 @@ public sealed class ReplayRunState : IReportSource
 /// <para>The body runs inside one <c>try</c>/<c>catch</c>/<c>finally</c>. The <c>catch</c> records any
 /// exception, cancellation included, as <c>CHK-EXCEPTION</c>. The <c>finally</c> runs the report attempt,
 /// the cleanup and the report rewrite, each inside its own <c>try</c>/<c>catch</c>, so a failure in one never
-/// skips the next. Cleanup uses <see cref="CancellationToken.None"/>, so a cancelled run (SIGTERM) still shuts
-/// its components down; every wait is bounded by the shutdown client's own limits. Each report write runs off
+/// skips the next. Cleanup never takes the run's token itself, so a cancelled run (SIGTERM) still shuts its
+/// components down; every wait is bounded by the shutdown client's own limits and, once the run is cancelled,
+/// each component's shutdown also by <see cref="CancelledShutdownLimit"/>, so a cancelled run reaches its final
+/// line within <see cref="CancelledExitBudget"/> whatever limits are configured. Each report write runs off
 /// the calling thread and is abandoned as failed, like a write that throws, when it has not finished within
 /// <see cref="ReportWriteLimit"/>, so a destination that stalls never keeps the run from its cleanup, its final
 /// line and its exit code. A blocked file-system call cannot be cancelled, so an abandoned write may still
@@ -399,10 +401,32 @@ public sealed class ReplayMode
     // indefinitely). Publishing RESULTS.md takes milliseconds, so only a destination that stalls reaches it.
     private const int DefaultReportWriteLimitSeconds = 30;
 
+    // How long the seed restoration closing an empty-state bracket (replay and capture) may still run once the
+    // run is cancelled, and likewise each component's shutdown when its configured limit is longer: each counts
+    // from the later of the cancellation and the step's own start, so neither depends on the configured request
+    // or shutdown limits.
+    internal const int CancelledRestorationLimitSeconds = 15;
+    internal const int CancelledShutdownLimitSeconds = 15;
+
     // The longest wait Task.Delay accepts as a finite delay.
     private static readonly TimeSpan MaximumReportWriteLimit = TimeSpan.FromMilliseconds(int.MaxValue);
 
+    /// <summary>
+    /// The longest a cancelled replay spends between its cancellation and its final line, at the production
+    /// limits: a seed restoration in flight (15 s), the report attempt (30 s), the facade's and the stand-in's
+    /// shutdown (15 s each) and the report rewrite (30 s), 105 s in all. Every other wait of the body observes the
+    /// run's token. <c>harness/scripts/run-local.sh</c> (<c>HARNESS_STOP_SECONDS</c>) and
+    /// <c>docker-compose.yml</c> (the harness service's <c>stop_grace_period</c>) wait longer than this plus
+    /// <see cref="Program.SignalCancellation.CompletionLimit"/> before they kill the harness.
+    /// </summary>
+    internal static readonly TimeSpan CancelledExitBudget = TimeSpan.FromSeconds(
+        CancelledRestorationLimitSeconds
+        + DefaultReportWriteLimitSeconds
+        + (2 * CancelledShutdownLimitSeconds)
+        + DefaultReportWriteLimitSeconds);
+
     private readonly TimeSpan _reportWriteLimit = TimeSpan.FromSeconds(DefaultReportWriteLimitSeconds);
+    private readonly TimeSpan _cancelledShutdownLimit = TimeSpan.FromSeconds(CancelledShutdownLimitSeconds);
 
     private readonly HarnessOptions _options;
     private readonly IReplayBody _body;
@@ -468,8 +492,24 @@ public sealed class ReplayMode
             : throw new ArgumentOutOfRangeException(nameof(value), value, "The report-write limit must be positive and finite.");
     }
 
+    /// <summary>
+    /// How long each component's shutdown may still run once the run is cancelled, counted from the later of
+    /// the cancellation and the shutdown's start, before the mode abandons it and records
+    /// <c>CHK-SHUTDOWN</c> (<c>still-running</c>); 15 s unless a test shortens it. It applies only when the
+    /// configured shutdown limit is longer: a shorter one runs as configured, on a token nothing cancels.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is not positive or is longer than a finite delay allows.</exception>
+    internal TimeSpan CancelledShutdownLimit
+    {
+        get => _cancelledShutdownLimit;
+        init => _cancelledShutdownLimit = CancellationGrace.RequireLimit(value);
+    }
+
     /// <summary>Runs the replay and its exit path. Call once per instance.</summary>
-    /// <param name="ct">Cancels the body only; the report and cleanup always run.</param>
+    /// <param name="ct">
+    /// Cancels the body; the report and cleanup always run, and once it is cancelled each component's shutdown
+    /// is also bounded by <see cref="CancelledShutdownLimit"/>.
+    /// </param>
     /// <returns>
     /// 0 when the report was written, every failing item is documented and every captured case was
     /// compared; otherwise 1.
@@ -486,14 +526,15 @@ public sealed class ReplayMode
         }
         finally
         {
-            await FinishAsync().ConfigureAwait(false);
+            await FinishAsync(ct).ConfigureAwait(false);
         }
 
         return Conclude();
     }
 
-    // The three exit-path steps of AAP 0.8.4, each guarded on its own.
-    private async Task FinishAsync()
+    // The three exit-path steps of AAP 0.8.4, each guarded on its own. The run's token never skips a step;
+    // once it is cancelled it only bounds each component's shutdown.
+    private async Task FinishAsync(CancellationToken run)
     {
         try
         {
@@ -507,7 +548,7 @@ public sealed class ReplayMode
         var countBefore = State.Failures.Count;
         try
         {
-            await ShutDownComponentsAsync().ConfigureAwait(false);
+            await ShutDownComponentsAsync(run).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -632,9 +673,9 @@ public sealed class ReplayMode
 
     // The facade always (it fronts the stand-in, so it goes first); the stand-in only when the backend has
     // an admin URL. A blank Backend:AdminUrl marks an external backend, which is never shut down.
-    private async Task ShutDownComponentsAsync()
+    private async Task ShutDownComponentsAsync(CancellationToken run)
     {
-        await ShutDownAsync(ShutdownTarget.FacadeComponent, _options.Target?.AdminUrl).ConfigureAwait(false);
+        await ShutDownAsync(ShutdownTarget.FacadeComponent, _options.Target?.AdminUrl, run).ConfigureAwait(false);
 
         var backendAdminUrl = _options.Backend?.AdminUrl;
         if (string.IsNullOrWhiteSpace(backendAdminUrl))
@@ -643,12 +684,16 @@ public sealed class ReplayMode
             return;
         }
 
-        await ShutDownAsync(ShutdownTarget.StandInComponent, backendAdminUrl).ConfigureAwait(false);
+        await ShutDownAsync(ShutdownTarget.StandInComponent, backendAdminUrl, run).ConfigureAwait(false);
     }
 
     // The item is always named after the target's component, never after what the shutdown client
     // returned, so the CHK-SHUTDOWN item of each component is the one recorded whatever the client does.
-    private async Task ShutDownAsync(string component, string? adminUrl)
+    // A configured shutdown limit within CancelledShutdownLimit runs as configured, on a token nothing
+    // cancels. A longer one gets a token cancelled CancelledShutdownLimit after the later of the run's
+    // cancellation and this shutdown's start, so each component keeps a whole slice of its own of the
+    // cancelled exit budget, and an uncancelled run still waits the whole configured limit.
+    private async Task ShutDownAsync(string component, string? adminUrl, CancellationToken run)
     {
         try
         {
@@ -659,13 +704,32 @@ public sealed class ReplayMode
                 return;
             }
 
-            var outcome = await _shutdown.ShutdownAsync(target, CancellationToken.None).ConfigureAwait(false);
+            ShutdownOutcome? outcome;
+            var abandoned = false;
+            if (_options.ShutdownTimeout <= _cancelledShutdownLimit)
+            {
+                outcome = await _shutdown.ShutdownAsync(target, CancellationToken.None).ConfigureAwait(false);
+            }
+            else
+            {
+                using var grace = new CancellationGrace(run, _cancelledShutdownLimit);
+                outcome = await _shutdown.ShutdownAsync(target, grace.Token).ConfigureAwait(false);
+                abandoned = grace.Token.IsCancellationRequested;
+            }
+
             if (outcome is null || !outcome.Stopped)
             {
-                State.AddFailure(new FailureItem(
-                    FailureItemIds.Shutdown(component),
-                    FailureItemIds.StillRunning,
-                    Detail: outcome?.Detail ?? "no shutdown outcome returned"));
+                var detail = outcome?.Detail ?? "no shutdown outcome returned";
+                if (abandoned)
+                {
+                    var limit = string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"abandoned at the cancelled run's {_cancelledShutdownLimit.TotalSeconds:0.###} s shutdown limit");
+                    detail = $"{detail}; {limit}";
+                    Print($"cleanup: {component} shutdown {limit}");
+                }
+
+                State.AddFailure(new FailureItem(FailureItemIds.Shutdown(component), FailureItemIds.StillRunning, Detail: detail));
             }
         }
         catch (Exception ex)
@@ -898,6 +962,19 @@ public sealed class ReplayBody(
     private readonly OperationCatalogue? _catalogue = catalogue;
     private readonly KnownLimitationsRegister _register = register ?? throw new ArgumentNullException(nameof(register));
     private readonly TextWriter _stdout = stdout ?? throw new ArgumentNullException(nameof(stdout));
+    private readonly TimeSpan _cancelledRestorationLimit = TimeSpan.FromSeconds(ReplayMode.CancelledRestorationLimitSeconds);
+
+    /// <summary>
+    /// How long the seed restoration closing the empty-state bracket may still run once the run is cancelled,
+    /// counted from the later of the cancellation and the restoration's start, before it is abandoned and
+    /// recorded as <c>CHK-EXCEPTION</c>; 15 s unless a test shortens it.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is not positive or is longer than a finite delay allows.</exception>
+    internal TimeSpan CancelledRestorationLimit
+    {
+        get => _cancelledRestorationLimit;
+        init => _cancelledRestorationLimit = CancellationGrace.RequireLimit(value);
+    }
 
     /// <inheritdoc/>
     /// <exception cref="ArgumentNullException"><paramref name="state"/> is null.</exception>
@@ -910,7 +987,7 @@ public sealed class ReplayBody(
 
         using var runner = CaseRunner.FromOptions(_options);
         using var reset = new StateReset(_options);
-        var execution = new Execution(_options, catalogue, _register, state, runner, reset, _stdout, ct);
+        var execution = new Execution(_options, catalogue, _register, state, runner, reset, _stdout, _cancelledRestorationLimit, ct);
         await execution.RunAsync().ConfigureAwait(false);
     }
 
@@ -1003,6 +1080,7 @@ public sealed class ReplayBody(
         CaseRunner runner,
         StateReset reset,
         TextWriter stdout,
+        TimeSpan restorationLimit,
         CancellationToken ct)
     {
         private const string LinePrefix = "replay: ";
@@ -1347,19 +1425,31 @@ public sealed class ReplayBody(
             }
         }
 
-        // The seed reset closing the empty-state bracket. It takes CancellationToken.None rather than the run
-        // token, so it still runs after the run was cancelled; it stays bounded because StateReset bounds each
-        // of its at most three admin requests by HarnessOptions.RequestTimeout. It never throws, so the case's
+        // The seed reset closing the empty-state bracket. Its token is not the run's: nothing cancels it while
+        // the run runs, so it still runs after the run was cancelled, and StateReset bounds each of its at most
+        // three admin requests by HarnessOptions.RequestTimeout. Once the run is cancelled it is cancelled
+        // restorationLimit after the later of the cancellation and the restoration's start, so a cancelled run
+        // never waits on it for longer, whatever the configured request limit. It never throws, so the case's
         // own failure or the run's cancellation propagates unchanged: a mismatch is a CHK-RESET item like every
-        // other reset's, and any other failure of the restore a CHK-EXCEPTION item of its own.
+        // other reset's, an abandoned restoration a CHK-EXCEPTION item that says so, and any other failure of
+        // the restore a CHK-EXCEPTION item of its own.
         private async Task RestoreSeedAsync(string caseId)
         {
+            using var grace = new CancellationGrace(ct, restorationLimit);
             try
             {
                 var result = await reset
-                    .ResetAsync(ResetPoints.After(caseId), AdminRoutes.ResetStateSeed, _expectations, CancellationToken.None)
+                    .ResetAsync(ResetPoints.After(caseId), AdminRoutes.ResetStateSeed, _expectations, grace.Token)
                     .ConfigureAwait(false);
                 state.AddFailures(result.Failures);
+            }
+            catch (OperationCanceledException ex) when (grace.Token.IsCancellationRequested)
+            {
+                var detail = string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"seed restoration after {caseId} was abandoned {restorationLimit.TotalSeconds:0.###} s after the run was cancelled");
+                state.AddFailure(new FailureItem(FailureItemIds.Exception, FailureItemIds.ExceptionNature(ex), Detail: detail));
+                Print(detail);
             }
             catch (Exception ex)
             {
@@ -1699,4 +1789,57 @@ public sealed class ReplayBody(
 
         private void PrintBaseline(string line) => LifecycleConsole.WriteLine(stdout, $"{SourceLabels.ConsolePrefix} {line}");
     }
+}
+
+/// <summary>
+/// The token of a step that must still run once the run is cancelled, yet not for ever: nothing cancels it
+/// while the run runs, and it is cancelled a fixed limit after the run's token is, counted from that
+/// cancellation, or from the grace's creation when the run was already cancelled. The seed restoration closing
+/// an empty-state bracket and each component's shutdown take one, so a cancelled run's exit path stays within
+/// <see cref="ReplayMode.CancelledExitBudget"/> whatever limits are configured.
+/// </summary>
+/// <remarks>Create one per step and dispose it when the step ends; the step owns it alone.</remarks>
+internal sealed class CancellationGrace : IDisposable
+{
+    // The longest delay CancelAfter accepts as finite.
+    private static readonly TimeSpan MaximumLimit = TimeSpan.FromMilliseconds(int.MaxValue);
+
+    private readonly CancellationTokenSource _source = new();
+    private readonly TimeSpan _limit;
+    private readonly CancellationTokenRegistration _registration;
+
+    /// <summary>Creates the grace of one step.</summary>
+    /// <param name="run">The run's token; one that can never be cancelled gives a token that never is.</param>
+    /// <param name="limit">How long the step may still run once the run is cancelled.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="limit"/> is not positive or is longer than a finite delay allows.</exception>
+    internal CancellationGrace(CancellationToken run, TimeSpan limit)
+    {
+        _limit = RequireLimit(limit);
+
+        // A token already cancelled runs the callback here and now, so the limit then counts from the step's start.
+        _registration = run.Register(static grace => ((CancellationGrace)grace!).StartCountdown(), this);
+    }
+
+    /// <summary>The step's token: cancelled the limit after the run's cancellation, and never before it.</summary>
+    internal CancellationToken Token => _source.Token;
+
+    /// <summary>Returns <paramref name="limit"/> when it is a usable grace: positive and finite.</summary>
+    /// <param name="limit">The limit to check.</param>
+    /// <returns><paramref name="limit"/>.</returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="limit"/> is not positive or is longer than a finite delay allows.</exception>
+    internal static TimeSpan RequireLimit(TimeSpan limit) =>
+        limit > TimeSpan.Zero && limit <= MaximumLimit
+            ? limit
+            : throw new ArgumentOutOfRangeException(nameof(limit), limit, "A cancelled-run limit must be positive and finite.");
+
+    /// <summary>Ends the grace: the run's cancellation no longer reaches it, and its timer is released.</summary>
+    public void Dispose()
+    {
+        // The registration first: disposing it waits for a callback already running, so no callback reaches the
+        // source once the source is disposed.
+        _registration.Dispose();
+        _source.Dispose();
+    }
+
+    private void StartCountdown() => _source.CancelAfter(_limit);
 }

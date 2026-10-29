@@ -141,10 +141,21 @@ public abstract record XmlComparisonContext
 /// Elements and attributes are compared by expanded name, so prefix choice is irrelevant; attributes form a
 /// set excluding namespace declarations; QName-valued attributes compare by resolved expanded name;
 /// differently named siblings form an unordered set of name groups, and same-named siblings pair in
-/// document order. At a SOAP-exposed DTO property that a normalisation rule targets, the pairwise rule of
+/// document order. In a discrepancy a resolved QName is its <c>{uri}local</c> form, or its local name in no
+/// namespace, and the raw text of a QName-valued attribute that does not resolve follows the tag
+/// <c>(unresolved) </c>, so <c>xsi:type="p:T"</c> with <c>p</c> bound to <c>urn:t</c> and the raw text
+/// <c>xsi:type="{urn:t}T"</c>, which never compare equal, never give the same literal. At a SOAP-exposed
+/// DTO property that a normalisation rule targets, the pairwise rule of
 /// <see cref="Normaliser"/> decides equality, and an <c>xsi:nil</c> element that holds no text is its null.
 /// Content there that is neither a valid value nor a plain nil, element children or an <c>xsi:nil</c> element
 /// that holds text, is compared exactly.
+/// </para>
+/// <para>
+/// When both sides hold a group of same-named siblings with different counts, each unmatched element of the
+/// longer group is recorded in full after the <c>length</c> discrepancy: its expanded name, attributes, kept
+/// text and children, under the same rules as a paired comparison, so two observations with the same count
+/// difference but different unmatched items give different lists, while a prefix or indentation choice
+/// inside an unmatched item changes nothing.
 /// </para>
 /// <para>
 /// In a WSDL compared with <c>soap:address/@location</c> excluded, the location's value is never compared
@@ -464,7 +475,8 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
     /// <summary>
     /// An attribute value as compared: the resolved expanded name of a QName-valued attribute in
     /// <c>{uri}local</c> form, or the exact text otherwise. A QName that does not resolve is kept as raw text
-    /// and never equals a resolved one, even when the texts coincide.
+    /// and never equals a resolved one, even when the texts coincide; a discrepancy shows such raw text
+    /// after the <c>(unresolved) </c> tag, so its literal never coincides with a resolved name's either.
     /// </summary>
     private readonly record struct AttributeValue(bool IsResolvedQName, string Text);
 
@@ -559,6 +571,9 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
 
         // The WSDL 1.1 and XML Schema attributes whose values are QNames; prefix choice must not matter.
         private static readonly string[] WsdlQNameAttributes = ["type", "element", "message", "binding", "base"];
+
+        // What a discrepancy puts before the raw text of a QName-valued attribute whose value did not resolve.
+        private const string UnresolvedQNameTag = "(unresolved) ";
 
         // The one element of the WSDL and XML Schema vocabularies that holds prose rather than structure.
         private const string DocumentationElement = "documentation";
@@ -794,7 +809,7 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
 
         /// <summary>
         /// Compares the attributes of two elements as sets by expanded name, each side's QName values resolved
-        /// in that side's scope.
+        /// in that side's scope, and reports each value as <see cref="AttributeLiteral"/> shows it.
         /// </summary>
         private void CompareAttributes(XElement baseline, NamespaceScope baselineScope, XElement observed, NamespaceScope observedScope)
         {
@@ -805,7 +820,7 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
             {
                 if (!observedAttributes.TryGetValue(name, out var observedAttribute))
                 {
-                    AddAttribute(name, DiscrepancyKinds.Missing, DiscrepancyValue.Literal(ValueOf(baselineAttribute, baselineScope).Text), DiscrepancyValue.Absent);
+                    AddAttribute(name, DiscrepancyKinds.Missing, AttributeLiteral(name, ValueOf(baselineAttribute, baselineScope)), DiscrepancyValue.Absent);
                     continue;
                 }
 
@@ -818,7 +833,7 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
                 var observedValue = ValueOf(observedAttribute, observedScope);
                 if (baselineValue != observedValue)
                 {
-                    AddAttribute(name, DiscrepancyKinds.Value, DiscrepancyValue.Literal(baselineValue.Text), DiscrepancyValue.Literal(observedValue.Text));
+                    AddAttribute(name, DiscrepancyKinds.Value, AttributeLiteral(name, baselineValue), AttributeLiteral(name, observedValue));
                 }
             }
 
@@ -826,7 +841,7 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
             {
                 if (!baselineAttributes.ContainsKey(name))
                 {
-                    AddAttribute(name, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, DiscrepancyValue.Literal(ValueOf(observedAttribute, observedScope).Text));
+                    AddAttribute(name, DiscrepancyKinds.Extra, DiscrepancyValue.Absent, AttributeLiteral(name, ValueOf(observedAttribute, observedScope)));
                 }
             }
 
@@ -876,11 +891,27 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
             name == XsiType
             || (_wsdl && name.Namespace == XNamespace.None && Array.IndexOf(WsdlQNameAttributes, name.LocalName) >= 0);
 
-        /// <summary>The value of <paramref name="attribute"/> as compared, a QName resolved in <paramref name="scope"/>, its element's scope.</summary>
+        /// <summary>
+        /// The value of <paramref name="attribute"/> as compared, a QName resolved in <paramref name="scope"/>,
+        /// its element's scope. A discrepancy shows it through <see cref="AttributeLiteral"/>.
+        /// </summary>
         private AttributeValue ValueOf(XAttribute attribute, NamespaceScope scope) =>
             IsQNameAttribute(attribute.Name) && TryResolveQName(attribute.Value, scope, out var ns, out var local)
                 ? new AttributeValue(IsResolvedQName: true, ExpandedName(ns, local))
                 : new AttributeValue(IsResolvedQName: false, attribute.Value);
+
+        /// <summary>
+        /// How the compared <paramref name="value"/> of attribute <paramref name="name"/> appears in a
+        /// discrepancy: a QName-valued attribute whose value did not resolve as
+        /// <see cref="UnresolvedQNameTag"/> followed by its raw text, and every other value, a resolved QName
+        /// included, as its text. A resolved QName is <c>{uri}local</c> or a bare local name, which never
+        /// starts with the tag, so an unresolved text that reads like a resolved name never gives the same
+        /// literal, while the prefix a resolved name was written with still changes nothing.
+        /// </summary>
+        private DiscrepancyValue AttributeLiteral(XName name, AttributeValue value) =>
+            IsQNameAttribute(name) && !value.IsResolvedQName
+                ? DiscrepancyValue.Literal(UnresolvedQNameTag + value.Text)
+                : DiscrepancyValue.Literal(value.Text);
 
         /// <summary>
         /// Resolves the QName <paramref name="text"/> of an attribute in <paramref name="scope"/>, the scope of
@@ -1040,6 +1071,11 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
         /// one group pairwise in document order. A group's path is the parent's with <c>/local</c>, or with
         /// <c>/{uri}local</c> when another group shares the local name, and an item's adds <c>[n]</c> when
         /// either side's group holds more than one element. Each child pair is compared in its own scopes.
+        /// A group only one side holds gives one <c>missing</c> or <c>extra</c> discrepancy per element, holding
+        /// its normalised value or its markup. A group both sides hold with different counts gives a
+        /// <c>length</c> discrepancy, the comparison of the common pairs, and then the complete semantic
+        /// evidence of each unmatched element of the longer group at its item path, as
+        /// <see cref="AddOneSided"/> records it.
         /// </summary>
         private void CompareChildren(XElement baseline, NamespaceScope baselineScope, XElement observed, NamespaceScope observedScope, Role role)
         {
@@ -1134,10 +1170,157 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
 
                     _path.Length = groupLength;
                 }
+
+                // The unmatched elements of the longer group, each recorded in full at its own item path.
+                for (var index = common; index < baselineElements.Count; index++)
+                {
+                    AppendItemIndex(index, indexed);
+                    AddOneSidedChild(baselineElements[index], baselineScope, role, DiscrepancyKinds.Missing);
+                    _path.Length = groupLength;
+                }
+
+                for (var index = common; index < observedElements.Count; index++)
+                {
+                    AppendItemIndex(index, indexed);
+                    AddOneSidedChild(observedElements[index], observedScope, role, DiscrepancyKinds.Extra);
+                    _path.Length = groupLength;
+                }
             }
 
             _path.Length = parentLength;
         }
+
+        /// <summary>
+        /// Records the complete evidence of <paramref name="child"/>, a child that only one side holds, at the
+        /// current path, which is the child's: in its own namespace scope, entered from
+        /// <paramref name="parentScope"/>, and with the role and rule a paired child would be compared with
+        /// under a parent of role <paramref name="parentRole"/>. A child the parent's runtime class targets with
+        /// a rule is a leaf that follows the rule unless it has element children, which no valid value has.
+        /// </summary>
+        /// <param name="child">The element only one side holds.</param>
+        /// <param name="parentScope">The namespace scope of the child's parent.</param>
+        /// <param name="parentRole">The role of the child's parent.</param>
+        /// <param name="kind"><see cref="DiscrepancyKinds.Missing"/> for a baseline element, <see cref="DiscrepancyKinds.Extra"/> for an observed one.</param>
+        private void AddOneSidedChild(XElement child, NamespaceScope parentScope, Role parentRole, string kind)
+        {
+            var scope = parentScope.Enter(child);
+            var rule = parentRole.Kind == RoleKind.Dto ? TargetRule(parentRole.Dto!, child.Name.LocalName) : null;
+            if (rule is not null && !child.HasElements)
+            {
+                AddOneSided(child, scope, Role.Leaf, rule, kind);
+            }
+            else
+            {
+                AddOneSided(child, scope, ChildRole(parentRole, child, scope), rule: null, kind);
+            }
+        }
+
+        /// <summary>
+        /// Records the complete semantic evidence of <paramref name="element"/>, which only one side holds, at
+        /// the current path, as <c>missing</c> discrepancies for a baseline element or <c>extra</c> ones for an
+        /// observed element, the other side absent. Nothing is taken from the element's markup, so the evidence
+        /// is the same whatever prefixes, namespace declarations, attribute order or ignored whitespace the
+        /// element is written with, and it differs whenever the element differs in a compared way.
+        /// </summary>
+        /// <remarks>
+        /// The entries are: the element's expanded name at its path; each attribute except namespace
+        /// declarations at its attribute path, a QName value resolved in <paramref name="scope"/> and shown as
+        /// <see cref="AttributeLiteral"/> shows it; its text, as
+        /// the single <c>/text()</c> entry holding the rule's token when <paramref name="rule"/> targets the
+        /// element and its value is valid, otherwise every text run that <see cref="CompareText"/> keeps for
+        /// <paramref name="role"/> at the path that method reports it at; and every child element, recursively,
+        /// at the path <see cref="CompareChildren"/> gives it.
+        /// </remarks>
+        /// <param name="element">The element only one side holds.</param>
+        /// <param name="scope">The element's own namespace scope.</param>
+        /// <param name="role">The role the element is compared with.</param>
+        /// <param name="rule">The normalisation rule that targets the element, a leaf; null when none does.</param>
+        /// <param name="kind"><see cref="DiscrepancyKinds.Missing"/> for a baseline element, <see cref="DiscrepancyKinds.Extra"/> for an observed one.</param>
+        private void AddOneSided(XElement element, NamespaceScope scope, Role role, string? rule, string kind)
+        {
+            // As for a paired comparison, a pathologically deep element becomes an exception the caller can
+            // report instead of a stack overflow.
+            RuntimeHelpers.EnsureSufficientExecutionStack();
+
+            AddOneSidedValue(kind, DiscrepancyValue.Literal(element.Name.ToString()));
+
+            foreach (var attribute in element.Attributes())
+            {
+                if (!attribute.IsNamespaceDeclaration)
+                {
+                    var (baselineValue, observedValue) = OneSidedSides(kind, AttributeLiteral(attribute.Name, ValueOf(attribute, scope)));
+                    AddAttribute(attribute.Name, kind, baselineValue, observedValue);
+                }
+            }
+
+            var elementLength = _path.Length;
+            if (rule is not null
+                && !element.HasElements
+                && Slot(element) is { } slot
+                && _normaliser.ToValue(rule, slot, WireSyntax.Xml) is { IsValid: true } valid)
+            {
+                _path.Append("/text()");
+                AddOneSidedValue(kind, valid);
+                _path.Length = elementLength;
+            }
+            else
+            {
+                var runs = TextRuns(element, role.IsElementOnly);
+                for (var index = 0; index < runs.Count; index++)
+                {
+                    if (runs[index] is { } run)
+                    {
+                        _path.Append("/text()");
+                        AppendItemIndex(index, element.HasElements);
+                        AddOneSidedValue(kind, DiscrepancyValue.Literal(run));
+                        _path.Length = elementLength;
+                    }
+                }
+            }
+
+            var groups = GroupByName(element);
+            var ambiguousLocalNames = AmbiguousLocalNames(new List<XName>(groups.Keys));
+            foreach (var (name, children) in groups)
+            {
+                _path.Length = elementLength;
+                _path.Append('/');
+                if (ambiguousLocalNames.Contains(name.LocalName))
+                {
+                    AppendExpandedName(name);
+                }
+                else
+                {
+                    _path.Append(name.LocalName);
+                }
+
+                var groupLength = _path.Length;
+                var indexed = children.Count > 1;
+                for (var index = 0; index < children.Count; index++)
+                {
+                    AppendItemIndex(index, indexed);
+                    AddOneSidedChild(children[index], scope, role, kind);
+                    _path.Length = groupLength;
+                }
+            }
+
+            _path.Length = elementLength;
+        }
+
+        /// <summary>Adds a one-sided discrepancy of <paramref name="kind"/> holding <paramref name="value"/> at the current path.</summary>
+        private void AddOneSidedValue(string kind, DiscrepancyValue value)
+        {
+            var (baseline, observed) = OneSidedSides(kind, value);
+            Add(kind, baseline, observed);
+        }
+
+        /// <summary>
+        /// The two sides of a one-sided discrepancy of <paramref name="kind"/> holding <paramref name="value"/>:
+        /// the value on the baseline side for <c>missing</c>, on the observed side for <c>extra</c>.
+        /// </summary>
+        private static (DiscrepancyValue Baseline, DiscrepancyValue Observed) OneSidedSides(string kind, DiscrepancyValue value) =>
+            string.Equals(kind, DiscrepancyKinds.Missing, StringComparison.Ordinal)
+                ? (value, DiscrepancyValue.Absent)
+                : (DiscrepancyValue.Absent, value);
 
         private static Dictionary<XName, List<XElement>> GroupByName(XElement parent)
         {
