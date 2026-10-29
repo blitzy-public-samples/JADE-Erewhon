@@ -12,10 +12,10 @@
 //
 // Facade test failures are identified across runs by a signature over the exception type, the failing
 // line and the assertion message. Forged Host values carry run-time ports, so they are built per test
-// and never asserted on or printed, and every message is built only from fixed values: stub ids,
-// sockets, listener names, methods, paths, Host variants and counts. That is also why no Assert.Single,
-// Assert.Empty or Assert.Equal is applied to recorded StubRequest data, its fields included: the dump
-// would print observed values, among them the Host header and with it a port.
+// and never asserted on or printed. Every message is built only from fixed values (stub ids, sockets,
+// listener names, methods, paths and Host variants); observed counts and lengths are never printed.
+// That is also why no Assert.Single, Assert.Empty or Assert.Equal is applied to recorded StubRequest
+// data, its fields included: the dump would print observed values, among them the Host header's port.
 
 using System.Globalization;
 using System.Net;
@@ -310,7 +310,7 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
         Assert.Equal(404, response.Status);
         Assert.True(
             response.Body.Length == 0,
-            $"{label}: facade answered 404 with a {response.Body.Length}-byte body, expected an empty body");
+            $"{label}: admin catch-all answered 404 with a non-empty body, expected an empty body");
         AssertNothingForwarded(label);
     }
 
@@ -321,21 +321,21 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
     }
 
     // Asserts that the stub recorded exactly one request, on any listener or only on the one given, and
-    // returns it. The snapshot is read once, so the count in the message is the count that was checked.
+    // returns it. The snapshot is read once, so the list returned from is the list that was checked.
     private static StubRequest SingleRequest(StubBackend stub, string label, StubListener? listener = null)
     {
         IReadOnlyList<StubRequest> received = listener is { } only ? stub.ReceivedOn(only) : stub.Received;
         string where = listener is { } on ? $" on its {on} listener" : string.Empty;
         Assert.True(
             received.Count == 1,
-            $"{label}: stub {stub.Id} received {received.Count} requests{where}, expected exactly 1");
+            $"{label}: stub {stub.Id} did not receive exactly one request{where}");
         return received[0];
     }
 
     private static void AssertNoRequests(StubBackend stub, string label)
     {
         int count = stub.Received.Count;
-        Assert.True(count == 0, $"{label}: stub {stub.Id} received {count} requests, expected none");
+        Assert.True(count == 0, $"{label}: stub {stub.Id} received an unexpected request, expected none");
     }
 
     // Asserts that a recorded request arrived on the expected listener with the caller's method and raw
