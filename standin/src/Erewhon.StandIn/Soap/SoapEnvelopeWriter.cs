@@ -60,7 +60,9 @@ public static class SoapEnvelopeWriter
     /// <summary>
     /// The writer settings of every body: UTF-8 without a byte-order mark, so the declaration reads
     /// <c>&lt;?xml version="1.0" encoding="utf-8"?&gt;</c> and the first byte is <c>0x3C</c>; no
-    /// indentation; <c>\n</c> line breaks; character checking on; the output stream left open.
+    /// indentation; <c>\n</c> line breaks (the bodies written here carry a stored carriage return as the
+    /// character reference <c>&amp;#xD;</c> instead, so that a parser reads it back); character checking
+    /// on; the output stream left open.
     /// </summary>
     /// <remarks>
     /// The instance is read-only, so no caller can change the bytes another caller gets: assigning any
@@ -93,7 +95,10 @@ public static class SoapEnvelopeWriter
     /// <exception cref="ArgumentNullException"><paramref name="operation"/> is null.</exception>
     /// <exception cref="ArgumentException">
     /// <paramref name="operation"/> has no SOAP binding, or <paramref name="result"/> is neither null, a
-    /// node of the operation's return type nor an array of it.
+    /// node of the operation's return type nor an array of it. The <see cref="XmlWriter"/> also throws it,
+    /// through <see cref="Settings"/>' character checking, when a value in the tree holds a character XML 1.0
+    /// cannot represent, such as U+0001, U+000B or U+FFFF; no envelope can carry such a value, so it is
+    /// neither replaced nor skipped.
     /// </exception>
     /// <exception cref="InvalidOperationException"><paramref name="result"/> is null and the binding's result is not nillable.</exception>
     /// <exception cref="NotSupportedException">
@@ -378,12 +383,27 @@ public static class SoapEnvelopeWriter
 
     // XmlWriter escapes the text. An empty value, such as the JADE null string, is written as an
     // empty-element tag: WriteString("") would close the start tag and give <street></street> instead.
+    // Each carriage return is written as the character reference &#xD;, because Settings' line-break
+    // handling turns a literal CR, alone or in CR LF, into LF, and a parser would read a literal CR as
+    // LF anyway; the reference reads back as the stored CR. LF and tab are written as they are.
     private static void WriteText(XmlWriter writer, string elementName, string text)
     {
         writer.WriteStartElement(string.Empty, elementName, ServiceNamespace);
-        if (text.Length > 0)
+        var start = 0;
+        for (var index = text.IndexOf('\r'); index >= 0; index = text.IndexOf('\r', start))
         {
-            writer.WriteString(text);
+            if (index > start)
+            {
+                writer.WriteString(text[start..index]);
+            }
+
+            writer.WriteCharEntity('\r');
+            start = index + 1;
+        }
+
+        if (start < text.Length)
+        {
+            writer.WriteString(text[start..]);
         }
 
         writer.WriteEndElement();

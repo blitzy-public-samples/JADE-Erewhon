@@ -25,7 +25,15 @@ namespace Erewhon.StandIn.Rest;
 /// <see cref="RestOperationMatcher"/> decides which catalogue operation the raw request target is, so no
 /// verb, path or format suffix is restated here; anything unmatched answers 404 with no body. The
 /// <c>.xml</c> and <c>.jsonn</c> output formats are not modelled (KL-REST-FORMAT) and answer 501 before any
-/// parsing or state access; every other response is JSON, whatever <c>Accept</c> says.
+/// parsing or model access; every other response is JSON, whatever <c>Accept</c> says.
+/// </para>
+/// <para>
+/// A state-changing request is counted once in <see cref="StandInState.Mutations"/>, which moves the
+/// clock, however it is answered: by <see cref="StandInState.Mutate{T}"/> when its handler runs, and by
+/// <see cref="StandInState.CountRejected"/> when it is answered without it, with 501 for a suffix, 400
+/// with <c>null</c> for a value that does not convert, or 500 for a failure before the handler. A read is
+/// never counted, nor is a state-changing request that its client abandons, or Kestrel refuses, before
+/// its handler runs.
 /// </para>
 /// <para>
 /// Path parameters are converted by their catalogue JADE types and the <c>DTOAgent</c>/<c>DTOClient</c>
@@ -133,18 +141,32 @@ public static class RestEndpoints
             RequestLogEntry log = RequestLogEntry.For(context);
             log.Operation = operation.Id;
             CancellationToken aborted = context.RequestAborted;
+
+            // True once the request is in the mutation count, or its handler is reached and Mutate counts
+            // it, so that a state-changing request is counted exactly once however it is answered.
+            bool accounted = false;
             try
             {
                 OperationBinding binding = _bindings[operation.JadeMethod];
 
-                // Before any parsing or state access, so a suffixed write changes nothing and keeps the clock.
+                // Before any parsing or model access, so a suffixed write changes no business state; it is
+                // still counted, and moves the clock, as a state-changing request answered without its handler.
                 if (!IsJsonFormat(match.FormatSuffix))
                 {
+                    accounted = true;
+                    CountRejected(operation);
                     await WriteFormatNotModelledAsync(context.Response, aborted).ConfigureAwait(false);
                     return;
                 }
 
                 RestArguments? arguments = await ReadArgumentsAsync(context.Request, binding, match, aborted).ConfigureAwait(false);
+                if (arguments is null)
+                {
+                    CountRejected(operation);
+                }
+
+                // Counted just above, or by Mutate as Execute enters it.
+                accounted = true;
                 RestOutcome outcome = arguments is null ? new RestOutcome(_status.BadRequest, null) : Execute(binding, arguments);
 
                 await JadeJsonWriter.WriteAsync(context.Response, outcome.Status, outcome.Body, operation.ReturnType, aborted)
@@ -178,6 +200,13 @@ public static class RestEndpoints
             }
             catch (Exception exception)
             {
+                // A failure before the handler still answers the request, so it is counted; a request
+                // Kestrel refused while its body was read is answered above and is not.
+                if (!accounted)
+                {
+                    CountRejected(operation);
+                }
+
                 log.Outcome = RequestOutcome.Failed;
                 _logger.LogError(
                     exception,
@@ -195,6 +224,16 @@ public static class RestEndpoints
             return binding.Operation.StateChanging
                 ? _state.Mutate((company, context) => handler.Write!(company, context, arguments))
                 : _state.Read(company => handler.Read!(company, arguments));
+        }
+
+        // A request answered without its handler: counted, as Mutate would have counted it, exactly when
+        // the operation is state-changing.
+        private void CountRejected(OperationDescriptor operation)
+        {
+            if (operation.StateChanging)
+            {
+                _state.CountRejected();
+            }
         }
 
         private FrozenDictionary<string, OperationHandler> CreateHandlers() =>

@@ -119,7 +119,10 @@ public static class ResetKinds
 /// <param name="SeedSha256">The <see cref="SeedFingerprint"/> of the seed directory, as 64 lowercase hex digits.</param>
 /// <param name="ReferenceDate">The reference date as <c>yyyy-MM-dd</c>.</param>
 /// <param name="Generation">The number of completed resets since the process started.</param>
-/// <param name="Mutations">The number of state-changing requests since the last reset.</param>
+/// <param name="Mutations">
+/// The number of state-changing requests answered since the last reset, each counted once whether its
+/// handler ran or it was rejected before the handler (<see cref="StandInState.Mutations"/>).
+/// </param>
 public sealed record StandInInfo(string Source, string SeedSha256, string ReferenceDate, long Generation, long Mutations);
 
 /// <summary>
@@ -170,14 +173,16 @@ public sealed class MutationContext
 /// <see cref="Mutate{T}(Func{Company?, MutationContext, T})"/> exactly when the resolved operation's
 /// <see cref="Erewhon.Contracts.Catalogue.OperationDescriptor.StateChanging"/> is true (the four REST
 /// <c>postCreate*</c> and the four SOAP <c>update*</c> operations), never from a list of their own,
-/// and <see cref="Read{T}(Func{Company?, T})"/> otherwise. Callers finish every asynchronous step,
-/// reading and parsing the request body included, before entering either; the callbacks are
+/// and <see cref="Read{T}(Func{Company?, T})"/> otherwise; a state-changing request they answer
+/// without its handler is counted with <see cref="CountRejected"/>. Callers finish every asynchronous
+/// step, reading and parsing the request body included, before entering either; the callbacks are
 /// synchronous, never wait on I/O and never call <see cref="Read{T}(Func{Company?, T})"/> or
 /// <see cref="Mutate{T}(Func{Company?, MutationContext, T})"/> themselves.
 /// </para>
 /// <para>
 /// No real clock or random GUID is ever read. "Now" is <see cref="ClockBase"/> plus one second per
-/// state-changing request since the last reset, and every generated GUID comes from a counter that
+/// state-changing request answered since the last reset, whether its handler ran or it was rejected
+/// before the handler (<see cref="Mutations"/>), and every generated GUID comes from a counter that
 /// each reset restarts at 1, so a re-capture repeats every value on every run and every process
 /// restart. The state lives in memory only and no write is recorded anywhere.
 /// </para>
@@ -311,7 +316,17 @@ public sealed class StandInState
         }
     }
 
-    /// <summary>The number of state-changing requests since the last reset, failed ones included.</summary>
+    /// <summary>
+    /// The number of state-changing requests answered since the last reset, each counted exactly once: by
+    /// <see cref="Mutate{T}(Func{Company?, MutationContext, T})"/> when its handler runs, whether the handler
+    /// accepts it or rejects it with 400 or 404, and by <see cref="CountRejected"/> when it is rejected
+    /// before its handler runs.
+    /// </summary>
+    /// <remarks>
+    /// A request resolved to a read operation or to no operation is never counted, nor is a state-changing
+    /// one that its client abandons, or the transport refuses, before its handler runs. "Now" is
+    /// <see cref="ClockBase"/> plus this many seconds.
+    /// </remarks>
     public long Mutations
     {
         get
@@ -396,7 +411,9 @@ public sealed class StandInState
     /// The mutation count advances before the handler runs, whatever its outcome, so a request
     /// rejected with 400 or 404, or one that throws, still moves the clock: "now" is always
     /// <see cref="ClockBase"/> plus <see cref="Mutations"/> seconds, and the first write after a reset
-    /// runs at 12:00:01 UTC. Nothing is rolled back; handlers report business errors as results.
+    /// runs at 12:00:01 UTC. Nothing is rolled back; handlers report business errors as results. A
+    /// state-changing request answered without its handler is counted by <see cref="CountRejected"/>
+    /// instead, never by both.
     /// </remarks>
     /// <typeparam name="T">The handler's result.</typeparam>
     /// <param name="mutate">
@@ -415,6 +432,25 @@ public sealed class StandInState
             Snapshot current = _current;
             var context = new MutationContext(current.Company, current.Guids.Next, now);
             return mutate(current.Company, context);
+        }
+    }
+
+    /// <summary>
+    /// Accounts for a state-changing request answered without its handler running, exactly as
+    /// <see cref="Mutate{T}(Func{Company?, MutationContext, T})"/> accounts for one whose handler runs:
+    /// <see cref="Mutations"/> advances by one, and with it the clock.
+    /// </summary>
+    /// <remarks>
+    /// The endpoints call it once for a request resolved to a state-changing operation and rejected
+    /// before its handler: an input that does not convert, an envelope without the operation's request
+    /// element or parameters, an output format the stand-in does not model, or a failure before the
+    /// handler. No handler runs, no GUID is taken and nothing else changes.
+    /// </remarks>
+    public void CountRejected()
+    {
+        lock (_gate)
+        {
+            _mutations++;
         }
     }
 

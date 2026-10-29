@@ -8,6 +8,7 @@ using Erewhon.Contracts.Matching;
 using Erewhon.StandIn.Dto;
 using Erewhon.StandIn.Model;
 using Erewhon.StandIn.State;
+using Microsoft.AspNetCore.WebUtilities;
 
 namespace Erewhon.StandIn.Soap;
 
@@ -29,11 +30,24 @@ namespace Erewhon.StandIn.Soap;
 /// the lock is released. Business errors travel as a <c>DTOResult</c> with HTTP 200, never as a Fault.
 /// </para>
 /// <para>
+/// A request resolved to a state-changing operation is counted once in
+/// <see cref="StandInState.Mutations"/>, which moves the clock, however it is answered: by
+/// <see cref="StandInState.Mutate{T}"/> when its handler runs, and by <see cref="StandInState.CountRejected"/>
+/// when a Fault answers it first, for malformed XML, a missing request element or DTO parameter, or a
+/// failure before the handler. An unresolved request and a read are never counted, nor is a
+/// state-changing request that its client abandons, or Kestrel refuses, before its handler runs.
+/// </para>
+/// <para>
 /// HTTP 500 Faults are reserved for requests the stand-in cannot model: an unresolved operation, malformed
 /// XML, a missing request element or DTO parameter (<c>soap:Client</c>), and the empty state with no
-/// company (<c>soap:Server</c>). An unexpected exception is a stand-in defect and is not caught, so the
-/// framework's 500 surfaces it during capture. A client that goes away mid-request is logged at Debug,
-/// and nothing more is written to it.
+/// company (<c>soap:Server</c>). An unexpected exception is a stand-in defect: it is logged with its stack
+/// trace and answered with a <c>soap:Server</c> Fault, so every response the <c>POST</c> produces is a
+/// SOAP 1.1 envelope. That includes a stored value holding a character XML 1.0 cannot represent, such as
+/// U+0001 created over REST, which no envelope can carry; it is neither replaced nor skipped, because
+/// altering or hiding stored data would make the SOAP surface disagree with REST. The exceptions are a
+/// client that goes away mid-request, which is logged at Debug and gets nothing more; a request Kestrel
+/// refuses itself, such as a body over its size limit, which keeps Kestrel's answer; and a failure after
+/// the response has started, which aborts the connection.
 /// </para>
 /// <para>
 /// Every endpoint, the catch-all included, is dispatched only for requests arriving on the SOAP socket
@@ -103,13 +117,16 @@ public static partial class SoapEndpoint
 
     // The one writer of every SOAP and WSDL body: status, Content-Type and length, then the bytes. No other
     // header is set; Program.cs disables the Server header.
-    private static async Task WriteXmlAsync(HttpContext context, int status, byte[] body)
+    private static Task WriteXmlAsync(HttpContext context, int status, byte[] body) =>
+        WriteXmlAsync(context, status, body, context.RequestAborted);
+
+    private static async Task WriteXmlAsync(HttpContext context, int status, byte[] body, CancellationToken cancellationToken)
     {
         HttpResponse response = context.Response;
         response.StatusCode = status;
         response.ContentType = SoapEnvelopeWriter.ContentType;
         response.ContentLength = body.Length;
-        await response.Body.WriteAsync(body, context.RequestAborted).ConfigureAwait(false);
+        await response.Body.WriteAsync(body, cancellationToken).ConfigureAwait(false);
     }
 
     // Every Fault string is fixed by the stand-in (a constant, or a catalogue parameter name), never taken
@@ -140,6 +157,12 @@ public static partial class SoapEndpoint
 
     [LoggerMessage(EventId = 1, Level = LogLevel.Debug, Message = "SOAP {OperationId}: the client aborted the request.")]
     private static partial void LogClientAborted(ILogger logger, string operationId);
+
+    [LoggerMessage(EventId = 2, Level = LogLevel.Error, Message = "SOAP {OperationId} failed unexpectedly; answering a {FaultCode} Fault.")]
+    private static partial void LogFailed(ILogger logger, Exception exception, string operationId, string faultCode);
+
+    [LoggerMessage(EventId = 3, Level = LogLevel.Error, Message = "SOAP {OperationId}: the {FaultCode} Fault could not be written.")]
+    private static partial void LogFaultNotWritten(ILogger logger, Exception exception, string operationId, string faultCode);
 
     /// <summary>What a handler produced under the state lock: its result, or no company to run against.</summary>
     /// <param name="Result">A <see cref="DtoNode"/>, a <see cref="DtoArray"/> or null, which is written as <c>xsi:nil</c>.</param>
@@ -175,6 +198,7 @@ public static partial class SoapEndpoint
         private const string MalformedRequest = $"{SoapEnvelopeWriter.FaultStringPrefix} malformed request XML";
         private const string RequestElementNotFound = $"{SoapEnvelopeWriter.FaultStringPrefix} request element not found";
         private const string NoCompanyLoaded = $"{SoapEnvelopeWriter.FaultStringPrefix} no company loaded";
+        private const string InternalError = $"{SoapEnvelopeWriter.FaultStringPrefix} internal error";
 
         private static readonly XName EnvelopeName = XName.Get("Envelope", SoapEnvelopeWriter.SoapEnvelopeNamespace);
         private static readonly XName BodyName = XName.Get("Body", SoapEnvelopeWriter.SoapEnvelopeNamespace);
@@ -183,15 +207,18 @@ public static partial class SoapEndpoint
         // The XML white space characters an xsd:boolean value may carry around its literal.
         private static readonly char[] XmlWhitespace = [' ', '\t', '\n', '\r'];
 
-        // The whole body is parsed; the reader resolves nothing external and expands no DTD. Kestrel forbids
-        // synchronous reads of a request body, so the reader runs in async mode. Whitespace is reported, so
-        // a parameter's text reaches the TA exactly as sent; the TAs do their own trimming.
+        // The whole body is parsed; the reader resolves nothing external and expands no DTD. The body is
+        // buffered in full before it is parsed, so the reader never reads Kestrel's stream, and it runs in
+        // async mode, which XDocument.LoadAsync requires. The reader reports whitespace-only text and the
+        // load keeps it, so whitespace-only and padded parameter text such as <pName> </pName> reaches the
+        // ported body exactly as sent; the TAs do their own trimming.
         private static readonly XmlReaderSettings RequestSettings = new()
         {
             Async = true,
             DtdProcessing = DtdProcessing.Prohibit,
             XmlResolver = null,
             IgnoreComments = true,
+            IgnoreWhitespace = false,
         };
 
         private readonly OperationCatalogue _catalogue;
@@ -236,72 +263,128 @@ public static partial class SoapEndpoint
         }
 
         // A client that goes away while its body is read or its answer written ends the request with a Debug
-        // line, exactly when the request's abort token has fired; any other exception is left to the host.
+        // line, exactly when the request's abort token has fired. A request Kestrel refuses itself is left to
+        // Kestrel; any other failure is logged and answered with a soap:Server Fault.
         public async Task HandlePostAsync(HttpContext context)
         {
+            HttpRequest request = context.Request;
             RequestLogEntry log = RequestLogEntry.For(context);
             CancellationToken aborted = context.RequestAborted;
+
+            // The operation once the request resolves; an unresolved request is never counted. accounted is
+            // true once a resolved request is in the mutation count, or its handler is reached and Mutate
+            // counts it, so that a state-changing request is counted exactly once however it is answered.
+            OperationDescriptor? resolved = null;
+            bool accounted = false;
             try
             {
-                await AnswerPostAsync(context, log).ConfigureAwait(false);
+                // No buffer limit: any body Kestrel accepts is parsed in full.
+                request.EnableBuffering();
+                SoapResolution resolution = await _resolver.ResolveAsync(request, aborted).ConfigureAwait(false);
+                if (resolution.Operation is not { } operation || !_bindings.TryGetValue(operation.JadeMethod, out OperationBinding? binding))
+                {
+                    await WriteFaultAsync(context, SoapEnvelopeWriter.FaultCodeClient, OperationNotRecognised).ConfigureAwait(false);
+                    return;
+                }
+
+                resolved = operation;
+                log.Operation = operation.Id;
+
+                // Buffer the rest of the body before parsing it. XDocument.LoadAsync still makes a
+                // synchronous read after the XML declaration, and one that reached Kestrel's stream would
+                // throw, so the answer would depend on how the body was chunked in transit.
+                await request.Body.DrainAsync(aborted).ConfigureAwait(false);
+                request.Body.Position = 0;
+                XDocument document;
+                try
+                {
+                    using XmlReader reader = XmlReader.Create(request.Body, RequestSettings);
+                    document = await XDocument.LoadAsync(reader, LoadOptions.PreserveWhitespace, aborted).ConfigureAwait(false);
+                }
+                catch (XmlException)
+                {
+                    accounted = true;
+                    CountRejected(operation);
+                    await WriteFaultAsync(context, SoapEnvelopeWriter.FaultCodeClient, MalformedRequest).ConfigureAwait(false);
+                    return;
+                }
+
+                if (FindRequestElement(document, binding.Soap.RequestElement) is not { } wrapper)
+                {
+                    accounted = true;
+                    CountRejected(operation);
+                    await WriteFaultAsync(context, SoapEnvelopeWriter.FaultCodeClient, RequestElementNotFound).ConfigureAwait(false);
+                    return;
+                }
+
+                if (!TryReadArguments(wrapper, binding, out SoapArguments? arguments, out string? fault))
+                {
+                    accounted = true;
+                    CountRejected(operation);
+                    await WriteFaultAsync(context, SoapEnvelopeWriter.FaultCodeClient, fault).ConfigureAwait(false);
+                    return;
+                }
+
+                // Mutate counts it as Execute enters it, whatever the handler does.
+                accounted = true;
+                SoapOutcome outcome = Execute(binding, arguments);
+                if (outcome.CompanyMissing)
+                {
+                    await WriteFaultAsync(context, SoapEnvelopeWriter.FaultCodeServer, NoCompanyLoaded).ConfigureAwait(false);
+                    return;
+                }
+
+                log.ResultStatusCode = ResultStatusCodeOf(outcome.Result);
+                byte[] body = SoapEnvelopeWriter.WriteResponse(operation, outcome.Result);
+                await WriteXmlAsync(context, StatusCodes.Status200OK, body).ConfigureAwait(false);
             }
             catch (Exception exception) when (aborted.IsCancellationRequested && exception is OperationCanceledException or IOException)
             {
                 log.Outcome = RequestOutcome.Aborted;
                 LogClientAborted(_logger, log.Operation);
             }
+            catch (Exception exception) when (exception is not BadHttpRequestException)
+            {
+                // A BadHttpRequestException is Kestrel's own refusal of the request, such as a body over its
+                // size limit; it propagates, so Kestrel keeps answering it with its own status, uncounted. Any
+                // other failure before the handler still answers a resolved request, so it is counted.
+                if (!accounted && resolved is not null)
+                {
+                    CountRejected(resolved);
+                }
+
+                log.Outcome = RequestOutcome.Failed;
+                LogFailed(_logger, exception, log.Operation, SoapEnvelopeWriter.FaultCodeServer);
+                await WriteServerErrorAsync(context, log).ConfigureAwait(false);
+            }
         }
 
-        private async Task AnswerPostAsync(HttpContext context, RequestLogEntry log)
+        // The soap:Server Fault of an unexpected failure, written whatever the request's own cancellation
+        // says, so no request is left with the framework's empty 500.
+        private async Task WriteServerErrorAsync(HttpContext context, RequestLogEntry log)
         {
-            HttpRequest request = context.Request;
-            CancellationToken aborted = context.RequestAborted;
-
-            // No buffer limit: any body Kestrel accepts is parsed in full.
-            request.EnableBuffering();
-            SoapResolution resolution = await _resolver.ResolveAsync(request, aborted).ConfigureAwait(false);
-            if (resolution.Operation is not { } operation || !_bindings.TryGetValue(operation.JadeMethod, out OperationBinding? binding))
+            if (context.Response.HasStarted)
             {
-                await WriteFaultAsync(context, SoapEnvelopeWriter.FaultCodeClient, OperationNotRecognised).ConfigureAwait(false);
+                // Part of a response is already on the wire; aborting keeps it from passing as complete.
+                context.Abort();
                 return;
             }
 
-            log.Operation = operation.Id;
-            request.Body.Position = 0;
-            XDocument document;
             try
             {
-                using XmlReader reader = XmlReader.Create(request.Body, RequestSettings);
-                document = await XDocument.LoadAsync(reader, LoadOptions.None, aborted).ConfigureAwait(false);
-            }
-            catch (XmlException)
-            {
-                await WriteFaultAsync(context, SoapEnvelopeWriter.FaultCodeClient, MalformedRequest).ConfigureAwait(false);
-                return;
-            }
+                context.Response.Clear();
+                byte[] fault = SoapEnvelopeWriter.WriteFault(SoapEnvelopeWriter.FaultCodeServer, InternalError);
 
-            if (FindRequestElement(document, binding.Soap.RequestElement) is not { } wrapper)
-            {
-                await WriteFaultAsync(context, SoapEnvelopeWriter.FaultCodeClient, RequestElementNotFound).ConfigureAwait(false);
-                return;
+                // The request log reports the Fault actually written, not a result built before the failure.
+                log.ResultStatusCode = null;
+                log.FaultString = InternalError;
+                await WriteXmlAsync(context, StatusCodes.Status500InternalServerError, fault, CancellationToken.None).ConfigureAwait(false);
             }
-
-            if (!TryReadArguments(wrapper, binding, out SoapArguments? arguments, out string? fault))
+            catch (Exception exception)
             {
-                await WriteFaultAsync(context, SoapEnvelopeWriter.FaultCodeClient, fault).ConfigureAwait(false);
-                return;
+                LogFaultNotWritten(_logger, exception, log.Operation, SoapEnvelopeWriter.FaultCodeServer);
+                context.Abort();
             }
-
-            SoapOutcome outcome = Execute(binding, arguments);
-            if (outcome.CompanyMissing)
-            {
-                await WriteFaultAsync(context, SoapEnvelopeWriter.FaultCodeServer, NoCompanyLoaded).ConfigureAwait(false);
-                return;
-            }
-
-            log.ResultStatusCode = ResultStatusCodeOf(outcome.Result);
-            byte[] body = SoapEnvelopeWriter.WriteResponse(operation, outcome.Result);
-            await WriteXmlAsync(context, StatusCodes.Status200OK, body).ConfigureAwait(false);
         }
 
         // Each of the 9 bodies dereferences app.myCompany before producing any result, so the empty state is
@@ -316,6 +399,16 @@ public static partial class SoapEndpoint
                     company is null ? SoapOutcome.NoCompany : new SoapOutcome(handler.Write!(company, context, arguments), false))
                 : _state.Read(company =>
                     company is null ? SoapOutcome.NoCompany : new SoapOutcome(handler.Read!(company, arguments), false));
+        }
+
+        // A resolved request answered without its handler: counted, as Mutate would have counted it,
+        // exactly when the operation is state-changing.
+        private void CountRejected(OperationDescriptor operation)
+        {
+            if (operation.StateChanging)
+            {
+                _state.CountRejected();
+            }
         }
 
         private FrozenDictionary<string, OperationHandler> CreateHandlers() =>
@@ -451,10 +544,13 @@ public static partial class SoapEndpoint
             address.WebSite = values.Website;
         }
 
-        // soap:Envelope/soap:Body, then the first Body child that is the operation's request element.
+        // soap:Envelope/soap:Body, then the first Body child that is the operation's request element. This
+        // lookup is strict: the element must be in the service namespace, as the resolver's body inspection
+        // requires, so an unqualified or foreign-namespace wrapper is never executed, whether or not
+        // SOAPAction names the operation.
         private static XElement? FindRequestElement(XDocument document, string requestElement) =>
             document.Root is { } root && root.Name == EnvelopeName && root.Element(BodyName) is { } body
-                ? FindChild(body, requestElement)
+                ? body.Element(XName.Get(requestElement, SoapEnvelopeWriter.ServiceNamespace))
                 : null;
 
         // The parameters in signature order. A missing or nil String parameter is the JADE null string, any
@@ -503,7 +599,9 @@ public static partial class SoapEndpoint
             return true;
         }
 
-        // A message element: the local name compared ordinally, in the service namespace or unqualified.
+        // A parameter, or a member of a DTO parameter: the local name compared ordinally, in the service
+        // namespace or unqualified. This lookup is tolerant; only the request element itself must be
+        // qualified (FindRequestElement).
         private static XElement? FindChild(XElement parent, string localName) =>
             parent.Elements().FirstOrDefault(child =>
                 string.Equals(child.Name.LocalName, localName, StringComparison.Ordinal)
