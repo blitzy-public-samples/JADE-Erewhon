@@ -1,0 +1,24 @@
+{
+  "order": 37,
+  "caseId": "REST-postCreateClient-02",
+  "operation": "Rest.postCreateClient",
+  "kind": "error",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/createClient",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "bodyText": "{\"city\":\"Christchurch\",\"country\":\"New Zealand\",\"email\":\"wild@more.co.nz\",\"fax\":\"64 3 834 7172\",\"name\":\"Pauline Wild\",\"phone\":\"64 3 923 1010\",\"street\":\"24c Dryside Place\",\"website\":\"www.wild.co.nz\"}"
+  },
+  "response": {
+    "status": 400,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"guid\":\"\",\"allErrors\":[\"Client already exists\"],\"allWarnings\":[],\"statusCode\":400}",
+    "bodySha256": "e3a67ff0a39e3de6a245fa86129792add7a6c1be69b54da5a1d6a8f4f4c2257f",
+    "bodyFile": null
+  }
+}

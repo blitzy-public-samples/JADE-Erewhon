@@ -1,0 +1,22 @@
+{
+  "order": 40,
+  "caseId": "REST-postCreateRetailSale-03",
+  "operation": "Rest.postCreateRetailSale",
+  "kind": "error",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/createRetailSale/Brian%20Olsen/ANQU/999",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 404,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"guid\":\"\",\"allErrors\":[\"Item was not found\"],\"allWarnings\":[],\"statusCode\":404}",
+    "bodySha256": "fabb0022942b0a45274842d3d90d076a47769155403403ab97bac41e104b84f0",
+    "bodyFile": null
+  }
+}

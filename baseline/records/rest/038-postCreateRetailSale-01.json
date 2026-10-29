@@ -1,0 +1,22 @@
+{
+  "order": 38,
+  "caseId": "REST-postCreateRetailSale-01",
+  "operation": "Rest.postCreateRetailSale",
+  "kind": "success",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/createRetailSale/Brian%20Olsen/ANQU/2",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 201,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"guid\":\"{00000000-0000-4000-8000-0000000000ea}\",\"allErrors\":[],\"allWarnings\":[],\"statusCode\":201}",
+    "bodySha256": "312e19ec442debb02346432d89e09b4b7215e35b8a503768f9ab0eebbdd15c77",
+    "bodyFile": null
+  }
+}

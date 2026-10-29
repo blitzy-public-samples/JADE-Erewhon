@@ -1,0 +1,24 @@
+{
+  "order": 36,
+  "caseId": "REST-postCreateClient-01",
+  "operation": "Rest.postCreateClient",
+  "kind": "success",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/createClient",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "bodyText": "{\"city\":\"Nelson\",\"country\":\"New Zealand\",\"email\":\"aroha@kowhai.co.nz\",\"fax\":\"64 3 546 2200\",\"name\":\"Aroha Whaanga\",\"phone\":\"64 3 546 2201\",\"street\":\"7 Kowhai Lane\",\"website\":\"www.kowhai.co.nz\"}"
+  },
+  "response": {
+    "status": 201,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"guid\":\"{00000000-0000-4000-8000-0000000000e8}\",\"allErrors\":[],\"allWarnings\":[],\"statusCode\":201}",
+    "bodySha256": "60fa213f4a67271eba97dc6ca13bb7092bc8adf51cf155669de45860f471b5ef",
+    "bodyFile": null
+  }
+}

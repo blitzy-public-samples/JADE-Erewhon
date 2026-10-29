@@ -1,0 +1,22 @@
+{
+  "order": 20,
+  "caseId": "REST-getSale-02",
+  "operation": "Rest.getSale",
+  "kind": "success",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "GET",
+    "pathAndQuery": "/sale/PROP/70",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 200,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"__type\":\"DTOTenderSale\",\"guid\":\"{00000000-0000-4000-8000-0000000000e5}\",\"agentCommission\":227532.59,\"client\":{\"guid\":\"{00000000-0000-4000-8000-000000000048}\",\"city\":\"Llanelli\",\"country\":\"Wales\",\"email\":\"pjenkins@yippee.com\",\"fax\":\"44 2920 444 233\",\"name\":\"Philip Jenkins\",\"phone\":\"44 2920 534 242\",\"street\":\"736 Amroth Street\",\"website\":\"\"},\"item\":{\"guid\":\"{43565cee-e216-ee11-9fbf-0050568d0023}\",\"agent\":{\"guid\":\"{00000000-0000-4000-8000-000000000030}\",\"city\":\"Singapore\",\"country\":\"Singapore\",\"email\":\"suzie@holiday.com\",\"fax\":\"65 7374 9734\",\"name\":\"Suzie Wu\",\"phone\":\"65 1837 8234\",\"street\":\"26b Colonial Plaza\",\"website\":\"www.holiday.com\"},\"categoryPrefix\":\"\",\"description\":\"Located in romantic England, this 15th century castle maintains character while providing expansive grounds and luxurious surroundings.\",\"itemCategory\":\"Properties\",\"listedDate\":\"\\/Date(1761955200000)\\/\",\"name\":\"Castle\",\"number\":70,\"photo\":null,\"price\":6500000.00,\"region\":\"Oxford\",\"sale\":null},\"offer\":0.00,\"tender\":{\"guid\":\"{00000000-0000-4000-8000-0000000000ce}\",\"client\":{\"guid\":\"{00000000-0000-4000-8000-000000000048}\",\"city\":\"Llanelli\",\"country\":\"Wales\",\"email\":\"pjenkins@yippee.com\",\"fax\":\"44 2920 444 233\",\"name\":\"Philip Jenkins\",\"phone\":\"44 2920 534 242\",\"street\":\"736 Amroth Street\",\"website\":\"\"},\"offer\":6500931.00,\"tenderItem\":{\"guid\":\"{43565cee-e216-ee11-9fbf-0050568d0023}\",\"agent\":{\"guid\":\"{00000000-0000-4000-8000-000000000030}\",\"city\":\"Singapore\",\"country\":\"Singapore\",\"email\":\"suzie@holiday.com\",\"fax\":\"65 7374 9734\",\"name\":\"Suzie Wu\",\"phone\":\"65 1837 8234\",\"street\":\"26b Colonial Plaza\",\"website\":\"www.holiday.com\"},\"categoryPrefix\":\"\",\"description\":\"Located in romantic England, this 15th century castle maintains character while providing expansive grounds and luxurious surroundings.\",\"itemCategory\":\"Properties\",\"listedDate\":\"\\/Date(1761955200000)\\/\",\"name\":\"Castle\",\"number\":70,\"photo\":null,\"price\":6500000.00,\"region\":\"Oxford\",\"sale\":{\"guid\":\"{00000000-0000-4000-8000-0000000000e5}\",\"agentCommission\":227532.59,\"client\":{\"guid\":\"{00000000-0000-4000-8000-000000000048}\",\"city\":\"Llanelli\",\"country\":\"Wales\",\"email\":\"pjenkins@yippee.com\",\"fax\":\"44 2920 444 233\",\"name\":\"Philip Jenkins\",\"phone\":\"44 2920 534 242\",\"street\":\"736 Amroth Street\",\"website\":\"\"}},\"closureDate\":\"\\/Date(1767225600000)\\/\"},\"timestamp\":\"\\/Date(1763399520000)\\/\"}}",
+    "bodySha256": "8c85c3df33ea36d82faad853ed143b78e6732b03ef711a26a1764a58aca422c6",
+    "bodyFile": null
+  }
+}

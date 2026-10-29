@@ -1,0 +1,24 @@
+{
+  "order": 34,
+  "caseId": "REST-postCreateAgent-01",
+  "operation": "Rest.postCreateAgent",
+  "kind": "success",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/createAgent",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "bodyText": "{\"city\":\"Wellington\",\"country\":\"New Zealand\",\"email\":\"rangi@parata.co.nz\",\"fax\":\"64 4 472 1100\",\"name\":\"Rangi Parata\",\"phone\":\"64 4 472 1101\",\"street\":\"12 Harbour View Road\",\"website\":\"www.parata.co.nz\"}"
+  },
+  "response": {
+    "status": 201,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"guid\":\"{00000000-0000-4000-8000-0000000000e6}\",\"allErrors\":[],\"allWarnings\":[],\"statusCode\":201}",
+    "bodySha256": "d96b84ef847d90e2efaa113530681290055253c04782e57d5e177c28f8ad1a89",
+    "bodyFile": null
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "order": 15,
+  "caseId": "REST-getItemsByPrice-01",
+  "operation": "Rest.getItemsByPrice",
+  "kind": "success",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "GET",
+    "pathAndQuery": "/itemsByPrice/800/900",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 200,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "[{\"__type\":\"DTOTenderItem\",\"guid\":\"{bc5b68ee-e216-ee11-9fc3-0050568d0023}\",\"agent\":{\"guid\":\"{00000000-0000-4000-8000-000000000030}\",\"city\":\"Singapore\",\"country\":\"Singapore\",\"email\":\"suzie@holiday.com\",\"fax\":\"65 7374 9734\",\"name\":\"Suzie Wu\",\"phone\":\"65 1837 8234\",\"street\":\"26b Colonial Plaza\",\"website\":\"www.holiday.com\"},\"categoryPrefix\":\"\",\"description\":\"Solid rimu cabinet with gold handles and hand-painted decorations.\",\"itemCategory\":\"Antiques\",\"listedDate\":\"\\/Date(1766275200000)\\/\",\"name\":\"Cabinet\",\"number\":85,\"photo\":null,\"price\":899.00,\"region\":\"Auckland\",\"sale\":null,\"closureDate\":\"\\/Date(1771718400000)\\/\"},{\"__type\":\"DTOTenderItem\",\"guid\":\"{bc5b68ee-e216-ee11-9fc4-0050568d0023}\",\"agent\":{\"guid\":\"{00000000-0000-4000-8000-00000000002a}\",\"city\":\"Los Angeles\",\"country\":\"United States of America\",\"email\":\"hank@it.com\",\"fax\":\"1 8 6354 7364\",\"name\":\"Hank Williams\",\"phone\":\"1 8 2938 4756\",\"street\":\"9127 Bel Air Drive\",\"website\":\"www.it.com\"},\"categoryPrefix\":\"\",\"description\":\"Greek Gods were once bathed using these handcrafted works of art.\",\"itemCategory\":\"Antiques\",\"listedDate\":\"\\/Date(1759190400000)\\/\",\"name\":\"Water Jugs\",\"number\":87,\"photo\":null,\"price\":899.00,\"region\":\"Greece\",\"sale\":null,\"closureDate\":\"\\/Date(1762905600000)\\/\"}]",
+    "bodySha256": "4b1ec4f9023b4a1f06e2be96759d4ed4ff6289dee8cfe8a74ad1d5348a2f299a",
+    "bodyFile": null
+  }
+}

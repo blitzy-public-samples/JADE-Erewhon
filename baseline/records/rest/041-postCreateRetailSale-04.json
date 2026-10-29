@@ -1,0 +1,22 @@
+{
+  "order": 41,
+  "caseId": "REST-postCreateRetailSale-04",
+  "operation": "Rest.postCreateRetailSale",
+  "kind": "error",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/createRetailSale/Brian%20Olsen/PROP/59",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 400,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"guid\":\"\",\"allErrors\":[\"Item is not a Retail Item\"],\"allWarnings\":[],\"statusCode\":400}",
+    "bodySha256": "da5635e81f9deef5986a98f77238b2d4531e047dc0722ff00e4f5d55cc7f3e70",
+    "bodyFile": null
+  }
+}

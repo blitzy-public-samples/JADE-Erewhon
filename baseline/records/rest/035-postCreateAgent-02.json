@@ -1,0 +1,24 @@
+{
+  "order": 35,
+  "caseId": "REST-postCreateAgent-02",
+  "operation": "Rest.postCreateAgent",
+  "kind": "error",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/createAgent",
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "bodyText": "{\"name\":\"Tama Ngata\"}"
+  },
+  "response": {
+    "status": 400,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"guid\":\"\",\"allErrors\":[\"Street is required\",\"City is required\",\"Country is required\",\"Phone number is required\",\"Email is required\"],\"allWarnings\":[],\"statusCode\":400}",
+    "bodySha256": "955025dc13b188d11ce59fecf4413084916aa6de5176d3fc6ec87d684c85e9b1",
+    "bodyFile": null
+  }
+}

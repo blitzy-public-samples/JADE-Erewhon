@@ -1,0 +1,22 @@
+{
+  "order": 19,
+  "caseId": "REST-getSale-01",
+  "operation": "Rest.getSale",
+  "kind": "success",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "GET",
+    "pathAndQuery": "/sale/DEST/18",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 200,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"__type\":\"DTORetailSale\",\"guid\":\"{00000000-0000-4000-8000-0000000000d2}\",\"agentCommission\":25.98,\"client\":{\"guid\":\"{00000000-0000-4000-8000-00000000003a}\",\"city\":\"Nagano\",\"country\":\"Japan\",\"email\":\"elaine@lee.co.jp\",\"fax\":\"81 8 7463 8282\",\"name\":\"Elaine Lee\",\"phone\":\"81 8 7273 1822\",\"street\":\"273 Mt Fuji Rise\",\"website\":\"www.lee.co.jp\"},\"item\":{\"guid\":\"{d73b5be3-e216-ee11-9fb1-0050568d0023}\",\"agent\":{\"guid\":\"{00000000-0000-4000-8000-000000000024}\",\"city\":\"Christchurch\",\"country\":\"New Zealand\",\"email\":\"ps@theplace.co.nz\",\"fax\":\"64 3 378 2992\",\"name\":\"Peter Smallsmith\",\"phone\":\"64 3 392 3746\",\"street\":\"645 Gregan Road\",\"website\":\"www.theplace.co.nz\"},\"categoryPrefix\":\"\",\"description\":\"Reef diving in South Africa.\",\"itemCategory\":\"Holidays\",\"listedDate\":\"\\/Date(1757635200000)\\/\",\"name\":\"Africa Diving\",\"number\":18,\"photo\":null,\"price\":1299.00,\"region\":\"South Africa\",\"sale\":null},\"timestamp\":\"\\/Date(1769067363000)\\/\"}",
+    "bodySha256": "2f7cc942cdf1d221584d8d6744ee7ad4ebc836a2123dc78e15b2dda04f5f8bab",
+    "bodyFile": null
+  }
+}
