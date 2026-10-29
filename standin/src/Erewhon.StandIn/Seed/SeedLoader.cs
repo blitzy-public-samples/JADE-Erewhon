@@ -70,6 +70,10 @@ public static class SeedLoader
 
     private const NumberStyles DecimalStyles = NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint;
 
+    // The chunk an image file is read in, between two observations of the load's cancellation
+    // token: the buffer size Stream.CopyTo uses.
+    private const int PictureReadChunkSize = 81920;
+
     /// <summary>
     /// Loads the seed with a new load context: no company yet, guids from <paramref name="newGuid"/>
     /// and the clock at <paramref name="referenceDate"/> 12:00:00 UTC.
@@ -79,14 +83,19 @@ public static class SeedLoader
     /// <param name="newGuid">
     /// Generates the guid of every entity created without a seed guid, in creation order.
     /// </param>
+    /// <param name="cancellationToken">Stops the load between seed files and between rows.</param>
     /// <returns>The loaded model, its context, the counts and the rows the agents rejected.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="newGuid"/> is null.</exception>
-    /// <inheritdoc cref="Load(string, DateOnly, ModelContext)" path="/exception"/>
-    public static SeedLoadResult Load(string seedDirectory, DateOnly referenceDate, Func<string> newGuid)
+    /// <inheritdoc cref="Load(string, DateOnly, ModelContext, CancellationToken)" path="/exception"/>
+    public static SeedLoadResult Load(
+        string seedDirectory,
+        DateOnly referenceDate,
+        Func<string> newGuid,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(newGuid);
         var context = new ModelContext(null, newGuid, referenceDate.ToDateTime(LoadTimeOfDay, DateTimeKind.Utc));
-        return Load(seedDirectory, referenceDate, context);
+        return Load(seedDirectory, referenceDate, context, cancellationToken);
     }
 
     /// <summary>
@@ -103,6 +112,11 @@ public static class SeedLoader
     /// The load context. Its company is replaced by the new one (JADE deletes the existing company
     /// first), and its date must be <paramref name="referenceDate"/>. Its clock is not advanced.
     /// </param>
+    /// <param name="cancellationToken">
+    /// Stops the load: it is observed before the existing company is deleted, before each seed file
+    /// is read, once per physical line of each seed file, before each chunk of each image file,
+    /// before each row is persisted and before the tender closure.
+    /// </param>
     /// <returns>The loaded model, its context, the counts and the rows the agents rejected.</returns>
     /// <exception cref="ArgumentNullException">
     /// <paramref name="seedDirectory"/> or <paramref name="context"/> is null.
@@ -113,16 +127,40 @@ public static class SeedLoader
     /// </exception>
     /// <exception cref="DirectoryNotFoundException">The seed directory does not exist.</exception>
     /// <exception cref="FileNotFoundException">A seed file does not exist.</exception>
+    /// <exception cref="IOException">
+    /// A seed file is not a regular file (the message names the file, not its directory), or it
+    /// cannot be read.
+    /// </exception>
     /// <exception cref="InvalidDataException">
-    /// A seed value does not convert, an image file is missing, or an agent rate names a missing
-    /// agent, category or rate (each a JADE runtime exception).
+    /// A seed row cannot be loaded: a seed value does not convert, an image file is missing, or an
+    /// agent rate names a missing agent, category or rate or repeats an agent the rate already holds
+    /// (each a JADE runtime exception); a seed date plus the day offset is outside the range of
+    /// <see cref="DateOnly"/>; an image file is not a regular file or cannot be read; or a photo
+    /// name is not a plain file name directly inside the seed directory, or is a symbolic link that
+    /// cannot be resolved or whose final target is not an existing file directly inside it. The
+    /// message names the seed file, its line and the field, category or rate at fault; a range, link
+    /// or read error is the inner exception.
     /// </exception>
     /// <exception cref="InvalidOperationException">The company could not be created.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     /// <remarks>
-    /// When the load throws, the context is left with no company, as JADE's aborted load leaves the
-    /// database after the committed deletion of the previous company.
+    /// <para>
+    /// The arguments, the seed directory and the context's date are validated, and
+    /// <paramref name="cancellationToken"/> is checked, before the context's company is deleted, so a
+    /// load that throws at that point leaves the context unchanged. A load that throws once loading
+    /// has begun, a cancellation included, leaves the context with no company, as JADE's aborted load
+    /// leaves the database after the committed deletion of the previous company.
+    /// </para>
+    /// <para>
+    /// A seed file or image file of length 0 is read as empty without being opened. A FIFO or a
+    /// device also reports length 0, so none can block the load waiting for a writer.
+    /// </para>
     /// </remarks>
-    public static SeedLoadResult Load(string seedDirectory, DateOnly referenceDate, ModelContext context)
+    public static SeedLoadResult Load(
+        string seedDirectory,
+        DateOnly referenceDate,
+        ModelContext context,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(context);
         string directory = ValidateDirectoryPath(seedDirectory);
@@ -135,6 +173,8 @@ public static class SeedLoader
                 nameof(context));
         }
 
+        cancellationToken.ThrowIfCancellationRequested();
+
         // JADE: delete Company.firstInstance(), committed before the load begins.
         context.Company = null;
         try
@@ -143,8 +183,9 @@ public static class SeedLoader
 
             // dateOffset (8466-8470): the days from 1 January 2000 to the current date.
             int dateOffsetDays = referenceDate.DayNumber - OffsetStartDate.DayNumber;
-            var load = new LoadState(directory, context, company, dateOffsetDays);
+            var load = new LoadState(directory, context, company, dateOffsetDays, cancellationToken);
 
+            // Each stage observes the token before it reads its file and before each row it persists.
             LoadLocations(load);
             LoadAgents(load);
             LoadClients(load);
@@ -155,6 +196,8 @@ public static class SeedLoader
             LoadAgentRates(load);
             LoadTenders(load);
             LoadRetailSales(load);
+
+            cancellationToken.ThrowIfCancellationRequested();
 
             // closeTendersAtCurrentDate (7891-7911): closeTendersAtDate( currentDate, total ).
             _ = company.CloseTendersAtDate(referenceDate, context);
@@ -407,7 +450,7 @@ public static class SeedLoader
                 new ItemRow(guid, shortDescription, fullDescription, photoFileName, reservePrice, listedDate, agentName, countryName, regionName, categoryName),
                 TenderItemsFile,
                 line);
-            tenderItemTA.ClosureDate = closureDate.AddDays(load.DateOffsetDays);
+            tenderItemTA.ClosureDate = AddDateOffset(load, closureDate, TenderItemsFile, line, "closureDate");
 
             _ = Persist(load, tenderItemTA, TenderItemsFile, line);
         }
@@ -469,12 +512,13 @@ public static class SeedLoader
 
             if (agent == null)
             {
-                throw RowError(AgentRatesFile, line, $"no agent is named '{agentName}'");
+                // Agent names are personal data, so the row and field identify the reference.
+                throw RowError(AgentRatesFile, line, "field 'agent' names no loaded agent");
             }
 
             if (commissionRateTA.AllAgents.Includes(agent))
             {
-                throw RowError(AgentRatesFile, line, $"agent '{agentName}' already uses this commission rate");
+                throw RowError(AgentRatesFile, line, "field 'agent' names an agent that already uses this commission rate");
             }
 
             commissionRateTA.AllAgents.Add(agent);
@@ -521,7 +565,7 @@ public static class SeedLoader
             var tenderTA = new TenderTA();
             tenderTA.Initialize();
             tenderTA.Offer = offer;
-            tenderTA.DateTendered = ToTimeStamp(load, date, time);
+            tenderTA.DateTendered = ToTimeStamp(load, date, time, TendersFile, line, "date");
             tenderTA.MyClient = load.Company.AllClients[clientName];
             tenderTA.MyTenderItem = load.Company.AllTenderItems.GetAtKey(guid);
 
@@ -547,7 +591,7 @@ public static class SeedLoader
 
             var retailSaleTA = new RetailSaleTA();
             retailSaleTA.Initialize();
-            retailSaleTA.DateSold = ToTimeStamp(load, date, time);
+            retailSaleTA.DateSold = ToTimeStamp(load, date, time, RetailSalesFile, line, "date");
             retailSaleTA.SalePrice = price;
             retailSaleTA.MyClient = load.Company.AllClients[clientName];
             retailSaleTA.MyItem = load.Company.AllRetailItems.GetAtKey(guid);
@@ -588,7 +632,7 @@ public static class SeedLoader
         itemTA.Photo = LoadPicture(load, row.PhotoFileName, fileName, line);
         itemTA.Price = row.Price;
         itemTA.Name = row.ShortDescription;
-        itemTA.ListedDate = row.ListedDate.AddDays(load.DateOffsetDays);
+        itemTA.ListedDate = AddDateOffset(load, row.ListedDate, fileName, line, "listedDate");
     }
 
     /// <summary>
@@ -596,28 +640,215 @@ public static class SeedLoader
     /// 8827</c>): the raw bytes of the image file (KL-STANDIN-PHOTO).
     /// </summary>
     /// <remarks>
+    /// <para>
     /// The name is appended to the directory as JADE concatenates it, so a rooted name cannot select
     /// a file outside the seed directory; <see cref="Path.Combine(string, string)"/> would discard the
     /// directory for one. The name's case is used as written.
+    /// </para>
+    /// <para>
+    /// Only a file directly inside the seed directory is read, as the seed set is flat. The name must
+    /// be a plain file name (<see cref="IsPlainFileName"/>), so <c>../</c> and every other path form
+    /// is refused before anything is looked up, and a name that is a symbolic link is read only
+    /// through a final target that is an existing file directly inside the seed directory
+    /// (<see cref="ResolveContainedLink"/>). A refused name is a row error for field <c>photo</c>.
+    /// </para>
     /// </remarks>
+    /// <exception cref="InvalidDataException">
+    /// The name is refused, names no existing file or no regular file, or the file cannot be read
+    /// (the read error is the inner exception). The message names the seed file, its line and field
+    /// <c>photo</c>.
+    /// </exception>
+    /// <exception cref="OperationCanceledException">The load was cancelled while the image was read.</exception>
     private static byte[] LoadPicture(LoadState load, string photoFileName, string fileName, SeedLine line)
     {
-        string path = Path.Join(load.SeedDirectory, photoFileName);
-        if (photoFileName.Length == 0 || !File.Exists(path))
+        if (!IsPlainFileName(photoFileName))
         {
-            throw RowError(fileName, line, $"the image file '{photoFileName}' does not exist in the seed directory");
+            throw RowError(fileName, line, $"field 'photo' value '{photoFileName}' is not a file name directly inside the seed directory");
         }
 
-        return File.ReadAllBytes(path);
+        var image = new FileInfo(Path.Join(load.SeedDirectory, photoFileName));
+        if (!image.Exists)
+        {
+            throw RowError(fileName, line, $"field 'photo' image file '{photoFileName}' does not exist in the seed directory");
+        }
+
+        try
+        {
+            if (image.LinkTarget != null)
+            {
+                image = ResolveContainedLink(load, image, photoFileName, fileName, line);
+            }
+
+            return ReadPicture(load, image, photoFileName, fileName, line);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // The message names the row and the seed's own file name only; the inner exception
+            // keeps the host path.
+            string reason = ex switch
+            {
+                UnauthorizedAccessException => "access is denied",
+                FileNotFoundException or DirectoryNotFoundException => "it no longer exists",
+                _ => "an I/O error occurred",
+            };
+            throw RowError(fileName, line, $"field 'photo' image file '{photoFileName}' could not be read: {reason}", ex);
+        }
+    }
+
+    /// <summary>
+    /// The bytes <see cref="File.ReadAllBytes(string)"/> returns for an image file, read so that a
+    /// reset can stop: an entry of length 0 is not opened, an opened entry that cannot seek is
+    /// refused, and the file is read in chunks of <see cref="PictureReadChunkSize"/> bytes with the
+    /// load's cancellation token observed before each.
+    /// </summary>
+    /// <remarks>
+    /// An empty file gives the empty image, which <see cref="Item.Photo"/> stores as null. A FIFO or a
+    /// device also reports length 0, and opening one for reading waits for a writer, which no
+    /// cancellation can interrupt, so it gives the empty image too instead of blocking the reset.
+    /// </remarks>
+    /// <param name="load">The load, whose cancellation token is observed.</param>
+    /// <param name="image">The image file, a symbolic link already resolved to its final target.</param>
+    /// <param name="photoFileName">The image name as the seed line gives it, for messages.</param>
+    /// <param name="fileName">The seed file of the row, for messages.</param>
+    /// <param name="line">The seed line of the row, for messages.</param>
+    /// <returns>The file's bytes; empty for an entry of length 0.</returns>
+    /// <exception cref="InvalidDataException">
+    /// The opened entry is not a regular file. The message names the seed file, its line and field
+    /// <c>photo</c>.
+    /// </exception>
+    /// <exception cref="IOException">
+    /// The file cannot be read, is longer than an array can hold, or ends before its length
+    /// (<see cref="EndOfStreamException"/>), as with <see cref="File.ReadAllBytes(string)"/>.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">The file cannot be opened for reading.</exception>
+    /// <exception cref="OperationCanceledException">The load was cancelled.</exception>
+    private static byte[] ReadPicture(LoadState load, FileInfo image, string photoFileName, string fileName, SeedLine line)
+    {
+        load.CancellationToken.ThrowIfCancellationRequested();
+
+        // Taken now rather than from the state cached when the name was checked, so the length
+        // describes the entry as it is just before the open.
+        image.Refresh();
+        if (image.Length == 0)
+        {
+            return [];
+        }
+
+        // Unbuffered: each chunk is read straight into the result.
+        using var stream = new FileStream(image.FullName, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: 0, FileOptions.SequentialScan);
+        if (!stream.CanSeek)
+        {
+            throw RowError(fileName, line, $"field 'photo' image file '{photoFileName}' is not a regular file");
+        }
+
+        // The length of the opened file, as File.ReadAllBytes takes it, not the one checked above.
+        long length = stream.Length;
+        if (length > Array.MaxLength)
+        {
+            throw new IOException(string.Create(
+                CultureInfo.InvariantCulture,
+                $"The image file '{photoFileName}' is longer than the {Array.MaxLength} bytes an image can hold."));
+        }
+
+        var bytes = new byte[length];
+        var offset = 0;
+        while (offset < bytes.Length)
+        {
+            load.CancellationToken.ThrowIfCancellationRequested();
+            int read = stream.Read(bytes, offset, Math.Min(PictureReadChunkSize, bytes.Length - offset));
+            if (read == 0)
+            {
+                // File.ReadAllBytes fails the same way when the file shrinks while it is read.
+                throw new EndOfStreamException();
+            }
+
+            offset += read;
+        }
+
+        return bytes;
+    }
+
+    /// <summary>
+    /// Whether an image name is a plain file name: not empty, <c>.</c> or <c>..</c>, free of both
+    /// directory separators on every platform and of every other character
+    /// <see cref="Path.GetInvalidFileNameChars"/> lists, and its own <see cref="Path.GetFileName(string)"/>.
+    /// </summary>
+    private static bool IsPlainFileName(string name) =>
+        name.Length > 0
+        && name is not ("." or "..")
+        && !name.Contains('/', StringComparison.Ordinal)
+        && !name.Contains('\\', StringComparison.Ordinal)
+        && name.IndexOfAny(Path.GetInvalidFileNameChars()) < 0
+        && string.Equals(Path.GetFileName(name), name, StringComparison.Ordinal);
+
+    /// <summary>
+    /// The final target of an image name that is a symbolic link, accepted only when it is an
+    /// existing file that is not itself a link and lies directly inside the seed directory, which
+    /// is the flat set of files <c>SeedFingerprint</c> hashes.
+    /// </summary>
+    /// <returns>The target, read in place of the link.</returns>
+    /// <exception cref="InvalidDataException">
+    /// The link cannot be resolved (the resolution error is the inner exception), or its target is
+    /// anything else.
+    /// </exception>
+    private static FileInfo ResolveContainedLink(LoadState load, FileInfo link, string photoFileName, string fileName, SeedLine line)
+    {
+        FileInfo? target;
+        try
+        {
+            // The target's path is normalised, so it is checked again as a file and as a non-link,
+            // and that checked path, not the link, is the one read.
+            target = link.ResolveLinkTarget(returnFinalTarget: true) as FileInfo;
+            if (target != null
+                && (!target.Exists
+                    || target.LinkTarget != null
+                    || !IsSeedDirectory(load.SeedDirectory, Path.GetDirectoryName(target.FullName))))
+            {
+                target = null;
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            throw RowError(fileName, line, $"field 'photo' value '{photoFileName}' is a symbolic link that cannot be resolved", ex);
+        }
+
+        return target
+            ?? throw RowError(fileName, line, $"field 'photo' value '{photoFileName}' is a symbolic link to no file directly inside the seed directory");
+    }
+
+    /// <summary>
+    /// Whether <paramref name="directory"/> is the seed directory itself, compared ordinally with any
+    /// trailing separator removed, against the directory as configured and, when that is a symbolic
+    /// link, against its final target.
+    /// </summary>
+    private static bool IsSeedDirectory(string seedDirectory, string? directory)
+    {
+        if (directory == null)
+        {
+            return false;
+        }
+
+        string candidate = Path.TrimEndingDirectorySeparator(Path.GetFullPath(directory));
+        var seed = new DirectoryInfo(Path.TrimEndingDirectorySeparator(Path.GetFullPath(seedDirectory)));
+        if (string.Equals(candidate, seed.FullName, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return seed.LinkTarget != null
+            && seed.ResolveLinkTarget(returnFinalTarget: true) is { } canonicalSeed
+            && string.Equals(candidate, Path.TrimEndingDirectorySeparator(canonicalSeed.FullName), StringComparison.Ordinal);
     }
 
     /// <summary>
     /// Persists one row's agent with <see cref="TransactionType.Persist"/>. JADE ignores the result,
     /// so a rejected row is simply not created; here it is also recorded with the agent's errors.
+    /// A cancelled load stops here, before the row is applied.
     /// </summary>
     /// <returns>True when the agent applied the row.</returns>
     private static bool Persist(LoadState load, ModelTA transactionAgent, string fileName, SeedLine line)
     {
+        load.CancellationToken.ThrowIfCancellationRequested();
         if (transactionAgent.PersistEntityInTransState(TransactionType.Persist, load.Context))
         {
             return true;
@@ -627,9 +858,16 @@ public static class SeedLoader
         return false;
     }
 
-    /// <summary>Reads the data lines of one seed file, named explicitly, from the seed directory.</summary>
-    private static IReadOnlyList<SeedLine> ReadDataLines(LoadState load, string fileName) =>
-        SeedTokenizer.ReadLines(Path.Combine(load.SeedDirectory, fileName));
+    /// <summary>
+    /// Reads the data lines of one seed file, named explicitly, from the seed directory. Each load
+    /// stage starts here, so a cancelled load stops before it opens the next file, and the tokenizer
+    /// observes the token once per physical line of the file.
+    /// </summary>
+    private static IReadOnlyList<SeedLine> ReadDataLines(LoadState load, string fileName)
+    {
+        load.CancellationToken.ThrowIfCancellationRequested();
+        return SeedTokenizer.ReadLines(Path.Combine(load.SeedDirectory, fileName), load.CancellationToken);
+    }
 
     /// <summary>
     /// JADE <c>String.Decimal</c> into a <c>Decimal[n,2]</c> local: an optionally signed decimal
@@ -675,8 +913,34 @@ public static class SeedLoader
     /// JADE <c>timeStamp.setDate( date + self.dateOffset ); timeStamp.setTime( time )</c>, in UTC
     /// because the JADE applications run in <c>Etc/UTC</c>.
     /// </summary>
-    private static DateTime ToTimeStamp(LoadState load, DateOnly date, TimeOnly time) =>
-        date.AddDays(load.DateOffsetDays).ToDateTime(time, DateTimeKind.Utc);
+    /// <exception cref="InvalidDataException">The offset date is out of range (<see cref="AddDateOffset"/>).</exception>
+    private static DateTime ToTimeStamp(LoadState load, DateOnly date, TimeOnly time, string fileName, SeedLine line, string field) =>
+        AddDateOffset(load, date, fileName, line, field).ToDateTime(time, DateTimeKind.Utc);
+
+    /// <summary>
+    /// JADE <c>date + self.dateOffset</c>: a seed date moved forward by the load's day offset.
+    /// </summary>
+    /// <exception cref="InvalidDataException">
+    /// The offset date is outside the range of <see cref="DateOnly"/>, for example
+    /// <c>December 31 9999</c> with a positive offset; the range error is the inner exception.
+    /// </exception>
+    private static DateOnly AddDateOffset(LoadState load, DateOnly date, string fileName, SeedLine line, string field)
+    {
+        try
+        {
+            return date.AddDays(load.DateOffsetDays);
+        }
+        catch (ArgumentOutOfRangeException ex)
+        {
+            throw RowError(
+                fileName,
+                line,
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"field '{field}' value '{FormatDate(date)}' plus the date offset of {load.DateOffsetDays} days is outside the supported date range"),
+                ex);
+        }
+    }
 
     /// <summary>
     /// The counts of the objects the loaded company holds. Agent rates are the agent-rate lines
@@ -706,8 +970,8 @@ public static class SeedLoader
     private static InvalidDataException ConversionError(string fileName, SeedLine line, string field, string token, string kind) =>
         RowError(fileName, line, $"field '{field}' value '{token}' is not a valid {kind}");
 
-    private static InvalidDataException RowError(string fileName, SeedLine line, string problem) =>
-        new(string.Create(CultureInfo.InvariantCulture, $"{fileName} line {line.LineNumber}: {problem}."));
+    private static InvalidDataException RowError(string fileName, SeedLine line, string problem, Exception? innerException = null) =>
+        new(string.Create(CultureInfo.InvariantCulture, $"{fileName} line {line.LineNumber}: {problem}."), innerException);
 
     private static string FormatDate(DateOnly date) => date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
 
@@ -728,7 +992,12 @@ public static class SeedLoader
     /// The state of one load: JADE <c>InitialDataLoader</c>'s <c>dirPath</c>, <c>myCompany</c> and
     /// <c>dateOffset</c>, plus what this port reports. A new instance per call keeps loads independent.
     /// </summary>
-    private sealed class LoadState(string seedDirectory, ModelContext context, Company company, int dateOffsetDays)
+    private sealed class LoadState(
+        string seedDirectory,
+        ModelContext context,
+        Company company,
+        int dateOffsetDays,
+        CancellationToken cancellationToken)
     {
         public string SeedDirectory { get; } = seedDirectory;
 
@@ -738,13 +1007,17 @@ public static class SeedLoader
 
         public int DateOffsetDays { get; } = dateOffsetDays;
 
+        // Observed by ReadDataLines once per file, by SeedTokenizer.ReadLines once per line, by
+        // ReadPicture before each image chunk and by Persist once per row.
+        public CancellationToken CancellationToken { get; } = cancellationToken;
+
         public List<SeedRowRejection> Rejections { get; } = [];
 
         public int AgentRatesUpdated { get; set; }
     }
 }
 
-/// <summary>The outcome of <see cref="SeedLoader.Load(string, DateOnly, ModelContext)"/>.</summary>
+/// <summary>The outcome of <see cref="SeedLoader.Load(string, DateOnly, ModelContext, CancellationToken)"/>.</summary>
 /// <param name="Company">The loaded company, also the context's company.</param>
 /// <param name="Context">The load context; its clock is still the load time.</param>
 /// <param name="ReferenceDate">The date that replaced JADE's current date.</param>
@@ -838,4 +1111,3 @@ public sealed record SeedLoadCounts(
 /// <param name="LineNumber">The 1-based physical line number.</param>
 /// <param name="Errors">The agent's errors, in the order raised.</param>
 public sealed record SeedRowRejection(string FileName, int LineNumber, IReadOnlyList<string> Errors);
-

@@ -187,7 +187,7 @@ public sealed class MutationContext
 /// restart. The state lives in memory only and no write is recorded anywhere.
 /// </para>
 /// </remarks>
-public sealed class StandInState
+public sealed partial class StandInState
 {
     private const string DateFormat = "yyyy-MM-dd";
 
@@ -205,26 +205,33 @@ public sealed class StandInState
     private readonly Lock _gate = new();
 
     // Serialises resets, so concurrent resets cannot interleave generations or GUID sequences while
-    // the seed is loaded outside _gate.
-    private readonly Lock _resetGate = new();
+    // the seed is loaded outside _gate. A semaphore, so an admin reset waits for it without holding a
+    // thread and stops waiting when its client goes away. It is never disposed: its wait handle is
+    // never requested, so it holds no unmanaged resource, and it lives as long as this singleton.
+    private readonly SemaphoreSlim _resetGate = new(1, 1);
 
     // Before the first reset: no company, no fingerprint, and a GUID counter of this instance's own.
     private Snapshot _current = new(null, ResetKind.Empty, "", null, new GuidSequence());
     private long _generation;
     private long _mutations;
 
+    private readonly ILogger<StandInState> _logger;
+
     /// <summary>Creates the state with no company; <see cref="Reset(ResetKind)"/> loads it.</summary>
     /// <param name="options">The <see cref="StandInOptions.SectionName"/> settings.</param>
-    /// <exception cref="ArgumentNullException"><paramref name="options"/> is null.</exception>
+    /// <param name="logger">Receives the console failures a published reset survives.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="options"/> or <paramref name="logger"/> is null.</exception>
     /// <exception cref="InvalidOperationException">
     /// <c>StandIn:SeedDirectory</c> is empty or not a valid path
     /// (<see cref="ResolveSeedDirectory(string?)"/>), or <c>StandIn:ReferenceDate</c> is not a
     /// <c>yyyy-MM-dd</c> date from 1001-01-01 to 8999-12-31, the range that keeps every seed date
     /// moved by its offset from 2000-01-01, and the clock, representable.
     /// </exception>
-    public StandInState(IOptions<StandInOptions> options)
+    public StandInState(IOptions<StandInOptions> options, ILogger<StandInState> logger)
     {
         ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(logger);
+        _logger = logger;
         StandInOptions settings = options.Value;
 
         SeedDirectory = ResolveSeedDirectory(settings.SeedDirectory);
@@ -456,63 +463,141 @@ public sealed class StandInState
 
     /// <summary>
     /// Rebuilds the state and swaps it in atomically: the generation advances, the mutation count and
-    /// clock restart, and the GUID counter restarts at 1.
+    /// clock restart, and the GUID counter restarts at 1. Start-up calls this form, on the calling
+    /// thread; the admin endpoint calls <see cref="ResetAsync(ResetKind, CancellationToken)"/>.
     /// </summary>
     /// <remarks>
     /// The new state is built outside the request lock, so requests are held only for the swap; a
     /// request served during the load still sees the previous state, with its own GUID counter. Both
     /// kinds fingerprint the seed directory, because the harness compares the reported hash with the
-    /// baseline manifest after an empty reset too. When building fails, the exception propagates and
-    /// the previous state, generation and mutation count stay as they were. Every reset prints
+    /// baseline manifest after an empty reset too. Every exception is thrown before the swap, so a
+    /// reset that throws leaves the previous state, generation and mutation count as they were, and a
+    /// reset that swaps always returns its <see cref="StandInInfo"/>. Every reset prints
     /// <see cref="SourceLabels.Banner"/>, a summary line and, for <see cref="ResetKind.Seed"/>, the
-    /// load description.
+    /// load description; they are composed before the swap and written after it, and a console that
+    /// cannot be written is logged as a warning without failing the reset.
     /// </remarks>
     /// <param name="kind">The state to build.</param>
     /// <returns>The <see cref="StandInInfo"/> of the new state.</returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="kind"/> is not a defined kind.</exception>
     /// <exception cref="DirectoryNotFoundException">The seed directory does not exist.</exception>
-    /// <exception cref="IOException">A seed file could not be read.</exception>
-    /// <exception cref="InvalidDataException">A seed value does not convert, or an image file is missing.</exception>
+    /// <exception cref="IOException">A seed file could not be read or is not a regular file.</exception>
+    /// <exception cref="InvalidDataException">
+    /// A seed row cannot be loaded: a value does not convert, an offset date is out of range, a photo
+    /// name is refused, its image file is missing, unreadable or not a regular file, or an agent rate
+    /// names a missing agent, category or rate or repeats an agent the rate already holds (see
+    /// <see cref="SeedLoader.Load(string, DateOnly, ModelContext, CancellationToken)"/>). The message
+    /// names the seed file, its line and the field, category or rate at fault.
+    /// </exception>
     /// <exception cref="InvalidOperationException">The seed company could not be created.</exception>
     public StandInInfo Reset(ResetKind kind)
     {
         string kindText = ResetKinds.ToQueryValue(kind);
 
-        lock (_resetGate)
+        _resetGate.Wait();
+        try
         {
-            string seedSha256 = SeedFingerprint.ComputeSha256Hex(SeedDirectory);
-
-            // Created before the load, so load-time GUIDs take 1, 2, 3, ... in creation order and
-            // request-time GUIDs continue from where the load stopped.
-            var guids = new GuidSequence();
-            SeedLoadResult? load = null;
-            if (kind == ResetKind.Seed)
-            {
-                var loadContext = new ModelContext(null, guids.Next, ClockBase);
-                load = SeedLoader.Load(SeedDirectory, ReferenceDate, loadContext);
-            }
-
-            var snapshot = new Snapshot(load?.Company, kind, seedSha256, load, guids);
-            StandInInfo info;
-            lock (_gate)
-            {
-                _current = snapshot;
-                _generation++;
-                _mutations = 0;
-                info = CreateInfo();
-            }
-
-            Console.WriteLine(SourceLabels.Banner);
-            Console.WriteLine(string.Create(
-                CultureInfo.InvariantCulture,
-                $"{SourceLabels.ConsolePrefix} reset generation={info.Generation} kind={kindText} referenceDate={info.ReferenceDate} seedSha256={info.SeedSha256}"));
-            if (load != null)
-            {
-                Console.WriteLine(load.Describe());
-            }
-
-            return info;
+            return BuildAndPublish(kind, kindText, CancellationToken.None);
         }
+        finally
+        {
+            _resetGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// The admin form of <see cref="Reset(ResetKind)"/>: the same reset, which waits for a running
+    /// reset without holding a thread, builds the new state off the request thread and stops before
+    /// the swap once <paramref name="cancellationToken"/> is cancelled.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The reset gate admits one reset at a time, so at most one worker builds a state, whatever the
+    /// number of waiting requests. Cancellation is cooperative: it is observed while waiting for the
+    /// gate, before and after the seed fingerprint, between the seed files, lines, image chunks and
+    /// rows of the load, and once more immediately before the swap. A cancelled reset leaves the
+    /// previous state, generation and mutation count as they were; once that last check passes, the
+    /// swap and the console lines are no longer cancellable and the reset completes.
+    /// </para>
+    /// <para>
+    /// The load never opens a seed or image entry of length 0, so a FIFO or device in the seed
+    /// directory cannot block it. Two points remain that no cancellation interrupts, and the request
+    /// waits for the worker to stop rather than answer while it may still publish: the shared
+    /// <see cref="SeedFingerprint"/>, which opens and reads every file in the directory synchronously
+    /// and so waits on a FIFO there until a writer opens it, and an entry replaced by a FIFO between
+    /// the load's length check and its open.
+    /// </para>
+    /// </remarks>
+    /// <param name="kind">The state to build.</param>
+    /// <param name="cancellationToken">Stops the reset before the swap, normally the request's abort token.</param>
+    /// <returns>The <see cref="StandInInfo"/> of the new state.</returns>
+    /// <inheritdoc cref="Reset(ResetKind)" path="/exception"/>
+    /// <exception cref="OperationCanceledException">
+    /// <paramref name="cancellationToken"/> was cancelled before the swap; nothing changed.
+    /// </exception>
+    public async Task<StandInInfo> ResetAsync(ResetKind kind, CancellationToken cancellationToken)
+    {
+        string kindText = ResetKinds.ToQueryValue(kind);
+
+        await _resetGate.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            // The one reset worker: the gate is held until it ends, so no second build can start.
+            return await Task.Run(() => BuildAndPublish(kind, kindText, cancellationToken), cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            _resetGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Builds the new state, then swaps it in and prints the reset lines; callers hold the reset
+    /// gate. Every exception, a cancellation included, is thrown before the swap; from the swap on
+    /// nothing throws.
+    /// </summary>
+    private StandInInfo BuildAndPublish(ResetKind kind, string kindText, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        string seedSha256 = SeedFingerprint.ComputeSha256Hex(SeedDirectory);
+        cancellationToken.ThrowIfCancellationRequested();
+
+        // Created before the load, so load-time GUIDs take 1, 2, 3, ... in creation order and
+        // request-time GUIDs continue from where the load stopped.
+        var guids = new GuidSequence();
+        SeedLoadResult? load = null;
+        if (kind == ResetKind.Seed)
+        {
+            var loadContext = new ModelContext(null, guids.Next, ClockBase);
+            load = SeedLoader.Load(SeedDirectory, ReferenceDate, loadContext, cancellationToken);
+        }
+
+        var snapshot = new Snapshot(load?.Company, kind, seedSha256, load, guids);
+
+        // Only a reset changes the generation and resets are serialised, so the generation this
+        // reset publishes is known now. Every console line is composed before the swap, so that
+        // nothing after it can fail.
+        long generation = Generation + 1;
+        string summary = string.Create(
+            CultureInfo.InvariantCulture,
+            $"{SourceLabels.ConsolePrefix} reset generation={generation} kind={kindText} referenceDate={ReferenceDateText} seedSha256={seedSha256}");
+        string? description = load?.Describe();
+
+        // The last point at which the reset can still stop with nothing changed.
+        cancellationToken.ThrowIfCancellationRequested();
+
+        StandInInfo info;
+        lock (_gate)
+        {
+            _current = snapshot;
+            _generation = generation;
+            _mutations = 0;
+            info = CreateInfo();
+        }
+
+        WriteResetLines(generation, summary, description);
+        return info;
     }
 
     /// <summary>Returns the facts <see cref="AdminRoutes.Info"/> reports.</summary>
@@ -528,6 +613,33 @@ public sealed class StandInState
     // Callers hold _gate.
     private StandInInfo CreateInfo() =>
         new(SourceLabels.StandIn, _current.SeedSha256, ReferenceDateText, _generation, _mutations);
+
+    /// <summary>
+    /// Prints <see cref="SourceLabels.Banner"/>, the reset summary and, when present, the load
+    /// description, after the new state is published. The reset has then already happened, so a
+    /// console that cannot be written (a full disk, a file-size limit, a closed or redirected stream
+    /// that rejects writes) is logged as a warning instead of failing the reset.
+    /// </summary>
+    private void WriteResetLines(long generation, string summary, string? description)
+    {
+        try
+        {
+            Console.WriteLine(SourceLabels.Banner);
+            Console.WriteLine(summary);
+            if (description != null)
+            {
+                Console.WriteLine(description);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or ArgumentException or ObjectDisposedException
+            or UnauthorizedAccessException or NotSupportedException)
+        {
+            LogResetOutputFailed(_logger, ex, generation);
+        }
+    }
+
+    [LoggerMessage(EventId = 1, Level = LogLevel.Warning, Message = "Reset generation {Generation} is published, but its console lines could not be written")]
+    private static partial void LogResetOutputFailed(ILogger logger, Exception exception, long generation);
 
     /// <summary>
     /// One built state. The fields never change; the company's object graph is the live model that

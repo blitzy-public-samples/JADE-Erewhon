@@ -42,6 +42,9 @@ public static class SeedTokenizer
     private const char Space = ' ';
     private const int Windows1252CodePage = 1252;
 
+    // The file buffer StreamReader uses when it opens a path itself.
+    private const int FileStreamBufferSize = 4096;
+
     static SeedTokenizer()
     {
         // Registration is idempotent; doing it here keeps the tokenizer usable without relying
@@ -64,27 +67,66 @@ public static class SeedTokenizer
     /// the null string and its first character is not <see cref="LineSkipDelimiter"/>.
     /// </summary>
     /// <param name="path">The seed file to read.</param>
+    /// <param name="cancellationToken">
+    /// Stops the read: it is observed before the file is opened and once per physical line.
+    /// </param>
     /// <returns>
     /// The data lines in file order, each trimmed of leading and trailing spaces and carrying its
     /// 1-based physical line number. Tabs are kept; the token rule skips leading ones.
     /// </returns>
     /// <remarks>
+    /// <para>
     /// <c>\n</c>, <c>\r\n</c> and <c>\r</c> terminators are all accepted, as with JADE's automatic
     /// end-of-line handling (<c>endOfLine := null</c>), and a final line without a terminator is
     /// read. No byte-order mark is interpreted, because JADE reads these files as ANSI.
+    /// </para>
+    /// <para>
+    /// An entry whose length is 0, after any symbolic link is resolved to its final target, is not
+    /// opened and has no lines. An empty file has none anyway, and a FIFO or a device also reports
+    /// length 0: opening one for reading waits for a writer, which no cancellation can interrupt.
+    /// </para>
     /// </remarks>
     /// <exception cref="FileNotFoundException">The file does not exist, as JADE's <c>openInput</c> fails.</exception>
     /// <exception cref="DirectoryNotFoundException">The file's directory does not exist.</exception>
-    public static IReadOnlyList<SeedLine> ReadLines(string path)
+    /// <exception cref="IOException">
+    /// The opened entry is not a regular file (the message names the file, not its directory), or
+    /// the file cannot be read.
+    /// </exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public static IReadOnlyList<SeedLine> ReadLines(string path, CancellationToken cancellationToken = default)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
+        cancellationToken.ThrowIfCancellationRequested();
 
         var lines = new List<SeedLine>();
-        using var reader = new StreamReader(path, SeedEncoding, detectEncodingFromByteOrderMarks: false);
+
+        // A FileInfo describes a symbolic link itself, whose length is that of its target's path, so
+        // the final target is the entry whose length decides. A missing file, a dangling link and a
+        // directory do not exist as files; the open below then throws as it always has.
+        var entry = new FileInfo(path);
+        if (entry.LinkTarget != null && entry.ResolveLinkTarget(returnFinalTarget: true) is FileInfo target)
+        {
+            entry = target;
+        }
+
+        if (entry.Exists && entry.Length == 0)
+        {
+            return lines;
+        }
+
+        // The stream StreamReader(path, ...) opens, so the bytes read and their decoding are unchanged.
+        using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, FileStreamBufferSize, FileOptions.SequentialScan);
+        if (!stream.CanSeek)
+        {
+            throw new IOException($"The seed file '{Path.GetFileName(path)}' is not a regular file.");
+        }
+
+        using var reader = new StreamReader(stream, SeedEncoding, detectEncodingFromByteOrderMarks: false);
 
         var lineNumber = 0;
         while (reader.ReadLine() is { } raw)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             lineNumber++;
             var text = TrimBlanks(raw);
             if (text.Length == 0 || text[FirstIndexInLine - 1] == LineSkipDelimiter)

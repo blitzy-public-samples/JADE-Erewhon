@@ -41,6 +41,10 @@ public static partial class AdminEndpoints
     private const string InvalidStateMessage =
         $"{AdminRoutes.ResetStateQueryKey} must be '{AdminRoutes.ResetStateSeed}' or '{AdminRoutes.ResetStateEmpty}'";
 
+    // The whole body of a failed reset. The exception goes only to the log: its message can name
+    // host paths, seed file names and seed values.
+    private const string ResetFailedMessage = "reset failed; the previous state is kept";
+
     /// <summary>
     /// Maps <see cref="AdminRoutes.Health"/>, <see cref="AdminRoutes.Info"/>,
     /// <see cref="AdminRoutes.Reset"/>, <see cref="AdminRoutes.Shutdown"/> and the admin
@@ -103,28 +107,44 @@ public static partial class AdminEndpoints
             .RequireListener(ListenerKind.Admin);
     }
 
-    private static Task ResetAsync(HttpContext context, StandInState state, ILogger logger)
+    /// <summary>
+    /// Runs <see cref="StandInState.ResetAsync"/> for the requested kind without holding the request
+    /// thread, and stops it before the swap when the client disconnects.
+    /// </summary>
+    private static async Task ResetAsync(HttpContext context, StandInState state, ILogger logger)
     {
         if (!TryGetResetKind(context.Request.Query[AdminRoutes.ResetStateQueryKey], out ResetKind kind))
         {
-            return WriteTextAsync(context.Response, StatusCodes.Status400BadRequest, InvalidStateMessage, context.RequestAborted);
+            await WriteTextAsync(context.Response, StatusCodes.Status400BadRequest, InvalidStateMessage, context.RequestAborted)
+                .ConfigureAwait(false);
+            return;
         }
 
         StandInInfo info;
         try
         {
-            info = state.Reset(kind);
+            info = await state.ResetAsync(kind, context.RequestAborted).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (context.RequestAborted.IsCancellationRequested)
+        {
+            // The client went away, so no response can reach it, and the reset stopped before the
+            // swap: nothing changed and nothing failed.
+            LogResetAbandoned(logger, ResetKinds.ToQueryValue(kind));
+            return;
         }
         catch (Exception ex)
         {
-            // StandInState swaps the state only after a successful build, so the previous state,
-            // generation and mutation count still stand and the harness sees the failure as a
-            // generation that did not advance.
+            // StandInState throws only before it swaps in the new state; once swapped, a reset
+            // returns its info even when the console lines cannot be written. A failure here
+            // therefore leaves the previous state, generation and mutation count, and the harness
+            // sees it as a generation that did not advance.
             LogResetFailed(logger, ex, ResetKinds.ToQueryValue(kind));
-            return WriteTextAsync(context.Response, StatusCodes.Status500InternalServerError, ex.Message, context.RequestAborted);
+            await WriteTextAsync(context.Response, StatusCodes.Status500InternalServerError, ResetFailedMessage, context.RequestAborted)
+                .ConfigureAwait(false);
+            return;
         }
 
-        return WriteInfoAsync(context.Response, info, context.RequestAborted);
+        await WriteInfoAsync(context.Response, info, context.RequestAborted).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -208,6 +228,9 @@ public static partial class AdminEndpoints
     [LoggerMessage(EventId = 1, Level = LogLevel.Information, Message = "Shutdown requested on the admin listener; the host stops once the response completes")]
     private static partial void LogShutdownRequested(ILogger logger);
 
-    [LoggerMessage(EventId = 2, Level = LogLevel.Error, Message = "Reset to state '{State}' failed; the previous state is kept")]
+    [LoggerMessage(EventId = 2, Level = LogLevel.Error, Message = "Reset to state '{State}' failed before the new state was published; the previous state, generation and mutation count are kept")]
     private static partial void LogResetFailed(ILogger logger, Exception exception, string state);
+
+    [LoggerMessage(EventId = 3, Level = LogLevel.Information, Message = "Reset to state '{State}' abandoned because the client disconnected; the previous state, generation and mutation count are kept")]
+    private static partial void LogResetAbandoned(ILogger logger, string state);
 }
