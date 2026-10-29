@@ -67,6 +67,12 @@ public abstract class Sale : PersistentModel
     /// </remarks>
     /// <param name="salePrice">The amount the commission is earned on.</param>
     /// <exception cref="InvalidOperationException">The sale has no item.</exception>
+    /// <exception cref="JadeDecimalOverflowException">
+    /// The rounded commission does not fit <c>Decimal[12,2]</c>; <see cref="AgentCommission"/> is
+    /// left at 0, as JADE leaves it after its first assignment. A sale price that fits
+    /// <c>Decimal[12,2]</c> never overflows while <c>CommissionRateTA</c> keeps every percentage at
+    /// 100 or below.
+    /// </exception>
     internal void CalculateAgentCommission(decimal salePrice)
     {
         // JADE raises a null-reference exception reading myItem.myItemCategory; the sale agents
@@ -87,9 +93,10 @@ public abstract class Sale : PersistentModel
             if (rate != null)
             {
                 // Assignment to Decimal[12,2] rounds to two places, assumed half away from zero
-                // (register entry KL-STANDIN-ROUNDING); the product itself is exact in decimal.
-                AgentCommission = Math.Round(
-                    salePrice * (rate.Percentage / 100m), 2, MidpointRounding.AwayFromZero);
+                // (register entry KL-STANDIN-ROUNDING), and raises JADE exception 4033 when the
+                // result does not fit; the product itself is exact in decimal.
+                AgentCommission = JadeValues.AssignDecimal(
+                    salePrice * (rate.Percentage / 100m), precision: 12);
             }
         }
     }

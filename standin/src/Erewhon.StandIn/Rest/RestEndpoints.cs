@@ -472,13 +472,28 @@ public static class RestEndpoints
                 return Result(_status.BadRequest, [Messages.ItemNotTenderItem]);
             }
 
-            var tenderTA = new TenderTA
+            var tenderTA = new TenderTA();
+            try
             {
-                Offer = arguments.Amount(3),
-                DateTendered = context.Now,
-                MyClient = client,
-                MyTenderItem = tenderItem,
-            };
+                tenderTA.Offer = arguments.Amount(3);
+            }
+            catch (JadeDecimalOverflowException exception)
+            {
+                // tenderTA.offer := pOffer (scm:2841) raises JADE exception 4033 for an offer that does
+                // not fit Decimal[12,2]. The method does not handle it, and an unhandled exception in a
+                // JadeRestService method answers HTTP 500; nothing has been persisted. A modelled JADE
+                // outcome, not a stand-in fault, so it is not logged as an error.
+                _logger.LogDebug(
+                    "REST {OperationId}: {Message} Answering {Status} with null.",
+                    arguments.Operation.Id,
+                    exception.Message,
+                    _status.ServerError);
+                return NullBody(_status.ServerError);
+            }
+
+            tenderTA.DateTendered = context.Now;
+            tenderTA.MyClient = client;
+            tenderTA.MyTenderItem = tenderItem;
 
             return tenderTA.PersistEntity(TransactionType.Persist, context.Model)
                 ? CreatedResult(tenderTA)

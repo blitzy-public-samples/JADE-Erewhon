@@ -61,6 +61,18 @@ public sealed class OrderingEvidence(HarnessOptions options)
 
     private readonly HarnessOptions _options = options ?? throw new ArgumentNullException(nameof(options));
 
+    private readonly GitRunner _git = Git.RunAsync;
+
+    /// <summary>Creates the check with the git runner every git invocation goes through.</summary>
+    /// <param name="options">The harness settings: <see cref="HarnessOptions.RepoRoot"/>.</param>
+    /// <param name="git">Runs each git invocation in place of <see cref="Git.RunAsync"/>.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="options"/> or <paramref name="git"/> is null.</exception>
+    internal OrderingEvidence(HarnessOptions options, GitRunner git)
+        : this(options)
+    {
+        _git = git ?? throw new ArgumentNullException(nameof(git));
+    }
+
     /// <summary>Runs the check.</summary>
     /// <param name="ct">Cancels the check; the running git process is killed and the cancellation rethrown.</param>
     /// <returns>The report row, the failing item and the two commits found.</returns>
@@ -76,7 +88,7 @@ public sealed class OrderingEvidence(HarnessOptions options)
         // In a shallow clone the boundary commit looks as if it added every file it holds, so the first
         // adding commit git reports could be an artefact of the truncation rather than evidence.
         string[] shallowArgs = ["rev-parse", "--is-shallow-repository"];
-        var shallow = await Git.RunAsync(repoRoot, shallowArgs, Git.DefaultTimeout, ct).ConfigureAwait(false);
+        var shallow = await _git(repoRoot, shallowArgs, Git.DefaultTimeout, ct).ConfigureAwait(false);
         if (!shallow.Succeeded)
         {
             return NotRun(CommandFailure(shallowArgs, shallow), baselineCommit: null, facadeCommit: null);
@@ -129,7 +141,7 @@ public sealed class OrderingEvidence(HarnessOptions options)
         }
 
         string[] ancestorArgs = ["merge-base", "--is-ancestor", baselineCommit, facadeCommit];
-        var ancestor = await Git.RunAsync(repoRoot, ancestorArgs, Git.DefaultTimeout, ct).ConfigureAwait(false);
+        var ancestor = await _git(repoRoot, ancestorArgs, Git.DefaultTimeout, ct).ConfigureAwait(false);
         if (ancestor.Unavailable || ancestor.TimedOut)
         {
             return NotRun(CommandFailure(ancestorArgs, ancestor), baselineCommit, facadeCommit);
@@ -157,7 +169,7 @@ public sealed class OrderingEvidence(HarnessOptions options)
     }
 
     // The commit that first added a path matching the pathspec, or null when none did.
-    private static async Task<CommitLookup> FirstAddingCommitAsync(string repoRoot, string pathspec, CancellationToken ct)
+    private async Task<CommitLookup> FirstAddingCommitAsync(string repoRoot, string pathspec, CancellationToken ct)
     {
         // `--reverse` is applied after commit limiting, so `-n1` would yield the newest adding commit;
         // the first line of the full reversed list is the oldest instead.
@@ -171,7 +183,7 @@ public sealed class OrderingEvidence(HarnessOptions options)
             "log", "--full-history", "--date-order", "--root", "--no-follow",
             "--diff-filter=A", "--no-renames", "--reverse", "--format=%H", "--", pathspec,
         ];
-        var log = await Git.RunAsync(repoRoot, args, Git.DefaultTimeout, ct).ConfigureAwait(false);
+        var log = await _git(repoRoot, args, Git.DefaultTimeout, ct).ConfigureAwait(false);
         if (!log.Succeeded)
         {
             return new CommitLookup(Commit: null, CommandFailure(args, log));

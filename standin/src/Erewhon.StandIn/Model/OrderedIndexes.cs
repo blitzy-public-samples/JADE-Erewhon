@@ -33,8 +33,13 @@ public abstract class PersistentModel
 /// </summary>
 /// <remarks>
 /// <para>
-/// Membership is by reference. Changing a key member of an included entry leaves the order stale
-/// until <see cref="Rekey"/> is called for it, so callers re-key immediately after such a change.
+/// Membership is by reference, held in a reference-identity set beside the ordered entries, so
+/// <see cref="Includes"/> and the duplicate check of <see cref="Add"/> take constant time.
+/// <see cref="Remove"/> and <see cref="Rekey"/> find an entry by binary search on its keys, and by
+/// a scan only when its key members changed since it was placed. Changing a key member of an
+/// included entry leaves the order stale until <see cref="Rekey"/> is called for it, so callers
+/// re-key immediately after such a change. A key comparison that throws leaves the dictionary
+/// unchanged.
 /// </para>
 /// <para>
 /// The Erewhon dictionaries do not allow duplicate keys in JADE, which raises exception 1310 for
@@ -49,6 +54,9 @@ public abstract class MemberKeyDictionary<T> : IReadOnlyCollection<T>
     where T : PersistentModel
 {
     private readonly List<T> _entries = [];
+
+    // The same references as _entries: every successful Add and Remove changes both.
+    private readonly HashSet<T> _members = new(ReferenceEqualityComparer.Instance);
 
     /// <summary>Number of entries.</summary>
     public int Count => _entries.Count;
@@ -67,14 +75,18 @@ public abstract class MemberKeyDictionary<T> : IReadOnlyCollection<T>
     public void Add(T item)
     {
         ArgumentNullException.ThrowIfNull(item);
-        if (IndexOfReference(item) >= 0)
+        if (_members.Contains(item))
         {
             // JADE raises exception 1309 when an object is added to a collection that holds it.
             throw new InvalidOperationException(
                 $"{GetType().Name} already includes this {item.GetType().Name} (oid {item.Oid}).");
         }
 
-        _entries.Insert(InsertionIndex(item), item);
+        // The position is found before either structure changes, so a key comparison that throws
+        // leaves the dictionary as it was.
+        int index = InsertionIndex(item, excludedIndex: -1);
+        _entries.Insert(index, item);
+        _members.Add(item);
     }
 
     /// <summary>
@@ -84,13 +96,13 @@ public abstract class MemberKeyDictionary<T> : IReadOnlyCollection<T>
     public bool Remove(T item)
     {
         ArgumentNullException.ThrowIfNull(item);
-        int index = IndexOfReference(item);
-        if (index < 0)
+        if (!_members.Contains(item))
         {
             return false;
         }
 
-        _entries.RemoveAt(index);
+        _entries.RemoveAt(IndexOfMember(item));
+        _members.Remove(item);
         return true;
     }
 
@@ -101,18 +113,24 @@ public abstract class MemberKeyDictionary<T> : IReadOnlyCollection<T>
     public void Rekey(T item)
     {
         ArgumentNullException.ThrowIfNull(item);
-        int index = IndexOfReference(item);
-        if (index < 0)
+        if (!_members.Contains(item))
         {
             return;
         }
 
-        _entries.RemoveAt(index);
-        _entries.Insert(InsertionIndex(item), item);
+        // Both positions are found before the entries change, so a key comparison that throws
+        // leaves the entry where it was. Membership is unchanged.
+        int index = IndexOfMember(item);
+        int target = InsertionIndex(item, excludedIndex: index);
+        if (target != index)
+        {
+            _entries.RemoveAt(index);
+            _entries.Insert(target, item);
+        }
     }
 
     /// <summary>True when this exact reference is included; false for null.</summary>
-    public bool Includes(T? item) => item is not null && IndexOfReference(item) >= 0;
+    public bool Includes(T? item) => item is not null && _members.Contains(item);
 
     /// <summary>The first entry in key order, or null when empty.</summary>
     public T? First() => _entries.Count == 0 ? null : _entries[0];
@@ -164,16 +182,72 @@ public abstract class MemberKeyDictionary<T> : IReadOnlyCollection<T>
         return low < _entries.Count && compareEntryToKey(_entries[low]) == 0 ? _entries[low] : null;
     }
 
-    // Upper bound under the total order (keys, then Oid): the item goes after every entry that
-    // sorts before or equal to it.
-    private int InsertionIndex(T item)
+    /// <summary>
+    /// Returns a snapshot of every entry, in key order, whose key equals the probe; empty when none
+    /// does. Two binary searches bound the matching range, and only that range is copied.
+    /// </summary>
+    /// <param name="compareEntryToKey">
+    /// Sign of the entry's key against the probe key, using the comparers of
+    /// <see cref="CompareKeys"/>; the probe may cover only the leading keys.
+    /// </param>
+    protected IReadOnlyList<T> FindAll(Func<T, int> compareEntryToKey)
     {
+        ArgumentNullException.ThrowIfNull(compareEntryToKey);
+
+        // Lower bound: the first entry that does not sort before the probe.
         int low = 0;
         int high = _entries.Count;
         while (low < high)
         {
             int mid = low + ((high - low) >> 1);
-            if (CompareEntries(_entries[mid], item) <= 0)
+            if (compareEntryToKey(_entries[mid]) < 0)
+            {
+                low = mid + 1;
+            }
+            else
+            {
+                high = mid;
+            }
+        }
+
+        // Upper bound: the first entry after the start that sorts after the probe.
+        int start = low;
+        high = _entries.Count;
+        while (low < high)
+        {
+            int mid = low + ((high - low) >> 1);
+            if (compareEntryToKey(_entries[mid]) <= 0)
+            {
+                low = mid + 1;
+            }
+            else
+            {
+                high = mid;
+            }
+        }
+
+        if (low == start)
+        {
+            return [];
+        }
+
+        var matches = new T[low - start];
+        _entries.CopyTo(start, matches, 0, matches.Length);
+        return matches;
+    }
+
+    // Upper bound under the total order (keys, then Oid): the item goes after every entry that
+    // sorts before or equal to it. With excludedIndex >= 0 the search runs over the entries without
+    // the one at that index, and the result is the position in the list once it is removed.
+    private int InsertionIndex(T item, int excludedIndex)
+    {
+        int low = 0;
+        int high = excludedIndex < 0 ? _entries.Count : _entries.Count - 1;
+        while (low < high)
+        {
+            int mid = low + ((high - low) >> 1);
+            T entry = _entries[excludedIndex < 0 || mid < excludedIndex ? mid : mid + 1];
+            if (CompareEntries(entry, item) <= 0)
             {
                 low = mid + 1;
             }
@@ -184,6 +258,46 @@ public abstract class MemberKeyDictionary<T> : IReadOnlyCollection<T>
         }
 
         return low;
+    }
+
+    // Index of an included entry. An entry still at the position its keys dictate is found by
+    // binary search under the total order (keys, then Oid); one whose key members changed and that
+    // has not been re-keyed yet is found by scanning.
+    private int IndexOfMember(T item)
+    {
+        int low = 0;
+        int high = _entries.Count;
+        while (low < high)
+        {
+            int mid = low + ((high - low) >> 1);
+            if (CompareEntries(_entries[mid], item) < 0)
+            {
+                low = mid + 1;
+            }
+            else
+            {
+                high = mid;
+            }
+        }
+
+        for (int i = low; i < _entries.Count && CompareEntries(_entries[i], item) == 0; i++)
+        {
+            if (ReferenceEquals(_entries[i], item))
+            {
+                return i;
+            }
+        }
+
+        int index = IndexOfReference(item);
+        if (index < 0)
+        {
+            // Unreachable while every change goes through Add and Remove, which update both.
+            throw new InvalidOperationException(
+                $"{GetType().Name} has this {item.GetType().Name} (oid {item.Oid}) in its " +
+                "membership set but not in its entries.");
+        }
+
+        return index;
     }
 
     private int CompareEntries(T x, T y)
@@ -472,6 +586,13 @@ public sealed class TendersByItemTimeOfferDict : MemberKeyDictionary<Tender>
 /// </summary>
 public sealed class TendersByOfferTimeDict : MemberKeyDictionary<Tender>
 {
+    /// <summary>
+    /// A snapshot of the tenders whose offer equals this one by value (3.5 equals 3.50), in key
+    /// order: earliest first. Empty when none does.
+    /// </summary>
+    public IReadOnlyList<Tender> WithOffer(decimal offer) =>
+        FindAll(entry => KeyOrder.Descending(KeyOrder.Value(entry.Offer, offer)));
+
     /// <inheritdoc />
     protected override int CompareKeys(Tender x, Tender y)
     {

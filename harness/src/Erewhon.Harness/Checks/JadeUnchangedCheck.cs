@@ -22,6 +22,17 @@ public sealed record GitResult(int ExitCode, string StdOut, string StdErr, bool 
 }
 
 /// <summary>
+/// Runs one git invocation for <see cref="JadeUnchangedCheck"/> and <see cref="OrderingEvidence"/>.
+/// <see cref="Git.RunAsync"/> is the production implementation; tests pass a scripted one.
+/// </summary>
+/// <param name="repoRoot">The repository root; also git's working directory.</param>
+/// <param name="args">The git arguments, passed as an argument list.</param>
+/// <param name="timeout">The limit for the whole invocation.</param>
+/// <param name="ct">Cancels the invocation.</param>
+/// <returns>The invocation's outcome.</returns>
+internal delegate Task<GitResult> GitRunner(string repoRoot, IReadOnlyList<string> args, TimeSpan timeout, CancellationToken ct);
+
+/// <summary>
 /// The harness's single git runner. Every git invocation the harness makes (the JADE-unchanged and
 /// ordering checks, and capture's <c>rev-parse HEAD</c>) goes through <see cref="RunAsync"/>, so each one
 /// is bounded, read-only with respect to the index, and independent of the caller's git configuration
@@ -253,6 +264,18 @@ public sealed class JadeUnchangedCheck(HarnessOptions options)
 
     private readonly HarnessOptions _options = options ?? throw new ArgumentNullException(nameof(options));
 
+    private readonly GitRunner _git = Git.RunAsync;
+
+    /// <summary>Creates the check with the git runner every git invocation goes through.</summary>
+    /// <param name="options">The harness settings: <see cref="HarnessOptions.RepoRoot"/> and <see cref="HarnessOptions.StartingCommit"/>.</param>
+    /// <param name="git">Runs each git invocation in place of <see cref="Git.RunAsync"/>.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="options"/> or <paramref name="git"/> is null.</exception>
+    internal JadeUnchangedCheck(HarnessOptions options, GitRunner git)
+        : this(options)
+    {
+        _git = git ?? throw new ArgumentNullException(nameof(git));
+    }
+
     private enum ChangeKind
     {
         // Ordered by precedence when the diff and the status disagree about one path.
@@ -285,19 +308,19 @@ public sealed class JadeUnchangedCheck(HarnessOptions options)
         string[] statusArgs = ["status", "--porcelain", "--no-renames", "--untracked-files=all", "-z", "--", JadePathspec];
         string[] treeArgs = ["ls-tree", "-r", "--name-only", "-z", commit, "--", JadePathspec];
 
-        var diff = await Git.RunAsync(repoRoot, diffArgs, Git.DefaultTimeout, ct).ConfigureAwait(false);
+        var diff = await _git(repoRoot, diffArgs, Git.DefaultTimeout, ct).ConfigureAwait(false);
         if (!diff.Succeeded)
         {
             return NotRun(CommandFailure(diffArgs, diff));
         }
 
-        var status = await Git.RunAsync(repoRoot, statusArgs, Git.DefaultTimeout, ct).ConfigureAwait(false);
+        var status = await _git(repoRoot, statusArgs, Git.DefaultTimeout, ct).ConfigureAwait(false);
         if (!status.Succeeded)
         {
             return NotRun(CommandFailure(statusArgs, status));
         }
 
-        var tree = await Git.RunAsync(repoRoot, treeArgs, Git.DefaultTimeout, ct).ConfigureAwait(false);
+        var tree = await _git(repoRoot, treeArgs, Git.DefaultTimeout, ct).ConfigureAwait(false);
         if (!tree.Succeeded)
         {
             return NotRun(CommandFailure(treeArgs, tree));
@@ -412,9 +435,9 @@ public sealed class JadeUnchangedCheck(HarnessOptions options)
 
     // The blob id git would store for the path's current content (filters applied, nothing written),
     // or "unknown" when git cannot hash it, for example for a nested repository's directory.
-    private static async Task<string> BlobIdAsync(string repoRoot, string path, CancellationToken ct)
+    private async Task<string> BlobIdAsync(string repoRoot, string path, CancellationToken ct)
     {
-        var hash = await Git.RunAsync(repoRoot, ["hash-object", "--", path], Git.DefaultTimeout, ct).ConfigureAwait(false);
+        var hash = await _git(repoRoot, ["hash-object", "--", path], Git.DefaultTimeout, ct).ConfigureAwait(false);
         var blob = hash.Succeeded ? hash.StdOut.Trim() : string.Empty;
         return blob.Length == 0 || blob.Contains('\n', StringComparison.Ordinal) ? UnknownBlob : blob;
     }

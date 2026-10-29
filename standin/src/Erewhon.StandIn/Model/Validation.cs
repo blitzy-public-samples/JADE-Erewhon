@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text.RegularExpressions;
 
 namespace Erewhon.StandIn.Model;
@@ -61,11 +62,18 @@ public static class JadeValues
     // String::trimWhiteSpace constant WhiteSpaceCharacters: Cr & Lf & Tab & Space & #'00'.
     private static readonly char[] WhiteSpaceCharacters = ['\r', '\n', '\t', ' ', '\0'];
 
-    // JadeRegex@isMatch( email, EmailRegEx, true ) ignores case (ErewhonModelSchema.scm 9876).
+    // JadeRegex wraps PCRE, whose default \w is this ASCII word class. .NET's \w also matches the
+    // letters, digits and connector punctuation of every script, so josé@example.com would pass.
+    private const string AsciiWordClass = "[A-Za-z0-9_]";
+
+    // EmailRegEx as JADE evaluates it: its text with each \w replaced by AsciiWordClass and nothing
+    // else changed. EmailRegEx holds no escaped backslash, so every "\w" in it is the class escape.
+    // JadeRegex@isMatch( email, EmailRegEx, true ) ignores case (ErewhonModelSchema.scm 9876); with
+    // IgnoreCase the class also matches U+212A KELVIN SIGN, the case equivalent of K.
     // NonBacktracking gives the same match result in linear time, so an email sent in a request
     // cannot make the shared request lock wait on regex backtracking.
     private static readonly Regex EmailPattern = new(
-        EmailRegEx,
+        EmailRegEx.Replace(@"\w", AsciiWordClass, StringComparison.Ordinal),
         RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.NonBacktracking);
 
     /// <summary>
@@ -79,18 +87,80 @@ public static class JadeValues
     /// <returns>The trimmed text; the JADE null string (<c>""</c>) for null input.</returns>
     public static string TrimBlanks(string? value) => value?.Trim(' ') ?? "";
 
+    // The scale of every Decimal attribute the stand-in models (Decimal[5,2] and Decimal[12,2]).
+    private const int DecimalScale = 2;
+
+    // System.Decimal holds every number of up to 28 digits exactly, so the overflow bound of a
+    // larger declared precision could not be represented.
+    private const int MaxDecimalPrecision = 28;
+
+    // DecimalOverflowBounds[precision - DecimalScale] is 10^(precision - 2), the smallest magnitude a
+    // Decimal[precision,2] cannot hold.
+    private static readonly decimal[] DecimalOverflowBounds = CreateDecimalOverflowBounds();
+
     /// <summary>
-    /// Assignment to a JADE <c>Decimal[n,2]</c>: rounds to two decimal places, half away from zero.
+    /// The scale-rounding step of an assignment to a JADE <c>Decimal[n,2]</c>: rounds to two decimal
+    /// places, half away from zero. It does not check the precision <c>n</c>; an assignment to a
+    /// declared attribute goes through <see cref="AssignDecimal"/>, which does.
     /// </summary>
     /// <remarks>
     /// JADE does not document its Decimal assignment rounding; half away from zero is the assumption
     /// registered as KL-STANDIN-ROUNDING.
     /// </remarks>
-    public static decimal RoundScale2(decimal value) => Math.Round(value, 2, MidpointRounding.AwayFromZero);
+    public static decimal RoundScale2(decimal value) => Math.Round(value, DecimalScale, MidpointRounding.AwayFromZero);
+
+    /// <summary>
+    /// Assignment to a JADE <c>Decimal[<paramref name="precision"/>,2]</c> attribute: rounds the value
+    /// to two decimal places with <see cref="RoundScale2"/>, then raises JADE exception 4033 when the
+    /// rounded value needs more than <paramref name="precision"/> digits.
+    /// </summary>
+    /// <remarks>
+    /// The precision counts every digit, the two fractional ones included, so <c>Decimal[12,2]</c>
+    /// holds magnitudes up to 9999999999.99 and <c>Decimal[5,2]</c> up to 999.99. Rounding comes
+    /// first: 9999999999.994 assigns 9999999999.99, and 9999999999.995 rounds to 10000000000.00 and
+    /// overflows. The caller stores only the returned value, so an assignment that overflows leaves
+    /// the attribute as it was.
+    /// </remarks>
+    /// <param name="value">The value assigned.</param>
+    /// <param name="precision">The attribute's declared precision, from 2 to 28.</param>
+    /// <returns><paramref name="value"/> rounded to two decimal places.</returns>
+    /// <exception cref="JadeDecimalOverflowException">
+    /// The rounded value does not fit <c>Decimal[<paramref name="precision"/>,2]</c>.
+    /// </exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="precision"/> is below 2 or above 28.
+    /// </exception>
+    public static decimal AssignDecimal(decimal value, int precision)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(precision, DecimalScale);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(precision, MaxDecimalPrecision);
+
+        decimal rounded = RoundScale2(value);
+        if (Math.Abs(rounded) >= DecimalOverflowBounds[precision - DecimalScale])
+        {
+            throw new JadeDecimalOverflowException(value, precision, DecimalScale);
+        }
+
+        return rounded;
+    }
+
+    private static decimal[] CreateDecimalOverflowBounds()
+    {
+        var bounds = new decimal[MaxDecimalPrecision - DecimalScale + 1];
+        decimal bound = 1m;
+        for (int integerDigits = 0; integerDigits < bounds.Length; integerDigits++)
+        {
+            bounds[integerDigits] = bound;
+            bound *= 10m;
+        }
+
+        return bounds;
+    }
 
     /// <summary>
     /// JADE <c>JadeRegex@isMatch( email, EmailRegEx, true )</c>: true when <paramref name="email"/>
-    /// matches <see cref="EmailRegEx"/>, ignoring case.
+    /// matches <see cref="EmailRegEx"/>, ignoring case, with <c>\w</c> as PCRE's ASCII word class
+    /// <c>[A-Za-z0-9_]</c>.
     /// </summary>
     /// <exception cref="ArgumentNullException"><paramref name="email"/> is null.</exception>
     public static bool IsValidEmail(string email)
@@ -161,6 +231,48 @@ public static class JadeValues
             && bytes.Length >= EnhancedMetafileSignatureOffset + EnhancedMetafileSignature.Length
             && bytes.Slice(EnhancedMetafileSignatureOffset, EnhancedMetafileSignature.Length)
                 .SequenceEqual(EnhancedMetafileSignature));
+}
+
+/// <summary>
+/// JADE exception 4033, "Result of expression overflows Decimal precision": raised by
+/// <see cref="JadeValues.AssignDecimal"/> when a value, rounded to the attribute's scale, needs more
+/// digits than the attribute's declared <c>Decimal[precision,scale]</c> holds.
+/// </summary>
+/// <remarks>
+/// It models the JADE runtime outcome of the assignment, not a validation rule: no transaction agent
+/// message exists for it, and the attribute keeps its previous value. A JADE REST method that does
+/// not handle it answers HTTP 500.
+/// </remarks>
+public sealed class JadeDecimalOverflowException : OverflowException
+{
+    /// <summary>The JADE error number of the overflow.</summary>
+    public const int JadeErrorNumber = 4033;
+
+    /// <summary>The JADE error text of <see cref="JadeErrorNumber"/>.</summary>
+    public const string JadeErrorText = "Result of expression overflows Decimal precision";
+
+    /// <summary>Creates the exception for <paramref name="value"/> assigned to a <c>Decimal[precision,scale]</c>.</summary>
+    /// <param name="value">The value assigned, before rounding.</param>
+    /// <param name="precision">The declared precision: the number of digits, fractional ones included.</param>
+    /// <param name="scale">The declared scale: the number of fractional digits.</param>
+    public JadeDecimalOverflowException(decimal value, int precision, int scale)
+        : base(string.Create(
+            CultureInfo.InvariantCulture,
+            $"JADE exception {JadeErrorNumber}, {JadeErrorText}: {value} rounded to {scale} decimal places does not fit Decimal[{precision},{scale}]."))
+    {
+        Value = value;
+        Precision = precision;
+        Scale = scale;
+    }
+
+    /// <summary>The value assigned, before rounding.</summary>
+    public decimal Value { get; }
+
+    /// <summary>The declared precision of the attribute assigned.</summary>
+    public int Precision { get; }
+
+    /// <summary>The declared scale of the attribute assigned.</summary>
+    public int Scale { get; }
 }
 
 /// <summary>
@@ -1495,10 +1607,14 @@ public sealed class CommissionRateTA : ModelTA
     private decimal _percentage;
 
     /// <summary>JADE <c>percentage: Decimal[5,2]</c>, rounded to two places on assignment.</summary>
+    /// <exception cref="JadeDecimalOverflowException">
+    /// The rounded value needs more than 5 digits (its magnitude is 1000 or more); the percentage
+    /// keeps its previous value.
+    /// </exception>
     public decimal Percentage
     {
         get => _percentage;
-        set => _percentage = JadeValues.RoundScale2(value);
+        set => _percentage = JadeValues.AssignDecimal(value, precision: 5);
     }
 
     /// <summary>JADE <c>myItemCategory</c>.</summary>
@@ -1688,10 +1804,14 @@ public abstract class ItemTA : ModelTA
     /// <summary>
     /// JADE <c>price: Decimal[12,2]</c> (a tender item's reserve), rounded to two places on assignment.
     /// </summary>
+    /// <exception cref="JadeDecimalOverflowException">
+    /// The rounded value needs more than 12 digits (its magnitude is 10000000000 or more); the price
+    /// keeps its previous value.
+    /// </exception>
     public decimal Price
     {
         get => _price;
-        set => _price = JadeValues.RoundScale2(value);
+        set => _price = JadeValues.AssignDecimal(value, precision: 12);
     }
 
     /// <summary>JADE <c>myAgent</c>.</summary>
@@ -1928,10 +2048,14 @@ public abstract class SaleTA : ModelTA
     /// JADE <c>agentCommission: Decimal[12,2]</c>, rounded to two places on assignment. The sale
     /// replaces it with the computed commission when it is created.
     /// </summary>
+    /// <exception cref="JadeDecimalOverflowException">
+    /// The rounded value needs more than 12 digits (its magnitude is 10000000000 or more); the
+    /// commission keeps its previous value.
+    /// </exception>
     public decimal AgentCommission
     {
         get => _agentCommission;
-        set => _agentCommission = JadeValues.RoundScale2(value);
+        set => _agentCommission = JadeValues.AssignDecimal(value, precision: 12);
     }
 
     /// <summary>JADE <c>myClient</c>: the buyer.</summary>
@@ -2042,10 +2166,14 @@ public sealed class RetailSaleTA : SaleTA
     }
 
     /// <summary>JADE <c>salePrice: Decimal[12,2]</c>, rounded to two places on assignment.</summary>
+    /// <exception cref="JadeDecimalOverflowException">
+    /// The rounded value needs more than 12 digits (its magnitude is 10000000000 or more); the sale
+    /// price keeps its previous value.
+    /// </exception>
     public decimal SalePrice
     {
         get => _salePrice;
-        set => _salePrice = JadeValues.RoundScale2(value);
+        set => _salePrice = JadeValues.AssignDecimal(value, precision: 12);
     }
 
     /// <summary>JADE <c>getModelObject</c>.</summary>
@@ -2205,10 +2333,14 @@ public sealed class TenderTA : ModelTA
     private decimal _offer;
 
     /// <summary>JADE <c>offer: Decimal[12,2]</c>, rounded to two places on assignment.</summary>
+    /// <exception cref="JadeDecimalOverflowException">
+    /// The rounded value needs more than 12 digits (its magnitude is 10000000000 or more); the offer
+    /// keeps its previous value.
+    /// </exception>
     public decimal Offer
     {
         get => _offer;
-        set => _offer = JadeValues.RoundScale2(value);
+        set => _offer = JadeValues.AssignDecimal(value, precision: 12);
     }
 
     /// <summary>
@@ -2292,11 +2424,14 @@ public sealed class TenderTA : ModelTA
             }
 
             // JADE: myClient <> null and offer <> null, the null Decimal being 0; one error per match.
+            // JADE scans all of allTendersByOfferTime for the client's tenders with an equal offer.
+            // That dictionary is keyed by offer first, so its equal-offer range holds every such
+            // tender in the same order, and only that range is read.
             if (MyClient != null && Offer != 0m)
             {
-                foreach (Tender tender in MyTenderItem.AllTendersByOfferTime)
+                foreach (Tender tender in MyTenderItem.AllTendersByOfferTime.WithOffer(Offer))
                 {
-                    if (ReferenceEquals(tender.MyClient, MyClient) && Offer == tender.Offer)
+                    if (ReferenceEquals(tender.MyClient, MyClient))
                     {
                         AddError(Messages.TenderAlreadyPlaced, FocusConstants.Offer);
                     }

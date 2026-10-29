@@ -20,12 +20,15 @@ namespace Erewhon.Harness.Checks;
 /// </param>
 /// <param name="Failures">
 /// <c>TEST:&lt;className&gt;/&lt;testName&gt;</c> items (<c>failed:&lt;signature&gt;</c> or <c>not-run</c>) and
-/// <c>CHK-FACADE-TRX</c> <c>missing</c> items, sorted ordinally by item id and free of duplicate
-/// (item id, nature) pairs.
+/// at most one <c>CHK-FACADE-TRX</c> <c>missing</c> item, whose detail names every problem with the
+/// TRX file and with the run's completion evidence. The list is sorted ordinally by item id and free
+/// of duplicate (item id, nature) pairs.
 /// </param>
 /// <param name="ExitCode">
-/// The <c>dotnet test</c> exit status recorded in <c>exit-code</c>; null when that file is absent or
-/// does not hold an integer.
+/// The <c>dotnet test</c> exit status recorded in <c>exit-code</c>; null when that file is absent,
+/// unreadable or does not hold an integer. It is report context only: whenever it is null or does
+/// not agree with the TRX results, <paramref name="Failures"/> holds the <c>CHK-FACADE-TRX</c>
+/// <c>missing</c> item that carries the verdict.
 /// </param>
 public sealed record FacadeTestSummary(
     CheckResult Routing,
@@ -47,6 +50,17 @@ public sealed record FacadeTestSummary(
 /// stack frame that carries source information, and the assertion message. Only the file name is kept
 /// from that frame, so the same failure gives the same signature under <c>/src/facade</c> in the image,
 /// in a local checkout and on Windows.</para>
+/// <para>The TRX results count only when the run's completion evidence agrees with them: <c>exit-code</c>
+/// holds 0 and the TRX records no failed result, or it holds 2, Microsoft.Testing.Platform's status
+/// for a run in which at least one test failed, and the TRX records at least one failed result. A
+/// failed result is one whose outcome is neither <c>Passed</c> nor a not-run outcome, in any class.
+/// Every other combination (an absent, unreadable or non-integer <c>exit-code</c>, any other exit
+/// status, or a status the results contradict) adds the <c>CHK-FACADE-TRX</c> <c>missing</c> item, so
+/// an all-passed TRX never yields a clean verdict after an unverified or abnormal completion. The
+/// three checks still show the counts exactly as the TRX states them.</para>
+/// <para>All problems with the TRX evidence share one <c>CHK-FACADE-TRX</c> <c>missing</c> item, whose
+/// detail lists them in a fixed order: the TRX file itself, the test classes it holds no results for,
+/// then the completion evidence.</para>
 /// <para>Nothing is ever written. Instances hold no mutable state and are thread-safe.</para>
 /// </remarks>
 public sealed partial class FacadeTestResults(HarnessOptions options)
@@ -65,6 +79,17 @@ public sealed partial class FacadeTestResults(HarnessOptions options)
     private const string LineMarker = ":line ";
     private const string InMarker = " in ";
 
+    // `dotnet test` on Microsoft.Testing.Platform exits 0 when every test passed or was skipped.
+    private const int SucceededExitCode = 0;
+
+    // Microsoft.Testing.Platform's exit status for a run that completed with at least one failed test.
+    private const int TestFailedExitCode = 2;
+
+    // The longest excerpt of a non-integer exit-code file quoted in a detail.
+    private const int ExitCodeExcerptLimit = 40;
+
+    private const string NoExitStatus = "no valid dotnet test exit status was recorded";
+
     private static readonly XNamespace Trx = "http://microsoft.com/schemas/VisualStudio/TeamTest/2010";
 
     // Outcomes of a result that never ran; every other outcome except Passed counts as failed.
@@ -78,19 +103,21 @@ public sealed partial class FacadeTestResults(HarnessOptions options)
 
     /// <summary>
     /// Reads <c>exit-code</c> and <c>facade-tests.trx</c> from <see cref="HarnessOptions.FacadeTestsDirectory"/>.
-    /// An absent or unreadable TRX file gives one <c>CHK-FACADE-TRX</c> <c>missing</c> item and three
-    /// <c>not-run</c> checks; I/O failures never escape.
+    /// An absent or unreadable TRX file gives three <c>not-run</c> checks and the <c>CHK-FACADE-TRX</c>
+    /// <c>missing</c> item. An <c>exit-code</c> file that is absent, unreadable (a directory included)
+    /// or holds no integer, or an exit status the TRX results contradict, also gives that item, its
+    /// detail naming the precise problem. I/O failures never escape.
     /// </summary>
     /// <returns>The counts, failure items and recorded exit status.</returns>
     public FacadeTestSummary Read()
     {
         var directory = _options.FacadeTestsDirectory;
-        var exitCode = ReadExitCode(Path.Combine(directory, ExitCodeFileName));
+        var exit = ReadExitCode(Path.Combine(directory, ExitCodeFileName));
         var trxPath = Path.Combine(directory, TrxFileName);
 
         if (!File.Exists(trxPath))
         {
-            return Unavailable($"TRX file absent: {trxPath}", exitCode);
+            return Unavailable($"TRX file absent: {trxPath}", exit);
         }
 
         string trxXml;
@@ -100,23 +127,31 @@ public sealed partial class FacadeTestResults(HarnessOptions options)
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return Unavailable($"TRX file unreadable: {trxPath}: {ex.Message}", exitCode);
+            return Unavailable($"TRX file unreadable: {trxPath}: {ex.Message}", exit);
         }
 
-        return Parse(trxXml, exitCode);
+        return Parse(trxXml, exit);
     }
 
     /// <summary>
     /// Turns TRX text into the three checks and their failure items. Text that is not well-formed XML
-    /// gives one <c>CHK-FACADE-TRX</c> <c>missing</c> item and three <c>not-run</c> checks. A check whose
-    /// test class has no result in the TRX is <c>not-run</c>, and one <c>CHK-FACADE-TRX</c>
-    /// <c>missing</c> item names every such class.
+    /// gives three <c>not-run</c> checks and the <c>CHK-FACADE-TRX</c> <c>missing</c> item. A check whose
+    /// test class has no result in the TRX is <c>not-run</c>, and the <c>CHK-FACADE-TRX</c>
+    /// <c>missing</c> item names every such class. That item is also added, naming the reason, unless
+    /// <paramref name="exitCode"/> is 0 and the TRX records no failed result, or it is 2 (at least one
+    /// test failed) and the TRX records at least one; a null <paramref name="exitCode"/> always adds it.
     /// </summary>
     /// <param name="trxXml">The TRX file's text.</param>
-    /// <param name="exitCode">The recorded <c>dotnet test</c> exit status, carried into the summary unchanged.</param>
+    /// <param name="exitCode">
+    /// The recorded <c>dotnet test</c> exit status, or null when no valid status was recorded; carried
+    /// into the summary unchanged.
+    /// </param>
     /// <returns>The counts, failure items and exit status.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="trxXml"/> is null.</exception>
-    public static FacadeTestSummary Parse(string trxXml, int? exitCode)
+    public static FacadeTestSummary Parse(string trxXml, int? exitCode) =>
+        Parse(trxXml, exitCode is { } code ? ExitStatus.Recorded(code) : ExitStatus.Invalid(NoExitStatus));
+
+    private static FacadeTestSummary Parse(string trxXml, ExitStatus exit)
     {
         ArgumentNullException.ThrowIfNull(trxXml);
 
@@ -127,7 +162,7 @@ public sealed partial class FacadeTestResults(HarnessOptions options)
         }
         catch (XmlException ex)
         {
-            return Unavailable($"TRX file unparseable: {ex.Message}", exitCode);
+            return Unavailable($"TRX file unparseable: {ex.Message}", exit);
         }
 
         var root = document.Root is { } run && run.Name == Trx + "TestRun" ? run : null;
@@ -139,6 +174,7 @@ public sealed partial class FacadeTestResults(HarnessOptions options)
         var unreachable = new Tally();
         var timeout = new Tally();
         var items = new List<FailureItem>();
+        var failedResults = 0;
 
         IEnumerable<XElement> results = root is null ? [] : root.Elements(Trx + "Results").Elements(Trx + "UnitTestResult");
         foreach (var result in results)
@@ -156,6 +192,10 @@ public sealed partial class FacadeTestResults(HarnessOptions options)
             if (!passed)
             {
                 items.Add(ToFailureItem(test));
+                if (!IsNotRun(test.Outcome))
+                {
+                    failedResults++;
+                }
             }
         }
 
@@ -164,15 +204,12 @@ public sealed partial class FacadeTestResults(HarnessOptions options)
         var failureCheck = ToCheck(CheckNames.Failure, failure, FailureClassSuffix, absentClasses, FailureSplit(unreachable, timeout));
         var listenerCheck = ToCheck(CheckNames.ListenerIsolation, listenerIsolation, ListenerIsolationClassSuffix, absentClasses, detail: null);
 
-        if (absentClasses.Count > 0)
-        {
-            items.Add(new FailureItem(
-                FailureItemIds.FacadeTrx,
-                FailureItemIds.Missing,
-                Detail: $"TRX file holds no results for {string.Join(", ", absentClasses)}"));
-        }
+        AddTrxItem(
+            items,
+            absentClasses.Count > 0 ? $"TRX file holds no results for {string.Join(", ", absentClasses)}" : null,
+            CompletionProblem(exit, failedResults));
 
-        return new FacadeTestSummary(routingCheck, failureCheck, listenerCheck, Normalise(items), exitCode);
+        return new FacadeTestSummary(routingCheck, failureCheck, listenerCheck, Normalise(items), exit.Code);
     }
 
     /// <summary>
@@ -341,33 +378,103 @@ public sealed partial class FacadeTestResults(HarnessOptions options)
             .ToArray();
     }
 
-    private static FacadeTestSummary Unavailable(string detail, int? exitCode) => new(
-        NotRunCheck(CheckNames.Routing),
-        NotRunCheck(CheckNames.Failure),
-        NotRunCheck(CheckNames.ListenerIsolation),
-        [new FailureItem(FailureItemIds.FacadeTrx, FailureItemIds.Missing, Detail: detail)],
-        exitCode);
+    // No results can be read, so only the completion evidence itself can be judged: its own problems and
+    // an exit status that is neither success nor test failure.
+    private static FacadeTestSummary Unavailable(string trxProblem, ExitStatus exit)
+    {
+        var items = new List<FailureItem>(1);
+        AddTrxItem(items, trxProblem, CompletionProblem(exit, failedResults: null));
+        return new FacadeTestSummary(
+            NotRunCheck(CheckNames.Routing),
+            NotRunCheck(CheckNames.Failure),
+            NotRunCheck(CheckNames.ListenerIsolation),
+            items,
+            exit.Code);
+    }
 
     private static CheckResult NotRunCheck(string name) => new(name, CheckOutcomes.NotRun, 0, 0, null);
 
-    private static int? ReadExitCode(string path)
+    // Every CHK-FACADE-TRX problem goes into one item: its identity allows only the nature `missing`, and
+    // Normalise keeps the first item per (item id, nature), so a second item would lose its detail.
+    private static void AddTrxItem(List<FailureItem> items, params string?[] problems)
     {
+        var reasons = problems.Where(problem => problem is not null).ToArray();
+        if (reasons.Length > 0)
+        {
+            items.Add(new FailureItem(FailureItemIds.FacadeTrx, FailureItemIds.Missing, Detail: string.Join("; ", reasons)));
+        }
+    }
+
+    // Why the completion evidence does not vouch for the TRX results, or null when it does.
+    // failedResults is null when no TRX results could be read.
+    //
+    // Exit 2 with at least one failed result is consistent on purpose: a test that legitimately fails is
+    // then documented by its TEST item alone. Flagging every non-zero exit would force a register entry
+    // for CHK-FACADE-TRX `missing` on that run, and the entry would then also document, and so hide, a
+    // later run whose TRX is genuinely missing.
+    private static string? CompletionProblem(ExitStatus exit, int? failedResults)
+    {
+        if (exit.Code is not { } code)
+        {
+            return exit.Problem ?? NoExitStatus;
+        }
+
+        return code switch
+        {
+            SucceededExitCode when failedResults > 0 => string.Create(
+                CultureInfo.InvariantCulture,
+                $"dotnet test exited {SucceededExitCode}, but the TRX records {failedResults} failed result(s)"),
+            SucceededExitCode => null,
+            TestFailedExitCode when failedResults == 0 => string.Create(
+                CultureInfo.InvariantCulture,
+                $"dotnet test exited {TestFailedExitCode} (at least one test failed), but the TRX records no failed result"),
+            TestFailedExitCode => null,
+            _ => string.Create(
+                CultureInfo.InvariantCulture,
+                $"dotnet test exited {code}, so it did not complete normally and its results are unverified"),
+        };
+    }
+
+    private static ExitStatus ReadExitCode(string path)
+    {
+        // File.Exists is false for a directory, which would otherwise be reported as an absent file.
+        if (Directory.Exists(path))
+        {
+            return ExitStatus.Invalid($"exit-code file unreadable: {path} is a directory");
+        }
+
+        string text;
         try
         {
             if (!File.Exists(path))
             {
-                return null;
+                return ExitStatus.Invalid($"exit-code file absent: {path}");
             }
 
-            var text = File.ReadAllText(path).Trim();
-            return int.TryParse(text, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var value)
-                ? value
-                : null;
+            text = File.ReadAllText(path).Trim();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return null;
+            return ExitStatus.Invalid($"exit-code file unreadable: {path}: {ex.Message}");
         }
+
+        return int.TryParse(text, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out var value)
+            ? ExitStatus.Recorded(value)
+            : ExitStatus.Invalid($"exit-code file {path} does not hold an integer: '{Excerpt(text)}'");
+    }
+
+    // The text on one line, cut to ExitCodeExcerptLimit characters, so a detail stays a single short line.
+    private static string Excerpt(string text)
+    {
+        var line = string.Join(' ', text.Split(['\0', '\r', '\n'], StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+        if (line.Length <= ExitCodeExcerptLimit)
+        {
+            return line;
+        }
+
+        // Never cut between the two halves of a surrogate pair.
+        var length = char.IsHighSurrogate(line[ExitCodeExcerptLimit - 1]) ? ExitCodeExcerptLimit - 1 : ExitCodeExcerptLimit;
+        return string.Concat(line.AsSpan(0, length), "…");
     }
 
     private static (string File, string Line) FirstSourceLocation(string? stackTrace)
@@ -439,6 +546,14 @@ public sealed partial class FacadeTestResults(HarnessOptions options)
     private static string? NullIfBlank(string? value) => string.IsNullOrWhiteSpace(value) ? null : value;
 
     private sealed record TestDefinition(string? Name, string? ClassName, string? MethodName);
+
+    // Code is the recorded exit status; when no valid status was recorded it is null and Problem says why.
+    private readonly record struct ExitStatus(int? Code, string? Problem)
+    {
+        public static ExitStatus Recorded(int code) => new(code, Problem: null);
+
+        public static ExitStatus Invalid(string problem) => new(Code: null, problem);
+    }
 
     private sealed record TestResultInfo(
         string ClassName,
