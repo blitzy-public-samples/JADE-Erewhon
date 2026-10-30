@@ -45,7 +45,10 @@ namespace Erewhon.Harness.Modes;
 /// the existing manifest (<see cref="BaselineStore.DeleteManifest"/>), and the new one is published last and
 /// atomically, so a capture that fails or is cancelled once it has begun writing leaves no manifest beside
 /// the partial baseline. An empty-state bracket reset that is not confirmed stops the capture once the
-/// bracket's seed restore has been attempted, and no manifest is written. Every line this mode prints
+/// bracket's seed restore has been attempted, and no manifest is written. The answered bodies are kept for
+/// the conformance check, together at most <see cref="KeptBodyLimit"/> bytes: the case whose body would
+/// exceed it stops the capture before its record is written, with one line naming its position, its id and
+/// the limit, and no manifest is written. Every line this mode prints
 /// starts with <see cref="SourceLabels.ConsolePrefix"/>, readiness lines included. It announces the
 /// readiness wait with its limit, and prints one progress line per case (position, case id, status and
 /// outcome), never a request path, body or header.
@@ -101,6 +104,7 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
     private readonly OperationCatalogue _catalogue = catalogue ?? throw new ArgumentNullException(nameof(catalogue));
     private readonly TextWriter _stdout = stdout ?? throw new ArgumentNullException(nameof(stdout));
     private readonly TimeSpan _cancelledRestorationLimit = TimeSpan.FromSeconds(ReplayMode.CancelledRestorationLimitSeconds);
+    private readonly int _keptBodyLimit = HarnessOptions.EvidenceByteLimit;
 
     /// <summary>
     /// How long the seed restoration closing the empty-state bracket may still run once the capture is
@@ -115,10 +119,28 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
     }
 
     /// <summary>
+    /// The most bytes of answered case bodies one capture keeps for its conformance check, all cases together;
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/> unless a test lowers it.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is negative.</exception>
+    internal int KeptBodyLimit
+    {
+        get => _keptBodyLimit;
+        init
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            _keptBodyLimit = value;
+        }
+    }
+
+    /// <summary>
     /// Waits for the stand-in, resets it to seed, runs every case, and writes the baseline.
     /// </summary>
     /// <param name="ct">Cancels the capture; cancellation exits 1.</param>
-    /// <returns>0 when the manifest was written; 1 otherwise.</returns>
+    /// <returns>
+    /// 0 when the manifest was written; 1 otherwise, a capture stopped by an unconfirmed reset bracket or by
+    /// answered bodies over <see cref="KeptBodyLimit"/> included.
+    /// </returns>
     public async Task<int> RunAsync(CancellationToken ct)
     {
         try
@@ -142,7 +164,7 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
         CaseMatrix matrix;
         try
         {
-            matrix = CaseMatrix.Load(_options.CaseMatrixPath, _catalogue);
+            matrix = CaseMatrix.Load(_options.CaseMatrixPath, _catalogue, _options.ResolvePath("."));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException
                                        or ArgumentException or NotSupportedException)
@@ -195,6 +217,7 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
         var bodies = new Dictionary<string, byte[]>(StringComparer.Ordinal);
         var notCaptured = new List<string>();
         var unconfirmedBrackets = new List<StateResetResult>();
+        long keptBodyBytes = 0;
         bool wsdlCaptured;
 
         using (var runner = CaseRunner.FromOptions(_options))
@@ -226,6 +249,19 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
                     notCaptured.Add(definition.Id);
                     Log($"WARN {progress} {definition.Id} not captured: {response.NoResponse} {response.Detail}");
                     continue;
+                }
+
+                // Every answered body is kept for the conformance check until the capture ends, so their total is
+                // held to the limit before this one is recorded: a body over it stops the capture with no record
+                // of it and no manifest, rather than dropping it from the baseline.
+                keptBodyBytes += response.Body.Length;
+                if (keptBodyBytes > _keptBodyLimit)
+                {
+                    Log(string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"{progress} {definition.Id}: the response bodies this capture keeps for its conformance check exceed the "
+                        + $"{_keptBodyLimit}-byte limit; capture stopped, baseline/manifest.json not written"));
+                    return 1;
                 }
 
                 var record = BuildRecord(definition, position, status, response, binaryOperationId);

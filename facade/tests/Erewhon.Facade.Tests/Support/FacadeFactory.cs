@@ -17,9 +17,13 @@ using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Xml;
 using Erewhon.Contracts.Catalogue;
+using Erewhon.Facade.Forwarding;
+using Erewhon.Facade.Routing;
+using Erewhon.Facade.Soap;
 using Microsoft.AspNetCore.Connections;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
@@ -30,6 +34,7 @@ using Microsoft.Extensions.Configuration.EnvironmentVariables;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Yarp.ReverseProxy.Forwarder;
 
 // The facade tests bind real sockets and assert on elapsed times, and WebApplicationFactory captures the
 // facade's host through hosting diagnostics that every host built in the process raises, so no two tests
@@ -85,6 +90,14 @@ public sealed class FacadeTestSettings
     /// and the facade's configured level filters apply to it. The caller owns it.
     /// </summary>
     public ILoggerProvider? LoggerProvider { get; init; }
+
+    /// <summary>
+    /// The chain policy the facade validates an https target's certificate with, for example
+    /// <see cref="TestCertificates.CreateTrustPolicy"/>, which trusts the test certificate authority alone;
+    /// null keeps the platform's default trust, as in production. The certificate must name the target's
+    /// host either way.
+    /// </summary>
+    public X509ChainPolicy? BackendCertificateChainPolicy { get; init; }
 }
 
 /// <summary>
@@ -135,6 +148,7 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
 
     private readonly KeyValuePair<string, string?>[] _settings;
     private readonly ILoggerProvider? _loggerProvider;
+    private readonly X509ChainPolicy? _backendCertificateChainPolicy;
 
     /// <summary>
     /// Draws three distinct free loopback ports and prepares the facade's settings. The facade is not
@@ -151,6 +165,7 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
         AdminBaseAddress = LoopbackAddress(AdminPort);
         _settings = BuildSettings(settings, RestPort, SoapPort, AdminPort);
         _loggerProvider = settings.LoggerProvider;
+        _backendCertificateChainPolicy = settings.BackendCertificateChainPolicy;
     }
 
     /// <summary>The port of the REST listener (<c>Facade:RestPort</c>) on 127.0.0.1.</summary>
@@ -391,6 +406,11 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
     /// A <see cref="FacadeTestSettings.LoggerProvider"/> is registered here, after the facade's entry point
     /// has replaced the default logging providers.
     /// </para>
+    /// <para>
+    /// A <see cref="FacadeTestSettings.BackendCertificateChainPolicy"/> is given to the facade's forwarder:
+    /// a registration made here, after the entry point's own, builds the singleton
+    /// <see cref="BackendForwarder"/> from the same services with that policy.
+    /// </para>
     /// </remarks>
     protected override void ConfigureWebHost(IWebHostBuilder builder)
     {
@@ -409,6 +429,17 @@ public sealed class FacadeFactory : WebApplicationFactory<global::Program>
         if (_loggerProvider is { } loggerProvider)
         {
             builder.ConfigureServices(services => services.AddSingleton(loggerProvider));
+        }
+
+        if (_backendCertificateChainPolicy is { } chainPolicy)
+        {
+            builder.ConfigureServices(services => services.AddSingleton(provider => new BackendForwarder(
+                provider.GetRequiredService<IHttpForwarder>(),
+                provider.GetRequiredService<OperationRouter>(),
+                provider.GetRequiredService<PassThroughTransformer>(),
+                provider.GetRequiredService<SoapFaultWriter>(),
+                provider.GetRequiredService<ILogger<BackendForwarder>>(),
+                chainPolicy)));
         }
     }
 

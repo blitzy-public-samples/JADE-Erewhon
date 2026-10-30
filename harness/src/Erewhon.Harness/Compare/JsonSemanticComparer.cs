@@ -58,6 +58,26 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
     private readonly OperationCatalogue _catalogue = catalogue ?? throw new ArgumentNullException(nameof(catalogue));
     private readonly Normaliser _normaliser = normaliser ?? throw new ArgumentNullException(nameof(normaliser));
 
+    // The characters of discrepancy evidence each comparison's EvidenceBudget allows.
+    private readonly int _evidenceLimit = HarnessOptions.EvidenceByteLimit;
+
+    /// <summary>
+    /// Creates a comparer each of whose comparisons may retain at most <paramref name="evidenceLimit"/>
+    /// characters of discrepancy evidence, counted as <see cref="EvidenceBudget"/> counts them, instead of
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>.
+    /// </summary>
+    /// <param name="catalogue">The operation catalogue the bodies are typed by.</param>
+    /// <param name="normaliser">The N1/N2 normaliser applied at targeted positions.</param>
+    /// <param name="evidenceLimit">The evidence limit in characters, at least 0.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="catalogue"/> or <paramref name="normaliser"/> is null.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="evidenceLimit"/> is negative.</exception>
+    internal JsonSemanticComparer(OperationCatalogue catalogue, Normaliser normaliser, int evidenceLimit)
+        : this(catalogue, normaliser)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(evidenceLimit);
+        _evidenceLimit = evidenceLimit;
+    }
+
     /// <summary>
     /// Compares <paramref name="observed"/> with <paramref name="baseline"/> and returns every difference
     /// in walk order: baseline members in document order, then observed-only members in document order,
@@ -76,6 +96,10 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
     /// <see cref="DiscrepancyValue.Absent"/> for a side that parsed.
     /// </returns>
     /// <exception cref="ArgumentNullException"><paramref name="baseline"/> or <paramref name="observed"/> is null.</exception>
+    /// <exception cref="InvalidDataException">
+    /// The comparison would retain more discrepancy evidence than its <see cref="EvidenceBudget"/> allows; it is
+    /// refused rather than truncated.
+    /// </exception>
     public IReadOnlyList<Discrepancy> Compare(string baseline, string observed, string? declaredType)
     {
         ArgumentNullException.ThrowIfNull(baseline);
@@ -111,6 +135,10 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
     /// <param name="declaredType">The catalogue DTO or array name the root is declared as; null compares untyped.</param>
     /// <returns>The discrepancies in walk order, empty when the bodies are equivalent.</returns>
     /// <exception cref="ArgumentNullException">A text or a document is null.</exception>
+    /// <exception cref="InvalidDataException">
+    /// The comparison would retain more discrepancy evidence than its <see cref="EvidenceBudget"/> allows; it is
+    /// refused rather than truncated.
+    /// </exception>
     internal IReadOnlyList<Discrepancy> Compare(
         string baseline,
         JsonDocument baselineDocument,
@@ -136,16 +164,16 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
                 : [new Discrepancy(RootPath, DiscrepancyKinds.Value, DiscrepancyValue.Literal(baseline), DiscrepancyValue.Literal(observed))];
         }
 
-        var discrepancies = new List<Discrepancy>();
+        var discrepancies = new DiscrepancyCollector(new EvidenceBudget(_evidenceLimit));
         Walk(RootPath, baselineRoot, observedRoot, declaredType, discrepancies);
-        return discrepancies.AsReadOnly();
+        return discrepancies.Result();
     }
 
     /// <summary>
     /// Compares two values at <paramref name="path"/>, typed by <paramref name="type"/>: a catalogue DTO
     /// name for an object, a catalogue array name for an array, or null for an untyped value.
     /// </summary>
-    private void Walk(string path, JsonElement baseline, JsonElement observed, string? type, List<Discrepancy> discrepancies)
+    private void Walk(string path, JsonElement baseline, JsonElement observed, string? type, DiscrepancyCollector discrepancies)
     {
         if (KindClass(baseline.ValueKind) != KindClass(observed.ValueKind))
         {
@@ -206,7 +234,7 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
     /// Compares two objects member by member, matched by name ordinally. A name repeated within one object
     /// is compared occurrence by occurrence in document order.
     /// </summary>
-    private void WalkObject(string path, JsonElement baseline, JsonElement observed, string? type, List<Discrepancy> discrepancies)
+    private void WalkObject(string path, JsonElement baseline, JsonElement observed, string? type, DiscrepancyCollector discrepancies)
     {
         var baselineMembers = MemberGroups.Of(baseline);
         var observedMembers = MemberGroups.Of(observed);
@@ -241,7 +269,7 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
         string name,
         IReadOnlyList<JsonElement> baselineValues,
         IReadOnlyList<JsonElement> observedValues,
-        List<Discrepancy> discrepancies)
+        DiscrepancyCollector discrepancies)
     {
         var path = MemberPath(objectPath, name);
         var rule = runtimeDto is null ? null : _normaliser.RuleFor(runtimeDto.Name, name);
@@ -307,7 +335,7 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
     /// kind can never be valid under a rule, so they are compared exactly by the untyped walk. Any other
     /// pair is a <c>type</c> discrepancy.
     /// </summary>
-    private void CompareNormalised(string path, string rule, JsonElement baseline, JsonElement observed, List<Discrepancy> discrepancies)
+    private void CompareNormalised(string path, string rule, JsonElement baseline, JsonElement observed, DiscrepancyCollector discrepancies)
     {
         var baselineKind = baseline.ValueKind;
         var observedKind = observed.ValueKind;
@@ -353,7 +381,7 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
     /// lookup rescans every preceding item of an array that holds objects or arrays, which would make
     /// the walk of a DTO collection quadratic in its item count.
     /// </remarks>
-    private void WalkArray(string path, JsonElement baseline, JsonElement observed, string? type, List<Discrepancy> discrepancies)
+    private void WalkArray(string path, JsonElement baseline, JsonElement observed, string? type, DiscrepancyCollector discrepancies)
     {
         var itemType = type is not null && _catalogue.TryGetArray(type, out var array) ? array.ItemType : null;
 
@@ -417,8 +445,8 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
     /// <param name="value">The value.</param>
     /// <param name="type">The catalogue DTO or array name the value is declared as; null for an untyped value.</param>
     /// <param name="rule">The normalisation rule that targets the value's position; null when none does.</param>
-    /// <param name="discrepancies">The list the entries are added to.</param>
-    private void AddOneSided(string path, string kind, JsonElement value, string? type, string? rule, List<Discrepancy> discrepancies)
+    /// <param name="discrepancies">The collector the entries are added to.</param>
+    private void AddOneSided(string path, string kind, JsonElement value, string? type, string? rule, DiscrepancyCollector discrepancies)
     {
         if (rule is not null && value.ValueKind is JsonValueKind.String or JsonValueKind.Null)
         {
@@ -664,6 +692,27 @@ public sealed class JsonSemanticComparer(OperationCatalogue catalogue, Normalise
                 _ = element.GetString();
                 break;
         }
+    }
+
+    /// <summary>
+    /// The discrepancies one comparison finds, in the order they are added, each charged to the comparison's
+    /// <see cref="EvidenceBudget"/> before it is kept.
+    /// </summary>
+    /// <param name="budget">The comparison's own budget.</param>
+    private sealed class DiscrepancyCollector(EvidenceBudget budget)
+    {
+        private readonly List<Discrepancy> _discrepancies = [];
+
+        /// <summary>Charges <paramref name="discrepancy"/> to the budget, then keeps it.</summary>
+        /// <exception cref="InvalidDataException">Everything charged so far, this discrepancy included, exceeds the budget's limit.</exception>
+        public void Add(Discrepancy discrepancy)
+        {
+            budget.Charge(discrepancy.Path.Length, discrepancy.Baseline, discrepancy.Observed);
+            _discrepancies.Add(discrepancy);
+        }
+
+        /// <summary>A read-only view of the discrepancies kept, in the order they were added.</summary>
+        public IReadOnlyList<Discrepancy> Result() => _discrepancies.AsReadOnly();
     }
 
     /// <summary>

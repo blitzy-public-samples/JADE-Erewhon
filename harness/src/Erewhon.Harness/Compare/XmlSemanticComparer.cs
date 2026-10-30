@@ -191,6 +191,26 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
     private readonly OperationCatalogue _catalogue = catalogue ?? throw new ArgumentNullException(nameof(catalogue));
     private readonly Normaliser _normaliser = normaliser ?? throw new ArgumentNullException(nameof(normaliser));
 
+    // The characters of discrepancy evidence each comparison's EvidenceBudget allows.
+    private readonly int _evidenceLimit = HarnessOptions.EvidenceByteLimit;
+
+    /// <summary>
+    /// Creates a comparer each of whose comparisons may retain at most <paramref name="evidenceLimit"/>
+    /// characters of discrepancy evidence, counted as <see cref="EvidenceBudget"/> counts them, instead of
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>.
+    /// </summary>
+    /// <param name="catalogue">The operation catalogue that types SOAP bodies.</param>
+    /// <param name="normaliser">The normaliser applied at targeted DTO properties.</param>
+    /// <param name="evidenceLimit">The evidence limit in characters, at least 0.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="catalogue"/> or <paramref name="normaliser"/> is null.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="evidenceLimit"/> is negative.</exception>
+    internal XmlSemanticComparer(OperationCatalogue catalogue, Normaliser normaliser, int evidenceLimit)
+        : this(catalogue, normaliser)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(evidenceLimit);
+        _evidenceLimit = evidenceLimit;
+    }
+
     /// <summary>
     /// Compares <paramref name="observed"/> with <paramref name="baseline"/> in <paramref name="context"/>.
     /// </summary>
@@ -203,6 +223,10 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
     /// value is the raw text on each side that failed and absent on a side that loaded.
     /// </returns>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
+    /// <exception cref="InvalidDataException">
+    /// The comparison would retain more discrepancy evidence than its <see cref="EvidenceBudget"/> allows, or
+    /// builds a path longer than the budget's limit; it is refused rather than truncated.
+    /// </exception>
     public IReadOnlyList<Discrepancy> Compare(string baseline, string observed, XmlComparisonContext context)
     {
         ArgumentNullException.ThrowIfNull(baseline);
@@ -242,6 +266,10 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
     /// <param name="context">What the bodies are, which types their elements.</param>
     /// <returns>Every discrepancy in <see cref="Discrepancy.CanonicalOrder"/>; empty when the bodies are equal.</returns>
     /// <exception cref="ArgumentNullException">An argument is null.</exception>
+    /// <exception cref="InvalidDataException">
+    /// The comparison would retain more discrepancy evidence than its <see cref="EvidenceBudget"/> allows, or
+    /// builds a path longer than the budget's limit; it is refused rather than truncated.
+    /// </exception>
     internal IReadOnlyList<Discrepancy> Compare(XElement baselineRoot, XElement observedRoot, XmlComparisonContext context)
     {
         ArgumentNullException.ThrowIfNull(baselineRoot);
@@ -260,7 +288,7 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
             ];
         }
 
-        var walk = new Walk(_catalogue, _normaliser, context);
+        var walk = new Walk(_catalogue, _normaliser, context, new EvidenceBudget(_evidenceLimit));
         walk.CompareRoots(baselineRoot, observedRoot);
         return walk.Result();
     }
@@ -555,7 +583,9 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
     /// The walk is depth-first. The path is one builder that each element extends by its segment on the way
     /// down and cuts back on the way up, and it is rendered only when a discrepancy is added; each side's
     /// namespace scope travels down with its element. Apart from rendering the path of a discrepancy, the
-    /// work done at an element therefore does not grow with its depth.
+    /// work done at an element therefore does not grow with its depth. Each discrepancy is charged to the
+    /// comparison's <see cref="EvidenceBudget"/> before it is kept, and the path is held to the budget's limit
+    /// as each name or index extends it.
     /// </remarks>
     private sealed class Walk
     {
@@ -589,14 +619,16 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
         private readonly bool _wsdl;
         private readonly bool _excludeSoapAddressLocation;
         private readonly List<Discrepancy> _discrepancies = [];
+        private readonly EvidenceBudget _budget;
 
         // The path of the element being compared; see the remarks.
         private readonly StringBuilder _path = new();
 
-        public Walk(OperationCatalogue catalogue, Normaliser normaliser, XmlComparisonContext context)
+        public Walk(OperationCatalogue catalogue, Normaliser normaliser, XmlComparisonContext context, EvidenceBudget budget)
         {
             _catalogue = catalogue;
             _normaliser = normaliser;
+            _budget = budget;
             switch (context)
             {
                 case XmlComparisonContext.SoapResponseContext response:
@@ -632,7 +664,8 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
         /// </summary>
         public void CompareRoots(XElement baseline, XElement observed)
         {
-            _path.Append(RootPath).Append(baseline.Name.LocalName);
+            _path.Append(RootPath);
+            AppendLocalName(baseline.Name.LocalName);
             var rootLength = _path.Length;
             CompareElements(
                 baseline,
@@ -672,11 +705,27 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
             CompareChildren(baseline, baselineScope, observed, observedScope, role);
         }
 
-        /// <summary>Adds a discrepancy at the current path, the only place a path is rendered.</summary>
-        private void Add(string kind, DiscrepancyValue baseline, DiscrepancyValue observed) =>
+        /// <summary>
+        /// Adds a discrepancy at the current path, the only place a path is rendered, once the evidence budget
+        /// has been charged with it.
+        /// </summary>
+        private void Add(string kind, DiscrepancyValue baseline, DiscrepancyValue observed)
+        {
+            _budget.Charge(_path.Length, baseline, observed);
             _discrepancies.Add(new Discrepancy(_path.ToString(), kind, baseline, observed));
+        }
 
-        /// <summary>Appends <paramref name="name"/> as <see cref="XName.ToString"/> writes it: <c>{uri}local</c>, or the local name alone in no namespace.</summary>
+        /// <summary>Appends the local name <paramref name="local"/>, then holds the grown path to the evidence budget's limit.</summary>
+        private void AppendLocalName(string local)
+        {
+            _path.Append(local);
+            _budget.CheckPath(_path.Length);
+        }
+
+        /// <summary>
+        /// Appends <paramref name="name"/> as <see cref="XName.ToString"/> writes it: <c>{uri}local</c>, or the local
+        /// name alone in no namespace; the grown path is held to the limit as <see cref="AppendLocalName"/> holds it.
+        /// </summary>
         private void AppendExpandedName(XName name)
         {
             if (name.Namespace != XNamespace.None)
@@ -684,15 +733,19 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
                 _path.Append('{').Append(name.NamespaceName).Append('}');
             }
 
-            _path.Append(name.LocalName);
+            AppendLocalName(name.LocalName);
         }
 
-        /// <summary>Appends the 1-based position <c>[n]</c> of the item at <paramref name="index"/> when its group is indexed.</summary>
+        /// <summary>
+        /// Appends the 1-based position <c>[n]</c> of the item at <paramref name="index"/> when its group is
+        /// indexed, then holds the grown path to the evidence budget's limit.
+        /// </summary>
         private void AppendItemIndex(int index, bool indexed)
         {
             if (indexed)
             {
                 _path.Append(CultureInfo.InvariantCulture, $"[{index + 1}]");
+                _budget.CheckPath(_path.Length);
             }
         }
 
@@ -1100,7 +1153,7 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
                 }
                 else
                 {
-                    _path.Append(name.LocalName);
+                    AppendLocalName(name.LocalName);
                 }
 
                 var groupLength = _path.Length;
@@ -1285,7 +1338,7 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
                 }
                 else
                 {
-                    _path.Append(name.LocalName);
+                    AppendLocalName(name.LocalName);
                 }
 
                 var groupLength = _path.Length;

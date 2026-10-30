@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -95,6 +96,11 @@ public sealed record CaseResponse(
 /// closes the connection before sending any response byte, and the last attempt decides the reason
 /// (observed on .NET 10). It never resends a request with a body, so a state-changing case reaches the
 /// server at most once.</para>
+/// <para>A response body is evidence the harness compares, stores or reports, so it is bounded by a byte
+/// limit, <see cref="HarnessOptions.EvidenceByteLimit"/> unless a test sets another: a body over it fails the
+/// call with <see cref="InvalidDataException"/> and is never truncated into a response. That failure is not a
+/// <see cref="NoResponseReasons"/> value, because a response was obtained; the caller reports it as the
+/// failure it is.</para>
 /// </remarks>
 public sealed class CaseRunner : IDisposable
 {
@@ -137,7 +143,12 @@ public sealed class CaseRunner : IDisposable
         SocketError.TimedOut,
     ];
 
+    // The first buffer of a body read, grown by doubling up to the limit plus one byte, so a read never
+    // allocates by a length the response declares.
+    private const int InitialBodyBytes = 64 * 1024;
+
     private readonly HttpClient _client;
+    private readonly int _responseByteLimit;
 
     /// <summary>Creates a runner whose connection attempts are limited to <see cref="DefaultRequestTimeout"/>.</summary>
     public CaseRunner()
@@ -145,7 +156,10 @@ public sealed class CaseRunner : IDisposable
     {
     }
 
-    /// <summary>Creates a runner whose connection attempts are limited to <paramref name="connectTimeout"/>.</summary>
+    /// <summary>
+    /// Creates a runner whose connection attempts are limited to <paramref name="connectTimeout"/> and whose
+    /// response bodies are limited to <see cref="HarnessOptions.EvidenceByteLimit"/>.
+    /// </summary>
     /// <param name="connectTimeout">
     /// A positive duration of at most <see cref="int.MaxValue"/> milliseconds, or
     /// <see cref="Timeout.InfiniteTimeSpan"/>.
@@ -155,8 +169,31 @@ public sealed class CaseRunner : IDisposable
     /// <see cref="int.MaxValue"/> milliseconds.
     /// </exception>
     public CaseRunner(TimeSpan connectTimeout)
+        : this(connectTimeout, HarnessOptions.EvidenceByteLimit)
+    {
+    }
+
+    /// <summary>
+    /// Creates a runner whose connection attempts are limited to <paramref name="connectTimeout"/> and whose
+    /// response bodies are limited to <paramref name="responseByteLimit"/> bytes.
+    /// </summary>
+    /// <param name="connectTimeout">
+    /// A positive duration of at most <see cref="int.MaxValue"/> milliseconds, or
+    /// <see cref="Timeout.InfiniteTimeSpan"/>.
+    /// </param>
+    /// <param name="responseByteLimit">The most bytes one response body may hold, at least 0 and below <see cref="Array.MaxLength"/>.</param>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="connectTimeout"/> is zero, negative other than infinite, or beyond
+    /// <see cref="int.MaxValue"/> milliseconds, or <paramref name="responseByteLimit"/> is out of range.
+    /// </exception>
+    internal CaseRunner(TimeSpan connectTimeout, int responseByteLimit)
     {
         ValidateTimeout(connectTimeout, nameof(connectTimeout));
+
+        // One byte past the limit is read to tell a longer body apart, so the limit plus one must fit an array.
+        ArgumentOutOfRangeException.ThrowIfNegative(responseByteLimit);
+        ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(responseByteLimit, Array.MaxLength);
+        _responseByteLimit = responseByteLimit;
 
         // UseProxy = false keeps HTTP_PROXY and similar container settings from redirecting harness
         // traffic; the other settings keep the handler from adding or altering anything.
@@ -262,6 +299,7 @@ public sealed class CaseRunner : IDisposable
     /// <paramref name="timeout"/> is zero, negative other than <see cref="Timeout.InfiniteTimeSpan"/>, or longer
     /// than <see cref="int.MaxValue"/> milliseconds.
     /// </exception>
+    /// <exception cref="InvalidDataException">The response body exceeds the runner's byte limit.</exception>
     /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
     public Task<CaseResponse> SendAsync(Uri baseUrl, CaseRequest request, TimeSpan timeout, CancellationToken ct)
     {
@@ -295,6 +333,7 @@ public sealed class CaseRunner : IDisposable
     /// <paramref name="timeout"/> is zero, negative other than <see cref="Timeout.InfiniteTimeSpan"/>, or longer
     /// than <see cref="int.MaxValue"/> milliseconds.
     /// </exception>
+    /// <exception cref="InvalidDataException">The response body exceeds the runner's byte limit.</exception>
     /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
     public Task<CaseResponse> GetAsync(Uri absoluteUri, TimeSpan timeout, CancellationToken ct) =>
         SendRawAsync(absoluteUri, "GET", null, null, timeout, ct);
@@ -313,6 +352,10 @@ public sealed class CaseRunner : IDisposable
     /// <para>A request that obtains no HTTP response returns <see cref="CaseResponse.Failed"/> with
     /// exactly one of the <see cref="NoResponseReasons"/> values, classified by
     /// <see cref="ClassifyFailure"/>.</para>
+    /// <para>The body is read within the same deadline and bounded by the runner's byte limit: a declared
+    /// <c>Content-Length</c> over it is refused before any body byte is read, and any other body is read to at
+    /// most the limit plus one byte, never into a buffer sized from the declared length. A body over the limit
+    /// throws <see cref="InvalidDataException"/>, whose message names the limit and never the target.</para>
     /// </remarks>
     /// <param name="absoluteUri">The absolute http or https target.</param>
     /// <param name="method">The HTTP method, for example <c>GET</c> or <c>POST</c>.</param>
@@ -330,6 +373,7 @@ public sealed class CaseRunner : IDisposable
     /// <paramref name="timeout"/> is zero, negative other than <see cref="Timeout.InfiniteTimeSpan"/>, or longer
     /// than <see cref="int.MaxValue"/> milliseconds.
     /// </exception>
+    /// <exception cref="InvalidDataException">The response body exceeds the runner's byte limit.</exception>
     /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
     public async Task<CaseResponse> SendRawAsync(
         Uri absoluteUri,
@@ -358,8 +402,10 @@ public sealed class CaseRunner : IDisposable
             using var response = await _client
                 .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, linked.Token)
                 .ConfigureAwait(false);
-            var body = await response.Content.ReadAsByteArrayAsync(linked.Token).ConfigureAwait(false);
-            return Capture(response, body, Stopwatch.GetElapsedTime(start));
+            if (await ReadBodyAsync(response.Content, linked.Token).ConfigureAwait(false) is { } body)
+            {
+                return Capture(response, body, Stopwatch.GetElapsedTime(start));
+            }
         }
         catch (Exception ex) when ((reason = ClassifyFailure(
             ex, ct.IsCancellationRequested, deadline.IsCancellationRequested)) is not null)
@@ -367,6 +413,58 @@ public sealed class CaseRunner : IDisposable
             // The filter leaves unclassified exceptions, the caller's cancellation included, unwound
             // with their original stack.
             return CaseResponse.Failed(reason, Stopwatch.GetElapsedTime(start), DescribeFailure(ex));
+        }
+
+        // Raised outside the guard above, so a deadline that expires meanwhile can never pass an oversized body
+        // off as a timeout. The message names only the limit: a request target carries personal names.
+        throw new InvalidDataException(
+            string.Create(CultureInfo.InvariantCulture, $"The response body exceeds the {_responseByteLimit}-byte limit on one response,")
+            + " so the response is refused rather than truncated.");
+    }
+
+    // The whole body, or null when it exceeds the limit. A declared Content-Length over the limit is refused
+    // before any byte is read; otherwise at most the limit plus one byte is read, into a buffer that starts
+    // small and grows by doubling, never one sized from the declared length, so a body sent without a length
+    // is told apart without reading the rest of it.
+    private async Task<byte[]?> ReadBodyAsync(HttpContent content, CancellationToken ct)
+    {
+        if (content.Headers.ContentLength > _responseByteLimit)
+        {
+            return null;
+        }
+
+        var stream = await content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        await using (stream.ConfigureAwait(false))
+        {
+            var buffer = new byte[Math.Min(InitialBodyBytes, _responseByteLimit + 1)];
+            var length = 0;
+            while (true)
+            {
+                if (length == buffer.Length)
+                {
+                    if (length > _responseByteLimit)
+                    {
+                        return null;
+                    }
+
+                    Array.Resize(ref buffer, (int)Math.Min(2L * buffer.Length, _responseByteLimit + 1L));
+                }
+
+                var read = await stream.ReadAsync(buffer.AsMemory(length), ct).ConfigureAwait(false);
+                if (read == 0)
+                {
+                    break;
+                }
+
+                length += read;
+            }
+
+            if (length != buffer.Length)
+            {
+                Array.Resize(ref buffer, length);
+            }
+
+            return buffer;
         }
     }
 

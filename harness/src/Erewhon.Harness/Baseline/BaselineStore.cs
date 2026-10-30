@@ -31,7 +31,10 @@ namespace Erewhon.Harness.Baseline;
 /// final entry inside the last handle, and a read opens it without following a link, so no directory on the
 /// way is looked up again once checked: one swapped for a link after it was opened cannot redirect the
 /// operation. A symbolic link or other reparse point on that chain or at the target, dangling or not, refuses
-/// the operation and is left in place, so no read returns bytes from outside <c>baseline/</c>.
+/// the operation and is left in place, so no read returns bytes from outside <c>baseline/</c>. A read opens its
+/// file without waiting for a FIFO's writer and takes the file's type from the opened descriptor, so a FIFO, a
+/// socket or a device is refused at once instead of blocking the read, and a file whose length exceeds
+/// <see cref="HarnessOptions.EvidenceByteLimit"/> is refused before any buffer is allocated for it.
 /// <see cref="ClearRecords(CancellationToken)"/> and the record readers also list each records directory
 /// through its handle; a link listed in one refuses the clear, and a record file that is a link refuses its read.
 /// A file is replaced, never rewritten in place: the old entry is removed and the new file created
@@ -42,7 +45,8 @@ namespace Erewhon.Harness.Baseline;
 /// whose Linux open flags this store does not know. Reads run on every platform. Where those handles are
 /// unavailable, a read first checks <c>baseline/</c>, each directory below it and the file itself by path with
 /// lstat-level attributes, refusing a link exactly as above, and then reads the file by its path, which cannot
-/// rule out a link swapped in between the check and the read.</para>
+/// rule out a link swapped in between the check and the read, nor refuse a FIFO before opening it: only the
+/// Linux reads refuse a special file without blocking.</para>
 /// <para>Files are written with one fixed JSON format and no timestamp, so a re-capture of an unchanged
 /// stand-in reproduces every file byte for byte (the manifest's <c>captureCommit</c> aside). Every file but
 /// the manifest is written straight to its final path. The manifest is the capture's completion record, so
@@ -144,7 +148,7 @@ public sealed class BaselineStore
     /// symbolic link or reparse point.
     /// </exception>
     /// <exception cref="IOException">
-    /// The file cannot be opened, or a component on the way is not a directory.
+    /// The file cannot be opened or is not a regular file, or a component on the way is not a directory.
     /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
@@ -786,7 +790,8 @@ public sealed class BaselineStore
     /// symbolic link or reparse point; the link is left in place.
     /// </exception>
     /// <exception cref="IOException">
-    /// The file cannot be read, or a component on the way is not a directory.
+    /// The file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>, or a component on the way is not a directory.
     /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
@@ -816,7 +821,8 @@ public sealed class BaselineStore
     /// symbolic link or reparse point; the link is left in place.
     /// </exception>
     /// <exception cref="IOException">
-    /// The file cannot be read, or a component on the way is not a directory.
+    /// The file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>, or a component on the way is not a directory.
     /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
@@ -849,7 +855,10 @@ public sealed class BaselineStore
     /// A records directory, a record or body file, or a directory above them at or below <c>baseline/</c> is a
     /// symbolic link or reparse point; the link is left in place.
     /// </exception>
-    /// <exception cref="IOException">A record or body file cannot be read.</exception>
+    /// <exception cref="IOException">
+    /// A record or body file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>.
+    /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
     /// </exception>
@@ -878,7 +887,10 @@ public sealed class BaselineStore
     /// A records directory, a record or body file, or a directory above them at or below <c>baseline/</c> is a
     /// symbolic link or reparse point; the link is left in place.
     /// </exception>
-    /// <exception cref="IOException">A record or body file cannot be read.</exception>
+    /// <exception cref="IOException">
+    /// A record or body file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>.
+    /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
     /// </exception>
@@ -916,7 +928,10 @@ public sealed class BaselineStore
     /// A records directory, a record or body file, or a directory above them at or below <c>baseline/</c> is a
     /// symbolic link or reparse point; the link is left in place.
     /// </exception>
-    /// <exception cref="IOException">A record or body file cannot be read.</exception>
+    /// <exception cref="IOException">
+    /// A record or body file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>.
+    /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
     /// </exception>
@@ -945,7 +960,10 @@ public sealed class BaselineStore
     /// A records directory, a record or body file, or a directory above them at or below <c>baseline/</c> is a
     /// symbolic link or reparse point; the link is left in place.
     /// </exception>
-    /// <exception cref="IOException">A record or body file cannot be read.</exception>
+    /// <exception cref="IOException">
+    /// A record or body file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>.
+    /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
     /// </exception>
@@ -990,7 +1008,10 @@ public sealed class BaselineStore
     /// link or reparse point; the link is left in place. A body file is not read, so a link there is refused
     /// only when its case is read.
     /// </exception>
-    /// <exception cref="IOException">A record file cannot be read.</exception>
+    /// <exception cref="IOException">
+    /// A record file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>.
+    /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
     /// </exception>
@@ -1041,7 +1062,10 @@ public sealed class BaselineStore
     /// The record or body file, or a directory above it at or below <c>baseline/</c>, is a symbolic link or
     /// reparse point; the link is left in place.
     /// </exception>
-    /// <exception cref="IOException">The record or body file cannot be read.</exception>
+    /// <exception cref="IOException">
+    /// The record or body file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>.
+    /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
     /// </exception>
@@ -1088,7 +1112,10 @@ public sealed class BaselineStore
     /// The body file, or a directory above it at or below <c>baseline/</c>, is a symbolic link or reparse point;
     /// the link is left in place.
     /// </exception>
-    /// <exception cref="IOException">The body file cannot be read.</exception>
+    /// <exception cref="IOException">
+    /// The body file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>.
+    /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
     /// </exception>
@@ -1115,7 +1142,10 @@ public sealed class BaselineStore
     /// The body file, or a directory above it at or below <c>baseline/</c>, is a symbolic link or reparse point;
     /// the link is left in place.
     /// </exception>
-    /// <exception cref="IOException">The body file cannot be read.</exception>
+    /// <exception cref="IOException">
+    /// The body file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>.
+    /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
     /// </exception>
@@ -1140,7 +1170,8 @@ public sealed class BaselineStore
     /// symbolic link or reparse point; the link is left in place.
     /// </exception>
     /// <exception cref="IOException">
-    /// The file cannot be read, or a component on the way is not a directory.
+    /// The file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>, or a component on the way is not a directory.
     /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
@@ -1161,7 +1192,8 @@ public sealed class BaselineStore
     /// symbolic link or reparse point; the link is left in place.
     /// </exception>
     /// <exception cref="IOException">
-    /// The file cannot be read, or a component on the way is not a directory.
+    /// The file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>, or a component on the way is not a directory.
     /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
@@ -1181,7 +1213,8 @@ public sealed class BaselineStore
     /// symbolic link or reparse point; the link is left in place.
     /// </exception>
     /// <exception cref="IOException">
-    /// The file cannot be read, or a component on the way is not a directory.
+    /// The file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>, or a component on the way is not a directory.
     /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
@@ -1203,7 +1236,8 @@ public sealed class BaselineStore
     /// symbolic link or reparse point; the link is left in place.
     /// </exception>
     /// <exception cref="IOException">
-    /// The file cannot be read, or a component on the way is not a directory.
+    /// The file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>, or a component on the way is not a directory.
     /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
@@ -1225,7 +1259,8 @@ public sealed class BaselineStore
     /// symbolic link or reparse point; the link is left in place.
     /// </exception>
     /// <exception cref="IOException">
-    /// The file cannot be read, or a component on the way is not a directory.
+    /// The file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>, or a component on the way is not a directory.
     /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
@@ -1243,7 +1278,8 @@ public sealed class BaselineStore
     /// symbolic link or reparse point; the link is left in place.
     /// </exception>
     /// <exception cref="IOException">
-    /// The file cannot be read, or a component on the way is not a directory.
+    /// The file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>, or a component on the way is not a directory.
     /// </exception>
     /// <exception cref="UnauthorizedAccessException">
     /// The operating system denies access to a directory or file on the way.
@@ -1409,10 +1445,13 @@ public sealed class BaselineStore
     // Opens the file at path, at or below baseline/, for reading, or returns null when it is absent: when a
     // directory on its way or the file itself is missing, or a directory stands at its name, as File.Exists
     // reports one. On Linux the directories from baseline/ down are opened as handles, each relative to the one
-    // above it without following a link, and the file is opened inside the last one without following a link,
-    // so no link on the way or at the file is followed, even one swapped in meanwhile. Elsewhere, and where the
-    // Linux open flags are unknown, CheckedEntryExists checks each component by its path first. A link refuses
-    // the read and is left in place. The caller disposes the handle.
+    // above it without following a link, and the file is opened inside the last one without following a link
+    // and without blocking, so no link on the way or at the file is followed, even one swapped in meanwhile,
+    // and only a regular file, by the type of the opened descriptor, is returned: a FIFO, a socket or a device
+    // is refused at once. Elsewhere, and where the Linux open flags are unknown, CheckedEntryExists checks each
+    // component by its path first and the file is then opened by its path, which refuses a link but not a
+    // special file, so only the Linux path guarantees that opening a FIFO cannot block. A link refuses the read
+    // and is left in place. The caller disposes the handle.
     private SafeFileHandle? OpenForReading(string path)
     {
         var target = ResolveReadPath(path);
@@ -1447,23 +1486,65 @@ public sealed class BaselineStore
             throw Failure(errno, "read", target.FullPath);
         }
 
-        // Opening read-only also succeeds on a directory, which reads as absent, as File.Exists reports it.
+        // Opening read-only also succeeds on a directory, which reads as absent, as File.Exists reports it. The
+        // open does not wait for a FIFO's writer, and the type comes from the opened descriptor itself, so a
+        // FIFO, a socket or a device is refused before any read could block on it.
         var handle = new SafeFileHandle(descriptor, ownsHandle: true);
-        var isDirectory = true;
+        var kept = false;
         try
         {
-            isDirectory = (File.GetAttributes(handle) & FileAttributes.Directory) != 0;
+            var type = OpenedFileType(handle, target.FullPath);
+            if (type == Native.S_IFDIR)
+            {
+                return null;
+            }
+
+            if (type != Native.S_IFREG)
+            {
+                throw new IOException(
+                    $"BaselineStore could not read '{Display(target.FullPath)}': it is not a regular file "
+                    + $"({FileKind(type)}).");
+            }
+
+            kept = true;
+            return handle;
         }
         finally
         {
-            if (isDirectory)
+            if (!kept)
             {
                 handle.Dispose();
             }
         }
-
-        return isDirectory ? null : handle;
     }
+
+    // The S_IFMT bits of the file an opened descriptor holds, read with statx and AT_EMPTY_PATH from the
+    // descriptor itself, never from the path, so nothing swapped in at the name since the open counts.
+    private int OpenedFileType(SafeFileHandle handle, string path)
+    {
+        Span<byte> status = stackalloc byte[Native.StatxSize];
+        if (Native.Statx(handle, string.Empty, Native.AT_EMPTY_PATH, Native.STATX_TYPE, ref MemoryMarshal.GetReference(status)) != 0)
+        {
+            throw Failure(Marshal.GetLastPInvokeError(), "examine", path);
+        }
+
+        // The kernel writes the structure in the process's own byte order.
+        if ((MemoryMarshal.Read<uint>(status) & Native.STATX_TYPE) == 0)
+        {
+            throw new IOException($"BaselineStore could not examine '{Display(path)}': its file type was not reported.");
+        }
+
+        return MemoryMarshal.Read<ushort>(status[Native.StatxModeOffset..]) & Native.S_IFMT;
+    }
+
+    private static string FileKind(int type) => type switch
+    {
+        Native.S_IFIFO => "a FIFO",
+        Native.S_IFSOCK => "a socket",
+        Native.S_IFCHR => "a character device",
+        Native.S_IFBLK => "a block device",
+        _ => string.Create(CultureInfo.InvariantCulture, $"file type 0x{type:x4}"),
+    };
 
     // OpenForReading where directory handles are unavailable: the file is opened by its path once
     // CheckedEntryExists has found it a file reached without a link. Unlike a handle, this cannot rule out a
@@ -1529,7 +1610,8 @@ public sealed class BaselineStore
     }
 
     // The whole file a read handle holds, as File.ReadAllBytes reads it: the length the file reports, every byte
-    // of it, and an error when the file ends sooner.
+    // of it, and an error when the file ends sooner. A reported length over HarnessOptions.EvidenceByteLimit is
+    // refused before anything is allocated, so a huge or sparse file is never read in full nor in part.
     private byte[] ReadToEnd(SafeFileHandle handle, string path)
     {
         var bytes = new byte[FileLength(handle, path)];
@@ -1571,11 +1653,12 @@ public sealed class BaselineStore
     private int FileLength(SafeFileHandle handle, string path)
     {
         var length = RandomAccess.GetLength(handle);
-        return length <= Array.MaxLength
+        return length <= HarnessOptions.EvidenceByteLimit
             ? (int)length
             : throw new IOException(string.Create(
                 CultureInfo.InvariantCulture,
-                $"BaselineStore could not read '{Display(path)}': its {length} bytes exceed the largest array."));
+                $"BaselineStore could not read '{Display(path)}': its {length} bytes exceed the "
+                + $"{HarnessOptions.EvidenceByteLimit}-byte limit."));
     }
 
     private EndOfStreamException EndedEarly(string path) =>
@@ -2280,7 +2363,7 @@ public sealed class BaselineStore
         return new TraversalFlags(
             Native.O_RDONLY | directory | noFollow | Native.O_CLOEXEC,
             Native.O_WRONLY | Native.O_CREAT | Native.O_EXCL | noFollow | Native.O_CLOEXEC,
-            Native.O_RDONLY | noFollow | Native.O_CLOEXEC);
+            Native.O_RDONLY | noFollow | Native.O_NONBLOCK | Native.O_NOCTTY | Native.O_CLOEXEC);
     }
 
     // Messages name paths relative to the repository root, so an error quoted in a report reads the same in
@@ -2399,7 +2482,8 @@ public sealed class BaselineStore
         string BaselineDirectory, string FullPath, string[] Segments, bool Read);
 
     // The open(2) flags of one read, write or delete: a directory opened read-only, a file created write-only and
-    // exclusively, and a file opened read-only, all without following a link and all closed on exec.
+    // exclusively, and a file opened read-only without waiting on a FIFO's writer and without becoming a
+    // controlling terminal, all without following a link and all closed on exec.
     private readonly record struct TraversalFlags(int OpenDirectory, int CreateFile, int OpenFile);
 
     // A directory held open by its file descriptor, so a call relative to it acts on that directory whatever is
@@ -2430,11 +2514,27 @@ public sealed class BaselineStore
     private static class Native
     {
         public const int AT_FDCWD = -100;
+        public const int AT_EMPTY_PATH = 0x1000;
+
+        // struct statx has one layout on every architecture: 256 bytes, with the u32 stx_mask at byte 0 and the
+        // u16 stx_mode at byte 28, whose S_IFMT bits give the file's type.
+        public const uint STATX_TYPE = 0x1;
+        public const int StatxSize = 256;
+        public const int StatxModeOffset = 28;
+        public const int S_IFMT = 0xF000;
+        public const int S_IFIFO = 0x1000;
+        public const int S_IFCHR = 0x2000;
+        public const int S_IFDIR = 0x4000;
+        public const int S_IFBLK = 0x6000;
+        public const int S_IFREG = 0x8000;
+        public const int S_IFSOCK = 0xC000;
 
         public const int O_RDONLY = 0;
         public const int O_WRONLY = 1;
         public const int O_CREAT = 0x40;
         public const int O_EXCL = 0x80;
+        public const int O_NOCTTY = 0x100;
+        public const int O_NONBLOCK = 0x800;
         public const int O_CLOEXEC = 0x80000;
 
         // rw-rw-rw- and rwxrwxrwx before the umask, the modes .NET itself creates files and directories with.
@@ -2472,6 +2572,11 @@ public sealed class BaselineStore
             [MarshalAs(UnmanagedType.LPUTF8Str)] string oldPath,
             DirectoryHandle newDirectory,
             [MarshalAs(UnmanagedType.LPUTF8Str)] string newPath);
+
+        // Called on an opened file with an empty name and AT_EMPTY_PATH, so it examines that file itself.
+        [DllImport("libc", EntryPoint = "statx", SetLastError = true)]
+        public static extern int Statx(
+            SafeHandle handle, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags, uint mask, ref byte buffer);
 
         [DllImport("libc", EntryPoint = "close", SetLastError = true)]
         public static extern int Close(int descriptor);

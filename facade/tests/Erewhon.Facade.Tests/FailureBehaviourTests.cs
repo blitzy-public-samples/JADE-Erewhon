@@ -29,8 +29,11 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Net;
+using System.Net.Security;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
+using System.Security.Authentication;
+using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Text.Json;
 using System.Xml.Linq;
@@ -269,8 +272,8 @@ public sealed class FailureBehaviourTests
         }
     }
 
-    // The stub records each request on arrival and then waits far beyond the facade's deadline; the wait
-    // ends when the facade aborts the call.
+    // The stub records each request once it has read the body, and then waits far beyond the facade's
+    // deadline; the wait ends when the facade aborts the call.
     private static Task<StubBackend> StartSlowBackendAsync(CancellationToken ct) =>
         StubBackend.StartAsync("slow", new StubBackendOptions { Delay = SlowBackendDelay }, ct);
 
@@ -850,19 +853,21 @@ public sealed class BackendErrorPassThroughTests
 }
 
 // Forwarding transport (class ForwardingTransportTests), observed as raw bytes on both sides of the
-// facade. The backends are raw TcpListener sockets and the caller is a raw socket where bytes matter,
-// because HttpClient adds Content-Length: 0 to a body-less write, refuses non-ASCII header values and
-// response heads over 64 KiB on the test's own side, sends a whole body before it reads any response,
-// and a Kestrel stub would decode the bytes it is meant to record. The backend's authority is replaced
-// by a fixed token before request heads are compared.
+// facade. The backends are raw TcpListener sockets, wrapped in a TLS server stream with a certificate
+// from TestCertificates for HTTPS, and the caller is a raw socket where bytes matter, because HttpClient
+// adds Content-Length: 0 to a body-less write, refuses non-ASCII header values and response heads over
+// 64 KiB on the test's own side, sends a whole body before it reads any response, and a Kestrel stub
+// would decode the bytes it is meant to record. The backend's authority is replaced by a fixed token
+// before request heads are compared.
 /// <summary>
 /// Raw-byte checks of what the facade sends to a backend and returns to a caller: single delivery of
 /// body-less writes and of writes sent with <c>Expect: 100-continue</c>, the unchanged wire form of
 /// body-less requests, Latin-1 header bytes in both directions, response heads beyond 64 KiB, request
 /// heads at and over the limit of 100 header lines, chunked writes whose head and trailer lines reach or
 /// pass that limit together, the unavailable answer to a backend that breaks its reply, uploads that carry
-/// only the caller's own <c>Expect</c>, and a backend's answer to, or drop of, an upload the caller has
-/// paused.
+/// only the caller's own <c>Expect</c>, a backend's answer to, drop of, switch of protocols during or
+/// interim responses, valid or not, during an upload the caller has paused, and uploads to HTTPS
+/// backends, whose certificates are validated.
 /// </summary>
 public sealed class ForwardingTransportTests
 {
@@ -871,6 +876,7 @@ public sealed class ForwardingTransportTests
     private const string PostCreateRetailSaleId = "Rest.postCreateRetailSale";
     private const string GetCompanyId = "Rest.getCompany";
     private const string GetAgentNamesId = "Soap.getAgentNames";
+    private const string UpdateAgentId = "Soap.updateAgent";
 
     // How a backend that has received the whole request breaks the exchange before any usable response
     // head: bytes that are no HTTP response, a close or a reset without an answer, a status line whose code
@@ -884,8 +890,10 @@ public sealed class ForwardingTransportTests
 
     private const string ForwardedOutcome = "forwarded";
     private const string UnavailableOutcome = "unavailable";
+    private const string FailedOutcome = "failed";
 
     private const string JsonContentType = "application/json";
+    private const string JsonContentTypeLine = "\r\nContent-Type: " + JsonContentType + "\r\n";
     private const string ExpectHeaderName = "Expect";
 
     // The HTTP stack's default response-head limit, 64 KiB, and header lines that together exceed it.
@@ -915,22 +923,62 @@ public sealed class ForwardingTransportTests
 
     private const string ProbeHeader = "X-Probe: one\r\n";
 
-    // The callers of a paused upload: a REST write, a SOAP call naming its operation in SOAPAction, and a
-    // SOAP call without SOAPAction, whose body the facade inspects and buffers before forwarding it.
+    // The callers of an upload, paused or whole: a REST write, a SOAP call naming its operation in
+    // SOAPAction, and a SOAP call without SOAPAction, whose body the facade inspects and buffers before
+    // forwarding it.
     private const string RestCaller = "rest";
     private const string SoapActionCaller = "soap-action";
     private const string SoapInspectedCaller = "soap-inspected";
 
     // How an early-answering backend treats a request once it has read the head: it answers 413 and
-    // closes its side, answers and keeps the connection open, or answers 100 Continue, reads part of the
-    // body and then answers 413; it reads part of the body and closes or resets without answering; or it
-    // sends an interim response, 100 Continue after the facade's wait for it or 103 Early Hints at once,
-    // and then reads the whole body and answers 200.
+    // closes its side, answers and keeps the connection open, answers 100 Continue, reads part of the
+    // body and then answers 413, or sends 103 Early Hints and, a moment later, answers 413 on the open
+    // connection; it does the same after eight 103 Early Hints of about 10 KiB each, after one 103 Early
+    // Hints of about 100 KiB, or after a 103 Early Hints, small or of about 100 KiB, that the HTTP stack
+    // rejects; it sends 101 Switching Protocols and keeps the connection open; it reads part of the body
+    // and closes or resets without answering; or it sends an interim response, 100 Continue after the
+    // facade's wait for it or 103 Early Hints at once, whole or split after its first nine bytes,
+    // "HTTP/1.1 ", with a pause before the rest, an unasked 100 Continue at once, split the same way, the
+    // eight 103 Early Hints at once, or the first 70 KiB of the 103 Early Hints of about 100 KiB at once
+    // and its rest only once the body has been read, and then reads the whole body and answers 200.
     private const string AnswerThenClose = "answer-then-close";
     private const string AnswerKeepOpen = "answer-keep-open";
     private const string ContinueThenAnswer = "continue-then-answer";
+    private const string EarlyHintsThenAnswer = "early-hints-then-answer";
+    private const string HintFloodThenAnswer = "hint-flood-then-answer";
+    private const string OversizedHintThenAnswer = "oversized-hint-then-answer";
+    private const string InvalidHintThenAnswer = "invalid-hint-then-answer";
+    private const string InvalidOversizedHintThenAnswer = "invalid-oversized-hint-then-answer";
+    private const string SwitchingProtocols = "switching-protocols";
     private const string LateContinue = "late-continue";
     private const string EarlyHints = "early-hints";
+    private const string SplitLateContinue = "split-late-continue";
+    private const string SplitContinue = "split-continue";
+    private const string SplitEarlyHints = "split-early-hints";
+    private const string HintFlood = "hint-flood";
+    private const string OversizedHintAroundUpload = "oversized-hint-around-upload";
+
+    // Forms of interim response, each named for what sets it apart; InterimResponseForm gives the bytes.
+    private const string NoReasonForm = "no-reason";
+    private const string OtherVersionAndCodeForm = "other-version-and-code";
+    private const string LineFeedLinesForm = "line-feed-lines";
+    private const string FoldedLineForm = "folded-line";
+    private const string ControlByteForm = "control-byte";
+    private const string LettersInCodeForm = "letters-in-code";
+    private const string FourDigitCodeForm = "four-digit-code";
+    private const string NulInReasonForm = "nul-in-reason";
+    private const string FirstLineFoldsForm = "first-line-folds";
+    private const string TwoCarriageReturnsForm = "two-carriage-returns";
+
+    // The transport between the facade and a backend: plain HTTP, or HTTPS with a certificate from
+    // TestCertificates that the facade is configured to trust.
+    private const string HttpScheme = "http";
+    private const string HttpsScheme = "https";
+
+    // How an https backend's certificate fails the facade's validation: it is issued by an authority the
+    // facade does not trust, or by the trusted authority for a host name other than the target's.
+    private const string UntrustedIssuer = "untrusted-issuer";
+    private const string NameMismatch = "name-mismatch";
 
     // The early answer, as the backend sends it and as the caller must receive its status, headers and body.
     private const string EarlyAnswerHead =
@@ -1061,14 +1109,84 @@ public sealed class ForwardingTransportTests
     public static TheoryData<bool> UploadFramings() => new() { false, true };
 
     /// <summary>
-    /// Every caller of a paused upload, of declared length or chunked, against each way a backend answers
-    /// it early: 413 and a close of its side, 413 on a connection it keeps open, and, to a caller's own
-    /// <c>Expect: 100-continue</c>, 100 Continue, part of the body read, then 413.
+    /// Every caller of a paused upload, of declared length or chunked, against each way a plain HTTP
+    /// backend answers it early: 413 and a close of its side, 413 on a connection it keeps open, to a
+    /// caller's own <c>Expect: 100-continue</c> 100 Continue, part of the body read, then 413, and 413
+    /// after 103 Early Hints, after interim responses of more than the 64 KiB the facade keeps of them,
+    /// and after one interim response larger than that.
     /// </summary>
-    public static MatrixTheoryData<string, bool, string> PausedUploadsAnswered() => new(
+    public static MatrixTheoryData<string, bool, string, string> PausedUploadsAnswered() => new(
         [RestCaller, SoapActionCaller, SoapInspectedCaller],
         [false, true],
-        [AnswerThenClose, AnswerKeepOpen, ContinueThenAnswer]);
+        [AnswerThenClose, AnswerKeepOpen, ContinueThenAnswer, EarlyHintsThenAnswer, HintFloodThenAnswer, OversizedHintThenAnswer],
+        [HttpScheme]);
+
+    /// <summary>
+    /// A REST write and a SOAP call naming its operation in <c>SOAPAction</c>, of declared length or
+    /// chunked, paused against an HTTPS backend that answers early: 413 and a close of its side, 413 on a
+    /// connection it keeps open, and 413 after 103 Early Hints, after interim responses of more than
+    /// 64 KiB and after one interim response larger than that.
+    /// </summary>
+    public static MatrixTheoryData<string, bool, string, string> PausedHttpsUploadsAnswered() => new(
+        [RestCaller, SoapActionCaller],
+        [false, true],
+        [AnswerThenClose, AnswerKeepOpen, EarlyHintsThenAnswer, HintFloodThenAnswer, OversizedHintThenAnswer],
+        [HttpsScheme]);
+
+    /// <summary>
+    /// A REST write and a SOAP call naming its operation in <c>SOAPAction</c>, of declared length or
+    /// chunked, paused against a plain HTTP backend that sends 413 after an interim response the HTTP
+    /// stack rejects, small or larger than the 64 KiB the facade keeps of interim responses, and against
+    /// an HTTPS backend that does so after the large one.
+    /// </summary>
+    public static TheoryData<string, bool, string, string> PausedUploadsWithInvalidInterim() => new()
+    {
+        { RestCaller, false, InvalidHintThenAnswer, HttpScheme },
+        { RestCaller, true, InvalidHintThenAnswer, HttpScheme },
+        { SoapActionCaller, false, InvalidHintThenAnswer, HttpScheme },
+        { SoapActionCaller, true, InvalidHintThenAnswer, HttpScheme },
+        { RestCaller, false, InvalidOversizedHintThenAnswer, HttpScheme },
+        { RestCaller, true, InvalidOversizedHintThenAnswer, HttpScheme },
+        { SoapActionCaller, false, InvalidOversizedHintThenAnswer, HttpScheme },
+        { SoapActionCaller, true, InvalidOversizedHintThenAnswer, HttpScheme },
+        { RestCaller, false, InvalidOversizedHintThenAnswer, HttpsScheme },
+        { SoapActionCaller, true, InvalidOversizedHintThenAnswer, HttpsScheme },
+    };
+
+    /// <summary>
+    /// A REST write and a SOAP call naming its operation in <c>SOAPAction</c>, of declared length or
+    /// chunked, paused against a plain HTTP backend that sends 101 Switching Protocols, and a REST write of
+    /// declared length against an HTTPS backend that does.
+    /// </summary>
+    public static TheoryData<string, bool, string> PausedUploadsSwitched() => new()
+    {
+        { RestCaller, false, HttpScheme },
+        { RestCaller, true, HttpScheme },
+        { SoapActionCaller, false, HttpScheme },
+        { SoapActionCaller, true, HttpScheme },
+        { RestCaller, false, HttpsScheme },
+    };
+
+    /// <summary>
+    /// Forms of interim response and whether the HTTP stack accepts them: without a reason phrase, with
+    /// another version digit and code, with lines ended by LF alone, with a header line folded onto the
+    /// one before it, and with a control byte in a header value, all accepted; and with letters in the
+    /// code, a code of four digits, a NUL in the reason phrase, a first header line that folds, and a
+    /// line of two CRs, all rejected.
+    /// </summary>
+    public static TheoryData<string, bool> InterimResponseForms() => new()
+    {
+        { NoReasonForm, true },
+        { OtherVersionAndCodeForm, true },
+        { LineFeedLinesForm, true },
+        { FoldedLineForm, true },
+        { ControlByteForm, true },
+        { LettersInCodeForm, false },
+        { FourDigitCodeForm, false },
+        { NulInReasonForm, false },
+        { FirstLineFoldsForm, false },
+        { TwoCarriageReturnsForm, false },
+    };
 
     /// <summary>
     /// Every caller of a paused upload, of declared length or chunked, against a backend that reads part of
@@ -1086,11 +1204,44 @@ public sealed class ForwardingTransportTests
     public static TheoryData<string> ImmediateAnswers() => new() { AnswerThenClose, AnswerKeepOpen };
 
     /// <summary>
-    /// The interim responses a backend sends during an upload it goes on to read in full: a 100 Continue to
-    /// the caller's own <c>Expect</c> that arrives after the facade's wait for it, and 103 Early Hints to an
-    /// upload without <c>Expect</c>.
+    /// The interim responses a plain HTTP backend sends during an upload of declared length or chunked that
+    /// it goes on to read in full: a 100 Continue to the caller's own <c>Expect</c> that arrives after the
+    /// facade's wait for it, and 103 Early Hints to an upload without <c>Expect</c>, each whole or split
+    /// after <c>HTTP/1.1 </c>, an unasked 100 Continue to an upload without <c>Expect</c>, split the same
+    /// way, interim responses of more than the 64 KiB the facade keeps of them, and one interim response
+    /// larger than that whose rest arrives only once the upload has been sent.
     /// </summary>
-    public static TheoryData<string> InterimResponses() => new() { LateContinue, EarlyHints };
+    public static MatrixTheoryData<string, bool, string> InterimResponses() => new(
+        [LateContinue, EarlyHints, SplitLateContinue, SplitContinue, SplitEarlyHints, HintFlood, OversizedHintAroundUpload],
+        [false, true],
+        [HttpScheme]);
+
+    /// <summary>
+    /// The 103 Early Hints, whole, split after <c>HTTP/1.1 </c>, of more than 64 KiB in all, or one larger
+    /// than that whose rest arrives once the upload has been sent, that an HTTPS backend sends during an
+    /// upload of declared length or chunked that it goes on to read in full.
+    /// </summary>
+    public static MatrixTheoryData<string, bool, string> HttpsInterimResponses() => new(
+        [EarlyHints, SplitEarlyHints, HintFlood, OversizedHintAroundUpload],
+        [false, true],
+        [HttpsScheme]);
+
+    /// <summary>
+    /// A REST write and a SOAP write naming its operation in <c>SOAPAction</c>, of declared length or
+    /// chunked, sent whole to a plain HTTP and to an HTTPS backend.
+    /// </summary>
+    public static MatrixTheoryData<string, string, bool> WholeUploads() => new(
+        [HttpScheme, HttpsScheme],
+        [RestCaller, SoapActionCaller],
+        [false, true]);
+
+    /// <summary>
+    /// Each way an HTTPS backend's certificate fails the facade's validation, for a REST write and a SOAP
+    /// operation.
+    /// </summary>
+    public static MatrixTheoryData<string, string> CertificateFailures() => new(
+        [UntrustedIssuer, NameMismatch],
+        [PostCreateAgentId, GetAgentNamesId]);
 
     [Theory]
     [MemberData(nameof(BodylessWrites))]
@@ -1590,22 +1741,26 @@ public sealed class ForwardingTransportTests
     /// reach the caller unchanged, well inside the deadline: for a REST write, a SOAP call naming its
     /// operation in <c>SOAPAction</c> and a SOAP call whose body the facade inspects, each declaring 4 MiB
     /// or chunked, sending 128 KiB and then only reading on its open connection. Whether the backend
-    /// answers at once and closes its side, answers and keeps the connection open, or answers a caller's
-    /// own <c>Expect: 100-continue</c>, reads part of the body and then answers, the caller gets the
-    /// backend's 413 with its headers and body, logged <c>forwarded</c>; the backend receives the request
-    /// once, with an <c>Expect</c> only when the caller sent one and no more of the body than the caller
-    /// sent, and the facade logs no error.
+    /// answers at once and closes its side, answers and keeps the connection open, answers a caller's own
+    /// <c>Expect: 100-continue</c>, reads part of the body and then answers, or answers after interim 103
+    /// Early Hints, which the facade passes over while it goes on watching, also when they exceed the
+    /// 64 KiB it keeps of them in all or in one response, the caller gets the backend's 413 with its
+    /// headers and body, logged <c>forwarded</c>; the backend receives the request once, with an
+    /// <c>Expect</c> only when the caller sent one and no more of the body than the caller sent, and the
+    /// facade logs no error. The same holds for a backend reached over HTTPS, whose answer the facade sees
+    /// above TLS.
     /// </summary>
     [Theory]
     [MemberData(nameof(PausedUploadsAnswered))]
-    public async Task BackendAnswerToPausedUploadReachesCallerAtOnce(string caller, bool chunked, string behaviour)
+    [MemberData(nameof(PausedHttpsUploadsAnswered))]
+    public async Task BackendAnswerToPausedUploadReachesCallerAtOnce(string caller, bool chunked, string behaviour, string scheme)
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
         var logs = new LogCapture();
         bool callerExpects = behaviour == ContinueThenAnswer;
         PausedUpload upload = PausedUpload.For(caller, chunked, callerExpects);
-        await using EarlyAnswerBackend backend = EarlyAnswerBackend.Start(behaviour);
-        FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, PausedUploadDeadlineSeconds, ct);
+        await using EarlyAnswerBackend backend = EarlyAnswerBackend.Start(behaviour, certificate: CertificateFor(scheme));
+        FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, PausedUploadDeadlineSeconds, ct, TrustFor(scheme));
 
         UploadExchange exchange;
         try
@@ -1684,6 +1839,176 @@ public sealed class ForwardingTransportTests
         Assert.Equal(LogLevel.Warning, calls[0].Level);
         Assert.True(logs.Entries.All(entry => entry.Level < LogLevel.Error), "facade logged an error for a dropped paused upload");
     }
+
+    /// <summary>
+    /// A backend that sends an interim response the HTTP stack rejects, here 103 Early Hints with a header
+    /// line that holds no colon, during an upload the caller has paused, and then 413 on the open
+    /// connection, gets the facade's unavailable answer at once, well inside the deadline, as a broken
+    /// reply does, never the 413 behind it or the timeout: REST 502 with the fixed problem+json body, or
+    /// the SOAP "Backend unavailable" Fault, logged <c>unavailable</c>. That holds for a small response
+    /// and for one larger than the 64 KiB the facade keeps of interim responses, whose rejected line comes
+    /// after them. The upload reaches the backend once, with no more of the body than the caller sent,
+    /// and the facade logs no error.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(PausedUploadsWithInvalidInterim))]
+    public async Task InvalidInterimResponseToPausedUploadGetsTheUnavailableAnswerAtOnce(string caller, bool chunked, string behaviour, string scheme)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var logs = new LogCapture();
+        PausedUpload upload = PausedUpload.For(caller, chunked, expectContinue: false);
+        await using EarlyAnswerBackend backend = EarlyAnswerBackend.Start(behaviour, certificate: CertificateFor(scheme));
+        FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, PausedUploadDeadlineSeconds, ct, TrustFor(scheme));
+
+        UploadExchange exchange;
+        try
+        {
+            exchange = await SendUploadAsync(upload.Port(facade), upload.HeadAndPart, rest: null, ct);
+        }
+        finally
+        {
+            await facade.DisposeAsync();
+        }
+
+        int expectedStatus = UnavailableAnswers.AssertMatches(exchange.ToRawResponse(), upload.OperationId);
+        Assert.True(exchange.Elapsed <= PausedAnswerBound, "unavailable answer to an invalid interim response did not arrive well inside the deadline");
+        Assert.True(
+            backend.Requests.Count == 1 && backend.Connections == 1,
+            "paused upload answered with an invalid interim response did not reach the backend exactly once");
+
+        // Disposing the backend waits for its connections to end, so its count of body bytes is final. A
+        // body of declared length goes out as the caller's own bytes, so the count shows that none of the
+        // padding completing it was sent; the HTTP stack frames a chunked body in chunks of its own.
+        await backend.DisposeAsync();
+        Assert.True(chunked || backend.BodyBytesReceived <= upload.PartLength, "backend received more of the paused upload than the caller sent");
+
+        IReadOnlyList<CapturedLog> calls = logs.BackendCalls;
+        Assert.True(calls.Count == 1, "invalid interim response did not write exactly one backend call line");
+        Assert.Equal(UnavailableOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(expectedStatus, calls[0].Value("Status"));
+        Assert.Equal(LogLevel.Warning, calls[0].Level);
+        Assert.True(logs.Entries.All(entry => entry.Level < LogLevel.Error), "facade logged an error for an invalid interim response");
+    }
+
+    /// <summary>
+    /// A backend that sends 101 Switching Protocols during an upload the caller has paused ends the upload
+    /// at once, because a 101 ends HTTP/1.1 on the connection and the HTTP stack takes it as the final
+    /// response: the call ends well inside the deadline, never with the timeout, as it ends for a 101 to
+    /// a whole upload. YARP switches protocols only for a request that asked to, so the caller's
+    /// connection closes without any response and the call is logged <c>failed</c> with the backend's
+    /// status 101. The upload reaches the backend once, with no more of the body than the caller sent,
+    /// and the facade logs no error.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(PausedUploadsSwitched))]
+    public async Task SwitchingProtocolsDuringPausedUploadEndsIt(string caller, bool chunked, string scheme)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var logs = new LogCapture();
+        PausedUpload upload = PausedUpload.For(caller, chunked, expectContinue: false);
+        await using EarlyAnswerBackend backend = EarlyAnswerBackend.Start(SwitchingProtocols, certificate: CertificateFor(scheme));
+        FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, PausedUploadDeadlineSeconds, ct, TrustFor(scheme));
+
+        ClosedExchange exchange;
+        try
+        {
+            exchange = await SendUploadUntilClosedAsync(upload.Port(facade), upload.HeadAndPart, ct);
+        }
+        finally
+        {
+            await facade.DisposeAsync();
+        }
+
+        Assert.True(exchange.Received.Length == 0, "facade sent a response to a caller whose backend switched protocols");
+        Assert.True(exchange.Elapsed <= PausedAnswerBound, "switched protocols did not end the paused upload well inside the deadline");
+        Assert.True(
+            backend.Requests.Count == 1 && backend.Connections == 1,
+            "paused upload answered with 101 Switching Protocols did not reach the backend exactly once");
+
+        // Disposing the backend waits for its connections to end, so its count of body bytes is final. A
+        // body of declared length goes out as the caller's own bytes, so the count shows that none of the
+        // padding completing it was sent; the HTTP stack frames a chunked body in chunks of its own.
+        await backend.DisposeAsync();
+        Assert.True(chunked || backend.BodyBytesReceived <= upload.PartLength, "backend received more of the paused upload than the caller sent");
+
+        IReadOnlyList<CapturedLog> calls = logs.BackendCalls;
+        Assert.True(calls.Count == 1, "switched protocols did not write exactly one backend call line");
+        Assert.Equal(FailedOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(101, calls[0].Value("Status"));
+        Assert.Equal(upload.JadeMethod, calls[0].Value("Operation"));
+        Assert.True(logs.Entries.All(entry => entry.Level < LogLevel.Error), "facade logged an error for switched protocols");
+    }
+
+    /// <summary>
+    /// An interim response that comes before more than the 64 KiB of interim responses the facade keeps is
+    /// judged as the HTTP stack judges it, whose own verdict, from a direct call through a handler with
+    /// the facade's head limit, is checked first. After one the stack accepts, sent while the caller
+    /// pauses between the two halves of a 256 KiB REST upload of declared length, the backend reads the
+    /// whole upload and answers 200: the upload does not end, the backend receives it once and byte for
+    /// byte, and the 200 reaches the caller unchanged, logged <c>forwarded</c>. After one the stack
+    /// rejects, sent while the caller has paused such an upload for good and followed by 413 on the open
+    /// connection, the caller gets the facade's unavailable answer at once, logged <c>unavailable</c>,
+    /// never the 413 behind it.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(InterimResponseForms))]
+    public async Task InterimResponseBeyondTheBoundIsJudgedAsTheHttpStackJudgesIt(string form, bool accepted)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        byte[] interim = InterimResponseForm(form);
+        Assert.True(
+            await HttpStackAcceptsAsync(interim, ct) == accepted,
+            "the HTTP stack's own verdict on the interim response is not the one expected of it");
+
+        var logs = new LogCapture();
+        PreparedRequest write = OperationRequests.ForRest(OperationCatalogue.Default.GetById(PostCreateAgentId));
+        if (accepted)
+        {
+            await using EarlyAnswerBackend backend = EarlyAnswerBackend.Start(HintFlood, leadingInterim: interim);
+            await using FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, InterimDeadlineSeconds, ct);
+            byte[] body = new byte[InterimUploadLength];
+            Array.Fill(body, (byte)'x');
+            byte[] head = Encoding.Latin1.GetBytes(
+                "POST " + write.PathAndQuery + " HTTP/1.1\r\nHost: facade\r\n"
+                + "Content-Type: " + write.ContentType + "\r\n"
+                + FramingHeader(chunked: false, InterimUploadLength)
+                + "\r\n");
+            int half = InterimUploadLength / 2;
+
+            UploadExchange exchange = await SendUploadAsync(facade.RestPort, [.. head, .. body[..half]], body[half..], ct);
+
+            Assert.Equal(200, exchange.Response.Status);
+            Assert.Equal(BackendBody, Encoding.Latin1.GetString(exchange.Response.Body));
+            IReadOnlyList<ScriptedRequest> received = backend.Requests;
+            Assert.True(received.Count == 1, "upload answered with interim responses the HTTP stack accepts did not reach the backend exactly once");
+            Assert.True(
+                received[0].Body.AsSpan().SequenceEqual(body),
+                "backend did not receive the whole upload byte for byte after interim responses the HTTP stack accepts");
+
+            IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
+            Assert.True(calls.Count == 1, "upload answered with interim responses did not write exactly one backend call line");
+            Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
+            Assert.Equal(200, calls[0].Value("Status"));
+        }
+        else
+        {
+            PausedUpload upload = PausedUpload.For(RestCaller, chunked: false, expectContinue: false);
+            await using EarlyAnswerBackend backend = EarlyAnswerBackend.Start(HintFloodThenAnswer, leadingInterim: interim);
+            await using FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, PausedUploadDeadlineSeconds, ct);
+
+            UploadExchange exchange = await SendUploadAsync(upload.Port(facade), upload.HeadAndPart, rest: null, ct);
+
+            int expectedStatus = UnavailableAnswers.AssertMatches(exchange.ToRawResponse(), upload.OperationId);
+            Assert.True(exchange.Elapsed <= PausedAnswerBound, "unavailable answer to a rejected interim response did not arrive well inside the deadline");
+            Assert.True(backend.Requests.Count == 1, "paused upload answered with a rejected interim response did not reach the backend exactly once");
+
+            IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
+            Assert.True(calls.Count == 1, "rejected interim response did not write exactly one backend call line");
+            Assert.Equal(UnavailableOutcome, calls[0].Value("Outcome"));
+            Assert.Equal(expectedStatus, calls[0].Value("Status"));
+        }
+    }
+
 
     /// <summary>
     /// On a backend connection reused from an earlier call, a backend that answers the head of a paused
@@ -1789,20 +2114,27 @@ public sealed class ForwardingTransportTests
 
     /// <summary>
     /// An interim response during an upload does not end it: a 100 Continue to the caller's own
-    /// <c>Expect</c> that arrives after the facade's one-second wait for it, and 103 Early Hints to an
-    /// upload without <c>Expect</c>, both while the caller pauses between the two halves of its body. The
-    /// backend still receives the whole upload, once and byte for byte, and its 200 reaches the caller,
-    /// logged <c>forwarded</c>.
+    /// <c>Expect</c> that arrives after the facade's one-second wait for it, 103 Early Hints to an upload
+    /// without <c>Expect</c>, and an unasked 100 Continue to such an upload, while the caller pauses
+    /// between the two halves of its body of declared length or chunked. Each is sent whole, or split
+    /// after <c>HTTP/1.1 </c> with a pause before the rest, so that the facade first sees a status line
+    /// prefix too short to tell an interim response from a final one, read by the HTTP stack itself while
+    /// it waits for the caller's expected 100 Continue, and otherwise by the facade's read ahead of it.
+    /// Neither do 103 Early Hints of more than the 64 KiB the facade keeps of them, sent at once, nor one
+    /// larger than that whose rest arrives only once the whole upload has been read. The backend still
+    /// receives the whole upload, once and byte for byte, and its 200 reaches the caller unchanged, logged
+    /// <c>forwarded</c>; the same holds for 103 Early Hints from a backend reached over HTTPS.
     /// </summary>
     [Theory]
     [MemberData(nameof(InterimResponses))]
-    public async Task InterimResponseDuringUploadDoesNotEndIt(string interim)
+    [MemberData(nameof(HttpsInterimResponses))]
+    public async Task InterimResponseDuringUploadDoesNotEndIt(string interim, bool chunked, string scheme)
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
         var logs = new LogCapture();
-        bool callerExpects = interim == LateContinue;
-        await using EarlyAnswerBackend backend = EarlyAnswerBackend.Start(interim);
-        await using FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, InterimDeadlineSeconds, ct);
+        bool callerExpects = interim is LateContinue or SplitLateContinue;
+        await using EarlyAnswerBackend backend = EarlyAnswerBackend.Start(interim, certificate: CertificateFor(scheme));
+        await using FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, InterimDeadlineSeconds, ct, TrustFor(scheme));
 
         PreparedRequest write = OperationRequests.ForRest(OperationCatalogue.Default.GetById(PostCreateAgentId));
         byte[] body = new byte[InterimUploadLength];
@@ -1811,12 +2143,20 @@ public sealed class ForwardingTransportTests
             "POST " + write.PathAndQuery + " HTTP/1.1\r\nHost: facade\r\n"
             + "Content-Type: " + write.ContentType + "\r\n"
             + (callerExpects ? ExpectContinueHeader : string.Empty)
-            + "Content-Length: " + InterimUploadLength.ToString(CultureInfo.InvariantCulture) + "\r\n\r\n");
+            + FramingHeader(chunked, InterimUploadLength)
+            + "\r\n");
         int half = InterimUploadLength / 2;
 
-        UploadExchange exchange = await SendUploadAsync(facade.RestPort, [.. head, .. body.AsSpan(0, half)], body[half..], ct);
+        UploadExchange exchange = await SendUploadAsync(
+            facade.RestPort,
+            [.. head, .. FramedPart(body[..half], chunked, last: false)],
+            FramedPart(body[half..], chunked, last: true),
+            ct);
 
         Assert.Equal(200, exchange.Response.Status);
+        Assert.True(
+            exchange.Response.Head.Contains(JsonContentTypeLine, StringComparison.Ordinal),
+            "backend's Content-Type did not reach the caller unchanged after its interim response");
         Assert.Equal(BackendBody, Encoding.Latin1.GetString(exchange.Response.Body));
         IReadOnlyList<ScriptedRequest> received = backend.Requests;
         Assert.True(received.Count == 1, "upload answered with an interim response did not reach the backend exactly once");
@@ -1827,6 +2167,97 @@ public sealed class ForwardingTransportTests
         Assert.True(calls.Count == 1, "upload answered with an interim response did not write exactly one backend call line");
         Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
         Assert.Equal(200, calls[0].Value("Status"));
+    }
+
+    /// <summary>
+    /// An upload the caller sends whole, on a fresh backend connection, reaches the backend once and byte
+    /// for byte, and the backend's 200 reaches the caller unchanged, logged <c>forwarded</c>: a REST
+    /// <c>postCreateAgent</c> and a SOAP <c>updateAgent</c> naming its operation in <c>SOAPAction</c>, each
+    /// a 256 KiB body of declared length or chunked, over plain HTTP and over HTTPS with a certificate the
+    /// facade trusts. Over HTTPS the backend watch sees only the plaintext above TLS, so the TLS records a
+    /// server sends after its handshake never end the upload. The body is the operation's sample payload
+    /// followed by spaces, which a JSON value or an XML document may end with.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(WholeUploads))]
+    public async Task WholeUploadReachesBackendOnceByteForByte(string scheme, string caller, bool chunked)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var logs = new LogCapture();
+        await using ScriptedBackend backend = ScriptedBackend.Start(OkReply(), certificate: CertificateFor(scheme));
+        await using FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, InterimDeadlineSeconds, ct, TrustFor(scheme));
+
+        OperationDescriptor operation = OperationCatalogue.Default.GetById(caller == RestCaller ? PostCreateAgentId : UpdateAgentId);
+        PreparedRequest request = caller == RestCaller
+            ? OperationRequests.ForRest(operation)
+            : OperationRequests.ForSoap(operation, includeSoapAction: true);
+        byte[] body = new byte[InterimUploadLength];
+        Array.Fill(body, (byte)' ');
+        request.Body!.CopyTo(body, 0);
+        string headers = "Content-Type: " + request.ContentType + "\r\n"
+            + (request.SoapAction is null ? string.Empty : "SOAPAction: " + request.SoapAction + "\r\n")
+            + FramingHeader(chunked, body.Length);
+        int port = operation.Surface == Surface.Rest ? facade.RestPort : facade.SoapPort;
+
+        RawExchange response = await SendRawAsync(
+            port,
+            CallerHead(request.Method.Method, request.PathAndQuery, headers, Encoding.Latin1.GetString(FramedPart(body, chunked, last: true))),
+            ct);
+
+        Assert.Equal(200, response.Status);
+        Assert.True(response.Head.Contains(JsonContentTypeLine, StringComparison.Ordinal), "backend's Content-Type did not reach the caller unchanged");
+        Assert.Equal(BackendBody, Encoding.Latin1.GetString(response.Body));
+        IReadOnlyList<ScriptedRequest> received = backend.Requests;
+        Assert.True(received.Count == 1, "whole upload did not reach the backend exactly once");
+        Assert.True(received[0].Body.AsSpan().SequenceEqual(body), "backend did not receive the whole upload byte for byte");
+        Assert.Equal(request.SoapAction, received[0].HeaderValue("SOAPAction"));
+
+        IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
+        Assert.True(calls.Count == 1, "whole upload did not write exactly one backend call line");
+        Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(200, calls[0].Value("Status"));
+        Assert.Equal(operation.JadeMethod, calls[0].Value("Operation"));
+    }
+
+    /// <summary>
+    /// An HTTPS backend whose certificate fails the facade's validation gets no request, and the caller
+    /// gets the facade's unavailable answer within the bound, logged <c>unavailable</c>: a certificate
+    /// from an authority the platform does not trust, sent to a facade that keeps the platform's default
+    /// trust, and a certificate from the authority the facade trusts that names another host than the
+    /// target's. Validation, the host name check included, is never skipped.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(CertificateFailures))]
+    public async Task HttpsBackendWhoseCertificateFailsValidationGetsTheUnavailableAnswer(string failure, string operationId)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var logs = new LogCapture();
+        bool nameMismatch = failure == NameMismatch;
+        await using ScriptedBackend backend = ScriptedBackend.Start(
+            OkReply(), certificate: nameMismatch ? TestCertificates.OtherHostServer : TestCertificates.LoopbackServer);
+        await using FacadeFactory facade = await StartFacadeAsync(
+            backend.BaseUrl, logs, timeoutSeconds: null, ct, nameMismatch ? TestCertificates.CreateTrustPolicy() : null);
+
+        OperationDescriptor operation = OperationCatalogue.Default.GetById(operationId);
+        PreparedRequest request = OperationRequests.For(operation);
+        string body = Encoding.Latin1.GetString(request.Body!);
+        string headers = "Content-Type: " + request.ContentType + "\r\n"
+            + (request.SoapAction is null ? string.Empty : "SOAPAction: " + request.SoapAction + "\r\n")
+            + FramingHeader(chunked: false, body.Length);
+        int port = operation.Surface == Surface.Rest ? facade.RestPort : facade.SoapPort;
+
+        var stopwatch = Stopwatch.StartNew();
+        RawExchange response = await SendRawAsync(port, CallerHead(request.Method.Method, request.PathAndQuery, headers, body), ct);
+        stopwatch.Stop();
+
+        int expectedStatus = UnavailableAnswers.AssertMatches(new UploadExchange(response, stopwatch.Elapsed).ToRawResponse(), operationId);
+        Assert.True(stopwatch.Elapsed <= UnavailableBound, "unavailable answer to a backend whose certificate fails validation did not arrive within the bound");
+        Assert.True(backend.Requests.Count == 0, "a request reached a backend whose certificate fails validation");
+
+        IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
+        Assert.True(calls.Count == 1, "call to a backend whose certificate fails validation did not write exactly one backend call line");
+        Assert.Equal(UnavailableOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(expectedStatus, calls[0].Value("Status"));
     }
 
     // The backend's early answer as the caller must receive it: status 413, the backend's X-Early and
@@ -1853,8 +2284,14 @@ public sealed class ForwardingTransportTests
             ct);
 
     // Routes both surfaces to one backend, captures the facade's log and sets the target deadline; null
-    // keeps the facade's default.
-    private static Task<FacadeFactory> StartFacadeAsync(string baseUrl, LogCapture logs, int? timeoutSeconds, CancellationToken ct) =>
+    // keeps the facade's default. A chain policy replaces the platform's default trust for an https
+    // backend's certificate; null keeps the default.
+    private static Task<FacadeFactory> StartFacadeAsync(
+        string baseUrl,
+        LogCapture logs,
+        int? timeoutSeconds,
+        CancellationToken ct,
+        X509ChainPolicy? certificateChainPolicy = null) =>
         FacadeFactory.StartAsync(
             new FacadeTestSettings
             {
@@ -1862,8 +2299,38 @@ public sealed class ForwardingTransportTests
                 BackendSoapBaseUrl = baseUrl,
                 BackendTimeoutSeconds = timeoutSeconds,
                 LoggerProvider = logs,
+                BackendCertificateChainPolicy = certificateChainPolicy,
             },
             ct);
+
+    // The certificate a backend serves on the scheme: the loopback certificate of the test authority for
+    // HTTPS, none for plain HTTP.
+    private static X509Certificate2? CertificateFor(string scheme) =>
+        scheme == HttpsScheme ? TestCertificates.LoopbackServer : null;
+
+    // The trust a facade needs for a backend on the scheme: the test authority alone for HTTPS, the
+    // platform's default, which plain HTTP never consults, otherwise.
+    private static X509ChainPolicy? TrustFor(string scheme) =>
+        scheme == HttpsScheme ? TestCertificates.CreateTrustPolicy() : null;
+
+    // The header line that frames an upload's body: chunked, or the declared length.
+    private static string FramingHeader(bool chunked, int length) =>
+        chunked
+            ? "Transfer-Encoding: chunked\r\n"
+            : "Content-Length: " + length.ToString(CultureInfo.InvariantCulture) + "\r\n";
+
+    // One part of an upload's body as the caller sends it: the bytes themselves, or, chunked, one chunk
+    // holding them, followed by the last chunk when the part ends the body.
+    private static byte[] FramedPart(byte[] part, bool chunked, bool last)
+    {
+        if (!chunked)
+        {
+            return part;
+        }
+
+        byte[] chunk = [.. Encoding.ASCII.GetBytes(part.Length.ToString("x", CultureInfo.InvariantCulture) + "\r\n"), .. part, .. "\r\n"u8];
+        return last ? [.. chunk, .. "0\r\n\r\n"u8] : chunk;
+    }
 
     // A backend's 200 with the JSON body BackendBody, framed by Content-Length.
     private static byte[] OkReply() => Encoding.Latin1.GetBytes(
@@ -1872,6 +2339,42 @@ public sealed class ForwardingTransportTests
         + "Content-Length: " + BackendBody.Length.ToString(CultureInfo.InvariantCulture) + "\r\n"
         + "\r\n"
         + BackendBody);
+
+    // The bytes of an interim response in one of the forms of InterimResponseForms.
+    private static byte[] InterimResponseForm(string form) => form switch
+    {
+        NoReasonForm => "HTTP/1.1 103\r\n\r\n"u8.ToArray(),
+        OtherVersionAndCodeForm => "HTTP/1.0 199 Miscellaneous\r\n\r\n"u8.ToArray(),
+        LineFeedLinesForm => "HTTP/1.1 103 Early Hints\nLink: </agent.css>\n\n"u8.ToArray(),
+        FoldedLineForm => "HTTP/1.1 103 Early Hints\r\nLink: </agent.css>\r\n ; rel=preload\r\n\r\n"u8.ToArray(),
+        ControlByteForm => "HTTP/1.1 102 Processing\r\nX-Note: a\u0001b\r\n\r\n"u8.ToArray(),
+        LettersInCodeForm => "HTTP/1.1 1ab Early Hints\r\n\r\n"u8.ToArray(),
+        FourDigitCodeForm => "HTTP/1.1 1030 Early Hints\r\n\r\n"u8.ToArray(),
+        NulInReasonForm => "HTTP/1.1 103 Early\0Hints\r\n\r\n"u8.ToArray(),
+        FirstLineFoldsForm => "HTTP/1.1 103 Early Hints\r\n ; rel=preload\r\n\r\n"u8.ToArray(),
+        TwoCarriageReturnsForm => "HTTP/1.1 103 Early Hints\r\nLink: </agent.css>\r\n\r\r\n"u8.ToArray(),
+        _ => throw new ArgumentOutOfRangeException(nameof(form)),
+    };
+
+    // Whether the HTTP stack, through a handler with the facade's head limit, takes the interim response
+    // and the 200 after it as a valid response: true when the call returns the 200, false when it fails
+    // because the response is invalid.
+    private static async Task<bool> HttpStackAcceptsAsync(byte[] interim, CancellationToken ct)
+    {
+        await using ScriptedBackend backend = ScriptedBackend.Start([.. interim, .. "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"u8]);
+        using var handler = new SocketsHttpHandler { UseProxy = false, MaxResponseHeadersLength = int.MaxValue };
+        using var invoker = new HttpMessageInvoker(handler);
+        using var request = new HttpRequestMessage(HttpMethod.Get, backend.BaseUrl + "/");
+        try
+        {
+            using HttpResponseMessage response = await invoker.SendAsync(request, ct);
+            return response.StatusCode == HttpStatusCode.OK;
+        }
+        catch (HttpRequestException exception) when (exception.HttpRequestError == HttpRequestError.InvalidResponse)
+        {
+            return false;
+        }
+    }
 
     // The bytes a backend that breaks its reply writes once it has read the request; null for none.
     private static byte[]? BrokenReply(string breakage) => breakage switch
@@ -1983,6 +2486,48 @@ public sealed class ForwardingTransportTests
         }
     }
 
+    // Sends an upload's head and first part to a facade socket, then only reads, until the facade closes or
+    // resets the connection. The elapsed time runs from the end of the part to the end of the connection.
+    private static async Task<ClosedExchange> SendUploadUntilClosedAsync(int port, byte[] first, CancellationToken ct)
+    {
+        using var limit = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        limit.CancelAfter(RawCallerTimeout);
+        using var received = new MemoryStream();
+        Stopwatch stopwatch;
+        try
+        {
+            using var client = new TcpClient(AddressFamily.InterNetwork);
+            await client.ConnectAsync(IPAddress.Loopback, port, limit.Token);
+            NetworkStream stream = client.GetStream();
+            await stream.WriteAsync(first, limit.Token);
+            stopwatch = Stopwatch.StartNew();
+            byte[] buffer = new byte[16 * 1024];
+            try
+            {
+                int read;
+                while ((read = await stream.ReadAsync(buffer, limit.Token)) > 0)
+                {
+                    received.Write(buffer, 0, read);
+                }
+            }
+            catch (IOException)
+            {
+                // The facade reset the connection, which ends it as a close does.
+            }
+
+            stopwatch.Stop();
+        }
+        catch (Exception exception) when (
+            exception is SocketException or IOException
+            || (exception is OperationCanceledException && !ct.IsCancellationRequested))
+        {
+            Assert.Fail("raw facade upload failed at the transport level (" + exception.GetType().Name + ")");
+            throw new UnreachableException();
+        }
+
+        return new ClosedExchange(received.ToArray(), stopwatch.Elapsed);
+    }
+
     // Reads until a final response and the whole body its Content-Length declares have arrived, past any
     // interim response, such as the 100 Continue the facade's server writes to a caller's own Expect.
     private static async Task<RawExchange> ReadFinalResponseAsync(NetworkStream stream, CancellationToken ct)
@@ -2042,6 +2587,11 @@ public sealed class ForwardingTransportTests
             return received.Length - start < length ? null : new RawExchange(status, head, received.Slice(start, length).ToArray());
         }
     }
+
+    /// <summary>What a raw caller of an upload received before the facade ended the connection, and when.</summary>
+    /// <param name="Received">Every byte the facade sent on the connection.</param>
+    /// <param name="Elapsed">The time from the end of the upload's first part to the end of the connection.</param>
+    private sealed record ClosedExchange(byte[] Received, TimeSpan Elapsed);
 
     /// <summary>The final response to an upload as the raw caller received it, and how long it took.</summary>
     /// <param name="Response">The final response.</param>
@@ -2214,7 +2764,11 @@ public sealed class ForwardingTransportTests
         /// <summary>The base URL to route a target to.</summary>
         public string BaseUrl => "http://" + Authority;
 
-        /// <summary>The request heads received so far, in arrival order, terminator included.</summary>
+        /// <summary>
+        /// The request heads read so far, terminator included when one arrived. A head is recorded when its
+        /// read ends, at the blank line, the peer's close or the size bound, so heads on concurrent
+        /// connections are in the order their reads ended, not the order the requests arrived.
+        /// </summary>
         public IReadOnlyList<byte[]> Heads => [.. _heads];
 
         /// <summary>Starts listening on a free loopback port.</summary>
@@ -2300,7 +2854,8 @@ public sealed class ForwardingTransportTests
                 }
                 catch (Exception exception) when (exception is OperationCanceledException or SocketException or IOException or ObjectDisposedException)
                 {
-                    // The facade or the test ended the connection first; the head, if any, is already recorded.
+                    // The facade or the test ended the connection first. A head whose read ended is already
+                    // recorded; one whose read this cut short is not.
                 }
             }
         }
@@ -2363,7 +2918,9 @@ public sealed class ForwardingTransportTests
     /// <c>Content-Length</c> or chunked framing declares, records it, and then writes a fixed reply, or
     /// nothing, and closes the connection, or resets it. It never sends 100 Continue. Given an expectation
     /// reply, it answers a request carrying <c>Expect</c> with that reply at once, before reading any of
-    /// its body. Connections are served concurrently, one request each.
+    /// its body. Given a certificate, it serves HTTPS: each connection completes a TLS handshake with that
+    /// certificate before anything is read, and a connection whose handshake fails records nothing.
+    /// Connections are served concurrently, one request each.
     /// </summary>
     private sealed class ScriptedBackend : IAsyncDisposable
     {
@@ -2377,27 +2934,35 @@ public sealed class ForwardingTransportTests
         private readonly byte[]? _reply;
         private readonly bool _reset;
         private readonly byte[]? _expectationReply;
+        private readonly X509Certificate2? _certificate;
         private readonly ConcurrentQueue<ScriptedRequest> _requests = new();
         private readonly ConcurrentQueue<Task> _connections = new();
         private readonly CancellationTokenSource _stop = new();
         private readonly Task _acceptLoop;
         private int _disposed;
 
-        private ScriptedBackend(byte[]? reply, bool reset, byte[]? expectationReply)
+        private ScriptedBackend(byte[]? reply, bool reset, byte[]? expectationReply, X509Certificate2? certificate)
         {
             _reply = reply;
             _reset = reset;
             _expectationReply = expectationReply;
+            _certificate = certificate;
             _listener = new TcpListener(IPAddress.Loopback, 0);
             _listener.Start();
-            BaseUrl = "http://127.0.0.1:" + ((IPEndPoint)_listener.LocalEndpoint).Port.ToString(CultureInfo.InvariantCulture);
+            BaseUrl = (certificate is null ? "http" : "https") + "://127.0.0.1:"
+                + ((IPEndPoint)_listener.LocalEndpoint).Port.ToString(CultureInfo.InvariantCulture);
             _acceptLoop = AcceptLoopAsync();
         }
 
         /// <summary>The base URL to route a target to.</summary>
         public string BaseUrl { get; }
 
-        /// <summary>The requests received so far, in arrival order.</summary>
+        /// <summary>
+        /// The requests recorded so far, at most one per connection, in the order they were recorded. A
+        /// request is recorded once its declared body has been read in full or, when it gets the expectation
+        /// reply, once its head has been read; a request whose body falls short is not recorded. With
+        /// concurrent connections that order need not be the order the requests arrived.
+        /// </summary>
         public IReadOnlyList<ScriptedRequest> Requests => [.. _requests];
 
         /// <summary>Starts listening on a free loopback port.</summary>
@@ -2407,9 +2972,11 @@ public sealed class ForwardingTransportTests
         /// The bytes written, before any body is read, to a request carrying <c>Expect</c>; null to treat
         /// such a request like any other.
         /// </param>
+        /// <param name="certificate">The server certificate, with its private key, to serve HTTPS with; null for plain HTTP.</param>
         /// <returns>The listening backend; the caller disposes it.</returns>
-        public static ScriptedBackend Start(byte[]? reply, bool reset = false, byte[]? expectationReply = null) =>
-            new(reply, reset, expectationReply);
+        public static ScriptedBackend Start(
+            byte[]? reply, bool reset = false, byte[]? expectationReply = null, X509Certificate2? certificate = null) =>
+            new(reply, reset, expectationReply, certificate);
 
         /// <summary>Stops listening and waits for every connection to end. Safe to call more than once; never throws.</summary>
         public async ValueTask DisposeAsync()
@@ -2444,8 +3011,10 @@ public sealed class ForwardingTransportTests
             }
         }
 
-        // The request is recorded before anything is written or the connection ends, so by the time the
-        // facade sees the backend's reply or close, and so before it answers its caller, it is counted.
+        // A request read in full, or one that gets the expectation reply once its head is read, is recorded
+        // before anything is written in reply and before the backend ends its side, so by the time the facade
+        // sees the backend's reply or close, and so before it answers its caller, it is counted. A request
+        // whose body falls short is never recorded.
         private async Task ServeAsync(Socket socket)
         {
             using (socket)
@@ -2454,7 +3023,7 @@ public sealed class ForwardingTransportTests
                 limit.CancelAfter(ConnectionLimit);
                 try
                 {
-                    using var stream = new NetworkStream(socket, ownsSocket: false);
+                    await using Stream stream = await AcceptBackendStreamAsync(socket, _certificate, limit.Token);
                     var reader = new ConnectionReader(stream);
                     byte[]? headBytes = await reader.ReadThroughAsync(HeadEnd, MaxHeadBytes, limit.Token);
                     if (headBytes is null)
@@ -2468,6 +3037,7 @@ public sealed class ForwardingTransportTests
                     {
                         _requests.Enqueue(received);
                         await stream.WriteAsync(_expectationReply, limit.Token);
+                        await SendCloseNotifyAsync(stream);
                         socket.Shutdown(SocketShutdown.Both);
                         return;
                     }
@@ -2492,19 +3062,25 @@ public sealed class ForwardingTransportTests
                     }
                     else
                     {
+                        await SendCloseNotifyAsync(stream);
                         socket.Shutdown(SocketShutdown.Both);
                     }
                 }
-                catch (Exception exception) when (exception is OperationCanceledException or SocketException or IOException or ObjectDisposedException)
+                catch (Exception exception) when (
+                    exception is OperationCanceledException or SocketException or IOException or ObjectDisposedException or AuthenticationException)
                 {
-                    // The facade or the test ended the connection first; a complete request is already recorded.
+                    // The facade or the test ended the connection first, or the facade refused the certificate
+                    // during the handshake; a complete request is already recorded.
                 }
             }
         }
 
-        // Reads the body the head declares: chunked when Transfer-Encoding names chunked, otherwise the
-        // Content-Length bytes, or none. Returns null when the connection ends first.
-        private static async Task<byte[]?> ReadBodyAsync(ConnectionReader reader, ScriptedRequest request, CancellationToken ct)
+        /// <summary>
+        /// Reads the body the head declares: chunked when Transfer-Encoding names chunked, with the chunk
+        /// framing removed, otherwise the <c>Content-Length</c> bytes, or none.
+        /// </summary>
+        /// <returns>The body; null when the connection ends first.</returns>
+        public static async Task<byte[]?> ReadBodyAsync(ConnectionReader reader, ScriptedRequest request, CancellationToken ct)
         {
             if (request.HeaderValue("Transfer-Encoding") is { } coding && coding.Contains("chunked", StringComparison.OrdinalIgnoreCase))
             {
@@ -2551,13 +3127,24 @@ public sealed class ForwardingTransportTests
     /// <summary>
     /// A backend on a raw loopback socket that treats each request as its behaviour scripts, once it has
     /// read the head, without waiting for the body: it answers 413 at once and closes its side, answers
-    /// and keeps the connection open, answers 100 Continue, reads 64 KiB of the body and answers 413, reads
-    /// 32 KiB and closes or resets without answering, or sends a late 100 Continue or 103 Early Hints and
-    /// then reads the whole body its <c>Content-Length</c> declares and answers 200. It records every head
-    /// before it answers, and the body it read in full. After answering, it drains what still arrives, so
-    /// that its close is a reset only when the behaviour is one. Given a first request to answer, it
-    /// answers the first request on each connection with a 200 that keeps the connection alive and treats
-    /// the next request as scripted. Connections are served concurrently.
+    /// and keeps the connection open, answers 100 Continue, reads 64 KiB of the body and answers 413, sends
+    /// 103 Early Hints (one small, eight of about 10 KiB, one of about 100 KiB, or one, small or of about
+    /// 100 KiB, with a header line the HTTP stack rejects) and after a pause answers 413 on the open
+    /// connection, sends 101 Switching Protocols and keeps the connection open, reads 32 KiB and closes or
+    /// resets without answering, or sends an interim response, whole or as its first nine bytes and, after
+    /// a pause, the rest (a late 100 Continue, or 103 Early Hints at once, either way; an unasked 100
+    /// Continue at once, split only; the eight 103 Early Hints at once, whole only; the 103 Early Hints of
+    /// about 100 KiB as its first 70 KiB at once and its rest once the body has been read), and then reads
+    /// the whole body its framing declares, of declared length or chunked, and answers 200, after the rest
+    /// of an interim response it split around the body. Each request it records is recorded before its
+    /// final answer is written and before the backend ends its side; <see cref="Requests"/> says when, and
+    /// which ones go unrecorded. After answering, it drains what still arrives, so that its close is a
+    /// reset only when the behaviour is one. Given a first request to answer, it answers the first request
+    /// on each connection with a 200 that keeps the connection alive and treats the next request as
+    /// scripted. Given a leading interim response, it sends that just before the eight 103 Early Hints.
+    /// Given a certificate, it serves HTTPS, completing a TLS handshake with that certificate before it
+    /// reads anything and ending its side with a TLS close before the socket's. Connections are served
+    /// concurrently.
     /// </summary>
     private sealed class EarlyAnswerBackend : IAsyncDisposable
     {
@@ -2565,9 +3152,32 @@ public sealed class ForwardingTransportTests
         private const int ContinueReadLength = 64 * 1024;
         private const int DroppedReadLength = 32 * 1024;
 
+        // The first nine bytes of a status line, "HTTP/1.1 ", which stop short of the status code that tells
+        // an interim response from a final one.
+        private const int SplitStatusLength = 9;
+
+        // Eight 103 Early Hints of 10,052 bytes each, 80,416 bytes in all, more than the 64 KiB the facade
+        // keeps of interim responses; each holds one Link line whose target is 10,000 bytes long.
+        private const int FloodHintCount = 8;
+        private const int FloodLinkLength = 10_000;
+
+        // One 103 Early Hints of 100 Link lines of 1,024 bytes, whose targets are 1,000 bytes long, 102,428
+        // bytes in all; the backend that splits it sends its first 70 KiB before it reads the body.
+        private const int OversizedHintLineCount = 100;
+        private const int OversizedLinkLength = 1000;
+        private const int OversizedHintFirstPart = 70 * 1024;
+
         private static readonly byte[] HeadEnd = "\r\n\r\n"u8.ToArray();
         private static readonly byte[] ContinueReply = "HTTP/1.1 100 Continue\r\n\r\n"u8.ToArray();
         private static readonly byte[] EarlyHintsReply = "HTTP/1.1 103 Early Hints\r\nLink: </agent.css>; rel=preload\r\n\r\n"u8.ToArray();
+        private static readonly byte[] HintFloodReply = HintFloodBytes();
+        private static readonly byte[] OversizedHintReply = OversizedHintBytes(rejectedLine: false);
+        private static readonly byte[] InvalidOversizedHintReply = OversizedHintBytes(rejectedLine: true);
+
+        // A header line without a colon, which the HTTP stack rejects in an interim response as in any other.
+        private static readonly byte[] InvalidHintReply = "HTTP/1.1 103 Early Hints\r\nThis Is Not A Header\r\n\r\n"u8.ToArray();
+        private static readonly byte[] SwitchingProtocolsReply =
+            "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: foo\r\n\r\n"u8.ToArray();
         private static readonly byte[] AnswerClosing = Encoding.Latin1.GetBytes(EarlyAnswerHead + "Connection: close\r\n\r\n" + EarlyAnswerBody);
         private static readonly byte[] AnswerKeepingOpen = Encoding.Latin1.GetBytes(EarlyAnswerHead + "\r\n" + EarlyAnswerBody);
         private static readonly byte[] OkClosing = Encoding.Latin1.GetBytes(
@@ -2583,9 +3193,15 @@ public sealed class ForwardingTransportTests
         // After the facade's one-second wait for 100 Continue, and before the caller's pause ends.
         private static readonly TimeSpan LateContinueDelay = TimeSpan.FromMilliseconds(1500);
 
+        // Between the two parts of a split interim response, and between 103 Early Hints and the answer
+        // after it; both pauses end well before the caller's pause and inside PausedAnswerBound.
+        private static readonly TimeSpan SplitPause = TimeSpan.FromMilliseconds(500);
+
         private readonly TcpListener _listener;
         private readonly string _behaviour;
         private readonly bool _answerFirstRequest;
+        private readonly X509Certificate2? _certificate;
+        private readonly byte[] _leadingInterim;
         private readonly ConcurrentQueue<ScriptedRequest> _requests = new();
         private readonly ConcurrentQueue<Task> _connections = new();
         private readonly CancellationTokenSource _stop = new();
@@ -2594,20 +3210,32 @@ public sealed class ForwardingTransportTests
         private long _bodyBytesReceived;
         private int _disposed;
 
-        private EarlyAnswerBackend(string behaviour, bool answerFirstRequest)
+        private EarlyAnswerBackend(string behaviour, bool answerFirstRequest, X509Certificate2? certificate, byte[] leadingInterim)
         {
             _behaviour = behaviour;
             _answerFirstRequest = answerFirstRequest;
+            _certificate = certificate;
+            _leadingInterim = leadingInterim;
             _listener = new TcpListener(IPAddress.Loopback, 0);
             _listener.Start();
-            BaseUrl = "http://127.0.0.1:" + ((IPEndPoint)_listener.LocalEndpoint).Port.ToString(CultureInfo.InvariantCulture);
+            BaseUrl = (certificate is null ? "http" : "https") + "://127.0.0.1:"
+                + ((IPEndPoint)_listener.LocalEndpoint).Port.ToString(CultureInfo.InvariantCulture);
             _acceptLoop = AcceptLoopAsync();
         }
 
         /// <summary>The base URL to route a target to.</summary>
         public string BaseUrl { get; }
 
-        /// <summary>The requests received so far, in arrival order; a body only when it was read in full.</summary>
+        /// <summary>
+        /// The requests recorded so far, in the order they were recorded. A request is recorded with an empty
+        /// body once its head has been read, before anything is written in reply to it. The exception is the
+        /// scripted request under the interim behaviours, <c>late-continue</c>, <c>early-hints</c>,
+        /// <c>split-late-continue</c>, <c>split-continue</c>, <c>split-early-hints</c>, <c>hint-flood</c>
+        /// and <c>oversized-hint-around-upload</c>: its interim response, or the first part of it, is
+        /// written first, and it is recorded with its body once the whole declared body has
+        /// been read, before the 200 is written, and not at all when the body falls short or the connection
+        /// ends first. With concurrent connections that order need not be the order the requests arrived.
+        /// </summary>
         public IReadOnlyList<ScriptedRequest> Requests => [.. _requests];
 
         /// <summary>The number of connections accepted so far.</summary>
@@ -2622,17 +3250,74 @@ public sealed class ForwardingTransportTests
         /// <summary>Starts listening on a free loopback port.</summary>
         /// <param name="behaviour">One of the scripted behaviours, for example <c>answer-then-close</c>.</param>
         /// <param name="answerFirstRequest">True to answer each connection's first request with a 200 that keeps it alive.</param>
+        /// <param name="certificate">The server certificate, with its private key, to serve HTTPS with; null for plain HTTP.</param>
+        /// <param name="leadingInterim">
+        /// An interim response, in whatever form, sent just before the eight 103 Early Hints of
+        /// <c>hint-flood</c> or <c>hint-flood-then-answer</c>; null for none.
+        /// </param>
         /// <returns>The listening backend; the caller disposes it.</returns>
-        /// <exception cref="ArgumentOutOfRangeException"><paramref name="behaviour"/> is not a scripted behaviour.</exception>
-        public static EarlyAnswerBackend Start(string behaviour, bool answerFirstRequest = false)
+        /// <exception cref="ArgumentOutOfRangeException">
+        /// <paramref name="behaviour"/> is not a scripted behaviour, or <paramref name="leadingInterim"/> is given
+        /// with a behaviour other than those two.
+        /// </exception>
+        public static EarlyAnswerBackend Start(
+            string behaviour, bool answerFirstRequest = false, X509Certificate2? certificate = null, byte[]? leadingInterim = null)
         {
-            if (behaviour is not (AnswerThenClose or AnswerKeepOpen or ContinueThenAnswer or CloseUnanswered or ResetUnanswered or LateContinue or EarlyHints))
+            if (behaviour is not (AnswerThenClose or AnswerKeepOpen or ContinueThenAnswer or EarlyHintsThenAnswer
+                or HintFloodThenAnswer or OversizedHintThenAnswer or InvalidHintThenAnswer or InvalidOversizedHintThenAnswer
+                or SwitchingProtocols or CloseUnanswered or ResetUnanswered or LateContinue or EarlyHints or SplitLateContinue
+                or SplitContinue or SplitEarlyHints or HintFlood or OversizedHintAroundUpload))
             {
                 throw new ArgumentOutOfRangeException(nameof(behaviour));
             }
 
-            return new EarlyAnswerBackend(behaviour, answerFirstRequest);
+            if (leadingInterim is not null && behaviour is not (HintFlood or HintFloodThenAnswer))
+            {
+                throw new ArgumentOutOfRangeException(nameof(leadingInterim));
+            }
+
+            return new EarlyAnswerBackend(behaviour, answerFirstRequest, certificate, leadingInterim ?? []);
         }
+
+        // FloodHintCount 103 Early Hints, each with one Link line whose target is FloodLinkLength bytes of x.
+        private static byte[] HintFloodBytes()
+        {
+            var hints = new StringBuilder();
+            for (int hint = 0; hint < FloodHintCount; hint++)
+            {
+                hints.Append("HTTP/1.1 103 Early Hints\r\nLink: </").Append('x', FloodLinkLength).Append(">; rel=preload\r\n\r\n");
+            }
+
+            return Encoding.Latin1.GetBytes(hints.ToString());
+        }
+
+        // One 103 Early Hints with OversizedHintLineCount Link lines, each target OversizedLinkLength bytes
+        // of x, and, when asked for, a last header line without a colon, which the HTTP stack rejects.
+        private static byte[] OversizedHintBytes(bool rejectedLine)
+        {
+            var hint = new StringBuilder("HTTP/1.1 103 Early Hints\r\n");
+            for (int line = 0; line < OversizedHintLineCount; line++)
+            {
+                hint.Append("Link: </").Append('x', OversizedLinkLength).Append(">; rel=preload\r\n");
+            }
+
+            if (rejectedLine)
+            {
+                hint.Append("This Is Not A Header\r\n");
+            }
+
+            return Encoding.Latin1.GetBytes(hint.Append("\r\n").ToString());
+        }
+
+        // The interim response sent before the answer under an interim-then-413 behaviour.
+        private static byte[] InterimBeforeAnswer(string behaviour) => behaviour switch
+        {
+            HintFloodThenAnswer => HintFloodReply,
+            OversizedHintThenAnswer => OversizedHintReply,
+            InvalidHintThenAnswer => InvalidHintReply,
+            InvalidOversizedHintThenAnswer => InvalidOversizedHintReply,
+            _ => EarlyHintsReply,
+        };
 
         /// <summary>Stops listening and waits for every connection to end. Safe to call more than once; never throws.</summary>
         public async ValueTask DisposeAsync()
@@ -2668,8 +3353,12 @@ public sealed class ForwardingTransportTests
             }
         }
 
-        // Each head is recorded before anything is written in reply, so by the time the facade sees the
-        // reply or the close, and so before it answers its caller, the request is counted.
+        // A request is recorded once its head has been read, before anything is written in reply, so by the
+        // time the facade sees the reply or the close, and so before it answers its caller, it is counted.
+        // That holds for the answer-first request and for the scripted request under every behaviour but
+        // the interim ones. Under those, the interim response is written first, and the scripted request is
+        // recorded only once its whole declared body has been read, before the 200 is written, so it is
+        // counted before the facade sees that 200, and never when the body falls short.
         private async Task ServeAsync(Socket socket)
         {
             using (socket)
@@ -2680,7 +3369,7 @@ public sealed class ForwardingTransportTests
                 long headBytes = 0;
                 try
                 {
-                    using var stream = new NetworkStream(socket, ownsSocket: false);
+                    await using Stream stream = await AcceptBackendStreamAsync(socket, _certificate, limit.Token);
                     reader = new ConnectionReader(stream);
                     byte[]? head = await reader.ReadThroughAsync(HeadEnd, MaxHeadBytes, limit.Token);
                     if (head is not null && _answerFirstRequest)
@@ -2697,9 +3386,13 @@ public sealed class ForwardingTransportTests
                         await ServeScriptedAsync(socket, stream, reader, new ScriptedRequest(Encoding.Latin1.GetString(head), []), limit.Token);
                     }
                 }
-                catch (Exception exception) when (exception is OperationCanceledException or SocketException or IOException or ObjectDisposedException)
+                catch (Exception exception) when (
+                    exception is OperationCanceledException or SocketException or IOException or ObjectDisposedException or AuthenticationException)
                 {
-                    // The facade or the test ended the connection first; every head read is already recorded.
+                    // The facade or the test ended the connection first, or the facade refused the certificate
+                    // during the handshake. Every request whose head was read in full is already recorded,
+                    // except the scripted request under an interim behaviour, which is recorded only once its
+                    // whole body has been read and so not when the connection ended before that.
                 }
                 finally
                 {
@@ -2709,13 +3402,14 @@ public sealed class ForwardingTransportTests
             }
         }
 
-        private async Task ServeScriptedAsync(Socket socket, NetworkStream stream, ConnectionReader reader, ScriptedRequest request, CancellationToken ct)
+        private async Task ServeScriptedAsync(Socket socket, Stream stream, ConnectionReader reader, ScriptedRequest request, CancellationToken ct)
         {
             switch (_behaviour)
             {
                 case AnswerThenClose:
                     _requests.Enqueue(request);
                     await stream.WriteAsync(AnswerClosing, ct);
+                    await SendCloseNotifyAsync(stream);
                     socket.Shutdown(SocketShutdown.Send);
                     await reader.DrainAsync(ct);
                     return;
@@ -2733,16 +3427,35 @@ public sealed class ForwardingTransportTests
                     if (await reader.CopyExactlyAsync(Stream.Null, ContinueReadLength, ct))
                     {
                         await stream.WriteAsync(AnswerClosing, ct);
+                        await SendCloseNotifyAsync(stream);
                         socket.Shutdown(SocketShutdown.Send);
                         await reader.DrainAsync(ct);
                     }
 
                     return;
 
+                case EarlyHintsThenAnswer or HintFloodThenAnswer or OversizedHintThenAnswer or InvalidHintThenAnswer
+                    or InvalidOversizedHintThenAnswer:
+                    // The answer follows the interim responses on the open connection, as a read of its own.
+                    _requests.Enqueue(request);
+                    await stream.WriteAsync((byte[])[.. _leadingInterim, .. InterimBeforeAnswer(_behaviour)], ct);
+                    await Task.Delay(SplitPause, ct);
+                    await stream.WriteAsync(AnswerKeepingOpen, ct);
+                    await reader.DrainAsync(ct);
+                    return;
+
+                case SwitchingProtocols:
+                    // No FIN follows the 101: the connection stays open until the facade closes it.
+                    _requests.Enqueue(request);
+                    await stream.WriteAsync(SwitchingProtocolsReply, ct);
+                    await reader.DrainAsync(ct);
+                    return;
+
                 case CloseUnanswered:
                     _requests.Enqueue(request);
                     if (await reader.CopyExactlyAsync(Stream.Null, DroppedReadLength, ct))
                     {
+                        await SendCloseNotifyAsync(stream);
                         socket.Shutdown(SocketShutdown.Send);
                         await reader.DrainAsync(ct);
                     }
@@ -2760,31 +3473,47 @@ public sealed class ForwardingTransportTests
                     return;
 
                 default:
-                    // LateContinue or EarlyHints: an interim response, then the whole declared body and a 200.
-                    if (_behaviour == LateContinue)
+                    // An interim response, whole, split or partly sent before the body, then the whole body its
+                    // framing declares, the rest of a partly sent interim response and a 200.
+                    byte[] interim = _behaviour switch
+                    {
+                        LateContinue or SplitLateContinue or SplitContinue => ContinueReply,
+                        HintFlood => [.. _leadingInterim, .. HintFloodReply],
+                        OversizedHintAroundUpload => OversizedHintReply,
+                        _ => EarlyHintsReply,
+                    };
+                    int sentBeforeBody = _behaviour == OversizedHintAroundUpload ? OversizedHintFirstPart : interim.Length;
+                    if (_behaviour is LateContinue or SplitLateContinue)
                     {
                         await Task.Delay(LateContinueDelay, ct);
-                        await stream.WriteAsync(ContinueReply, ct);
+                    }
+
+                    if (_behaviour is SplitLateContinue or SplitContinue or SplitEarlyHints)
+                    {
+                        await stream.WriteAsync(interim.AsMemory(0, SplitStatusLength), ct);
+                        await stream.FlushAsync(ct);
+                        await Task.Delay(SplitPause, ct);
+                        await stream.WriteAsync(interim.AsMemory(SplitStatusLength), ct);
                     }
                     else
                     {
-                        await stream.WriteAsync(EarlyHintsReply, ct);
+                        await stream.WriteAsync(interim.AsMemory(0, sentBeforeBody), ct);
                     }
 
-                    long declared = request.HeaderValue("Content-Length") is { } value
-                        ? long.Parse(value, NumberStyles.None, CultureInfo.InvariantCulture)
-                        : 0;
-                    using (var body = new MemoryStream())
+                    byte[]? body = await ScriptedBackend.ReadBodyAsync(reader, request, ct);
+                    if (body is null)
                     {
-                        if (!await reader.CopyExactlyAsync(body, declared, ct))
-                        {
-                            return;
-                        }
+                        return;
+                    }
 
-                        _requests.Enqueue(request with { Body = body.ToArray() });
+                    _requests.Enqueue(request with { Body = body });
+                    if (sentBeforeBody < interim.Length)
+                    {
+                        await stream.WriteAsync(interim.AsMemory(sentBeforeBody), ct);
                     }
 
                     await stream.WriteAsync(OkClosing, ct);
+                    await SendCloseNotifyAsync(stream);
                     socket.Shutdown(SocketShutdown.Send);
                     await reader.DrainAsync(ct);
                     return;
@@ -2792,9 +3521,43 @@ public sealed class ForwardingTransportTests
         }
     }
 
+    // The stream a test backend serves an accepted connection on: the socket's own, or, given a
+    // certificate, a TLS server stream over it whose handshake with that certificate has completed. The
+    // caller disposes the stream, which leaves the socket to the caller.
+    private static async Task<Stream> AcceptBackendStreamAsync(Socket socket, X509Certificate2? certificate, CancellationToken ct)
+    {
+        var network = new NetworkStream(socket, ownsSocket: false);
+        if (certificate is null)
+        {
+            return network;
+        }
+
+        var tls = new SslStream(network, leaveInnerStreamOpen: false);
+        try
+        {
+            await tls.AuthenticateAsServerAsync(new SslServerAuthenticationOptions { ServerCertificate = certificate }, ct);
+            return tls;
+        }
+        catch
+        {
+            await tls.DisposeAsync();
+            throw;
+        }
+    }
+
+    // Sends a TLS stream's close_notify before the backend shuts its socket down, so the facade reads the
+    // end of the stream as TLS ends it; a plain stream needs nothing.
+    private static async Task SendCloseNotifyAsync(Stream stream)
+    {
+        if (stream is SslStream tls)
+        {
+            await tls.ShutdownAsync();
+        }
+    }
+
     /// <summary>Reads one connection's bytes in order, keeping what arrived past the part asked for.</summary>
-    /// <param name="stream">The connection, read but not owned.</param>
-    private sealed class ConnectionReader(NetworkStream stream)
+    /// <param name="stream">The connection's stream, plain or TLS, read but not owned.</param>
+    private sealed class ConnectionReader(Stream stream)
     {
         private readonly byte[] _chunk = new byte[16 * 1024];
         private byte[] _pending = [];

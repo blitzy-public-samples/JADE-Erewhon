@@ -44,7 +44,9 @@ namespace Erewhon.Harness.Tests;
 /// and baseline-evidence tests run the real <see cref="ReplayBody"/> instead, against a temporary
 /// repository root and a closed loopback port, so every network step fails at once. The test of a blank
 /// facade admin URL runs it too, and contacts nothing: its backend is external and its facade listeners
-/// are a loopback socket that is only checked for connections. It also
+/// are a loopback socket that is only checked for connections. The kept-evidence test runs it through the
+/// exit path against a loopback stub as its facade, and refuses only the case that takes the run's kept
+/// discrepancy evidence over its limit. It also
 /// covers the lifecycle clients behind that path: shutdown confirmation against scripted and loopback
 /// admin replies, state-reset confirmation against scripted admin responses, and the lifecycle console
 /// sink, which escapes every printed line and never lets a writer that throws replace a computed result;
@@ -852,6 +854,142 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         Assert.Contains(result.Discrepancies, discrepancy => discrepancy.Kind == DiscrepancyKinds.NoResponse(NoResponseReasons.Connect));
         Assert.Contains(state.Failures, item => item.ItemId == FailureItemIds.Case(caseId) && item.Nature == result.ItemNature);
         Assert.False(listener.Pending(), "no request reached the facade listeners");
+    }
+
+    // The real body and exit path, with the capture stand-in stub as the facade: it answers every case 200 with
+    // the JSON body {}, and the backend is external, so nothing is reset. Of five records, the first, third and
+    // fourth differ from {} and the second and fifth equal it. The run may keep the evidence of the first and
+    // third, counted from their own comparisons as EvidenceBudget counts it, plus limitOffset characters. At
+    // exactly that total the third is kept and the smaller fourth is refused; one character less refuses the
+    // third instead, which charges nothing, so the fourth is kept. A refused case is the never-documentable
+    // CHK-EXCEPTION with the run's message and keeps no result or d: item, every other case keeps its own, the
+    // report is written and the run exits 1.
+    [Theory]
+    [InlineData(0, "REST-getAllClients-01")]
+    [InlineData(-1, "REST-getAllAgents-01")]
+    public async Task KeptEvidenceOverTheRunLimit_RefusesTheCaseThatExceedsIt_KeepsTheOthers_WritesTheReport_Exits1(
+        int limitOffset, string refusedCaseId)
+    {
+        const string contentType = "application/json; charset=utf-8";
+        (int Order, string CaseId, string Operation, string PathAndQuery, string Body)[] records =
+        [
+            (1, "REST-getAgent-01", "Rest.getAgent", "/agent/Hank%20Williams", """{"name":"Hank Williams"}"""),
+            (2, "REST-getAgent-02", "Rest.getAgent", "/agent/Nobody%20Agent", "{}"),
+            (3, "REST-getAllAgents-01", "Rest.getAllAgents", "/allAgents", $$"""[{"name":"{{new string('x', 200)}}"}]"""),
+            (4, "REST-getAllClients-01", "Rest.getAllClients", "/allClients", "[]"),
+            (5, "REST-getAllSales-01", "Rest.getAllSales", "/allSales", "{}"),
+        ];
+
+        await using var facade = await CaptureStandInStub.StartAsync(
+            new string('a', 64), DefaultReferenceDate, failEmptyReset: false, TestCancellation);
+        var options = Options(backendAdminUrl: "");
+        options.Target = new HarnessEndpoints { RestBaseUrl = facade.BaseUrl, SoapBaseUrl = facade.BaseUrl, AdminUrl = facade.BaseUrl };
+        options.Backend = new HarnessEndpoints { RestBaseUrl = facade.BaseUrl, SoapBaseUrl = facade.BaseUrl, AdminUrl = "" };
+        options.RequestTimeoutSeconds = LimitSeconds;
+
+        var store = new BaselineStore(options);
+        var comparer = new ResponseComparer(OperationCatalogue.Default, new Normaliser(NormalisationRules.FromCatalogue(OperationCatalogue.Default)));
+        var evidence = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var (order, caseId, operation, pathAndQuery, text) in records)
+        {
+            var body = Encoding.UTF8.GetBytes(text);
+            store.WriteRecord(
+                new BaselineRecord(
+                    order,
+                    caseId,
+                    operation,
+                    CaseKinds.Success,
+                    StateChanging: false,
+                    CasePreStates.Seed,
+                    SourceLabels.StandIn,
+                    new BaselineRequest("GET", pathAndQuery, new Dictionary<string, string> { ["Accept"] = "application/json" }, null),
+                    BaselineResponse.FromRawBody(200, contentType, body, bodyFile: null)),
+                body);
+            evidence[caseId] = KeptEvidence(comparer.Compare(
+                OperationCatalogue.Default.GetById(operation),
+                new ResponseSnapshot(200, contentType, body),
+                new ResponseSnapshot(200, contentType, "{}"u8.ToArray())).Discrepancies);
+        }
+
+        // The committed matrix plans each record at its position for its operation, and a captured manifest that
+        // lists no case as not captured completes the baseline, so no other step fails with the refusal's type.
+        RepoRootDirectory.Write(CaseMatrixPath, File.ReadAllText(Path.Combine(FindRepoRoot(), CaseMatrixPath)));
+        WriteManifest(options, new string('a', 64), DefaultReferenceDate);
+
+        Assert.Equal(0, evidence["REST-getAgent-02"] + evidence["REST-getAllSales-01"]);
+        Assert.True(evidence["REST-getAllClients-01"] > 0, "the fourth case differs from {}");
+        Assert.True(evidence["REST-getAllClients-01"] < evidence["REST-getAllAgents-01"], "the fourth case keeps less evidence than the third");
+        var limit = checked((int)(evidence["REST-getAgent-01"] + evidence["REST-getAllAgents-01"] + limitOffset));
+
+        Assert.Equal(
+            HarnessOptions.EvidenceByteLimit,
+            new ReplayBody(options, OperationCatalogue.Default, KnownLimitationsRegister.Empty, _stdout).KeptEvidenceLimit);
+        var replay = new ReplayBody(options, OperationCatalogue.Default, KnownLimitationsRegister.Empty, _stdout)
+        {
+            KeptEvidenceLimit = limit,
+        };
+        var writer = new RecordingReportWriter();
+        var shutdown = new RecordingShutdown();
+        var mode = NewMode(replay, writer, shutdown, KnownLimitationsRegister.Empty, options);
+
+        var exitCode = await RunAsync(mode);
+
+        AssertExitCode(1, exitCode);
+        var state = mode.State;
+        var refusal = Assert.Single(state.Failures, item => item.Detail?.StartsWith("replay case ", StringComparison.Ordinal) == true);
+        Assert.Equal((FailureItemIds.Exception, typeof(InvalidDataException).FullName), (refusal.ItemId, refusal.Nature));
+        Assert.True(refusal.IsNeverDocumentable, "a case refused for the run's kept evidence can never be documented");
+        Assert.Equal(
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"replay case {refusedCaseId}: The discrepancy evidence the replay run keeps for its report exceeds the {limit}-character limit, so the case is refused rather than truncated."),
+            refusal.Detail);
+        Assert.DoesNotContain(state.Cases, result => result.CaseId == refusedCaseId);
+        Assert.DoesNotContain(state.Failures, item => item.ItemId == FailureItemIds.Case(refusedCaseId));
+
+        foreach (var caseId in records.Select(record => record.CaseId).Where(caseId => caseId != refusedCaseId))
+        {
+            var result = Assert.Single(state.Cases, result => result.CaseId == caseId);
+            Assert.True(result.Compared, "every case the run did not refuse is compared");
+            Assert.Equal(evidence[caseId] == 0, result.Equivalent);
+            Assert.Equal(evidence[caseId], KeptEvidence(result.Discrepancies));
+            var natures = state.Failures.Where(item => item.ItemId == FailureItemIds.Case(caseId)).Select(item => item.Nature).ToList();
+            Assert.Equal(result.Equivalent ? 0 : 1, natures.Count);
+            Assert.All(natures, nature => Assert.Equal(result.ItemNature, nature));
+        }
+
+        // At exactly the limit the case is kept: the run then holds the whole limit, and never more.
+        var kept = state.Cases.Sum(result => KeptEvidence(result.Discrepancies));
+        Assert.True(kept <= limit, "the run keeps no more evidence than its limit");
+        Assert.Equal(limitOffset == 0, kept == limit);
+
+        Assert.Equal(1, writer.WriteCount);
+        Assert.True(writer.Written[^1].Contains(FailureItemIds.Case("REST-getAgent-01"), StringComparison.Ordinal), "the report lists the kept difference");
+        Assert.True(writer.Written[^1].Contains(FailureItemIds.Exception, StringComparison.Ordinal), "the report lists the refused case's CHK-EXCEPTION");
+        Assert.Equal([ShutdownTarget.FacadeComponent], shutdown.Components);
+        AssertFinalLineLast();
+    }
+
+    // A negative kept-evidence or kept-body limit is refused by its seam.
+    [Fact]
+    public void KeptLimits_Negative_AreRefused()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new ReplayBody(Options(), OperationCatalogue.Default, KnownLimitationsRegister.Empty, _stdout)
+        {
+            KeptEvidenceLimit = -1,
+        });
+        Assert.Throws<ArgumentOutOfRangeException>(() => new CaptureMode(Options(), OperationCatalogue.Default, _stdout)
+        {
+            KeptBodyLimit = -1,
+        });
+    }
+
+    // The characters of discrepancy evidence a run keeps for a case, counted as EvidenceBudget counts them: each
+    // path, plus each value's exact literal text or the display of an absent or valid value.
+    private static long KeptEvidence(IEnumerable<Discrepancy> discrepancies)
+    {
+        static int Size(DiscrepancyValue value) => value.Text?.Length ?? value.ToString().Length;
+        return discrepancies.Sum(discrepancy => (long)discrepancy.Path.Length + Size(discrepancy.Baseline) + Size(discrepancy.Observed));
     }
 
     // The SDK pin is baked into the harness assembly at build time, so the run facts state it although the
@@ -2873,6 +3011,68 @@ public sealed partial class ReplayLifecycleTests
         }
     }
 
+    // ---- Oversized admin bodies ----------------------------------------------------------------
+
+    // An /admin/info body one byte over the admin limit of a mebibyte is no admin answer, whether its length is
+    // declared or it is sent without one: it is the failure oversized, never parsed or truncated, so the reset
+    // records the info read after it as mismatch:http:info-oversized, and a plain read reports oversized.
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task OversizedInfoBody_IsTheFailureOversized(bool declaresLength)
+    {
+        var admin = new ScriptedAdmin()
+            .Then(InfoRequest, () => Json(Info(PreviousGeneration)))
+            .Then(SeedResetRequest, ResetAccepted)
+            .Then(InfoRequest, () => OversizedInfo(declaresLength));
+
+        var result = await ResetAsync(admin, ResetExpectations.None);
+
+        var item = Assert.Single(result.Failures);
+        Assert.Equal(FailureItemIds.Reset(ResetPoints.ReplayStart), item.ItemId);
+        Assert.Equal(FailureItemIds.Mismatch("http", "info-oversized"), item.Nature);
+        Assert.Contains($"GET {StandInAdminUrl}{AdminRoutes.Info}: body exceeds the 1048576-byte admin limit", item.Detail, StringComparison.Ordinal);
+        Assert.Null(result.After);
+
+        var reader = new ScriptedAdmin().Then(InfoRequest, () => OversizedInfo(declaresLength));
+        AdminInfoRead read;
+        using (var reset = new StateReset(StateResetOptions(), reader, _console))
+        {
+            read = await reset.ReadInfoOutcomeAsync(StandInAdminUrl, TestCancellation);
+        }
+
+        Assert.Null(read.Info);
+        Assert.Equal("oversized", read.Failure);
+    }
+
+    // A stand-in info object padded to one byte over the admin limit, which would parse were it read whole.
+    private HttpResponseMessage OversizedInfo(bool declaresLength)
+    {
+        const int adminLimit = 1024 * 1024;
+        var info = Info(PreviousGeneration + 1);
+        var unpadded = Encoding.UTF8.GetByteCount(info.ToJsonString());
+        info["pad"] = new string('x', adminLimit + 1 - unpadded - "\"pad\":\"\",".Length);
+        var bytes = Encoding.UTF8.GetBytes(info.ToJsonString());
+        Assert.Equal(adminLimit + 1, bytes.Length);
+        return new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = declaresLength ? new ByteArrayContent(bytes) : new UnsizedContent(bytes),
+        };
+    }
+
+    /// <summary>Content that states no length, as a body sent without <c>Content-Length</c> does.</summary>
+    private sealed class UnsizedContent(byte[] bytes) : HttpContent
+    {
+        protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) =>
+            stream.WriteAsync(bytes).AsTask();
+
+        protected override bool TryComputeLength(out long length)
+        {
+            length = 0;
+            return false;
+        }
+    }
+
     // ---- Undecodable info strings ---------------------------------------------------------------
 
     // JSON escapes as raw text: an unpaired high and low surrogate, which parse but throw when decoded,
@@ -3080,7 +3280,8 @@ public sealed partial class ReplayLifecycleTests
 // own baseline/ is never touched. Expected seed facts no stand-in can confirm refuse the capture before
 // the stand-in is contacted; a capture-start reset whose seed hash or reference date differs from the
 // first capture's or the manifest's refuses it before any write; an empty-state bracket reset that is
-// not confirmed stops it after the bracket's seed restore, with no manifest; and a confirmed capture
+// not confirmed stops it after the bracket's seed restore, with no manifest; answered bodies over the
+// kept-body limit stop it before the record of the body that exceeds it, with no manifest; and a confirmed capture
 // publishes the confirmed seed facts in a manifest written after every other file. A served WSDL the
 // facade would publish is stored in the baseline and written as the contract only when none exists; one
 // it would refuse writes neither WSDL file and is recorded as not captured; and a contracts directory
@@ -3264,6 +3465,48 @@ public sealed partial class ReplayLifecycleTests
         Assert.False(File.Exists(Full(ConformanceFile)));
         Assert.False(File.Exists(Full(ContractsWsdlFile)));
         AssertLastLineEndsWith($"reset bracket of {emptyStateCase} not confirmed; capture stopped, baseline/manifest.json not written");
+    }
+
+    // The stub answers every case with the 2-byte body {}, so a kept-body limit of 5 bytes keeps the first two
+    // bodies and one of 6 keeps three, the last of them exactly at the limit. The next answered body exceeds it
+    // and stops the capture before its record is written: the cases before it keep their records, no later case
+    // or WSDL fetch is sent, an earlier manifest stays withdrawn and the capture exits 1.
+    [Theory]
+    [InlineData(5, 3)]
+    [InlineData(6, 4)]
+    public async Task KeptBodiesOverTheLimit_StopTheCaptureBeforeTheRecordThatExceedsIt_WithNoManifest(int keptBodyLimit, int stoppedAt)
+    {
+        await using var standIn = await CaptureStandInStub.StartAsync(
+            CaptureSeedSha256, ReferenceDate, failEmptyReset: false, TestCancellation);
+        var options = CaptureOptions(standIn);
+        WriteManifest(options, CaptureSeedSha256, ReferenceDate);
+        var matrix = CaseMatrix.Load(options.CaseMatrixPath, OperationCatalogue.Default);
+        var stopped = matrix.Cases.Single(definition => matrix.PositionOf(definition.Id) == stoppedAt).Id;
+        Assert.Equal(HarnessOptions.EvidenceByteLimit, new CaptureMode(options, OperationCatalogue.Default, _captureConsole).KeptBodyLimit);
+        var capture = new CaptureMode(options, OperationCatalogue.Default, _captureConsole)
+        {
+            KeptBodyLimit = keptBodyLimit,
+        };
+
+        Assert.Equal(1, await capture.RunAsync(TestCancellation).WaitAsync(RunLimit, TestCancellation));
+
+        Assert.False(File.Exists(Full(ManifestFile)));
+        Assert.False(File.Exists(Full(ManifestTemporaryFile)));
+        Assert.False(File.Exists(Full(ConformanceFile)));
+        Assert.False(File.Exists(Full(BaselineWsdlFile)));
+        Assert.Equal(
+            matrix.Cases.Take(stoppedAt - 1).Select(definition => matrix.PositionOf(definition.Id).ToString("D3", CultureInfo.InvariantCulture)),
+            Directory.EnumerateFiles(Full("baseline/records"), "*", SearchOption.AllDirectories)
+                .Select(file => Path.GetFileName(file)[..3])
+                .Order(StringComparer.Ordinal));
+        Assert.Equal(
+            stoppedAt,
+            standIn.Requests.Count(request => !request.StartsWith("GET /health", StringComparison.Ordinal)
+                && !request.StartsWith("GET /admin/", StringComparison.Ordinal)
+                && !request.StartsWith("POST /admin/", StringComparison.Ordinal)));
+        AssertLastLineEndsWith(string.Create(
+            CultureInfo.InvariantCulture,
+            $"{stoppedAt:D3}/{matrix.PlannedCaseCount:D3} {stopped}: the response bodies this capture keeps for its conformance check exceed the {keptBodyLimit}-byte limit; capture stopped, baseline/manifest.json not written"));
     }
 
     [Theory]
@@ -4125,6 +4368,9 @@ public sealed partial class ReplayLifecycleTests
     [InlineData("mismatch:http:invalid-url", "mismatch:http:invalid-url")]
     [InlineData("mismatch:http:info-invalid", "mismatch:http:info-invalid")]
     [InlineData("mismatch:http:info-404", "mismatch:http:info-404")]
+    [InlineData("mismatch:http:oversized", "mismatch:http:oversized")]
+    [InlineData("mismatch:http:info-oversized", "mismatch:http:info-oversized")]
+    [InlineData("mismatch:generation:before-oversized", "mismatch:generation:before-oversized")]
     [InlineData("mismatch:generation:before-null", "mismatch:generation:before-null")]
     [InlineData("mismatch:generation:before-timeout", "mismatch:generation:before-timeout")]
     [InlineData("mismatch:generation:5", "mismatch:generation:5")]
@@ -4575,7 +4821,7 @@ public sealed partial class ReplayLifecycleTests
 // setting that can be read and converted, so a replay with an unreadable harness.json or an unknown
 // execution mode still writes its report to the configured path and treats an empty backend admin URL
 // as an external backend. Each setting binds as binding the whole section would, an explicit null in
-// harness.json included.
+// harness.json included. A FIFO or a link at harness.json is refused at once by both loaders.
 // Every setting is passed as a --Harness:... argument, which overrides the environment, or written to
 // the tree's own harness.json, so no test sets a process environment variable. Every tree is a
 // TempDirectory, never the committed one, and no assertion reads standard error. URLs name loopback
@@ -4660,6 +4906,44 @@ public sealed partial class ReplayLifecycleTests
         Assert.IsType<InvalidDataException>(problem.Exception);
         Assert.Contains("harness.json", problem.Context, StringComparison.Ordinal);
         Assert.Throws<InvalidDataException>(() => Program.LoadOptions(args));
+    }
+
+    // A FIFO at harness.json that nobody writes to, and a link there to a file outside the repository, each
+    // fail the read at once instead of blocking the start or being followed: the strict loader throws the
+    // refusal, and the lenient one records it and keeps every other setting, the outside file's never applied.
+    [Theory]
+    [InlineData("fifo", "ConfinedTree could not read 'harness/config/harness.json': it is not a regular file (a FIFO).")]
+    [InlineData(
+        "link",
+        "ConfinedTree never reads through a link: refused 'harness/config/harness.json', because 'harness/config/harness.json' is a symbolic link.")]
+    public async Task HarnessJsonThatIsAFifoOrALink_IsRefusedPromptly_LenientKeepsEveryOtherSetting(string entry, string expectedRefusal)
+    {
+        using var outside = new TempDirectory();
+        var path = RepoRootDirectory.PathOf(HarnessJson);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        if (entry == "fifo")
+        {
+            SpecialFileSupport.CreateFifo(path);
+        }
+        else
+        {
+            File.CreateSymbolicLink(path, outside.Write("harness.json", """{ "Harness": { "ReadinessTimeoutSeconds": 6 } }"""));
+        }
+
+        var args = DestinationArgs("--Harness:ShutdownTimeoutSeconds=7");
+        var problems = new List<Program.OptionsProblem>();
+
+        var options = await Task.Run(() => Program.LoadOptions(args, problems), TestCancellation).WaitAsync(PromptLimit, TestCancellation);
+        var strict = await Assert.ThrowsAsync<IOException>(
+            () => Task.Run(() => Program.LoadOptions(args), TestCancellation).WaitAsync(PromptLimit, TestCancellation));
+
+        Assert.Equal(expectedRefusal, strict.Message);
+        AssertConfiguredDestinations(options);
+        Assert.Equal(7, options.ShutdownTimeoutSeconds);
+        Assert.Equal(new HarnessOptions().ReadinessTimeoutSeconds, options.ReadinessTimeoutSeconds);
+        var problem = AssertSingleProblem(problems);
+        Assert.Contains("harness.json", problem.Context, StringComparison.Ordinal);
+        Assert.Equal(expectedRefusal, Assert.IsType<IOException>(problem.Exception).Message);
     }
 
     [Fact]
@@ -5772,7 +6056,9 @@ internal sealed class CaptureStandInStub : IAsyncDisposable
 /// cleared directory, dangles, is a hard link or is swapped in mid-way; that a published file replaces only a
 /// regular file and never opens or follows the entry at its name, a FIFO included; that a file published
 /// create-only, as capture publishes the contracts WSDL, keeps a regular file at its name and refuses every
-/// other entry there and every linked directory above it; that paths not strictly
+/// other entry there and every linked directory above it; that a read returns a regular file whole, at most
+/// its byte limit, finds nothing where no file is, and refuses a FIFO, a link on the way or at the name and an
+/// oversized file at once, without reading the protected directory; that paths not strictly
 /// below the root are refused; and that <see cref="DiscrepancySignature.ArtifactFileName"/> keeps an item id
 /// byte for byte. The repository's own tree is never touched.
 /// </summary>
@@ -5786,6 +6072,13 @@ public sealed partial class ReplayLifecycleTests
 
     private const string LinkRefusal = "ConfinedTree never writes or deletes through a link";
     private const string OutsideRefusal = "ConfinedTree writes and deletes only below its root";
+    private const string OutsideReadRefusal = "ConfinedTree reads only below its root";
+
+    // The file the read tests read, two directories below the root as harness.json is.
+    private const string ReadTarget = "harness/config/harness.json";
+
+    // A refused read allocates its exception and message, never a buffer the length of the file.
+    private const long RefusalAllocationBound = 1024 * 1024;
     private const string DirectoryRefusal = "it is a directory.";
     private const string NotRegularFileRefusal = "it is not a regular file, so it is left in place.";
     private const string PublishedName = "RESULTS.md";
@@ -6351,6 +6644,119 @@ public sealed partial class ReplayLifecycleTests
         Assert.Equal(SecondBytes, await File.ReadAllBytesAsync(ConfinedFull("artifacts/replay/rest/001-getAgent-01.body"), TestCancellation));
     }
 
+    // ---- Reading a file -----------------------------------------------------------------------------
+
+    // A regular file at or below the limit is read whole, an empty one, one exactly at a small limit and one
+    // longer than the first read buffer included.
+    [Theory]
+    [InlineData(0, 0, false)]
+    [InlineData(0, 0, true)]
+    [InlineData(5, 5, false)]
+    [InlineData(5, 5, true)]
+    [InlineData(200_000, 200_000, false)]
+    [InlineData(200_000, 200_000, true)]
+    [InlineData(200_000, HarnessOptions.EvidenceByteLimit, false)]
+    [InlineData(200_000, HarnessOptions.EvidenceByteLimit, true)]
+    public async Task ReadFile_RegularFileWithinTheLimit_ReturnsEveryByte(int length, int byteLimit, bool useAsync)
+    {
+        var content = Enumerable.Range(0, length).Select(static index => (byte)(index % 251)).ToArray();
+        var path = ConfinedFull(ReadTarget);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        File.WriteAllBytes(path, content);
+
+        Assert.Equal(content, await ConfinedRead(ConfinedTreeUnderTest, path, byteLimit, useAsync));
+        Assert.Equal(content, File.ReadAllBytes(path));
+    }
+
+    // A sparse file reports its length without its bytes being written, so the largest case costs no disk. The
+    // reported length decides before any buffer exists: the refusal allocates far less on this thread than the
+    // file is long.
+    [Theory]
+    [InlineData(1L, 0, false)]
+    [InlineData(1L, 0, true)]
+    [InlineData(6L, 5, false)]
+    [InlineData(6L, 5, true)]
+    [InlineData(HarnessOptions.EvidenceByteLimit + 1L, HarnessOptions.EvidenceByteLimit, false)]
+    [InlineData(HarnessOptions.EvidenceByteLimit + 1L, HarnessOptions.EvidenceByteLimit, true)]
+    public async Task ReadFile_FileOverTheLimit_IsRefusedBeforeItIsRead(long length, int byteLimit, bool useAsync)
+    {
+        var path = ConfinedFull(ReadTarget);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        using (var handle = File.OpenHandle(path, FileMode.CreateNew, FileAccess.Write))
+        {
+            RandomAccess.SetLength(handle, length);
+        }
+
+        var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        var refusal = await Assert.ThrowsAsync<IOException>(() => ConfinedRead(ConfinedTreeUnderTest, path, byteLimit, useAsync));
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+
+        Assert.Equal($"ConfinedTree could not read '{ReadTarget}': it exceeds the {byteLimit}-byte limit.", refusal.Message);
+        Assert.True(allocated < RefusalAllocationBound, $"The refusal allocated {allocated} bytes, as if it had read the file.");
+    }
+
+    // A missing root, a missing directory on the way, a missing file and a directory at the name are nothing to
+    // read, and the read creates nothing on the way.
+    [Theory]
+    [InlineData("missing-root", false)]
+    [InlineData("missing-root", true)]
+    [InlineData("missing-directory", false)]
+    [InlineData("missing-directory", true)]
+    [InlineData("missing-file", false)]
+    [InlineData("missing-file", true)]
+    [InlineData("directory", false)]
+    [InlineData("directory", true)]
+    public async Task ReadFile_NothingThere_ReturnsNullAndCreatesNothing(string entry, bool useAsync)
+    {
+        var root = entry == "missing-root" ? Path.Combine(ConfinedTemp, "absent-root") : ConfinedRoot;
+        switch (entry)
+        {
+            case "missing-file":
+                Directory.CreateDirectory(Path.GetDirectoryName(ConfinedFull(ReadTarget))!);
+                break;
+            case "directory":
+                Directory.CreateDirectory(ConfinedFull(ReadTarget));
+                break;
+        }
+
+        var before = ConfinedSnapshot(ConfinedTemp);
+
+        var bytes = await ConfinedRead(new ConfinedTree(root), Path.Combine(root, ReadTarget), HarnessOptions.EvidenceByteLimit, useAsync);
+
+        Assert.Null(bytes);
+        Assert.Equal(before, ConfinedSnapshot(ConfinedTemp));
+    }
+
+    // A FIFO without a writer, a link to one, a link at the name, dangling or not, and a linked directory on the
+    // way each refuse the read at once, read nothing outside the root and stay in place.
+    [Theory]
+    [InlineData("fifo", false)]
+    [InlineData("fifo", true)]
+    [InlineData("link-to-fifo", false)]
+    [InlineData("link-to-fifo", true)]
+    [InlineData("file-link", false)]
+    [InlineData("file-link", true)]
+    [InlineData("dangling-link", false)]
+    [InlineData("dangling-link", true)]
+    [InlineData("linked-parent", false)]
+    [InlineData("linked-parent", true)]
+    [InlineData("linked-ancestor", false)]
+    [InlineData("linked-ancestor", true)]
+    public async Task ReadFile_SpecialFileOrLink_IsRefusedPromptlyAndLeftInPlace(string entry, bool useAsync)
+    {
+        ProtectedTree();
+        var (expected, kept) = PlaceRefusedReadEntry(entry);
+        var before = ConfinedSnapshot(ConfinedOutside);
+        var path = ConfinedFull(ReadTarget);
+
+        var read = Task.Run(() => ConfinedRead(ConfinedTreeUnderTest, path, HarnessOptions.EvidenceByteLimit, useAsync), TestCancellation);
+        var refusal = await Assert.ThrowsAsync<IOException>(() => read.WaitAsync(PromptLimit, TestCancellation));
+
+        Assert.Equal(expected, refusal.Message);
+        Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
+        Assert.True(kept(), "A refused read must leave the entry as it was.");
+    }
+
     // ---- Lexical containment ------------------------------------------------------------------------
 
     [Theory]
@@ -6378,6 +6784,15 @@ public sealed partial class ReplayLifecycleTests
         Assert.Contains(
             OutsideRefusal,
             (await Assert.ThrowsAsync<IOException>(() => ConfinedTreeUnderTest.PublishNewFileAsync(path, FirstBytes, TestCancellation))).Message,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            OutsideReadRefusal,
+            Assert.Throws<IOException>(() => ConfinedTreeUnderTest.ReadFile(path, HarnessOptions.EvidenceByteLimit)).Message,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            OutsideReadRefusal,
+            (await Assert.ThrowsAsync<IOException>(
+                () => ConfinedTreeUnderTest.ReadFileAsync(path, HarnessOptions.EvidenceByteLimit, TestCancellation))).Message,
             StringComparison.Ordinal);
         Assert.False(ConfinedTreeUnderTest.Contains(path), "A path not strictly below the root must not be contained.");
 
@@ -6467,6 +6882,55 @@ public sealed partial class ReplayLifecycleTests
             "directory" => !IsLink(name) && Directory.Exists(target) && SpecialFileSupport.Names(target).Count == 0,
             _ => IsLink(name),
         };
+    }
+
+    // Reads path through tree, synchronously or not; the synchronous form's outcome is returned as a task.
+    private static async Task<byte[]?> ConfinedRead(ConfinedTree tree, string path, int byteLimit, bool useAsync) =>
+        useAsync ? await tree.ReadFileAsync(path, byteLimit, TestCancellation) : tree.ReadFile(path, byteLimit);
+
+    // Puts one of the refused read entries on the way to ReadTarget, each a real escape route or a FIFO nobody
+    // writes to, and returns the refusal the read must give and a check that the entry is still in place. A
+    // FIFO stays below the root, so no snapshot of the protected directory ever opens it.
+    private (string Refusal, Func<bool> Kept) PlaceRefusedReadEntry(string entry)
+    {
+        var target = ConfinedFull(ReadTarget);
+        var parent = Path.GetDirectoryName(target)!;
+        var linkAtName = $"ConfinedTree never reads through a link: refused '{ReadTarget}', because '{ReadTarget}' is a symbolic link.";
+        switch (entry)
+        {
+            case "fifo":
+                Directory.CreateDirectory(parent);
+                SpecialFileSupport.CreateFifo(target);
+                return ($"ConfinedTree could not read '{ReadTarget}': it is not a regular file (a FIFO).", () => SpecialFileSupport.IsFifo(target));
+            case "link-to-fifo":
+                Directory.CreateDirectory(parent);
+                SpecialFileSupport.CreateFifo(Path.Combine(parent, "pipe"));
+                File.CreateSymbolicLink(target, Path.Combine(parent, "pipe"));
+                return (linkAtName, () => IsLink(ReadTarget) && SpecialFileSupport.IsFifo(Path.Combine(parent, "pipe")));
+            case "file-link":
+                Directory.CreateDirectory(parent);
+                File.CreateSymbolicLink(target, Path.Combine(ConfinedOutside, SentinelName));
+                return (linkAtName, () => IsLink(ReadTarget));
+            case "dangling-link":
+                Directory.CreateDirectory(parent);
+                File.CreateSymbolicLink(target, Path.Combine(ConfinedOutside, "absent"));
+                return (linkAtName, () => IsLink(ReadTarget));
+            case "linked-parent":
+                File.WriteAllBytes(Path.Combine(ConfinedOutside, "harness.json"), SentinelBytes);
+                LinkToOutside("harness/config");
+                return (
+                    $"ConfinedTree never reads through a link: refused '{ReadTarget}', because 'harness/config' is a symbolic link.",
+                    () => IsLink("harness/config"));
+            case "linked-ancestor":
+                Directory.CreateDirectory(Path.Combine(ConfinedOutside, "config"));
+                File.WriteAllBytes(Path.Combine(ConfinedOutside, "config", "harness.json"), SentinelBytes);
+                LinkToOutside("harness");
+                return (
+                    $"ConfinedTree never reads through a link: refused '{ReadTarget}', because 'harness' is a symbolic link.",
+                    () => IsLink("harness"));
+            default:
+                throw new ArgumentOutOfRangeException(nameof(entry), entry, "Unknown refused read entry.");
+        }
     }
 
     private static void AssertLinkRefusal(IOException refusal, string linkedComponent)

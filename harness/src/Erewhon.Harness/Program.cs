@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 using Erewhon.Contracts.Catalogue;
 using Erewhon.Harness.Baseline;
 using Erewhon.Harness.Lifecycle;
@@ -168,6 +169,15 @@ internal static class Program
     /// An argument is not a <c>--Harness:Key=value</c> setting, or the repository root cannot form a path.
     /// </exception>
     /// <exception cref="InvalidDataException"><c>harness.json</c> exists but is not valid JSON.</exception>
+    /// <exception cref="IOException">
+    /// <c>harness.json</c>, or a directory on its way below the repository root, is a symbolic link; the file is
+    /// not a regular file or exceeds <see cref="HarnessOptions.EvidenceByteLimit"/>; or it cannot be read.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">The operating system denies access to <c>harness.json</c> or its directories.</exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown, so
+    /// <c>harness.json</c> cannot be read confined to the repository root.
+    /// </exception>
     /// <exception cref="InvalidOperationException">A value cannot be converted to its setting's type; the message names the key.</exception>
     internal static HarnessOptions LoadOptions(string[] settingArgs) => Load(settingArgs, problems: null);
 
@@ -177,8 +187,9 @@ internal static class Program
     /// </summary>
     /// <remarks>
     /// <para>An argument that is not a <c>--Harness:Key=value</c> setting is left out. When
-    /// <c>harness.json</c> cannot be read (malformed, unreadable, or under a root that cannot form a path),
-    /// the environment and the arguments still apply. A setting whose value cannot be converted keeps its
+    /// <c>harness.json</c> cannot be read (malformed, reached through a link, a FIFO or another special file,
+    /// over <see cref="HarnessOptions.EvidenceByteLimit"/>, unreadable, or under a root that cannot form a
+    /// path), the environment and the arguments still apply. A setting whose value cannot be converted keeps its
     /// <see cref="HarnessOptions"/> default, and every other setting keeps its value: the repository root,
     /// the report path and the admin URLs that decide where the report goes and what cleanup shuts down,
     /// an empty backend admin URL included.</para>
@@ -236,11 +247,7 @@ internal static class Program
             // the stand-in's. A file that cannot be read loses only its own settings.
             try
             {
-                merged = new ConfigurationBuilder()
-                    .AddJsonFile(new HarnessOptions { RepoRoot = repoRoot }.HarnessConfigPath, optional: true, reloadOnChange: false)
-                    .AddEnvironmentVariables()
-                    .AddCommandLine([.. accepted])
-                    .Build();
+                merged = BuildConfiguration(repoRoot, accepted);
             }
             catch (Exception ex) when (problems is not null)
             {
@@ -266,9 +273,40 @@ internal static class Program
         }
         finally
         {
-            // Releases the file provider the JSON source created for the configuration directory.
+            // Each configuration root releases the providers it holds.
             (merged as IDisposable)?.Dispose();
             (overrides as IDisposable)?.Dispose();
+        }
+    }
+
+    // harness.json, the environment and the arguments as one configuration. The file is read once, through the
+    // repository root's confined reader, so a link on its way or at it, a FIFO, a socket, a device or a file
+    // over HarnessOptions.EvidenceByteLimit fails at once instead of being followed or blocking the start, and
+    // the JSON provider parses those bytes without opening the path again. A missing file, or a directory at
+    // its name, adds no JSON source, as an optional file does. A file that is not valid JSON fails as the file
+    // provider fails it, naming the file.
+    private static IConfigurationRoot BuildConfiguration(string repoRoot, List<string> accepted)
+    {
+        var locations = new HarnessOptions { RepoRoot = repoRoot };
+        var path = locations.HarnessConfigPath;
+        var json = new ConfinedTree(locations.ResolvePath(".")).ReadFile(path, HarnessOptions.EvidenceByteLimit);
+        using var stream = json is null ? null : new MemoryStream(json, writable: false);
+        var builder = new ConfigurationBuilder();
+        if (stream is not null)
+        {
+            builder.AddJsonStream(stream);
+        }
+
+        try
+        {
+            return builder
+                .AddEnvironmentVariables()
+                .AddCommandLine([.. accepted])
+                .Build();
+        }
+        catch (Exception ex) when (stream is not null && ex is (JsonException or FormatException))
+        {
+            throw new InvalidDataException($"Failed to load configuration from file '{path}'.", ex);
         }
     }
 
@@ -382,7 +420,7 @@ internal static class Program
         KnownLimitationsRegister register;
         try
         {
-            register = KnownLimitationsRegister.Load(options.KnownLimitationsPath);
+            register = KnownLimitationsRegister.Load(options.KnownLimitationsPath, options.ResolvePath("."));
         }
         catch (Exception ex)
         {

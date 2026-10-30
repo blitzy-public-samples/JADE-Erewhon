@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -28,6 +29,8 @@ namespace Erewhon.Harness.Tests;
 /// The response-level cases send REST responses through <see cref="ResponseComparer"/>: status,
 /// <c>Content-Type</c>, no-response outcomes, typing by the baseline status, the byte-order mark,
 /// malformed bodies and strict UTF-8 decoding, each with its complete discrepancy list and flags.
+/// Evidence that would outgrow its budget, through a long path repeated by many differences, is refused, and
+/// a comparison within the budget is unchanged.
 /// It also covers the OpenAPI drift check, which compares the live OpenAPI document with the checked-in
 /// contract under this JSON semantic comparison, against an in-process loopback stub in a temporary
 /// repository root of its own. It also covers the <c>export-openapi</c> mode, which writes that checked-in
@@ -1037,6 +1040,55 @@ public sealed partial class JsonSemanticComparerTests : IDisposable
             discrepancy);
     }
 
+    // ---- Discrepancy evidence budget -------------------------------------------------------------
+
+    // Every discrepancy carries its whole path, so one more differing leaf below a 65,536-character member name
+    // than EvidenceByteLimit characters hold copies of it, about 70 KB a side, would retain more evidence than
+    // the limit allows. The comparison is refused with a message that names the limit and quotes nothing from
+    // the bodies.
+    [Fact]
+    public void ManyDifferingLeaves_BelowALongMemberName_AreRefused()
+    {
+        var name = new string('n', 64 * 1024);
+        var leaves = Enumerable.Range(0, (HarnessOptions.EvidenceByteLimit / name.Length) + 1).ToArray();
+        string Body(int value) =>
+            "{\"" + name + "\":{"
+            + string.Join(",", leaves.Select(leaf => string.Create(CultureInfo.InvariantCulture, $"\"a{leaf}\":{value}")))
+            + "}}";
+
+        var refusal = Assert.Throws<InvalidDataException>(() => Compare(Body(1), Body(2), declaredType: null));
+
+        Assert.Equal(EvidenceRefusal(HarnessOptions.EvidenceByteLimit), refusal.Message);
+    }
+
+    // Within the budget a comparison gives exactly the list an unlimited one gives: with the limit set to that
+    // list's evidence, each path plus each value as the report shows it, an absent side as "(absent)" and a valid
+    // one as "{valid:N1}", the list is returned unchanged, and one character less refuses it.
+    [Theory]
+    [InlineData("""{"name":"Hank Williams","website":"www.it.com"}""", """{"name":"Hank Williams","website":"www.it.com "}""", 0)]
+    [InlineData("""{"name":"Hank Williams","website":"www.it.com"}""", """{"name":"Hank Williams","website":"www.it.com "}""", 1)]
+    [InlineData("""{"name":"Hank Williams"}""", """{"name":"Hank Williams","nicknames":["Hank","H"]}""", 0)]
+    [InlineData("""{"name":"Hank Williams"}""", """{"name":"Hank Williams","nicknames":["Hank","H"]}""", 1)]
+    [InlineData($$"""{"guid":"{{ValidGuidA}}","name":"Hank Williams"}""", """{"name":"Hank Williams"}""", 0)]
+    [InlineData($$"""{"guid":"{{ValidGuidA}}","name":"Hank Williams"}""", """{"name":"Hank Williams"}""", 1)]
+    public void Comparison_AtTheEvidenceLimit_IsUnchanged_OneCharacterLessIsRefused(string baseline, string observed, int shortfall)
+    {
+        var unlimited = Compare(baseline, observed, DtoAgent);
+        var limit = unlimited.Sum(discrepancy => discrepancy.Path.Length + discrepancy.Baseline.ToString().Length + discrepancy.Observed.ToString().Length) - shortfall;
+        var comparer = new JsonSemanticComparer(OperationCatalogue.Default, new Normaliser(NormalisationRules.FromCatalogue(OperationCatalogue.Default)), limit);
+
+        Assert.NotEmpty(unlimited);
+        if (shortfall == 0)
+        {
+            Assert.Equal(unlimited, comparer.Compare(baseline, observed, DtoAgent));
+        }
+        else
+        {
+            var refusal = Assert.Throws<InvalidDataException>(() => comparer.Compare(baseline, observed, DtoAgent));
+            Assert.Equal(EvidenceRefusal(limit), refusal.Message);
+        }
+    }
+
     // ---- Response level: status, Content-Type, no-response outcomes and REST body dispatch ----------
 
     [Fact]
@@ -1425,6 +1477,12 @@ public sealed partial class JsonSemanticComparerTests : IDisposable
     private static void AssertHas(IReadOnlyList<Discrepancy> result, string kind, string path) =>
         Assert.Contains(result, discrepancy => discrepancy.Kind == kind && discrepancy.Path == path);
 
+    /// <summary>The message of a comparison refused because its discrepancy evidence exceeds <paramref name="limit"/> characters.</summary>
+    private static string EvidenceRefusal(int limit) =>
+        string.Create(
+            CultureInfo.InvariantCulture,
+            $"The discrepancy evidence of one comparison exceeds the {limit}-character limit, so the comparison is refused rather than truncated.");
+
     /// <summary>The compact JSON string literal of an ASCII text that needs no escaping.</summary>
     private static string Quoted(string text) => "\"" + text + "\"";
 
@@ -1597,13 +1655,16 @@ public sealed partial class JsonSemanticComparerTests : IDisposable
 // ---- The OpenAPI drift check --------------------------------------------------------------------
 // The OpenAPI drift check against an in-process loopback stub standing in for the facade admin listener, in a
 // temporary repository root of its own: an unusable admin URL, no response or a status other than 200 is
-// not-run; an absent checked-in contract is missing and is never created; documents that differ only in
+// not-run; an absent checked-in contract is missing and is never created, and a FIFO or a link in its place is
+// refused at once; documents that differ only in
 // member order, whitespace or a byte order mark pass; changed, missing and extra members and an undecodable or
 // non-JSON document fail with exactly the discrepancies the signature is computed over, an undecodable one at
 // $body and a non-JSON one at $, and undecodable documents that differ in an invalid byte, in their decodable
 // peer or in which side decodes, or from non-JSON texts that spell their hexadecimal, give different natures;
 // and the check writes only artifacts/openapi/live.json, byte for byte as served, removing a stale one when
-// nothing was answered and reporting a failed save in its detail, and never rewrites the contract.
+// nothing was answered or the document was over the runner's limit and reporting a failed save in its detail,
+// and never rewrites the contract. The runner the check fetches with returns a body at its byte limit whole,
+// framed by its length or chunked, and refuses one over it, a declared length over it before any body byte.
 // These members live in this class because the harness test project keeps its fixed set of test classes,
 // and the drift check compares the live document with the checked-in contract under the JSON semantic
 // comparison this class covers.
@@ -1636,6 +1697,19 @@ public sealed partial class JsonSemanticComparerTests
 
     // Request limit and connect limit: generous for a loaded host, never reached by a passing test.
     private const int RequestLimitSeconds = 10;
+
+    // A refused contract read ends well within this; one that blocked on a FIFO fails the test instead of hanging.
+    private static readonly TimeSpan ContractReadLimit = TimeSpan.FromSeconds(10);
+
+    // The body limit the response body tests give their runner: past its first read buffer, far below the
+    // evidence limit, so no test sends 32 MiB.
+    private const int ResponseLimit = 200_000;
+
+    // The size of each chunk of a chunked test body.
+    private const int ChunkBytes = 16 * 1024;
+
+    // A request limit far beyond ContractReadLimit, so only a prompt refusal ends a call within that limit.
+    private static readonly TimeSpan SlowRequestLimit = TimeSpan.FromSeconds(60);
 
     // How an equal live document differs from the checked-in one.
     private const string Reordered = "reordered and compact";
@@ -1799,6 +1873,98 @@ public sealed partial class JsonSemanticComparerTests
         Assert.False(File.Exists(Options.ContractsOpenApiPath), "The check must never create the checked-in contract.");
         Assert.Equal(directoryAtContractPath, Directory.Exists(Options.ContractsOpenApiPath));
         AssertOnlyFilesWritten(contract: null, served);
+    }
+
+    // A FIFO nobody writes to at the contract path, and a link there to an equal contract outside the root, are
+    // neither missing nor followed: the read is refused at once and the refusal propagates, as an unreadable
+    // contract does.
+    [Theory]
+    [InlineData("fifo", "ConfinedTree could not read 'contracts/openapi/erewhon-rest.openapi.json': it is not a regular file (a FIFO).")]
+    [InlineData(
+        "link",
+        "ConfinedTree never reads through a link: refused 'contracts/openapi/erewhon-rest.openapi.json', because "
+            + "'contracts/openapi/erewhon-rest.openapi.json' is a symbolic link.")]
+    public async Task ContractThatIsAFifoOrALink_IsRefusedPromptly(string entry, string expectedRefusal)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        using var outside = new TempDirectory();
+        await using var facade = await ServeAsync(StatusCodes.Status200OK, Encoding.UTF8.GetBytes(LiveDocument()));
+        var path = Options.ContractsOpenApiPath;
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        if (entry == "fifo")
+        {
+            SpecialFileSupport.CreateFifo(path);
+        }
+        else
+        {
+            File.CreateSymbolicLink(path, outside.Write("erewhon-rest.openapi.json", ContractDocument()));
+        }
+
+        var refusal = await Assert.ThrowsAsync<IOException>(
+            () => Task.Run(() => RunAsync(facade.BaseUrl), ct).WaitAsync(ContractReadLimit, ct));
+
+        Assert.Equal(expectedRefusal, refusal.Message);
+        Assert.True(new FileInfo(path).LinkTarget is not null || SpecialFileSupport.IsFifo(path), "The refused entry must stay in place.");
+    }
+
+    // A live document over the runner's limit is refused: the refusal propagates, and a live.json an earlier
+    // run left is removed, so it never passes for this run's evidence.
+    [Fact]
+    public async Task OversizedLiveDocument_IsRefused_AndRemovesTheStaleLiveDocument()
+    {
+        var served = Encoding.UTF8.GetBytes(LiveDocument());
+        await using var facade = await ServeAsync(StatusCodes.Status200OK, served);
+        var contract = WriteContract(Encoding.UTF8.GetBytes(ContractDocument()));
+        WriteStaleLiveDocument();
+        Options.Target.AdminUrl = facade.BaseUrl;
+        using var limited = new CaseRunner(TimeSpan.FromSeconds(RequestLimitSeconds), served.Length - 1);
+
+        await Assert.ThrowsAsync<InvalidDataException>(
+            () => new OpenApiDriftCheck(Options, _comparer, limited).RunAsync(TestContext.Current.CancellationToken));
+
+        Assert.False(File.Exists(LiveDocumentPath), "A stale live document must be removed.");
+        AssertOnlyFilesWritten(contract, liveDocument: null);
+    }
+
+    // ---- Response body limit -------------------------------------------------------------------------
+
+    // A body at the runner's limit is returned whole, framed by its length or chunked; one byte more is refused
+    // either way, as is a declared length over the limit whose body never comes, which is refused before any
+    // body byte is read: the server holds that connection open, so a runner that read the body would wait for
+    // its whole request limit. The refusal names the limit only, never the target.
+    [Theory]
+    [InlineData("content-length", ResponseLimit, false)]
+    [InlineData("chunked", ResponseLimit, false)]
+    [InlineData("content-length", ResponseLimit + 1, true)]
+    [InlineData("chunked", ResponseLimit + 1, true)]
+    [InlineData("declared-only", 1024 * 1024 * 1024, true)]
+    public async Task ResponseBody_AtTheLimitIsWhole_OverItIsRefused(string framing, int length, bool refused)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var (response, body) = RawResponse(framing, length);
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        var serving = ServeOnceAsync(listener, response, ct);
+        using var runner = new CaseRunner(SlowRequestLimit, ResponseLimit);
+        var uri = new Uri(string.Create(
+            CultureInfo.InvariantCulture, $"http://{IPAddress.Loopback}:{((IPEndPoint)listener.LocalEndpoint).Port}{AdminRoutes.OpenApiDocument}"));
+
+        var call = runner.GetAsync(uri, SlowRequestLimit, ct).WaitAsync(ContractReadLimit, ct);
+        if (refused)
+        {
+            var refusal = await Assert.ThrowsAsync<InvalidDataException>(() => call);
+            Assert.Equal(
+                $"The response body exceeds the {ResponseLimit}-byte limit on one response, so the response is refused rather than truncated.",
+                refusal.Message);
+        }
+        else
+        {
+            var answered = await call;
+            Assert.Equal(StatusCodes.Status200OK, answered.Status);
+            Assert.Equal(body, answered.Body);
+        }
+
+        await serving.WaitAsync(ContractReadLimit, ct);
     }
 
     // ---- Pass --------------------------------------------------------------------------------------
@@ -2096,6 +2262,80 @@ public sealed partial class JsonSemanticComparerTests
     /// <summary>Starts a stub that answers the admin OpenAPI route with <paramref name="status"/> and <paramref name="body"/>.</summary>
     private static Task<LoopbackStub> ServeAsync(int status, byte[] body) =>
         LoopbackStub.StartAsync(AdminRoutes.OpenApiDocument, status, body, TestContext.Current.CancellationToken);
+
+    /// <summary>
+    /// The exact bytes of a 200 response whose body is <paramref name="length"/> deterministic bytes, framed by
+    /// <c>Content-Length</c> or chunked, with the body; <c>declared-only</c> declares the length and sends no body.
+    /// </summary>
+    private static (byte[] Response, byte[] Body) RawResponse(string framing, int length)
+    {
+        byte[] body = framing == "declared-only" ? [] : [.. Enumerable.Range(0, length).Select(static index => (byte)(index % 251))];
+        var head = framing switch
+        {
+            "content-length" or "declared-only" => string.Create(
+                CultureInfo.InvariantCulture,
+                $"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {length}\r\nConnection: close\r\n\r\n"),
+            "chunked" => "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n",
+            _ => throw new ArgumentOutOfRangeException(nameof(framing), framing, "Unknown response framing."),
+        };
+
+        using var response = new MemoryStream();
+        response.Write(Encoding.ASCII.GetBytes(head));
+        if (framing == "chunked")
+        {
+            for (var offset = 0; offset < body.Length; offset += ChunkBytes)
+            {
+                var size = Math.Min(ChunkBytes, body.Length - offset);
+                response.Write(Encoding.ASCII.GetBytes(string.Create(CultureInfo.InvariantCulture, $"{size:x}\r\n")));
+                response.Write(body, offset, size);
+                response.Write("\r\n"u8);
+            }
+
+            response.Write("0\r\n\r\n"u8);
+        }
+        else
+        {
+            response.Write(body);
+        }
+
+        return (response.ToArray(), body);
+    }
+
+    /// <summary>
+    /// Accepts one connection, reads the request head, sends <paramref name="response"/> exactly, then waits until
+    /// the client closes the connection, so the client alone decides when it stops reading. A client that
+    /// closes while the response is still being written ends the write.
+    /// </summary>
+    private static async Task ServeOnceAsync(TcpListener listener, byte[] response, CancellationToken ct)
+    {
+        using var client = await listener.AcceptTcpClientAsync(ct);
+        var stream = client.GetStream();
+        var buffer = new byte[4096];
+        var head = new StringBuilder();
+        while (!head.ToString().Contains("\r\n\r\n", StringComparison.Ordinal))
+        {
+            var read = await stream.ReadAsync(buffer, ct);
+            if (read == 0)
+            {
+                return;
+            }
+
+            head.Append(Encoding.ASCII.GetString(buffer, 0, read));
+        }
+
+        try
+        {
+            await stream.WriteAsync(response, ct);
+            while (await stream.ReadAsync(buffer, ct) > 0)
+            {
+                // The client sends nothing more; its close ends the wait.
+            }
+        }
+        catch (IOException)
+        {
+            // The client closed the connection before the whole response was written: it refused the body.
+        }
+    }
 
     /// <summary>Writes the checked-in contract and returns its bytes.</summary>
     private byte[] WriteContract(byte[] bytes)

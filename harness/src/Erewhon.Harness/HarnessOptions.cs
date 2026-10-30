@@ -53,6 +53,14 @@ public sealed class HarnessOptions
     /// </summary>
     public const string HarnessVersion = "1.0.0";
 
+    /// <summary>
+    /// The most bytes the harness takes from one input: one repository file it reads (the configuration, the
+    /// case matrix, the register, a baseline file, a checked-in contract or the report) or one HTTP response
+    /// body. A larger input fails explicitly and is never truncated. A constant rather than a setting, so no
+    /// configuration source can lift it.
+    /// </summary>
+    public const int EvidenceByteLimit = 32 * 1024 * 1024;
+
     // Compose service names of the facade and the stand-in on the project networks.
     private const string FacadeHost = "facade";
     private const string StandInHost = "standin";
@@ -267,9 +275,9 @@ public sealed class HarnessOptions
 // ConfinedTree sits beside the options because the harness roots every instance at Harness:RepoRoot, as
 // HarnessOptions.ResolvePath(".") resolves it.
 /// <summary>
-/// Writes and deletes files and directories strictly below one trusted root directory, the repository root,
-/// through Linux directory handles, so that no symbolic link below the root can redirect a write or a delete
-/// out of the tree.
+/// Reads, writes and deletes files and directories strictly below one trusted root directory, the repository
+/// root, through Linux directory handles, so that no symbolic link below the root can redirect a read, a write
+/// or a delete out of the tree, and no special file can block a read.
 /// </summary>
 /// <remarks>
 /// <para>The root and the directories above it belong to the caller and are trusted, so the root is opened by
@@ -277,16 +285,25 @@ public sealed class HarnessOptions
 /// <c>O_DIRECTORY | O_NOFOLLOW</c>, so a link on the way is refused, never followed, and a directory renamed or
 /// replaced by a link after it was opened cannot redirect the rest of the call, which acts on the directory
 /// the handle holds.</para>
+/// <para>A read opens its file inside the last handle without following a link, without waiting for a FIFO's
+/// writer and without becoming a controlling terminal, then takes the file's type from the opened descriptor
+/// itself, so what is read is exactly what was opened. Only a regular file is read, and at most a byte limit
+/// the caller sets: a FIFO, a socket, a device or a file over the limit fails at once and is never read in
+/// part. A missing directory on the way, a missing file or a directory at the name is nothing to read.</para>
 /// <para>A target must lie strictly below the root once <see cref="Path.GetFullPath(string)"/> has resolved it;
 /// the root itself and anything outside it are refused. Every refusal and operating-system error is an
 /// <see cref="IOException"/>, or an <see cref="UnauthorizedAccessException"/> where the operating system denies
 /// access, and its message names the path relative to the root, so it reads the same in every checkout and
-/// container. Writes and deletes run only on Linux.</para>
+/// container. Reads, writes and deletes run only on Linux.</para>
 /// <para>An instance holds only the root's path and may be shared. Concurrent calls on the same entries race
 /// as the file system lets them, but none of them leaves the tree.</para>
 /// </remarks>
 internal sealed class ConfinedTree
 {
+    // The first buffer of a read, grown by doubling up to the limit plus one byte, so a read never allocates
+    // by a length the file reports.
+    private const int InitialReadBytes = 64 * 1024;
+
     private static readonly char[] PathSeparators = [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar];
 
     // Every entry, dot names included; an entry that cannot be read fails the listing rather than being skipped.
@@ -693,7 +710,7 @@ internal sealed class ConfinedTree
 
     /// <summary>
     /// Whether <paramref name="path"/>, once <see cref="Path.GetFullPath(string)"/> has resolved it, lies strictly
-    /// below the root, which is what every write and delete requires. Nothing is opened or examined.
+    /// below the root, which is what every read, write and delete requires. Nothing is opened or examined.
     /// </summary>
     /// <param name="path">The path to test, absolute or relative to the current directory.</param>
     /// <returns>True when the path names an entry below the root; false for the root itself and anything outside.</returns>
@@ -702,6 +719,94 @@ internal sealed class ConfinedTree
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         return SegmentsBelowRoot(Path.GetFullPath(path)).Length > 0;
+    }
+
+    /// <summary>
+    /// Reads the whole regular file at <paramref name="path"/>, at most <paramref name="byteLimit"/> bytes,
+    /// creating nothing on the way.
+    /// </summary>
+    /// <remarks>
+    /// <para>A missing directory on the way, the root included, a missing file and a directory at the name
+    /// are nothing to read, as <see cref="File.Exists(string)"/> reports them, and give null. A link on the way
+    /// or at the name is refused and left in place.</para>
+    /// <para>The file is opened with <c>O_NOFOLLOW | O_NONBLOCK | O_NOCTTY</c>, so a FIFO without a writer opens
+    /// at once, and its type is read from the opened descriptor with <c>statx</c>: a FIFO, a socket or a device
+    /// is refused before any byte is read. A file whose reported length exceeds the limit is refused before
+    /// any byte is read, and the bytes go into a buffer that starts small and grows, never one sized from that
+    /// length, until the file ends or one byte past the limit is in, so a file that grows past the limit is
+    /// refused too, without the rest of it being read. A file is never returned in part.</para>
+    /// </remarks>
+    /// <param name="path">The file to read, strictly below the root.</param>
+    /// <param name="byteLimit">The most bytes the file may hold, at least 0 and below <see cref="Array.MaxLength"/>.</param>
+    /// <returns>The file's bytes, or null when nothing is there to read.</returns>
+    /// <exception cref="ArgumentException"><paramref name="path"/> is null, empty or not a usable path.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="byteLimit"/> is out of range.</exception>
+    /// <exception cref="IOException">
+    /// <paramref name="path"/> is not strictly below the root, a directory on the way or the file is a symbolic
+    /// link, a component on the way is not a directory, the file is not a regular file or exceeds
+    /// <paramref name="byteLimit"/>, or it cannot be opened, examined or read.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">The operating system denies access on the way.</exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown.
+    /// </exception>
+    public byte[]? ReadFile(string path, int byteLimit)
+    {
+        RequireByteLimit(byteLimit);
+        var flags = RequireLinuxTraversal();
+        var target = Resolve(path, read: true);
+        using var file = OpenRegularFile(target, flags);
+        return file is null ? null : ReadAtMost(file, target.FullPath, byteLimit);
+    }
+
+    /// <summary>
+    /// Reads the whole regular file at <paramref name="path"/> without blocking, as
+    /// <see cref="ReadFile(string, int)"/> does.
+    /// </summary>
+    /// <remarks>
+    /// The token is observed before the file is opened and passed to every read, so a cancelled read returns no
+    /// bytes. Every other outcome, exceptions and messages included, is that of the synchronous form.
+    /// </remarks>
+    /// <param name="path">The file to read, strictly below the root.</param>
+    /// <param name="byteLimit">The most bytes the file may hold, at least 0 and below <see cref="Array.MaxLength"/>.</param>
+    /// <param name="cancellationToken">Cancels the read.</param>
+    /// <returns>The file's bytes, or null when nothing is there to read.</returns>
+    /// <exception cref="ArgumentException"><paramref name="path"/> is null, empty or not a usable path.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="byteLimit"/> is out of range.</exception>
+    /// <exception cref="IOException">As for <see cref="ReadFile(string, int)"/>.</exception>
+    /// <exception cref="UnauthorizedAccessException">The operating system denies access on the way.</exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown.
+    /// </exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public async Task<byte[]?> ReadFileAsync(string path, int byteLimit, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        RequireByteLimit(byteLimit);
+        var flags = RequireLinuxTraversal();
+        var target = Resolve(path, read: true);
+        using var file = OpenRegularFile(target, flags);
+        return file is null
+            ? null
+            : await ReadAtMostAsync(file, target.FullPath, byteLimit, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The exception .NET raises for a file it cannot find, for a caller that requires the file
+    /// <see cref="ReadFile(string, int)"/> found nothing at: <see cref="DirectoryNotFoundException"/> when the
+    /// directory that would hold the file does not exist, otherwise <see cref="FileNotFoundException"/>, each
+    /// with the message .NET gives it.
+    /// </summary>
+    /// <param name="path">The file that was not found.</param>
+    /// <returns>The exception to throw.</returns>
+    /// <exception cref="ArgumentException"><paramref name="path"/> is null, empty or not a usable path.</exception>
+    public static IOException NotFound(string path)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(path);
+        var fullPath = Path.GetFullPath(path);
+        return Path.GetDirectoryName(fullPath) is { } directory && !Directory.Exists(directory)
+            ? new DirectoryNotFoundException($"Could not find a part of the path '{fullPath}'.")
+            : new FileNotFoundException($"Could not find file '{fullPath}'.", fullPath);
     }
 
     /// <summary>
@@ -774,6 +879,190 @@ internal sealed class ConfinedTree
 
         return new SafeFileHandle(descriptor, ownsHandle: true);
     }
+
+    private static void RequireByteLimit(int byteLimit)
+    {
+        // One byte past the limit is read to tell a longer file apart, so the limit plus one must fit an array.
+        ArgumentOutOfRangeException.ThrowIfNegative(byteLimit);
+        ArgumentOutOfRangeException.ThrowIfGreaterThanOrEqual(byteLimit, Array.MaxLength);
+    }
+
+    // Opens the read target's directory through handles, creating nothing, then opens the final name inside it
+    // without following a link and without blocking, and keeps it only when the opened descriptor is a regular
+    // file. Returns null when a directory on the way or the name is missing, or a directory stands at the name.
+    // The caller disposes the handle.
+    private SafeFileHandle? OpenRegularFile(ConfinedPath target, TraversalFlags flags)
+    {
+        var name = target.Segments[^1];
+        using var directory = OpenDirectory(target, target.Segments.Length - 1, create: false, flags);
+        if (directory is null)
+        {
+            return null;
+        }
+
+        var descriptor = Native.OpenAt(directory, name, flags.OpenFile, mode: 0);
+        if (descriptor < 0)
+        {
+            var errno = Marshal.GetLastPInvokeError();
+            if (errno == Native.ENOENT)
+            {
+                return null;
+            }
+
+            // With O_NOFOLLOW a link at the name, dangling or not, fails as ELOOP, so only reading the entry as a
+            // link tells it apart from another failure.
+            if (errno == Native.ELOOP && IsLink(directory, name, target.FullPath))
+            {
+                throw LinkRefusal(target, target.FullPath);
+            }
+
+            throw Failure(errno, "read", target.FullPath);
+        }
+
+        var file = new SafeFileHandle(descriptor, ownsHandle: true);
+        var kept = false;
+        try
+        {
+            var type = OpenedFileType(file, target.FullPath);
+            if (type == Native.S_IFDIR)
+            {
+                return null;
+            }
+
+            if (type != Native.S_IFREG)
+            {
+                throw new IOException(
+                    $"ConfinedTree could not read '{Display(target.FullPath)}': it is not a regular file "
+                    + $"({FileKind(type)}).");
+            }
+
+            kept = true;
+            return file;
+        }
+        finally
+        {
+            if (!kept)
+            {
+                file.Dispose();
+            }
+        }
+    }
+
+    // The S_IFMT bits of the file an opened descriptor holds, read with statx and AT_EMPTY_PATH from the
+    // descriptor itself, never from the path, so nothing swapped in at the name since the open counts.
+    private int OpenedFileType(SafeFileHandle file, string path)
+    {
+        Span<byte> status = stackalloc byte[Native.StatxSize];
+        if (Native.Statx(file, string.Empty, Native.AT_EMPTY_PATH, Native.STATX_TYPE, ref MemoryMarshal.GetReference(status)) != 0)
+        {
+            throw Failure(Marshal.GetLastPInvokeError(), "examine", path);
+        }
+
+        // The kernel writes the structure in the process's own byte order.
+        if ((MemoryMarshal.Read<uint>(status) & Native.STATX_TYPE) == 0)
+        {
+            throw new IOException($"ConfinedTree could not examine '{Display(path)}': its file type was not reported.");
+        }
+
+        return MemoryMarshal.Read<ushort>(status[Native.StatxModeOffset..]) & Native.S_IFMT;
+    }
+
+    private static string FileKind(int type) => type switch
+    {
+        Native.S_IFIFO => "a FIFO",
+        Native.S_IFSOCK => "a socket",
+        Native.S_IFCHR => "a character device",
+        Native.S_IFBLK => "a block device",
+        _ => string.Create(CultureInfo.InvariantCulture, $"file type 0x{type:x4}"),
+    };
+
+    // The whole regular file, at most byteLimit bytes: a reported length over the limit is refused before any
+    // read, and the bytes go into a buffer that grows by doubling up to the limit plus one byte, so a file that
+    // grew past the limit is told apart without reading the rest of it.
+    private byte[] ReadAtMost(SafeFileHandle file, string path, int byteLimit)
+    {
+        RequireWithinLimit(RandomAccess.GetLength(file), path, byteLimit);
+        var content = new byte[Math.Min(InitialReadBytes, byteLimit + 1)];
+        var length = 0;
+        while (true)
+        {
+            if (length == content.Length)
+            {
+                content = GrownBuffer(content, path, byteLimit);
+            }
+
+            var read = RandomAccess.Read(file, content.AsSpan(length), fileOffset: length);
+            if (read == 0)
+            {
+                return Trimmed(content, length);
+            }
+
+            length += read;
+        }
+    }
+
+    // ReadAtMost without blocking, passing the token to every read.
+    private async Task<byte[]> ReadAtMostAsync(SafeFileHandle file, string path, int byteLimit, CancellationToken cancellationToken)
+    {
+        RequireWithinLimit(RandomAccess.GetLength(file), path, byteLimit);
+        var content = new byte[Math.Min(InitialReadBytes, byteLimit + 1)];
+        var length = 0;
+        while (true)
+        {
+            if (length == content.Length)
+            {
+                content = GrownBuffer(content, path, byteLimit);
+            }
+
+            var read = await RandomAccess.ReadAsync(file, content.AsMemory(length), fileOffset: length, cancellationToken)
+                .ConfigureAwait(false);
+            if (read == 0)
+            {
+                return Trimmed(content, length);
+            }
+
+            length += read;
+        }
+    }
+
+    private void RequireWithinLimit(long length, string path, int byteLimit)
+    {
+        if (length > byteLimit)
+        {
+            throw ExceedsLimit(path, byteLimit);
+        }
+    }
+
+    // A full buffer doubled, at most to the limit plus one byte; one already that long holds a byte past the
+    // limit, so the file is refused.
+    private byte[] GrownBuffer(byte[] content, string path, int byteLimit)
+    {
+        if (content.Length > byteLimit)
+        {
+            throw ExceedsLimit(path, byteLimit);
+        }
+
+        var grown = content;
+        Array.Resize(ref grown, (int)Math.Min(2L * content.Length, byteLimit + 1L));
+        return grown;
+    }
+
+    private static byte[] Trimmed(byte[] content, int length)
+    {
+        if (length == content.Length)
+        {
+            return content;
+        }
+
+        var exact = content;
+        Array.Resize(ref exact, length);
+        return exact;
+    }
+
+    private IOException ExceedsLimit(string path, int byteLimit) =>
+        new(string.Create(
+            CultureInfo.InvariantCulture,
+            $"ConfinedTree could not read '{Display(path)}': it exceeds the {byteLimit}-byte limit."));
 
     // Removes the entry name inside directory, whatever it is, without following a link. A directory is
     // opened relative to its parent with O_NOFOLLOW, cleared through that handle and removed; anything else,
@@ -850,19 +1139,25 @@ internal sealed class ConfinedTree
         }
     }
 
+    // A write or delete target, resolved as Resolve(string, bool) resolves it.
+    private ConfinedPath Resolve(string path) => Resolve(path, read: false);
+
     // Refuses a path that leaves the tree lexically or names the root itself, and splits the rest into the
-    // components below the root that the directory handles walk.
-    private ConfinedPath Resolve(string path)
+    // components below the root that the directory handles walk. read marks a read target, whose refusals
+    // name a read.
+    private ConfinedPath Resolve(string path, bool read)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         var fullPath = Path.GetFullPath(path);
         var segments = SegmentsBelowRoot(fullPath);
         if (segments.Length == 0)
         {
-            throw new IOException($"ConfinedTree writes and deletes only below its root: refused '{Display(fullPath)}'.");
+            throw new IOException(read
+                ? $"ConfinedTree reads only below its root: refused '{Display(fullPath)}'."
+                : $"ConfinedTree writes and deletes only below its root: refused '{Display(fullPath)}'.");
         }
 
-        return new ConfinedPath(fullPath, segments);
+        return new ConfinedPath(fullPath, segments, read);
     }
 
     // The components of a full path below the root; none for the root itself or a path outside it.
@@ -917,7 +1212,7 @@ internal sealed class ConfinedTree
         {
             component = Path.Join(component, target.Segments[index]);
             using var parent = directory;
-            directory = OpenComponent(parent, target.Segments[index], component, target.FullPath, create, flags);
+            directory = OpenComponent(parent, target.Segments[index], component, target, create, flags);
         }
 
         return directory;
@@ -936,7 +1231,7 @@ internal sealed class ConfinedTree
         {
             component = Path.Join(component, target.Segments[index]);
             using var parent = directory;
-            directory = OpenComponent(parent, target.Segments[index], component, target.FullPath, create: index == depth - 1, flags)
+            directory = OpenComponent(parent, target.Segments[index], component, target, create: index == depth - 1, flags)
                 ?? throw Missing(target.FullPath, component);
         }
 
@@ -974,9 +1269,9 @@ internal sealed class ConfinedTree
 
     // The directory name inside parent, opened without following a link at name and, with create, made first
     // when it is missing; null when it is missing without create. component is the path name stands for, and
-    // refusedPath the target a refusal names.
+    // target the read, write or delete a refusal names.
     private DirectoryHandle? OpenComponent(
-        DirectoryHandle parent, string name, string component, string refusedPath, bool create, TraversalFlags flags)
+        DirectoryHandle parent, string name, string component, ConfinedPath target, bool create, TraversalFlags flags)
     {
         var descriptor = Native.OpenAt(parent, name, flags.OpenDirectory, mode: 0);
         var errno = descriptor < 0 ? Marshal.GetLastPInvokeError() : 0;
@@ -1009,7 +1304,7 @@ internal sealed class ConfinedTree
         // does, so only reading the entry as a link tells the two apart.
         if (errno is Native.ENOTDIR or Native.ELOOP)
         {
-            throw IsLink(parent, name, component) ? LinkRefusal(refusedPath, component) : NotDirectory(component);
+            throw IsLink(parent, name, component) ? LinkRefusal(target, component) : NotDirectory(component);
         }
 
         throw Failure(errno, "open the directory", component);
@@ -1037,6 +1332,13 @@ internal sealed class ConfinedTree
     private IOException LinkRefusal(string refusedPath, string component) =>
         new($"ConfinedTree never writes or deletes through a link: refused '{Display(refusedPath)}', because "
             + $"'{Display(component)}' is a symbolic link.");
+
+    // The refusal of a link at component on the way to target, worded for a read or for a write or delete.
+    private IOException LinkRefusal(ConfinedPath target, string component) =>
+        target.Read
+            ? new($"ConfinedTree never reads through a link: refused '{Display(target.FullPath)}', because "
+                + $"'{Display(component)}' is a symbolic link.")
+            : LinkRefusal(target.FullPath, component);
 
     private IOException NotDirectory(string component) =>
         new($"ConfinedTree could not open '{Display(component)}': it is not a directory.");
@@ -1069,14 +1371,14 @@ internal sealed class ConfinedTree
     private string Display(string path) =>
         Path.GetRelativePath(_root, path).Replace(Path.DirectorySeparatorChar, '/');
 
-    // The open(2) flags of every write and delete for this process, refusing a platform without Linux directory
-    // handles.
+    // The open(2) flags of every read, write and delete for this process, refusing a platform without Linux
+    // directory handles.
     private static TraversalFlags RequireLinuxTraversal()
     {
         if (!OperatingSystem.IsLinux())
         {
             throw new PlatformNotSupportedException(
-                "ConfinedTree writes and deletes only on Linux: it confines them below its root through Linux "
+                "ConfinedTree reads, writes and deletes only on Linux: it confines them below its root through Linux "
                 + "directory handles, which this operating system does not provide.");
         }
 
@@ -1087,23 +1389,25 @@ internal sealed class ConfinedTree
                 or Architecture.LoongArch64 => (0x10000, 0x20000),
             Architecture.Arm or Architecture.Arm64 or Architecture.Armv6 or Architecture.Ppc64le => (0x4000, 0x8000),
             var architecture => throw new PlatformNotSupportedException(
-                $"ConfinedTree writes and deletes only where it knows the Linux open flags, which it does not for "
-                + $"{architecture}."),
+                $"ConfinedTree reads, writes and deletes only where it knows the Linux open flags, which it does not "
+                + $"for {architecture}."),
         };
         return new TraversalFlags(
             Native.O_RDONLY | directory | Native.O_CLOEXEC,
             Native.O_RDONLY | directory | noFollow | Native.O_CLOEXEC,
-            Native.O_WRONLY | Native.O_CREAT | Native.O_EXCL | noFollow | Native.O_CLOEXEC);
+            Native.O_WRONLY | Native.O_CREAT | Native.O_EXCL | noFollow | Native.O_CLOEXEC,
+            Native.O_RDONLY | noFollow | Native.O_NONBLOCK | Native.O_NOCTTY | Native.O_CLOEXEC);
     }
 
-    // A write or delete target: its full path and the components below the root that lead to it, the target's
-    // own name last.
-    private readonly record struct ConfinedPath(string FullPath, string[] Segments);
+    // A read, write or delete target: its full path and the components below the root that lead to it, the
+    // target's own name last. Read marks a read target, whose refusals name a read.
+    private readonly record struct ConfinedPath(string FullPath, string[] Segments, bool Read);
 
-    // The open(2) flags of one write or delete: the trusted root opened read-only by its path, a directory below
-    // it opened read-only without following a link, and a file created write-only and exclusively without
-    // following a link, all closed on exec.
-    private readonly record struct TraversalFlags(int OpenRoot, int OpenDirectory, int CreateFile);
+    // The open(2) flags of one read, write or delete: the trusted root opened read-only by its path, a directory
+    // below it opened read-only without following a link, a file created write-only and exclusively without
+    // following a link, and a file opened read-only without following a link, without waiting on a FIFO's writer
+    // and without becoming a controlling terminal, all closed on exec.
+    private readonly record struct TraversalFlags(int OpenRoot, int OpenDirectory, int CreateFile, int OpenFile);
 
     // A directory held open by its file descriptor, so a call relative to it acts on that directory whatever is
     // later renamed, removed or linked at the path it was opened by.
@@ -1135,6 +1439,7 @@ internal sealed class ConfinedTree
         public const int AT_FDCWD = -100;
         public const int AT_SYMLINK_NOFOLLOW = 0x100;
         public const int AT_REMOVEDIR = 0x200;
+        public const int AT_EMPTY_PATH = 0x1000;
 
         // struct statx has one layout on every architecture: 256 bytes, with the u32 stx_mask at byte 0 and the
         // u16 stx_mode at byte 28, whose S_IFMT bits give the entry's type.
@@ -1142,13 +1447,19 @@ internal sealed class ConfinedTree
         public const int StatxSize = 256;
         public const int StatxModeOffset = 28;
         public const int S_IFMT = 0xF000;
+        public const int S_IFIFO = 0x1000;
+        public const int S_IFCHR = 0x2000;
         public const int S_IFDIR = 0x4000;
+        public const int S_IFBLK = 0x6000;
         public const int S_IFREG = 0x8000;
+        public const int S_IFSOCK = 0xC000;
 
         public const int O_RDONLY = 0;
         public const int O_WRONLY = 1;
         public const int O_CREAT = 0x40;
         public const int O_EXCL = 0x80;
+        public const int O_NOCTTY = 0x100;
+        public const int O_NONBLOCK = 0x800;
         public const int O_CLOEXEC = 0x80000;
 
         // rw-rw-rw- and rwxrwxrwx before the umask, the modes .NET itself creates files and directories with.
@@ -1184,9 +1495,10 @@ internal sealed class ConfinedTree
         public static extern int UnlinkAt(
             DirectoryHandle directory, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags);
 
+        // Takes a directory handle with a name below it, or an opened file with an empty name and AT_EMPTY_PATH.
         [DllImport("libc", EntryPoint = "statx", SetLastError = true)]
         public static extern int Statx(
-            DirectoryHandle directory, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags, uint mask, ref byte buffer);
+            SafeHandle handle, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags, uint mask, ref byte buffer);
 
         [DllImport("libc", EntryPoint = "renameat", SetLastError = true)]
         public static extern int RenameAt(

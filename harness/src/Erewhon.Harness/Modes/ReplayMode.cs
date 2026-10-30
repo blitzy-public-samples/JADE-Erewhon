@@ -934,6 +934,12 @@ public sealed class ReplayMode
 /// <para>Every step runs inside a guard that records an exception as <c>CHK-EXCEPTION</c> and carries on,
 /// so one failing case or check never prevents the others. Only the caller's cancellation ends the body
 /// early, and <see cref="ReplayMode"/> still writes the report and shuts the components down.</para>
+/// <para>The discrepancies of every compared case are kept for the report, together at most
+/// <see cref="KeptEvidenceLimit"/> characters across the run, counted as <see cref="EvidenceBudget"/> counts
+/// them. A case whose discrepancies would take the run over that limit is refused with
+/// <see cref="InvalidDataException"/> before any of them is kept: its guard records <c>CHK-EXCEPTION</c>,
+/// the case keeps no result, discrepancy artifact or <c>d:</c> item, and the next case is still compared.
+/// Equivalent cases keep no discrepancy, so the limit never refuses one.</para>
 /// <para>Before any case is counted or compared, the records are reconciled with the manifest and the case
 /// matrix. A record of a case the manifest lists as not captured, or one the matrix does not plan at its
 /// position for its operation, is never compared or counted as captured. Those records, records without a
@@ -974,6 +980,7 @@ public sealed class ReplayBody(
     private readonly KnownLimitationsRegister _register = register ?? throw new ArgumentNullException(nameof(register));
     private readonly TextWriter _stdout = stdout ?? throw new ArgumentNullException(nameof(stdout));
     private readonly TimeSpan _cancelledRestorationLimit = TimeSpan.FromSeconds(ReplayMode.CancelledRestorationLimitSeconds);
+    private readonly int _keptEvidenceLimit = HarnessOptions.EvidenceByteLimit;
 
     /// <summary>
     /// How long the seed restoration closing the empty-state bracket may still run once the run is cancelled,
@@ -987,6 +994,22 @@ public sealed class ReplayBody(
         init => _cancelledRestorationLimit = CancellationGrace.RequireLimit(value);
     }
 
+    /// <summary>
+    /// The most characters of discrepancy evidence one run keeps for its report across all its cases, counted
+    /// as <see cref="EvidenceBudget"/> counts them; <see cref="HarnessOptions.EvidenceByteLimit"/> unless a test
+    /// lowers it.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is negative.</exception>
+    internal int KeptEvidenceLimit
+    {
+        get => _keptEvidenceLimit;
+        init
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            _keptEvidenceLimit = value;
+        }
+    }
+
     /// <inheritdoc/>
     /// <exception cref="ArgumentNullException"><paramref name="state"/> is null.</exception>
     /// <exception cref="InvalidOperationException">The operation catalogue is unavailable.</exception>
@@ -998,7 +1021,8 @@ public sealed class ReplayBody(
 
         using var runner = CaseRunner.FromOptions(_options);
         using var reset = new StateReset(_options);
-        var execution = new Execution(_options, catalogue, _register, state, runner, reset, _stdout, _cancelledRestorationLimit, ct);
+        var execution = new Execution(
+            _options, catalogue, _register, state, runner, reset, _stdout, _cancelledRestorationLimit, _keptEvidenceLimit, ct);
         await execution.RunAsync().ConfigureAwait(false);
     }
 
@@ -1092,6 +1116,7 @@ public sealed class ReplayBody(
         StateReset reset,
         TextWriter stdout,
         TimeSpan restorationLimit,
+        int keptEvidenceLimit,
         CancellationToken ct)
     {
         private const string LinePrefix = "replay: ";
@@ -1107,6 +1132,10 @@ public sealed class ReplayBody(
 
         private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
         private readonly BaselineStore _store = new(options);
+
+        // The discrepancy evidence every compared case keeps for the report until it is written, charged one
+        // whole comparison at a time before any of the case is kept.
+        private readonly EvidenceBudget _keptEvidence = EvidenceBudget.OfReplayRun(keptEvidenceLimit);
 
         // Evidence problems the manifest shows by itself, found when it is read and reported with the
         // reconciliation of the records (ConfirmEvidence).
@@ -1346,7 +1375,7 @@ public sealed class ReplayBody(
 
         private void LoadMatrix()
         {
-            _matrix = CaseMatrix.Load(options.CaseMatrixPath, catalogue);
+            _matrix = CaseMatrix.Load(options.CaseMatrixPath, catalogue, options.ResolvePath("."));
             Print(string.Create(
                 CultureInfo.InvariantCulture,
                 $"{MatrixName}: {_matrix.PlannedCaseCount} planned cases over {_matrix.PlannedOperationCount} operations"));
@@ -1698,6 +1727,11 @@ public sealed class ReplayBody(
                 : new ResponseSnapshot(null, null, ReadOnlyMemory<byte>.Empty, NoResponseReasons.Connect);
             var baseline = new ResponseSnapshot(record.Response.Status, record.Response.ContentType, entry.Body);
             var comparison = comparer.Compare(operation, baseline, observed);
+
+            // Evidence the run cannot keep for its report is refused before any of the case is kept: the
+            // InvalidDataException reaches the case's guard, which records CHK-EXCEPTION, and the case keeps no
+            // result, artifact or d: item.
+            _keptEvidence.ChargeComparison(comparison.Discrepancies);
 
             string? nature = null;
             if (!comparison.Equivalent)

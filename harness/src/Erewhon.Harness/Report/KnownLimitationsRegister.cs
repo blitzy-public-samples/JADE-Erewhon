@@ -233,20 +233,40 @@ public sealed class KnownLimitationsRegister
     /// Reads a register file as UTF-8, with or without one leading byte order mark, and parses it as
     /// <see cref="Parse"/> does. Bytes that are not valid UTF-8 are rejected, never replaced.
     /// </summary>
+    /// <remarks>
+    /// The file is read through <see cref="ConfinedTree"/> below <paramref name="root"/>: a link on its way or at
+    /// it is refused and never followed, and a FIFO, a socket, a device or a file over
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/> fails at once, so nothing blocks the start of a run.
+    /// </remarks>
     /// <param name="path">The file path, normally <c>harness/config/known-limitations.json</c>.</param>
+    /// <param name="root">
+    /// The directory the read is confined to, normally the repository root; null confines it to the file's own
+    /// directory.
+    /// </param>
     /// <returns>The register.</returns>
     /// <exception cref="ArgumentException"><paramref name="path"/> is null or empty.</exception>
-    /// <exception cref="FileNotFoundException">The file does not exist.</exception>
+    /// <exception cref="FileNotFoundException">The file does not exist, or a directory stands at its name.</exception>
     /// <exception cref="DirectoryNotFoundException">A directory on the path does not exist.</exception>
+    /// <exception cref="IOException">
+    /// The path is not below <paramref name="root"/>, the file or a directory on its way is a symbolic link, the
+    /// file is not a regular file or exceeds <see cref="HarnessOptions.EvidenceByteLimit"/>, or it cannot be read.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">The operating system denies access on the way.</exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown.
+    /// </exception>
     /// <exception cref="InvalidDataException">
     /// The content is not valid UTF-8, not JSON or not a valid register as <see cref="Parse"/> describes;
     /// the message names the path.
     /// </exception>
-    public static KnownLimitationsRegister Load(string path)
+    public static KnownLimitationsRegister Load(string path, string? root = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
 
-        var bytes = File.ReadAllBytes(path);
+        var fullPath = Path.GetFullPath(path);
+        var bytes = new ConfinedTree(root ?? Path.GetDirectoryName(fullPath) ?? fullPath)
+            .ReadFile(fullPath, HarnessOptions.EvidenceByteLimit)
+            ?? throw ConfinedTree.NotFound(fullPath);
         string json;
         try
         {

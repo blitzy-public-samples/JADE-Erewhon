@@ -337,12 +337,13 @@ public static class ResetPoints
 /// <para>Every mismatch becomes a <c>CHK-RESET:&lt;point&gt;</c> item with nature
 /// <c>mismatch:&lt;field&gt;:&lt;observed&gt;</c> and the run continues. Such items can be documented, so
 /// the observed part is always a deterministic token (a status code, <c>connect</c>, <c>timeout</c>,
-/// <c>reset</c>, <c>before-</c> followed by the pre-reset read's token or <c>null</c> when the generation
-/// the reset had to increase is unknown, or the raw observed value); timings, URLs and exception messages
-/// go into <see cref="FailureItem.Detail"/> only. Network conditions never throw; only the caller's
-/// cancellation does.</para>
-/// <para>Each request is bounded by <see cref="HarnessOptions.RequestTimeout"/>. The instance is safe
-/// for concurrent use.</para>
+/// <c>reset</c>, <c>oversized</c>, <c>before-</c> followed by the pre-reset read's token or <c>null</c> when
+/// the generation the reset had to increase is unknown, or the raw observed value); timings, URLs and
+/// exception messages go into <see cref="FailureItem.Detail"/> only. Network conditions never throw; only the
+/// caller's cancellation does.</para>
+/// <para>Each request is bounded by <see cref="HarnessOptions.RequestTimeout"/>, and each 2xx body by a
+/// mebibyte, far above any admin answer: a body over it is the failure <c>oversized</c>, never read in full
+/// or truncated. The instance is safe for concurrent use.</para>
 /// </remarks>
 public sealed class StateReset : IDisposable
 {
@@ -359,6 +360,7 @@ public sealed class StateReset : IDisposable
     internal const string TimeoutFailure = "timeout";
     internal const string ResetFailure = "reset";
     internal const string InvalidBodyFailure = "invalid";
+    internal const string OversizedBodyFailure = "oversized";
     internal const string InvalidUrlFailure = "invalid-url";
     internal const string BlankUrlFailure = "blank-url";
     internal const string InfoFailurePrefix = "info-";
@@ -366,6 +368,13 @@ public sealed class StateReset : IDisposable
     internal const string NullObserved = "null";
 
     private const string DateFormat = "yyyy-MM-dd";
+
+    // The most bytes one admin response body may hold. Admin answers are JSON objects of a few hundred bytes,
+    // so a body over a mebibyte is no admin answer and is refused, never read in full or truncated.
+    private const int AdminBodyByteLimit = 1024 * 1024;
+
+    // The first buffer of an admin body read, which holds every admin answer whole.
+    private const int AdminBodyInitialBytes = 4 * 1024;
 
     private readonly HarnessOptions _options;
     private readonly HttpClient _client;
@@ -538,7 +547,7 @@ public sealed class StateReset : IDisposable
     /// only when both reads report one and the later is greater. Otherwise it is observed as
     /// <c>null</c> when the read after the reset has none; as <c>before-&lt;token&gt;</c> when the
     /// prior generation is unknown, where the token is the pre-reset read's failure token
-    /// (<c>connect</c>, <c>timeout</c>, <c>reset</c>, the status code or <c>invalid</c>) or <c>null</c>
+    /// (<c>connect</c>, <c>timeout</c>, <c>reset</c>, the status code, <c>oversized</c> or <c>invalid</c>) or <c>null</c>
     /// when that read reported no generation; and as itself when it did not increase.
     /// </summary>
     private void CheckFields(
@@ -647,8 +656,8 @@ public sealed class StateReset : IDisposable
     }
 
     /// <summary>
-    /// Sends one admin request with no body and no extra header, bounded by the request limit, and
-    /// classifies every way it can fail into a deterministic token.
+    /// Sends one admin request with no body and no extra header, bounded by the request limit and its 2xx
+    /// body by the admin body limit, and classifies every way it can fail into a deterministic token.
     /// </summary>
     private async Task<AdminCall> SendAsync(HttpMethod method, Uri uri, CancellationToken ct)
     {
@@ -658,9 +667,11 @@ public sealed class StateReset : IDisposable
 
         try
         {
+            // Only the headers are awaited, so the status decides before any body byte is read, and the body
+            // that is read is bounded.
             using var request = new HttpRequestMessage(method, uri);
             using var response = await _client
-                .SendAsync(request, HttpCompletionOption.ResponseContentRead, deadline.Token)
+                .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, deadline.Token)
                 .ConfigureAwait(false);
 
             var status = (int)response.StatusCode;
@@ -671,8 +682,13 @@ public sealed class StateReset : IDisposable
 
             // Both admin listeners write UTF-8 JSON; decoding the bytes directly cannot fail on an
             // unexpected charset parameter the way ReadAsStringAsync can.
-            var bytes = await response.Content.ReadAsByteArrayAsync(deadline.Token).ConfigureAwait(false);
-            return new AdminCall(Encoding.UTF8.GetString(bytes), null, null);
+            var bytes = await ReadBoundedBodyAsync(response.Content, deadline.Token).ConfigureAwait(false);
+            return bytes is null
+                ? new AdminCall(
+                    null,
+                    OversizedBodyFailure,
+                    string.Create(CultureInfo.InvariantCulture, $"{method} {uri}: body exceeds the {AdminBodyByteLimit}-byte admin limit"))
+                : new AdminCall(Encoding.UTF8.GetString(bytes), null, null);
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
@@ -687,6 +703,45 @@ public sealed class StateReset : IDisposable
         {
             ct.ThrowIfCancellationRequested();
             return new AdminCall(null, ResetFailure, Describe(method, uri, ex));
+        }
+    }
+
+    // The whole admin body, or null when it exceeds AdminBodyByteLimit: a declared Content-Length over the
+    // limit is refused before any byte is read, and otherwise at most the limit plus one byte is read, into a
+    // buffer that starts small and grows by doubling, so a longer body is told apart without reading the rest
+    // of it. A failure while reading is classified by the caller exactly as one while sending.
+    private static async Task<byte[]?> ReadBoundedBodyAsync(HttpContent content, CancellationToken ct)
+    {
+        if (content.Headers.ContentLength > AdminBodyByteLimit)
+        {
+            return null;
+        }
+
+        var stream = await content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+        await using (stream.ConfigureAwait(false))
+        {
+            var buffer = new byte[AdminBodyInitialBytes];
+            var length = 0;
+            while (true)
+            {
+                if (length == buffer.Length)
+                {
+                    if (length > AdminBodyByteLimit)
+                    {
+                        return null;
+                    }
+
+                    Array.Resize(ref buffer, Math.Min(2 * buffer.Length, AdminBodyByteLimit + 1));
+                }
+
+                var read = await stream.ReadAsync(buffer.AsMemory(length), ct).ConfigureAwait(false);
+                if (read == 0)
+                {
+                    return buffer[..length];
+                }
+
+                length += read;
+            }
         }
     }
 
@@ -763,8 +818,9 @@ public sealed class StateReset : IDisposable
 /// <param name="Failure">
 /// Null when <paramref name="Info"/> is set. Otherwise a deterministic token: <c>blank-url</c> or
 /// <c>invalid-url</c> when no request was sent; <c>connect</c>, <c>timeout</c> or <c>reset</c> when the
-/// request got no complete response; the status code of a response that is not 2xx; or <c>invalid</c> when
-/// the 2xx body is not a JSON object whose strings can be decoded.
+/// request got no complete response; the status code of a response that is not 2xx; <c>oversized</c> when the
+/// 2xx body exceeds the admin body limit of a mebibyte; or <c>invalid</c> when the 2xx body is not a JSON
+/// object whose strings can be decoded.
 /// </param>
 /// <param name="Detail">
 /// Why the read failed, for the console: the method, the credential-free URL and what went wrong, never the

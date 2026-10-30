@@ -453,6 +453,27 @@ public sealed partial class KnownLimitationsRegisterTests : IDisposable
         });
     }
 
+    // A FIFO nobody writes to, a link to one or to a valid register outside the root, and a sparse file over the
+    // evidence limit are each refused at once, before any byte is parsed, so nothing blocks a run's start.
+    [Theory]
+    [InlineData("fifo")]
+    [InlineData("link-to-fifo")]
+    [InlineData("link-to-file")]
+    [InlineData("oversized")]
+    public async Task Load_RegisterThatIsSpecialLinkedOrOversized_IsRefusedPromptly(string kind)
+    {
+        const string relative = "harness/config/known-limitations.json";
+        var ct = TestContext.Current.CancellationToken;
+        var path = Temp.PathOf(relative);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        PlantRefusedFile(path, kind, HarnessOptions.EvidenceByteLimit, """{"version":1,"entries":[]}""");
+
+        var refusal = await Assert.ThrowsAsync<IOException>(
+            () => Task.Run(() => KnownLimitationsRegister.Load(path, Temp.Root), ct).WaitAsync(PromptReadLimit, ct));
+
+        Assert.Equal(ConfinedReadRefusal(relative, kind), refusal.Message);
+    }
+
     // Strict decoding still accepts a leading byte order mark and every valid multi-byte sequence.
     [Fact]
     public void Load_ByteOrderMarkAndMultiByteText_LoadExactly()
@@ -3892,6 +3913,27 @@ public sealed partial class KnownLimitationsRegisterTests
                 () => CaseMatrix.Load(Path.Combine(directory, "absent", "case-matrix.json"), Catalogue)));
     }
 
+    // A FIFO nobody writes to, a link to one or to a valid matrix outside the root, and a sparse file over the
+    // evidence limit are each refused at once, before any byte is parsed, so nothing blocks a run.
+    [Theory]
+    [InlineData("fifo")]
+    [InlineData("link-to-fifo")]
+    [InlineData("link-to-file")]
+    [InlineData("oversized")]
+    public async Task Load_MatrixThatIsSpecialLinkedOrOversized_IsRefusedPromptly(string kind)
+    {
+        const string relative = "harness/config/case-matrix.json";
+        var ct = TestContext.Current.CancellationToken;
+        var path = Temp.PathOf(relative);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        PlantRefusedFile(path, kind, HarnessOptions.EvidenceByteLimit, CommittedMatrixText());
+
+        var refusal = await Assert.ThrowsAsync<IOException>(
+            () => Task.Run(() => CaseMatrix.Load(path, Catalogue, Temp.Root), ct).WaitAsync(PromptReadLimit, ct));
+
+        Assert.Equal(ConfinedReadRefusal(relative, kind), refusal.Message);
+    }
+
     [Fact]
     public void Load_NullOrEmptyArguments_Throw()
     {
@@ -5168,6 +5210,19 @@ public sealed partial class KnownLimitationsRegisterTests
         }
     }
 
+    // The refusal ConfinedTree gives, reading with the evidence limit below Temp's root, for what PlantRefusedFile
+    // planted at relative. The message names the path relative to the root, so it reads the same in every run.
+    private static string ConfinedReadRefusal(string relative, string kind) => kind switch
+    {
+        "fifo" => $"ConfinedTree could not read '{relative}': it is not a regular file (a FIFO).",
+        "link-to-fifo" or "link-to-file" =>
+            $"ConfinedTree never reads through a link: refused '{relative}', because '{relative}' is a symbolic link.",
+        "oversized" => string.Create(
+            CultureInfo.InvariantCulture,
+            $"ConfinedTree could not read '{relative}': it exceeds the {HarnessOptions.EvidenceByteLimit}-byte limit."),
+        _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "unknown kind of refused file"),
+    };
+
     // A path below Temp is shown in the failure with Temp's root redacted.
     private void MakeFifo(string path)
     {
@@ -6265,13 +6320,17 @@ public sealed partial class KnownLimitationsRegisterTests
 // final line and its line terminator; a seekable descriptor keeps the console writer; a full non-blocking
 // descriptor is waited for and never handed to the console writer, so the outcome follows what its reader
 // does. A pipe end the runtime opened reads as carrying close-on-exec, which no inherited standard output
-// does, and a file opened by path cannot tell. The report is a RESULTS.md in a temporary directory of the
-// test's own. These members live in this class because the harness test project keeps its fixed set of
+// does, and a file opened by path cannot tell. A report outside the root, behind a link, a FIFO or over the
+// evidence limit is refused at once and prints nothing. The report is a RESULTS.md in a temporary directory
+// of the test's own. These members live in this class because the harness test project keeps its fixed set of
 // test classes, and the summary mode prints the final line of the results report this class covers.
 public sealed partial class KnownLimitationsRegisterTests
 {
     private const string FinalLine = "22 of 22 operations equivalent, 0 documented differences";
     private const string AfterMarker = "after\n";
+
+    // The last line of a file outside the repository root, which no refused report may print.
+    private const string OutsideFinalLine = "a line from outside the repository";
 
     // Each one-byte send is charged a whole buffer of some hundred bytes, so a send buffer of the default
     // size fills after a few hundred sends; the bound ends the test if the socket never fills.
@@ -6434,6 +6493,59 @@ public sealed partial class KnownLimitationsRegisterTests
             var expected = new string(FillByte, filled) + (expectedExitCode == 0 ? FinalLine + "\n" : string.Empty);
             Assert.Equal(expected, Utf8.GetString(bytes));
         }
+    }
+
+    // A report path outside the repository root, a report that is a link to a file outside it, a report below
+    // a linked directory, a FIFO nobody writes to and a report over the evidence limit are each refused at once,
+    // exit 1 and print nothing: the outside file's last line, which a followed read would print, never reaches
+    // standard output.
+    [Theory]
+    [InlineData("outside-path")]
+    [InlineData("link-to-outside")]
+    [InlineData("linked-directory")]
+    [InlineData("fifo")]
+    [InlineData("oversized")]
+    public async Task RefusedReport_Exits1_AndPrintsNothing(string kind)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        using var outside = new TempDirectory();
+        var outsideReport = outside.Write("RESULTS.md", $"# Notes\n\n{OutsideFinalLine}\n");
+        var reportPath = SummaryRepoRoot.PathOf("RESULTS.md");
+        switch (kind)
+        {
+            case "outside-path":
+                reportPath = outsideReport;
+                break;
+            case "link-to-outside":
+                File.Delete(reportPath);
+                File.CreateSymbolicLink(reportPath, outsideReport);
+                break;
+            case "linked-directory":
+                Directory.CreateSymbolicLink(SummaryRepoRoot.PathOf("reports"), outside.Root);
+                reportPath = SummaryRepoRoot.PathOf("reports/RESULTS.md");
+                break;
+            case "fifo":
+                File.Delete(reportPath);
+                SpecialFileSupport.CreateFifo(reportPath);
+                break;
+            case "oversized":
+                using (var handle = File.OpenHandle(reportPath, FileMode.Truncate, FileAccess.Write))
+                {
+                    RandomAccess.SetLength(handle, HarnessOptions.EvidenceByteLimit + 1L);
+                }
+
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(kind), kind, "unknown kind of refused report");
+        }
+
+        var mode = new SummaryMode(
+            new HarnessOptions { RepoRoot = SummaryRepoRoot.Root, ReportPath = reportPath }, SummaryConsole, descriptor: null);
+
+        var exitCode = await Task.Run(() => mode.RunAsync(ct), ct).WaitAsync(WaitLimit, ct);
+
+        Assert.Equal(1, exitCode);
+        Assert.Equal(0, SummaryConsoleBytes.Length);
     }
 
     // The runtime opens every descriptor of its own with close-on-exec, as it does the descriptor that takes

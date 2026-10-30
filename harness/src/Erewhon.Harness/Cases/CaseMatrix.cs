@@ -146,20 +146,44 @@ public sealed partial class CaseMatrix
     /// <summary>
     /// Reads and validates a matrix file. The file is read as UTF-8 and only read, never written.
     /// </summary>
+    /// <remarks>
+    /// The file is read through <see cref="ConfinedTree"/> below <paramref name="root"/>: a link on its way or at
+    /// it is refused and never followed, and a FIFO, a socket, a device or a file over
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/> fails at once, so nothing blocks the run. The bytes are
+    /// decoded as <see cref="File.ReadAllText(string, Encoding)"/> decodes them: UTF-8 unless a byte order mark
+    /// names another encoding.
+    /// </remarks>
     /// <param name="path">The path of <c>case-matrix.json</c>, normally <c>HarnessOptions.CaseMatrixPath</c>.</param>
     /// <param name="catalogue">The catalogue the cases are validated against, normally <see cref="OperationCatalogue.Default"/>.</param>
+    /// <param name="root">
+    /// The directory the read is confined to, normally the repository root; null confines it to the file's own
+    /// directory.
+    /// </param>
     /// <returns>The validated matrix.</returns>
     /// <exception cref="ArgumentException"><paramref name="path"/> is null or empty.</exception>
     /// <exception cref="ArgumentNullException"><paramref name="catalogue"/> is null.</exception>
-    /// <exception cref="FileNotFoundException">The file does not exist; propagated unchanged.</exception>
-    /// <exception cref="DirectoryNotFoundException">A directory on the path does not exist; propagated unchanged.</exception>
-    /// <exception cref="IOException">The file cannot be read; propagated unchanged.</exception>
+    /// <exception cref="FileNotFoundException">The file does not exist, or a directory stands at its name.</exception>
+    /// <exception cref="DirectoryNotFoundException">A directory on the path does not exist.</exception>
+    /// <exception cref="IOException">
+    /// The path is not below <paramref name="root"/>, the file or a directory on its way is a symbolic link, the
+    /// file is not a regular file or exceeds <see cref="HarnessOptions.EvidenceByteLimit"/>, or it cannot be read.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">The operating system denies access on the way.</exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown.
+    /// </exception>
     /// <exception cref="InvalidDataException">The content breaks a rule of <see cref="Parse"/>.</exception>
-    public static CaseMatrix Load(string path, OperationCatalogue catalogue)
+    public static CaseMatrix Load(string path, OperationCatalogue catalogue, string? root = null)
     {
         ArgumentException.ThrowIfNullOrEmpty(path);
         ArgumentNullException.ThrowIfNull(catalogue);
-        return Parse(File.ReadAllText(path, Encoding.UTF8), catalogue);
+        var fullPath = Path.GetFullPath(path);
+        var bytes = new ConfinedTree(root ?? Path.GetDirectoryName(fullPath) ?? fullPath)
+            .ReadFile(fullPath, HarnessOptions.EvidenceByteLimit)
+            ?? throw ConfinedTree.NotFound(fullPath);
+        using var reader = new StreamReader(
+            new MemoryStream(bytes, writable: false), Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        return Parse(reader.ReadToEnd(), catalogue);
     }
 
     /// <summary>

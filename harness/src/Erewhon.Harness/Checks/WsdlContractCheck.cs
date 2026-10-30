@@ -113,6 +113,11 @@ public sealed class WsdlContractCheck(
     /// <returns>The check row, the failing item when the check did not pass, and the discrepancies of a difference.</returns>
     /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
     /// <exception cref="ArgumentOutOfRangeException">The configured request limit exceeds <see cref="int.MaxValue"/> milliseconds.</exception>
+    /// <exception cref="InvalidDataException">
+    /// A fetched body exceeds <see cref="HarnessOptions.EvidenceByteLimit"/>, as <see cref="CaseRunner"/>
+    /// refuses it, or the comparison of the two WSDLs would retain more discrepancy evidence than the
+    /// <see cref="XmlSemanticComparer"/> allows.
+    /// </exception>
     public async Task<ContractCheckResult> RunAsync(CancellationToken ct)
     {
         // File.Exists is false for a directory, which therefore also counts as absent. Artifacts left by an

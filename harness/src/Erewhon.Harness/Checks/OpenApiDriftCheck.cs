@@ -49,7 +49,9 @@ public sealed record ContractCheckResult(CheckResult Result, FailureItem? Failur
 /// <para>Evaluation order, first match wins:</para>
 /// <list type="number">
 ///   <item><c>GET &lt;Target.AdminUrl&gt;/openapi/v1.json</c> within the per-request limit. An answered response,
-///   whatever its status, is saved byte for byte to <c>artifacts/openapi/live.json</c>.</item>
+///   whatever its status, is saved byte for byte to <c>artifacts/openapi/live.json</c>. A document over
+///   <see cref="HarnessOptions.EvidenceByteLimit"/> is refused unread: <c>live.json</c> is removed and the
+///   refusal propagates.</item>
 ///   <item>No response, a status other than 200, or an unusable admin URL: <c>CHK-OPENAPI-DRIFT</c>
 ///   <c>not-run</c>, outcome <c>not-run</c>.</item>
 ///   <item>No checked-in file: <c>missing</c>, outcome <c>fail</c>.</item>
@@ -91,8 +93,21 @@ public sealed class OpenApiDriftCheck(HarnessOptions options, JsonSemanticCompar
     /// <param name="ct">The caller's cancellation, which propagates as <see cref="OperationCanceledException"/>.</param>
     /// <returns>The check row, the failing item when the check did not pass, and the discrepancies of a difference.</returns>
     /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
-    /// <exception cref="IOException">The checked-in contract exists but cannot be read.</exception>
+    /// <exception cref="IOException">
+    /// The checked-in contract, or a directory on its way below the repository root, is a symbolic link; the
+    /// contract is not a regular file or exceeds <see cref="HarnessOptions.EvidenceByteLimit"/>; or it exists but
+    /// cannot be read.
+    /// </exception>
     /// <exception cref="UnauthorizedAccessException">The checked-in contract exists but may not be read.</exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown, so the
+    /// contract cannot be read confined to the repository root.
+    /// </exception>
+    /// <exception cref="InvalidDataException">
+    /// The live document exceeds <see cref="HarnessOptions.EvidenceByteLimit"/>, as <see cref="CaseRunner"/>
+    /// refuses it, or its comparison with the checked-in contract would retain more discrepancy evidence than
+    /// the <see cref="JsonSemanticComparer"/> allows.
+    /// </exception>
     public async Task<ContractCheckResult> RunAsync(CancellationToken ct)
     {
         Uri documentUri;
@@ -106,9 +121,20 @@ public sealed class OpenApiDriftCheck(HarnessOptions options, JsonSemanticCompar
             return NotRun(Join($"Harness:Target:AdminUrl is not usable: {ex.Message}", RemoveLiveDocument()));
         }
 
-        var response = await _http
-            .GetAsync(documentUri, CaseRunner.RequestTimeoutOf(_options), ct)
-            .ConfigureAwait(false);
+        CaseResponse response;
+        try
+        {
+            response = await _http
+                .GetAsync(documentUri, CaseRunner.RequestTimeoutOf(_options), ct)
+                .ConfigureAwait(false);
+        }
+        catch (InvalidDataException)
+        {
+            // An oversized document is refused unread, so a live.json left by an earlier run would pass for its
+            // evidence; it is removed before the refusal propagates, and a failed removal never replaces it.
+            _ = RemoveLiveDocument();
+            throw;
+        }
 
         // A live.json left by an earlier run would pass for this run's evidence, so it is removed when
         // nothing was answered.
@@ -263,24 +289,15 @@ public sealed class OpenApiDriftCheck(HarnessOptions options, JsonSemanticCompar
         return span.StartsWith(Encoding.UTF8.Preamble) ? span[Encoding.UTF8.Preamble.Length..] : span;
     }
 
-    // File.Exists is false for a directory, which therefore also counts as missing; a file removed between
-    // the probe and the read is missing as well.
-    private static async Task<byte[]?> TryReadContractAsync(string path, CancellationToken ct)
-    {
-        if (!File.Exists(path))
-        {
-            return null;
-        }
-
-        try
-        {
-            return await File.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
-        }
-        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
-        {
-            return null;
-        }
-    }
+    // The contract is read through directory handles anchored at the repository root, as the live document is
+    // written: a missing directory on the way, a missing file or a directory at the name, a file removed before
+    // the read included, is missing. A link on the way or at the name, a FIFO, a socket, a device or a file over
+    // HarnessOptions.EvidenceByteLimit is refused at once rather than followed or waited on, and the refusal
+    // propagates, as an unreadable contract does.
+    private async Task<byte[]?> TryReadContractAsync(string path, CancellationToken ct) =>
+        await new ConfinedTree(_options.ResolvePath("."))
+            .ReadFileAsync(path, HarnessOptions.EvidenceByteLimit, ct)
+            .ConfigureAwait(false);
 
     private async Task<string?> SaveLiveDocumentAsync(byte[] body, CancellationToken ct)
     {

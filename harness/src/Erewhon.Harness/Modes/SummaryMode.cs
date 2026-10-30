@@ -15,13 +15,18 @@ namespace Erewhon.Harness.Modes;
 /// printing the result and returns 0. The mode therefore only reads
 /// <see cref="HarnessOptions.EffectiveReportPath"/>: it never opens a file for writing, creates a
 /// directory or touches the network.</para>
+/// <para>The report is read only strictly below the repository root, as replay writes it, and through
+/// <see cref="ConfinedTree"/>: a path outside the root is never opened, a link on the way or at the report
+/// is refused and never followed, and a FIFO, a socket, a device or a report over
+/// <see cref="HarnessOptions.EvidenceByteLimit"/> fails at once, so no other file's content reaches
+/// standard output and nothing blocks the mode.</para>
 /// <para>The printed line is the last line of the report that is not blank, with trailing white space
 /// removed and otherwise verbatim. The report writer owns the line's format, so it is not checked here.</para>
-/// <para>Exit code 0 means the line was printed. Every other outcome (no report, a directory at the
-/// report path, a read failure, a report with no non-blank line, an unwritable standard output or
-/// cancellation) is one line naming the path and the reason on standard error, never on
-/// <c>stdout</c>, and exit code 1. That line is printed through
-/// <see cref="LifecycleConsole.Display"/>, so a path or message cannot break it or drive the
+/// <para>Exit code 0 means the line was printed. Every other outcome (a report path outside the root, no
+/// report, a directory at the report path, a link, a special file, a report over the limit or another read
+/// failure, a report with no non-blank line, an unwritable standard output or cancellation) is one line
+/// naming the path and the reason on standard error, never on <c>stdout</c>, and exit code 1. That line is
+/// printed through <see cref="LifecycleConsole.Display"/>, so a path or message cannot break it or drive the
 /// terminal. <see cref="RunAsync"/> never throws.</para>
 /// <para>When the mode is given <see cref="Console.Out"/> itself on a system other than Windows, and
 /// descriptor 1 is not seekable (a pipe, a socket or a terminal), the line goes straight to descriptor 1 as
@@ -46,7 +51,7 @@ namespace Erewhon.Harness.Modes;
 /// kinds never hold O_CLOEXEC among their open flags; a file opened by path can (the terminal that
 /// <c>docker run -t</c> gives a container does), so for one the check cannot tell and is skipped. It is also
 /// skipped without <c>/proc/self/fdinfo</c>, or with a flags line that cannot be read. A <c>/dev/null</c>
-/// that the parent opened as descriptor 1 is inherited and is printed to as before.</para>
+/// that the parent opened as descriptor 1 is inherited and is printed to.</para>
 /// </remarks>
 public sealed class SummaryMode
 {
@@ -136,9 +141,13 @@ public sealed class SummaryMode
     public async Task<int> RunAsync(CancellationToken ct)
     {
         string path;
+        ConfinedTree tree;
+        bool contained;
         try
         {
             path = _options.EffectiveReportPath;
+            tree = new ConfinedTree(_options.ResolvePath("."));
+            contained = tree.Contains(path);
         }
         catch (Exception ex)
         {
@@ -146,17 +155,25 @@ public sealed class SummaryMode
             return 1;
         }
 
+        // The report is the repository's own, as replay writes it only below the root; any other file is never
+        // opened, so its content cannot reach standard output.
+        if (!contained)
+        {
+            ReportFailure($"'{path}' is not below the repository root '{tree.Root}', so it is not read");
+            return 1;
+        }
+
         string? finalLine;
         try
         {
-            // On Linux a directory opens as "access denied", which would hide the real cause.
+            // The read finds nothing at a directory, which would read as a missing report, so it is named first.
             if (Directory.Exists(path))
             {
                 ReportFailure($"'{path}' is a directory, not a report file");
                 return 1;
             }
 
-            finalLine = await ReadFinalLineAsync(path, ct).ConfigureAwait(false);
+            finalLine = await ReadFinalLineAsync(tree, path, ct).ConfigureAwait(false);
         }
         catch (Exception ex)
         {
@@ -353,19 +370,17 @@ public sealed class SummaryMode
         return null;
     }
 
-    // Streams the file so only the last non-blank line is held. ReadLine splits on "\n", "\r\n" and "\r",
-    // so a hand-written CRLF report reads the same as the writer's LF output, and a BOM is skipped.
-    private static async Task<string?> ReadFinalLineAsync(string path, CancellationToken ct)
+    // Reads the report once through the repository root's confined reader, which refuses a link on its way or
+    // at it, a FIFO, a socket, a device and a file over HarnessOptions.EvidenceByteLimit at once, then keeps the
+    // last non-blank line of those bytes. ReadLine splits on "\n", "\r\n" and "\r", so a hand-written CRLF
+    // report reads the same as the writer's LF output, and a BOM is skipped. Nothing there to read is a missing
+    // report; null means the report holds no non-blank line.
+    private static async Task<string?> ReadFinalLineAsync(ConfinedTree tree, string path, CancellationToken ct)
     {
-        var readOnly = new FileStreamOptions
-        {
-            Mode = FileMode.Open,
-            Access = FileAccess.Read,
-            Share = FileShare.ReadWrite | FileShare.Delete,
-            Options = FileOptions.SequentialScan,
-        };
-
-        using var reader = new StreamReader(path, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, readOnly);
+        var bytes = await tree.ReadFileAsync(path, HarnessOptions.EvidenceByteLimit, ct).ConfigureAwait(false)
+            ?? throw ConfinedTree.NotFound(path);
+        using var reader = new StreamReader(
+            new MemoryStream(bytes, writable: false), Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
         string? last = null;
         while (await reader.ReadLineAsync(ct).ConfigureAwait(false) is { } line)
         {

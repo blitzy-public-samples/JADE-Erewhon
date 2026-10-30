@@ -923,7 +923,8 @@ public sealed partial class BinaryComparerTests
 // the manifest's withdrawal and its atomic publication through one fixed temporary file, and
 // physical containment: no read, write or delete reaches outside baseline/ through a symbolic link,
 // whether the link sits on baseline/ itself, on a directory below it or at the target, dangles, or is
-// swapped in for a directory while the store works. Write and delete links point into a simulated
+// swapped in for a directory while the store works; and that a FIFO or a file over the evidence limit in
+// place of any baseline file refuses its read at once. Write and delete links point into a simulated
 // Erewhon/DataFiles inside the temporary root, and read links into a directory of their own beside it;
 // the repository's own tree is never touched. These members live in this
 // class because the harness test project keeps its fixed set of test classes, and the store writes
@@ -961,6 +962,15 @@ public sealed partial class BinaryComparerTests
 
     // The size of each large inline body the index regression writes.
     private const int LargeBodySize = 3 * 1024 * 1024;
+
+    // One byte over the evidence limit, the length of every oversized file the refusal tests plant.
+    private const long OversizedLength = HarnessOptions.EvidenceByteLimit + 1L;
+
+    // A refused read allocates its exception and message, never a buffer the length of the file.
+    private const long RefusalAllocationBound = 1024 * 1024;
+
+    // A refused read ends well within this; one that blocked on a FIFO fails the test instead of hanging.
+    private static readonly TimeSpan PromptLimit = TimeSpan.FromSeconds(10);
 
     private static readonly string[] DocumentNames =
         ["record", "body-file", "manifest", "normalisation-rules", "conformance", "wsdl"];
@@ -1114,6 +1124,39 @@ public sealed partial class BinaryComparerTests
                 foreach (var reader in readers)
                 {
                     data.Add(document, placement, reader);
+                }
+            }
+        }
+
+        return data;
+    }
+
+    /// <summary>
+    /// Each reader, in its synchronous and asynchronous forms, with the baseline file it reads replaced by a
+    /// FIFO nobody writes to or by a sparse file one byte over the evidence limit. <c>WsdlExists</c> opens the
+    /// WSDL without reading it, so only a FIFO refuses it; the record index reads no body, so a body file is left
+    /// to the case read.
+    /// </summary>
+    public static TheoryData<string, string, string> RefusedFileReads()
+    {
+        (string Document, string[] Readers)[] reads =
+        [
+            ("manifest", ["TryReadManifest", "TryReadManifestAsync"]),
+            ("normalisation-rules", ["ReadNormalisationRules", "ReadNormalisationRulesAsync"]),
+            ("conformance", ["TryReadConformance", "TryReadConformanceAsync"]),
+            ("wsdl", ["ReadWsdlBytes", "ReadWsdlBytesAsync", "WsdlExists"]),
+            ("record", [.. ReaderNames, RecordIndexReader, "ReadEntryAsync"]),
+            ("body-file", [.. ReaderNames, "ReadEntryAsync", "ReadBodyBytes", "ReadBodyBytesAsync"]),
+        ];
+
+        var data = new TheoryData<string, string, string>();
+        foreach (var (document, readers) in reads)
+        {
+            foreach (var kind in (string[])["fifo", "oversized"])
+            {
+                foreach (var reader in readers.Where(reader => kind == "fifo" || reader != "WsdlExists"))
+                {
+                    data.Add(document, kind, reader);
                 }
             }
         }
@@ -2315,6 +2358,64 @@ public sealed partial class BinaryComparerTests
         }
 
         Assert.True(Directory.Exists(Full(file)));
+    }
+
+    // ---- Special and oversized files -----------------------------------------------------------------
+
+    // A FIFO with no writer, which a blocking open would wait on for ever, and a sparse file over the evidence
+    // limit, which a whole read would allocate for, each refuse the read at once with an I/O error naming the
+    // file, and are left in place.
+    [Theory]
+    [MemberData(nameof(RefusedFileReads))]
+    public async Task SpecialOrOversizedFile_RefusesTheReadPromptlyAndIsLeftInPlace(string document, string kind, string reader)
+    {
+        await WriteFixture(Store, useAsync: false);
+        var file = ReadFile(document);
+        File.Delete(Full(file));
+        string expected;
+        if (kind == "fifo")
+        {
+            SpecialFileSupport.CreateFifo(Full(file));
+            expected = $"BaselineStore could not read '{file}': it is not a regular file (a FIFO).";
+        }
+        else
+        {
+            PlantSparseFile(file, OversizedLength);
+            expected = string.Create(
+                CultureInfo.InvariantCulture,
+                $"BaselineStore could not read '{file}': its {OversizedLength} bytes exceed the {HarnessOptions.EvidenceByteLimit}-byte limit.");
+        }
+
+        var read = Task.Run(() => ReadThrough(reader), TestCancellation);
+        var refusal = await Assert.ThrowsAsync<IOException>(() => read.WaitAsync(PromptLimit, TestCancellation));
+
+        Assert.Equal(expected, refusal.Message);
+        Assert.True(
+            kind == "fifo" ? SpecialFileSupport.IsFifo(Full(file)) : new FileInfo(Full(file)).Length == OversizedLength,
+            $"The refused {kind} must be left in place.");
+    }
+
+    // The reported length decides before any buffer exists, so a sparse record far over the limit costs the
+    // synchronous reader, which runs on this thread alone, far fewer bytes than the record is long.
+    [Fact]
+    public async Task OversizedRecord_IsRefusedWithoutAllocatingItsLength()
+    {
+        await WriteFixture(Store, useAsync: false);
+        File.Delete(Full(PhotoRecordPath));
+        PlantSparseFile(PhotoRecordPath, 4L * HarnessOptions.EvidenceByteLimit);
+
+        var allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
+        Assert.Throws<IOException>(() => Store.ReadEntries());
+        var allocated = GC.GetAllocatedBytesForCurrentThread() - allocatedBefore;
+
+        Assert.True(allocated < RefusalAllocationBound, $"The refusal allocated {allocated} bytes, as if it had read the record.");
+    }
+
+    // A file at relative that reports length without its bytes being written, so a huge one costs no disk.
+    private void PlantSparseFile(string relative, long length)
+    {
+        using var handle = File.OpenHandle(Full(relative), FileMode.CreateNew, FileAccess.Write);
+        RandomAccess.SetLength(handle, length);
     }
 
     private static BaselineRecord NewRecord(

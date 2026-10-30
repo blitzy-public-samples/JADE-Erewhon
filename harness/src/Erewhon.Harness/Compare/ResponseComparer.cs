@@ -287,6 +287,140 @@ public sealed record Discrepancy(string Path, string Kind, DiscrepancyValue Base
 }
 
 /// <summary>
+/// The most discrepancy evidence one comparison may retain or, from <see cref="OfReplayRun"/>, one replay run
+/// may keep for its report, <see cref="HarnessOptions.EvidenceByteLimit"/> characters unless a test sets
+/// another limit: every discrepancy's path plus each of its two values as
+/// <see cref="DiscrepancyValue.ToString"/> shows it, a literal as its exact text, an absent value as
+/// <c>(absent)</c> and a valid one as <c>{valid:N1}</c> or <c>{valid:N2}</c>.
+/// </summary>
+/// <remarks>
+/// <para>
+/// A semantic walk can retain far more than the bodies it reads: each discrepancy carries its whole path, so a
+/// long ancestor name is repeated once for every discrepancy below it, and the markup of an element repeats
+/// the namespace declarations in scope at it. The walk therefore charges each discrepancy before keeping it,
+/// and holds the path it builds to the limit as each name or index extends it, because a longer path could
+/// never be charged. Evidence over the limit fails the comparison with <see cref="InvalidDataException"/>,
+/// whose message names the limit and never a path or body content; it is never truncated into a shorter
+/// list.
+/// </para>
+/// <para>
+/// Only the semantic walks charge a comparison's budget. An entry added without walking the bodies, such as a
+/// status, a <c>Content-Type</c>, a malformed or exact-text body, or two different root elements, holds at most
+/// what the two responses themselves hold, which their own byte limit bounds. A comparison's budget serves that
+/// comparison alone, on one thread.
+/// </para>
+/// <para>
+/// A replay run's budget holds the evidence of every case the run keeps for its report, every entry of each
+/// comparison included, and is charged one whole comparison at a time on one thread, so a refused case charges
+/// nothing. Its refusal names the run and the case instead of the comparison.
+/// </para>
+/// </remarks>
+internal sealed class EvidenceBudget
+{
+    private readonly int _limit;
+
+    // Whose evidence the budget holds and what its refusal refuses, as the refusal message names them.
+    private readonly string _holder;
+    private readonly string _refused;
+    private long _charged;
+
+    /// <summary>Creates a budget of <paramref name="limit"/> characters with nothing charged.</summary>
+    /// <param name="limit">The most characters the comparison may retain, at least 0.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="limit"/> is negative.</exception>
+    internal EvidenceBudget(int limit)
+        : this(limit, "of one comparison", "the comparison")
+    {
+    }
+
+    private EvidenceBudget(int limit, string holder, string refused)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(limit);
+        _limit = limit;
+        _holder = holder;
+        _refused = refused;
+    }
+
+    /// <summary>
+    /// Creates the budget of one replay run: at most <paramref name="limit"/> characters of discrepancy
+    /// evidence across every case the run keeps for its report, with nothing charged.
+    /// </summary>
+    /// <param name="limit">The most characters the run may keep, at least 0.</param>
+    /// <returns>A budget charged through <see cref="ChargeComparison"/>.</returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="limit"/> is negative.</exception>
+    internal static EvidenceBudget OfReplayRun(int limit) => new(limit, "the replay run keeps for its report", "the case");
+
+    /// <summary>
+    /// Charges a discrepancy at a path of <paramref name="pathLength"/> characters that holds
+    /// <paramref name="baseline"/> and <paramref name="observed"/>, before the comparison keeps it.
+    /// </summary>
+    /// <param name="pathLength">The length of the discrepancy's path.</param>
+    /// <param name="baseline">The discrepancy's baseline value.</param>
+    /// <param name="observed">The discrepancy's observed value.</param>
+    /// <exception cref="InvalidDataException">Everything charged so far, this discrepancy included, exceeds the limit.</exception>
+    internal void Charge(int pathLength, DiscrepancyValue baseline, DiscrepancyValue observed)
+    {
+        _charged += (long)pathLength + Size(baseline) + Size(observed);
+        if (_charged > _limit)
+        {
+            throw Refusal();
+        }
+    }
+
+    /// <summary>
+    /// Charges every discrepancy of one comparison together, each counted as <see cref="Charge"/> counts it,
+    /// before the run keeps them: all of them when they fit within what is left of the limit, and none of them
+    /// otherwise. A null entry holds no evidence and charges nothing.
+    /// </summary>
+    /// <param name="discrepancies">The comparison's discrepancies.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="discrepancies"/> is null.</exception>
+    /// <exception cref="InvalidDataException">
+    /// Everything charged so far plus these discrepancies exceeds the limit; nothing is charged.
+    /// </exception>
+    internal void ChargeComparison(IReadOnlyList<Discrepancy> discrepancies)
+    {
+        ArgumentNullException.ThrowIfNull(discrepancies);
+
+        var total = _charged;
+        foreach (var discrepancy in discrepancies)
+        {
+            if (discrepancy is null)
+            {
+                continue;
+            }
+
+            total += (long)discrepancy.Path.Length + Size(discrepancy.Baseline) + Size(discrepancy.Observed);
+            if (total > _limit)
+            {
+                throw Refusal();
+            }
+        }
+
+        _charged = total;
+    }
+
+    /// <summary>Holds a path the comparison is building, <paramref name="pathLength"/> characters long, to the limit.</summary>
+    /// <param name="pathLength">The current length of the path.</param>
+    /// <exception cref="InvalidDataException">The path is longer than the limit.</exception>
+    internal void CheckPath(int pathLength)
+    {
+        if (pathLength > _limit)
+        {
+            throw new InvalidDataException(
+                string.Create(CultureInfo.InvariantCulture, $"A path in one comparison exceeds the {_limit}-character discrepancy evidence limit,")
+                + " so the comparison is refused rather than truncated.");
+        }
+    }
+
+    // Names only the limit, never a path or body content.
+    private InvalidDataException Refusal() => new(
+        string.Create(CultureInfo.InvariantCulture, $"The discrepancy evidence {_holder} exceeds the {_limit}-character limit,")
+        + $" so {_refused} is refused rather than truncated.");
+
+    // A literal's exact text, or the report display of an absent or valid value.
+    private static int Size(DiscrepancyValue value) => value.Text?.Length ?? value.ToString().Length;
+}
+
+/// <summary>
 /// The parts of one HTTP response that take part in comparison: the status code, the
 /// <c>Content-Type</c> header and the raw body bytes. Every other header is left out on purpose, so
 /// <c>Date</c>, <c>Server</c>, <c>Content-Length</c>, <c>Transfer-Encoding</c>, <c>Connection</c> and
@@ -352,10 +486,13 @@ public sealed record ResponseComparison(
 /// The instance holds only immutable state and performs no I/O, so concurrent <see cref="Compare"/>
 /// calls are safe. A malformed or undecodable body never makes <see cref="Compare"/> throw: it is compared
 /// exactly as above and, against a well-formed baseline, also reported as <c>malformed</c>. A JSON body
-/// nested beyond the reader's depth limit does not parse, so it is handled the same way. A SOAP body that
-/// loads as XML but is nested deeply enough to run short of execution stack is the one exception: the XML
+/// nested beyond the reader's depth limit does not parse, so it is handled the same way. Two bodies are the
+/// exceptions, and <see cref="Compare"/> lets each exception propagate for the caller to report: a SOAP body
+/// that loads as XML but is nested deeply enough to run short of execution stack, for which the XML
 /// comparer's depth guard throws <see cref="InsufficientExecutionStackException"/> instead of letting a
-/// stack overflow end the process, and <see cref="Compare"/> lets it propagate for the caller to report.
+/// stack overflow end the process, and a body whose semantic comparison would retain more discrepancy
+/// evidence than <see cref="EvidenceBudget"/> allows, which is refused with
+/// <see cref="InvalidDataException"/> rather than truncated.
 /// </para>
 /// </remarks>
 /// <param name="catalogue">The operation catalogue the semantic comparers type bodies by.</param>
@@ -395,6 +532,12 @@ public sealed class ResponseComparer(OperationCatalogue catalogue, Normaliser no
     /// A SOAP body loads as XML but is nested deeply enough to run short of execution stack, so the XML
     /// comparer's depth guard throws it instead of letting a stack overflow end the process. A malformed or
     /// undecodable body never throws; it is compared as the class remarks describe.
+    /// </exception>
+    /// <exception cref="InvalidDataException">
+    /// The JSON or XML comparison of the two bodies would retain more than
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/> characters of discrepancy evidence, counted as
+    /// <see cref="EvidenceBudget"/> counts them, or builds a longer path; the comparison is refused rather than
+    /// truncated.
     /// </exception>
     public ResponseComparison Compare(OperationDescriptor operation, ResponseSnapshot baseline, ResponseSnapshot observed)
     {

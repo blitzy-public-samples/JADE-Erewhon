@@ -33,7 +33,8 @@ namespace Erewhon.Harness.Tests;
 /// equivalence has a neighbouring case that must differ, so a comparer that never reports cannot pass.
 /// The response-level cases send SOAP bodies through <see cref="ResponseComparer"/>: XML dispatch, the
 /// media type, well-formedness as a SOAP 1.1 envelope, the byte-order mark, the encoding XML detection reads
-/// and lossless decoding.
+/// and lossless decoding. Evidence that would outgrow its budget, through repeated namespace declarations or
+/// a path that repeats a long namespace, is refused, and a comparison within the budget is unchanged.
 /// It also covers the WSDL contract check, which requires the facade to report the contracts WSDL as published
 /// and compares the facade WSDL with the backend WSDL under this XML semantic comparison with the
 /// <c>soap:address/@location</c> value excluded, against in-process loopback stubs in a temporary repository
@@ -1529,7 +1530,88 @@ public sealed partial class XmlSemanticComparerTests : IDisposable
             statusMatched: true);
     }
 
+    // ---- Discrepancy evidence budget -------------------------------------------------------------
+
+    // The markup of each unmatched element repeats the namespace declaration in scope at it, so a 65,540-character
+    // namespace declared once on the envelope and one more unmatched child in it than EvidenceByteLimit
+    // characters hold copies of it, about 70 KB of body, would retain more evidence than the limit allows. The
+    // response comparison is refused with a message that names the limit and quotes nothing from the body.
+    [Fact]
+    public void UnmatchedChildren_RepeatingALongInheritedDeclaration_AreRefused()
+    {
+        var longNamespace = "urn:" + new string('n', 64 * 1024);
+        var children = string.Concat(Enumerable.Repeat("<p:x/>", (HarnessOptions.EvidenceByteLimit / longNamespace.Length) + 1));
+        var observed = Envelope(GetAgent, Agent() + children, envelopeAttributes: $" xmlns:p=\"{longNamespace}\"");
+
+        var refusal = Assert.Throws<InvalidDataException>(
+            () => _responses.Compare(GetAgent, SoapSnapshot(Envelope(GetAgent, Agent())), SoapSnapshot(observed)));
+
+        Assert.Equal(EvidenceRefusal(HarnessOptions.EvidenceByteLimit), refusal.Message);
+    }
+
+    // Groups that share a local name carry their namespace in their path, so a chain of them below a
+    // 65,540-character namespace declared once repeats it at every level. Two equal documents one level deeper
+    // than EvidenceByteLimit characters hold copies of it, about 70 KB each, give no discrepancy at all, yet the
+    // path they build is refused as it outgrows the limit.
+    [Fact]
+    public void ChainOfAmbiguousNames_UnderALongNamespace_IsRefusedBeforeAnyDiscrepancy()
+    {
+        var longNamespace = "urn:" + new string('n', 64 * 1024);
+        var depth = (HarnessOptions.EvidenceByteLimit / longNamespace.Length) + 1;
+        var text = $"<root xmlns:a=\"{longNamespace}\" xmlns:b=\"urn:b\">"
+            + string.Concat(Enumerable.Repeat("<b:x/><a:x>", depth))
+            + string.Concat(Enumerable.Repeat("</a:x>", depth))
+            + "</root>";
+
+        var refusal = Assert.Throws<InvalidDataException>(() => _comparer.Compare(text, text, XmlComparisonContext.Untyped));
+
+        Assert.Equal(
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"A path in one comparison exceeds the {HarnessOptions.EvidenceByteLimit}-character discrepancy evidence limit, so the comparison is refused rather than truncated."),
+            refusal.Message);
+    }
+
+    // Within the budget a comparison gives exactly the list an unlimited one gives: with the limit set to that
+    // list's evidence, each path plus each value as the report shows it, the absent side as "(absent)", the list
+    // is returned unchanged, and one character less refuses it.
+    [Theory]
+    [InlineData("padded leaf", 0)]
+    [InlineData("padded leaf", 1)]
+    [InlineData("missing element", 0)]
+    [InlineData("missing element", 1)]
+    public void Comparison_AtTheEvidenceLimit_IsUnchanged_OneCharacterLessIsRefused(string difference, int shortfall)
+    {
+        var baseline = Envelope(GetAgent, Agent());
+        var observed = difference switch
+        {
+            "padded leaf" => Envelope(GetAgent, AgentWith("email", "<email>hank@it.com </email>")),
+            "missing element" => Envelope(GetAgent, Join(AgentElements().Where(element => element.Name != "fax").Select(element => element.Markup))),
+            _ => throw new ArgumentOutOfRangeException(nameof(difference), difference, "Not a difference this test builds."),
+        };
+        var unlimited = _comparer.Compare(baseline, observed, AgentResponse);
+        var limit = unlimited.Sum(discrepancy => discrepancy.Path.Length + discrepancy.Baseline.ToString().Length + discrepancy.Observed.ToString().Length) - shortfall;
+        var comparer = new XmlSemanticComparer(Catalogue, new Normaliser(NormalisationRules.FromCatalogue(Catalogue)), limit);
+
+        Assert.Single(unlimited);
+        if (shortfall == 0)
+        {
+            Assert.Equal(unlimited, comparer.Compare(baseline, observed, AgentResponse));
+        }
+        else
+        {
+            var refusal = Assert.Throws<InvalidDataException>(() => comparer.Compare(baseline, observed, AgentResponse));
+            Assert.Equal(EvidenceRefusal(limit), refusal.Message);
+        }
+    }
+
     // ---- Helpers ---------------------------------------------------------------------------------
+
+    /// <summary>The message of a comparison refused because its discrepancy evidence exceeds <paramref name="limit"/> characters.</summary>
+    private static string EvidenceRefusal(int limit) =>
+        string.Create(
+            CultureInfo.InvariantCulture,
+            $"The discrepancy evidence of one comparison exceeds the {limit}-character limit, so the comparison is refused rather than truncated.");
 
     /// <summary>A SOAP response with the catalogue status and content type whose body is <paramref name="body"/> in UTF-8, without a byte-order mark.</summary>
     private static ResponseSnapshot SoapSnapshot(string body) => SoapSnapshot(body, SoapContentType);

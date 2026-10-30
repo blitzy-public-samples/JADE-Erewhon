@@ -106,9 +106,10 @@ public sealed class StubBackendOptions
 }
 
 /// <summary>
-/// A stub backend with a REST listener and a SOAP listener on ephemeral loopback ports. It records every
-/// request on arrival, before any delay, and answers it with the configured response plus an
-/// <c>X-Stub-Id</c> header naming the stub.
+/// A stub backend with a REST listener and a SOAP listener on ephemeral loopback ports. It records each
+/// request once its body has been read in full or the read has failed, before any delay, and then
+/// answers it with the configured response plus an <c>X-Stub-Id</c> header naming the stub; a request
+/// whose body read failed is recorded but not answered.
 /// </summary>
 /// <remarks>
 /// Start stubs before starting a <c>FacadeFactory</c>, never concurrently with its start-up.
@@ -160,7 +161,11 @@ public sealed class StubBackend : IAsyncDisposable
     /// <summary>The SOAP listener's base URL, <c>http://127.0.0.1:&lt;port&gt;</c>, with no trailing slash.</summary>
     public string SoapBaseUrl => LoopbackUrl(SoapPort);
 
-    /// <summary>A snapshot of every request received since start or the last <see cref="ClearLog"/>, in arrival order.</summary>
+    /// <summary>
+    /// A snapshot of every request recorded since start or the last <see cref="ClearLog"/>, in recording
+    /// order: the order in which their body reads ended, so a slow upload can follow a request that
+    /// arrived after it.
+    /// </summary>
     public IReadOnlyList<StubRequest> Received
     {
         get
@@ -172,7 +177,7 @@ public sealed class StubBackend : IAsyncDisposable
         }
     }
 
-    /// <summary>A snapshot of the requests received on one listener, in arrival order.</summary>
+    /// <summary>A snapshot of the requests recorded on one listener, in the order of <see cref="Received"/>.</summary>
     public IReadOnlyList<StubRequest> ReceivedOn(StubListener listener)
     {
         lock (_gate)
@@ -181,7 +186,7 @@ public sealed class StubBackend : IAsyncDisposable
         }
     }
 
-    /// <summary>Forgets every request received so far.</summary>
+    /// <summary>Forgets every request recorded so far.</summary>
     public void ClearLog()
     {
         lock (_gate)

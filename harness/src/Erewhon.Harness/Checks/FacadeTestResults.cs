@@ -114,7 +114,7 @@ public sealed partial class FacadeTestResults(HarnessOptions options)
     private const int ExitCodeExcerptLimit = 40;
 
     /// <summary>
-    /// The most bytes a TRX or xunit XML file may hold. A real run's TRX is about 100 KB, so the limit leaves
+    /// The most bytes a TRX or xunit XML file may hold. A real run's TRX is under 1 MB, so the limit leaves
     /// room for far larger runs while a runaway or planted file is never read, or held in memory, without end.
     /// </summary>
     internal const int ResultsFileByteLimit = 32 * 1024 * 1024;

@@ -455,10 +455,10 @@ internal static class FailureItemDisplay
     /// <summary>
     /// Returns the console form of a value a state reset observed for <paramref name="field"/>: the value
     /// itself when it is empty, one of the reset's own tokens (<c>null</c>, <c>connect</c>, <c>timeout</c>,
-    /// <c>reset</c>, <c>invalid</c>, <c>invalid-url</c>, a three-digit status code, or <c>info-</c> or
-    /// <c>before-</c> followed by such a token) or of the strict form of its field (64 hexadecimal digits
-    /// for <c>seedSha256</c>, <c>yyyy-MM-dd</c> digits for <c>referenceDate</c>, an integer for
-    /// <c>generation</c> and <c>mutations</c>); otherwise the marker.
+    /// <c>reset</c>, <c>invalid</c>, <c>oversized</c>, <c>invalid-url</c>, a three-digit status code, or
+    /// <c>info-</c> or <c>before-</c> followed by such a token) or of the strict form of its field (64
+    /// hexadecimal digits for <c>seedSha256</c>, <c>yyyy-MM-dd</c> digits for <c>referenceDate</c>, an integer
+    /// for <c>generation</c> and <c>mutations</c>); otherwise the marker.
     /// </summary>
     /// <param name="field">The <c>/admin/info</c> field, for example <c>source</c>.</param>
     /// <param name="observed">The observed value, exactly as the nature holds it.</param>
@@ -534,6 +534,7 @@ internal static class FailureItemDisplay
     // What one admin request or info read can fail with.
     private static bool IsFailureToken(ReadOnlySpan<char> value) =>
         value is StateReset.ConnectFailure or StateReset.TimeoutFailure or StateReset.ResetFailure or StateReset.InvalidBodyFailure
+            or StateReset.OversizedBodyFailure
         || (value.Length == 3 && !value.ContainsAnyExceptInRange('0', '9'));
 
     private static bool HasFieldForm(string field, ReadOnlySpan<char> value) => field switch
