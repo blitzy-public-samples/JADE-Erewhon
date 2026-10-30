@@ -1,0 +1,25 @@
+{
+  "order": 54,
+  "caseId": "SOAP-updateClientWithDTO-01",
+  "operation": "Soap.updateClientWithDTO",
+  "kind": "success",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/updateClientWithDTO\""
+    },
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateClientWithDTO xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pDTOClient><city>Bristol</city><country>England</country><email>howy@thebeach.com</email><fax>44 2 8484 8182</fax><name>Howard Ellis</name><phone>44 2 8182 8283</phone><street>12 Harbourside Walk</street><website>www.thebeach.com</website></pDTOClient></updateClientWithDTO></soap:Body></soap:Envelope>"
+  },
+  "response": {
+    "status": 200,
+    "contentType": "text/xml; charset=utf-8",
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateClientWithDTOResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><updateClientWithDTOResult><allErrors /><allWarnings /><statusCode>200</statusCode></updateClientWithDTOResult></updateClientWithDTOResponse></soap:Body></soap:Envelope>",
+    "bodySha256": "41694236e2aa7fb5da1a803faaff44eb5aa35657e1c39e6c793e6ca57e22ef1b",
+    "bodyFile": null
+  }
+}

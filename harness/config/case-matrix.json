@@ -1,0 +1,979 @@
+{
+  "version": 1,
+  "description": "Capture input for the equivalence harness (AAP 0.7.3): 56 cases, 36 REST and 20 SOAP, in fixed replay order rest-read, soap-read, rest-write, soap-write, empty-state. A case's 1-based position is its baseline record's NNN. Operations are catalogue ids from contracts/operation-catalogue.json. Seed facts come from Erewhon/DataFiles.",
+  "cases": [
+    {
+      "id": "REST-getAgent-01",
+      "operation": "Rest.getAgent",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/agent/Hank%20Williams",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 200,
+      "description": "GET /agent/Hank Williams finds the seeded agent by exact name and returns 200 with a DTOAgent [Erewhon/ErehwhonExternalInterfacesSchema.scm:2348-2353; Erewhon/DataFiles/Agents.txt:4]."
+    },
+    {
+      "id": "REST-getAgent-02",
+      "operation": "Rest.getAgent",
+      "kind": "error",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/agent/Nobody%20Agent",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 404,
+      "description": "GET /agent/Nobody Agent names no seeded agent, so the exact-name lookup fails with 404 and the body null [Erewhon/ErehwhonExternalInterfacesSchema.scm:2343-2345, 3351-3380]."
+    },
+    {
+      "id": "REST-getAllAgents-01",
+      "operation": "Rest.getAllAgents",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/allAgents",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 200,
+      "description": "GET /allAgents returns 200 with a DTOAgentArray of the 8 seeded agents in name order [Erewhon/ErehwhonExternalInterfacesSchema.scm:2366-2375; Erewhon/DataFiles/Agents.txt:1-8]."
+    },
+    {
+      "id": "REST-getAllClients-01",
+      "operation": "Rest.getAllClients",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/allClients",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 200,
+      "description": "GET /allClients returns 200 with a DTOClientArray of the 20 seeded clients in name order, and carries the seed-token assertions that Pauline Wild's website is \"\" and Brian Olsen's email is \"bo@wol.com\" [Erewhon/ErehwhonExternalInterfacesSchema.scm:2388-2397; Erewhon/DataFiles/Clients.txt:1-20]."
+    },
+    {
+      "id": "REST-getAllSales-01",
+      "operation": "Rest.getAllSales",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/allSales",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 200,
+      "description": "GET /allSales returns 200 with a DTOSaleArray of the 19 seeded retail sales and the 1 tender sale closed at load (PROP/70) in category-prefix and code-number order; the tenders on items 80, 92 and 106 are rejected at load as already closed (KL-STANDIN-TENDER-LOAD) [Erewhon/ErehwhonExternalInterfacesSchema.scm:2410-2431; Erewhon/DataFiles/RetailSales.txt:1-19; Erewhon/DataFiles/Tenders.txt:121-140; Erewhon/ErewhonModelSchema.scm:5205-5209, 13910-13914]."
+    },
+    {
+      "id": "REST-getClient-01",
+      "operation": "Rest.getClient",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/client/Pauline%20Wild",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 200,
+      "description": "GET /client/Pauline Wild finds the seeded client and returns 200 with a DTOClient [Erewhon/ErehwhonExternalInterfacesSchema.scm:2444-2456; Erewhon/DataFiles/Clients.txt:1]."
+    },
+    {
+      "id": "REST-getClient-02",
+      "operation": "Rest.getClient",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/client/%20Pauline%20Wild%20",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 200,
+      "description": "GET /client/ Pauline Wild  (leading and trailing spaces) finds Pauline Wild because the name is trimmed before lookup and returns 200 with a DTOClient [Erewhon/ErehwhonExternalInterfacesSchema.scm:2444]."
+    },
+    {
+      "id": "REST-getClient-03",
+      "operation": "Rest.getClient",
+      "kind": "error",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/client/Nobody%20Client",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 404,
+      "description": "GET /client/Nobody Client names no seeded client, so the lookup fails with 404 and the body null [Erewhon/ErehwhonExternalInterfacesSchema.scm:2447-2449]."
+    },
+    {
+      "id": "REST-getCompany-01",
+      "operation": "Rest.getCompany",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/company",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 200,
+      "description": "GET /company returns 200 with the seeded DTOCompany Erewhon Investments Inc [Erewhon/ErehwhonExternalInterfacesSchema.scm:2475-2480; Erewhon/ErewhonModelSchema.scm:2692-2701]."
+    },
+    {
+      "id": "REST-getCompany-02",
+      "operation": "Rest.getCompany",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/company.json",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 200,
+      "description": "GET /company.json selects the JSON format by suffix and returns 200 with the same DTOCompany as the unsuffixed form [Erewhon/ErehwhonExternalInterfacesSchema.scm:2475-2480]."
+    },
+    {
+      "id": "REST-getItemByCode-01",
+      "operation": "Rest.getItemByCode",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/itemByCode/DEST/18",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 200,
+      "description": "GET /itemByCode/DEST/18 returns 200 with the DTORetailItem Africa Diving, sold to Elaine Lee and carrying its DTORetailSaleDetail [Erewhon/ErehwhonExternalInterfacesSchema.scm:2517-2523, 2188-2192; Erewhon/DataFiles/RetailItems.txt:18; Erewhon/DataFiles/RetailSales.txt:1]."
+    },
+    {
+      "id": "REST-getItemByCode-02",
+      "operation": "Rest.getItemByCode",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/itemByCode/PROP/70",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 200,
+      "description": "GET /itemByCode/PROP/70 returns 200 with the DTOTenderItem Castle closed to a tender sale at load, carrying a plain DTOSaleDetail [Erewhon/ErehwhonExternalInterfacesSchema.scm:2525-2530, 2208-2209; Erewhon/DataFiles/TenderItems.txt:12; Erewhon/DataFiles/Tenders.txt:121-140]."
+    },
+    {
+      "id": "REST-getItemByCode-03",
+      "operation": "Rest.getItemByCode",
+      "kind": "error",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/itemByCode/INVALID/1",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 400,
+      "description": "GET /itemByCode/INVALID/1 has a code prefix longer than 4 characters, so it returns 400 with the body null [Erewhon/ErehwhonExternalInterfacesSchema.scm:2497-2500]."
+    },
+    {
+      "id": "REST-getItemByCode-04",
+      "operation": "Rest.getItemByCode",
+      "kind": "error",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/itemByCode/ANQU/999",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 404,
+      "description": "GET /itemByCode/ANQU/999 names a code number no seeded item has (codes run 1-106), so it returns 404 with the body null [Erewhon/ErehwhonExternalInterfacesSchema.scm:2511-2514]."
+    },
+    {
+      "id": "REST-getItemsByPrice-01",
+      "operation": "Rest.getItemsByPrice",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/itemsByPrice/800/900",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 200,
+      "description": "GET /itemsByPrice/800/900 returns 200 with a DTOItemsArray holding only the tender items 85 (Cabinet) and 87 (Water Jugs), both priced 899 [Erewhon/ErehwhonExternalInterfacesSchema.scm:2569-2595; Erewhon/DataFiles/TenderItems.txt:27, 29]."
+    },
+    {
+      "id": "REST-getItemsByPrice-02",
+      "operation": "Rest.getItemsByPrice",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/itemsByPrice/1/2",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 200,
+      "description": "GET /itemsByPrice/1/2 matches no seeded item, so it returns 200 with an empty DTOItemsArray [Erewhon/ErehwhonExternalInterfacesSchema.scm:2569-2595]."
+    },
+    {
+      "id": "REST-getItemsByPrice-03",
+      "operation": "Rest.getItemsByPrice",
+      "kind": "error",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/itemsByPrice/-1/100",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 400,
+      "description": "GET /itemsByPrice/-1/100 has a negative minimum price, so it returns 400 with the body null [Erewhon/ErehwhonExternalInterfacesSchema.scm:2552-2555]."
+    },
+    {
+      "id": "REST-getItemsByPrice-04",
+      "operation": "Rest.getItemsByPrice",
+      "kind": "error",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/itemsByPrice/1000/100",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 400,
+      "description": "GET /itemsByPrice/1000/100 has a maximum below the minimum, so it returns 400 with the body null [Erewhon/ErehwhonExternalInterfacesSchema.scm:2564-2567]."
+    },
+    {
+      "id": "REST-getSale-01",
+      "operation": "Rest.getSale",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/sale/DEST/18",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 200,
+      "description": "GET /sale/DEST/18 returns 200 with the DTORetailSale of Africa Diving to Elaine Lee [Erewhon/ErehwhonExternalInterfacesSchema.scm:2633-2639; Erewhon/DataFiles/RetailSales.txt:1]."
+    },
+    {
+      "id": "REST-getSale-02",
+      "operation": "Rest.getSale",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/sale/PROP/70",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 200,
+      "description": "GET /sale/PROP/70 returns 200 with the DTOTenderSale created when the Castle's tenders closed at load [Erewhon/ErehwhonExternalInterfacesSchema.scm:2641-2646, 2247-2259; Erewhon/ErewhonModelSchema.scm:5214-5242]."
+    },
+    {
+      "id": "REST-getSale-03",
+      "operation": "Rest.getSale",
+      "kind": "error",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/sale/INVALID/18",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 400,
+      "description": "GET /sale/INVALID/18 has a code prefix longer than 4 characters, so it returns 400 with the body null [Erewhon/ErehwhonExternalInterfacesSchema.scm:2613-2616]."
+    },
+    {
+      "id": "REST-getSale-04",
+      "operation": "Rest.getSale",
+      "kind": "error",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "rest-read",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/sale/ANQU/999",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 404,
+      "description": "GET /sale/ANQU/999 names no sale for that prefix and code number, so it returns 404 with the body null [Erewhon/ErehwhonExternalInterfacesSchema.scm:2627-2630]."
+    },
+    {
+      "id": "SOAP-getAgent-01",
+      "operation": "Soap.getAgent",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "soap-read",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getAgent\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getAgent xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Hank Williams</pName></getAgent></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "description": "getAgent with pName Hank Williams returns a DTOAgent result for the seeded agent [Erewhon/ErehwhonExternalInterfacesSchema.scm:6552-6555; Erewhon/DataFiles/Agents.txt:4]."
+    },
+    {
+      "id": "SOAP-getAgent-02",
+      "operation": "Soap.getAgent",
+      "kind": "error",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "soap-read",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getAgent\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getAgent xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Nobody Agent</pName></getAgent></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "description": "getAgent with pName Nobody Agent names no seeded agent, so the result is nil [Erewhon/ErehwhonExternalInterfacesSchema.scm:6548-6549, 5382-5411]."
+    },
+    {
+      "id": "SOAP-getAgentNames-01",
+      "operation": "Soap.getAgentNames",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "soap-read",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getAgentNames\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getAgentNames xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"></getAgentNames></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "description": "getAgentNames returns a DTONameArray of the 8 seeded agent names in name order [Erewhon/ErehwhonExternalInterfacesSchema.scm:6576-6584; Erewhon/DataFiles/Agents.txt:1-8]."
+    },
+    {
+      "id": "SOAP-getClient-01",
+      "operation": "Soap.getClient",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "soap-read",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getClient\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getClient xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Pauline Wild</pName></getClient></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "description": "getClient with pName Pauline Wild returns a DTOClient result for the seeded client [Erewhon/ErehwhonExternalInterfacesSchema.scm:6605-6614; Erewhon/DataFiles/Clients.txt:1]."
+    },
+    {
+      "id": "SOAP-getClient-02",
+      "operation": "Soap.getClient",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "soap-read",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getClient\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getClient xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName> Pauline Wild </pName></getClient></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "description": "getClient with pName \" Pauline Wild \" (leading and trailing spaces) finds Pauline Wild because the name is trimmed before lookup [Erewhon/ErehwhonExternalInterfacesSchema.scm:6605]."
+    },
+    {
+      "id": "SOAP-getClient-03",
+      "operation": "Soap.getClient",
+      "kind": "error",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "soap-read",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getClient\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getClient xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Nobody Client</pName></getClient></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "description": "getClient with pName Nobody Client names no seeded client, so the result is nil [Erewhon/ErehwhonExternalInterfacesSchema.scm:6607-6608]."
+    },
+    {
+      "id": "SOAP-getClientNames-01",
+      "operation": "Soap.getClientNames",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "soap-read",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getClientNames\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getClientNames xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"></getClientNames></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "description": "getClientNames returns a DTONameArray of the 20 seeded client names in name order [Erewhon/ErehwhonExternalInterfacesSchema.scm:6635-6643; Erewhon/DataFiles/Clients.txt:1-20]."
+    },
+    {
+      "id": "SOAP-getPhoto-01",
+      "operation": "Soap.getPhoto",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "soap-read",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getPhoto\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getPhoto xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Pauline Wild</pName></getPhoto></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "description": "getPhoto with pName Pauline Wild returns a DTOPhoto holding the photo of her only purchase, retail item 16 (Silver Spurs) [Erewhon/ErehwhonExternalInterfacesSchema.scm:6671-6679; Erewhon/DataFiles/RetailSales.txt:19; Erewhon/DataFiles/RetailItems.txt:16]."
+    },
+    {
+      "id": "SOAP-getPhoto-02",
+      "operation": "Soap.getPhoto",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "soap-read",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getPhoto\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getPhoto xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Elaine Lee</pName></getPhoto></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "description": "getPhoto with pName Elaine Lee returns a DTOPhoto holding the photo of her last sale by date, retail item 11 (Choker Necklace), because the loop keeps the last photo [Erewhon/ErehwhonExternalInterfacesSchema.scm:6671-6679; Erewhon/ErewhonModelSchema.scm:5195-5200; Erewhon/DataFiles/RetailSales.txt:1, 6, 13]."
+    },
+    {
+      "id": "SOAP-getPhoto-03",
+      "operation": "Soap.getPhoto",
+      "kind": "success",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "soap-read",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getPhoto\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getPhoto xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>David Russel</pName></getPhoto></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "description": "getPhoto with pName David Russel, a seeded client with no sales, returns a DTOPhoto whose photo is nil [Erewhon/ErehwhonExternalInterfacesSchema.scm:6671-6679, 5835-5950; Erewhon/DataFiles/Clients.txt:5]."
+    },
+    {
+      "id": "SOAP-getPhoto-04",
+      "operation": "Soap.getPhoto",
+      "kind": "error",
+      "stateChanging": false,
+      "preState": "seed",
+      "group": "soap-read",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getPhoto\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getPhoto xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Nobody Client</pName></getPhoto></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "description": "getPhoto with pName Nobody Client names no seeded client, so the result is nil [Erewhon/ErehwhonExternalInterfacesSchema.scm:6667-6668]."
+    },
+    {
+      "id": "REST-postCreateAgent-01",
+      "operation": "Rest.postCreateAgent",
+      "kind": "success",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "rest-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/createAgent",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "bodyText": "{\"city\":\"Wellington\",\"country\":\"New Zealand\",\"email\":\"rangi@parata.co.nz\",\"fax\":\"64 4 472 1100\",\"name\":\"Rangi Parata\",\"phone\":\"64 4 472 1101\",\"street\":\"12 Harbour View Road\",\"website\":\"www.parata.co.nz\"}"
+      },
+      "expectedStatus": 201,
+      "description": "POST /createAgent with a complete new agent Rangi Parata whose every address field passes AddressTA creates the agent and returns 201 with a DTOResult carrying its guid [Erewhon/ErehwhonExternalInterfacesSchema.scm:2684-2689; Erewhon/ErewhonModelSchema.scm:9840-9880]."
+    },
+    {
+      "id": "REST-postCreateAgent-02",
+      "operation": "Rest.postCreateAgent",
+      "kind": "error",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "rest-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/createAgent",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "bodyText": "{\"name\":\"Tama Ngata\"}"
+      },
+      "expectedStatus": 400,
+      "description": "POST /createAgent with only the name Tama Ngata fails AddressTA because street, city, country, phone and email are required, and returns 400 with those errors in order [Erewhon/ErehwhonExternalInterfacesSchema.scm:2677-2681; Erewhon/ErewhonModelSchema.scm:9848-9879]."
+    },
+    {
+      "id": "REST-postCreateClient-01",
+      "operation": "Rest.postCreateClient",
+      "kind": "success",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "rest-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/createClient",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "bodyText": "{\"city\":\"Nelson\",\"country\":\"New Zealand\",\"email\":\"aroha@kowhai.co.nz\",\"fax\":\"64 3 546 2200\",\"name\":\"Aroha Whaanga\",\"phone\":\"64 3 546 2201\",\"street\":\"7 Kowhai Lane\",\"website\":\"www.kowhai.co.nz\"}"
+      },
+      "expectedStatus": 201,
+      "description": "POST /createClient with a complete new client Aroha Whaanga whose every address field passes AddressTA creates the client and returns 201 with a DTOResult carrying its guid [Erewhon/ErehwhonExternalInterfacesSchema.scm:2724-2729; Erewhon/ErewhonModelSchema.scm:9840-9880]."
+    },
+    {
+      "id": "REST-postCreateClient-02",
+      "operation": "Rest.postCreateClient",
+      "kind": "error",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "rest-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/createClient",
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "bodyText": "{\"city\":\"Christchurch\",\"country\":\"New Zealand\",\"email\":\"wild@more.co.nz\",\"fax\":\"64 3 834 7172\",\"name\":\"Pauline Wild\",\"phone\":\"64 3 923 1010\",\"street\":\"24c Dryside Place\",\"website\":\"www.wild.co.nz\"}"
+      },
+      "expectedStatus": 400,
+      "description": "POST /createClient with the seeded name Pauline Wild and every address field valid fails ClientTA because a client with the same name exists, and returns 400 [Erewhon/ErehwhonExternalInterfacesSchema.scm:2717-2721; Erewhon/ErewhonModelSchema.scm:10588; Erewhon/DataFiles/Clients.txt:1]."
+    },
+    {
+      "id": "REST-postCreateRetailSale-01",
+      "operation": "Rest.postCreateRetailSale",
+      "kind": "success",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "rest-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/createRetailSale/Brian%20Olsen/ANQU/2",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 201,
+      "description": "POST /createRetailSale/Brian Olsen/ANQU/2 sells the unsold retail item 2 (Chair) to a seeded client and returns 201 with a DTOResult carrying the sale's guid [Erewhon/ErehwhonExternalInterfacesSchema.scm:2789-2794; Erewhon/DataFiles/RetailItems.txt:2; Erewhon/DataFiles/Clients.txt:2]."
+    },
+    {
+      "id": "REST-postCreateRetailSale-02",
+      "operation": "Rest.postCreateRetailSale",
+      "kind": "error",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "rest-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/createRetailSale/Nobody%20Client/ANQU/3",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 404,
+      "description": "POST /createRetailSale/Nobody Client/ANQU/3 names no seeded client, which is checked before the item, so it returns 404 with \"Client not found\" [Erewhon/ErehwhonExternalInterfacesSchema.scm:2747-2755]."
+    },
+    {
+      "id": "REST-postCreateRetailSale-03",
+      "operation": "Rest.postCreateRetailSale",
+      "kind": "error",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "rest-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/createRetailSale/Brian%20Olsen/ANQU/999",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 404,
+      "description": "POST /createRetailSale/Brian Olsen/ANQU/999 names no item with code 999, so it returns 404 with \"Item was not found\" [Erewhon/ErehwhonExternalInterfacesSchema.scm:2757-2764]."
+    },
+    {
+      "id": "REST-postCreateRetailSale-04",
+      "operation": "Rest.postCreateRetailSale",
+      "kind": "error",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "rest-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/createRetailSale/Brian%20Olsen/PROP/59",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 400,
+      "description": "POST /createRetailSale/Brian Olsen/PROP/59 names the tender item 59 (Castle), so it returns 400 with \"Item is not a Retail Item\" [Erewhon/ErehwhonExternalInterfacesSchema.scm:2768-2772; Erewhon/DataFiles/TenderItems.txt:1]."
+    },
+    {
+      "id": "REST-postCreateRetailSale-05",
+      "operation": "Rest.postCreateRetailSale",
+      "kind": "error",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "rest-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/createRetailSale/Brian%20Olsen/DEST/18",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 400,
+      "description": "POST /createRetailSale/Brian Olsen/DEST/18 names retail item 18, already sold to Elaine Lee, so RetailSaleTA fails with \"The Item has already been sold\" and it returns 400 [Erewhon/ErehwhonExternalInterfacesSchema.scm:2782-2786; Erewhon/ErewhonModelSchema.scm:2777, 12814; Erewhon/DataFiles/RetailSales.txt:1]."
+    },
+    {
+      "id": "REST-postCreateTender-01",
+      "operation": "Rest.postCreateTender",
+      "kind": "success",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "rest-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/createTender/Brian%20Olsen/PROP/59/2600000.00",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 201,
+      "description": "POST /createTender/Brian Olsen/PROP/59/2600000.00 offers above the 2599999 reserve of the open, untendered Castle 59 and returns 201 with a DTOResult carrying the tender's guid [Erewhon/ErehwhonExternalInterfacesSchema.scm:2853-2858; Erewhon/ErewhonModelSchema.scm:13870-13946; Erewhon/DataFiles/TenderItems.txt:1]."
+    },
+    {
+      "id": "REST-postCreateTender-02",
+      "operation": "Rest.postCreateTender",
+      "kind": "error",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "rest-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/createTender/Brian%20Olsen/PROP/60/100.00",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 400,
+      "description": "POST /createTender/Brian Olsen/PROP/60/100.00 offers below the 4999999 reserve of Castle 60, so TenderTA fails with \"The offer price cannot be less than the reserve price\" and it returns 400 [Erewhon/ErehwhonExternalInterfacesSchema.scm:2846-2850; Erewhon/ErewhonModelSchema.scm:2878, 13921-13924; Erewhon/DataFiles/TenderItems.txt:2]."
+    },
+    {
+      "id": "REST-postCreateTender-03",
+      "operation": "Rest.postCreateTender",
+      "kind": "error",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "rest-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/createTender/Brian%20Olsen/ANQU/1/100.00",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 400,
+      "description": "POST /createTender/Brian Olsen/ANQU/1/100.00 names the retail item 1 (Lamp), so it returns 400 with \"Item is not a Tender Item\" [Erewhon/ErehwhonExternalInterfacesSchema.scm:2833-2837; Erewhon/DataFiles/RetailItems.txt:1]."
+    },
+    {
+      "id": "REST-postCreateTender-04",
+      "operation": "Rest.postCreateTender",
+      "kind": "error",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "rest-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/createTender/Nobody%20Client/PROP/61/7000000.00",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 404,
+      "description": "POST /createTender/Nobody Client/PROP/61/7000000.00 names no seeded client, which is checked before the item, so it returns 404 with \"Client not found\" [Erewhon/ErehwhonExternalInterfacesSchema.scm:2812-2820]."
+    },
+    {
+      "id": "SOAP-updateAgent-01",
+      "operation": "Soap.updateAgent",
+      "kind": "success",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "soap-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/updateAgent\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateAgent xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Peter Smallsmith</pName><pStreet>88 Worcester Boulevard</pStreet><pCity>Christchurch</pCity><pCountry>New Zealand</pCountry><pPhone>64 3 392 3746</pPhone><pFax>64 3 378 2992</pFax><pEmail>ps@theplace.co.nz</pEmail><pWebsite>www.theplace.co.nz</pWebsite></updateAgent></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "expectedResultStatusCode": 200,
+      "description": "updateAgent gives the seeded agent Peter Smallsmith a new street with every other field valid, so the DTOResult statusCode is 200 [Erewhon/ErehwhonExternalInterfacesSchema.scm:6748-6751; Erewhon/DataFiles/Agents.txt:1]."
+    },
+    {
+      "id": "SOAP-updateAgent-02",
+      "operation": "Soap.updateAgent",
+      "kind": "error",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "soap-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/updateAgent\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateAgent xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Nobody Agent</pName><pStreet>1 Nowhere Street</pStreet><pCity>Christchurch</pCity><pCountry>New Zealand</pCountry><pPhone>64 3 000 0001</pPhone><pFax>64 3 000 0002</pFax><pEmail>nobody@nowhere.co.nz</pEmail><pWebsite>www.nowhere.co.nz</pWebsite></updateAgent></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "expectedResultStatusCode": 404,
+      "description": "updateAgent with pName Nobody Agent names no seeded agent, so the DTOResult statusCode is 404 with \"Agent Nobody Agent not found\" [Erewhon/ErehwhonExternalInterfacesSchema.scm:6720-6723]."
+    },
+    {
+      "id": "SOAP-updateAgent-03",
+      "operation": "Soap.updateAgent",
+      "kind": "error",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "soap-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/updateAgent\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateAgent xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Hank Williams</pName><pStreet>9127 Bel Air Drive</pStreet><pCity>Los Angeles</pCity><pCountry>United States of America</pCountry><pPhone>1 8 2938 4756</pPhone><pFax>1 8 6354 7364</pFax><pEmail>hank.it.com</pEmail><pWebsite>www.it.com</pWebsite></updateAgent></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "expectedResultStatusCode": 400,
+      "description": "updateAgent keeps Hank Williams's seeded fields except an email hank.it.com that fails EmailRegEx, so the DTOResult statusCode is 400 with the invalid-format error [Erewhon/ErehwhonExternalInterfacesSchema.scm:6742-6745; Erewhon/ErewhonModelSchema.scm:140, 9874-9879; Erewhon/DataFiles/Agents.txt:4]."
+    },
+    {
+      "id": "SOAP-updateAgentWithDTO-01",
+      "operation": "Soap.updateAgentWithDTO",
+      "kind": "success",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "soap-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/updateAgentWithDTO\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateAgentWithDTO xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pDTOAgent><city>Kyoto</city><country>Japan</country><email>airi@yippe.co.jp</email><fax>81 4 2845 6362</fax><name>Airi Hamada</name><phone>81 4 8586 7273</phone><street>200 Kawaramachi Street</street><website>www.yippe.co.jp</website></pDTOAgent></updateAgentWithDTO></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "expectedResultStatusCode": 200,
+      "description": "updateAgentWithDTO gives the seeded agent Airi Hamada a new street with every other field valid, so the DTOResult statusCode is 200 [Erewhon/ErehwhonExternalInterfacesSchema.scm:6806-6809; Erewhon/DataFiles/Agents.txt:5]."
+    },
+    {
+      "id": "SOAP-updateAgentWithDTO-02",
+      "operation": "Soap.updateAgentWithDTO",
+      "kind": "error",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "soap-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/updateAgentWithDTO\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateAgentWithDTO xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pDTOAgent><city>Christchurch</city><country>New Zealand</country><email>nobody@nowhere.co.nz</email><fax>64 3 000 0002</fax><name>Nobody Agent</name><phone>64 3 000 0001</phone><street>1 Nowhere Street</street><website>www.nowhere.co.nz</website></pDTOAgent></updateAgentWithDTO></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "expectedResultStatusCode": 404,
+      "description": "updateAgentWithDTO with pDTOAgent.name Nobody Agent names no seeded agent, so the DTOResult statusCode is 404 with \"Agent Nobody Agent not found\" [Erewhon/ErehwhonExternalInterfacesSchema.scm:6778-6781]."
+    },
+    {
+      "id": "SOAP-updateClient-01",
+      "operation": "Soap.updateClient",
+      "kind": "success",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "soap-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/updateClient\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateClient xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>David Russel</pName><pStreet>101 Riccarton Road</pStreet><pCity>Christchurch</pCity><pCountry>New Zealand</pCountry><pPhone>64 3 392 9393</pPhone><pFax>64 3 828 2828</pFax><pEmail>russel@more.co.nz</pEmail><pWebsite>www.more/russel.co.nz</pWebsite></updateClient></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "expectedResultStatusCode": 200,
+      "description": "updateClient gives the seeded client David Russel a new street with every other field valid, so the DTOResult statusCode is 200 [Erewhon/ErehwhonExternalInterfacesSchema.scm:6880-6883; Erewhon/DataFiles/Clients.txt:5]."
+    },
+    {
+      "id": "SOAP-updateClient-02",
+      "operation": "Soap.updateClient",
+      "kind": "error",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "soap-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/updateClient\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateClient xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Nobody Client</pName><pStreet>1 Nowhere Street</pStreet><pCity>Christchurch</pCity><pCountry>New Zealand</pCountry><pPhone>64 3 000 0001</pPhone><pFax>64 3 000 0002</pFax><pEmail>nobody@nowhere.co.nz</pEmail><pWebsite>www.nowhere.co.nz</pWebsite></updateClient></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "expectedResultStatusCode": 404,
+      "description": "updateClient with pName Nobody Client names no seeded client, so the DTOResult statusCode is 404 with \"Client Nobody Client not found\" [Erewhon/ErehwhonExternalInterfacesSchema.scm:6851-6854]."
+    },
+    {
+      "id": "SOAP-updateClientWithDTO-01",
+      "operation": "Soap.updateClientWithDTO",
+      "kind": "success",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "soap-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/updateClientWithDTO\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateClientWithDTO xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pDTOClient><city>Bristol</city><country>England</country><email>howy@thebeach.com</email><fax>44 2 8484 8182</fax><name>Howard Ellis</name><phone>44 2 8182 8283</phone><street>12 Harbourside Walk</street><website>www.thebeach.com</website></pDTOClient></updateClientWithDTO></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "expectedResultStatusCode": 200,
+      "description": "updateClientWithDTO gives the seeded client Howard Ellis a new street with every other field valid, so the DTOResult statusCode is 200 [Erewhon/ErehwhonExternalInterfacesSchema.scm:6937-6940; Erewhon/DataFiles/Clients.txt:7]."
+    },
+    {
+      "id": "SOAP-updateClientWithDTO-02",
+      "operation": "Soap.updateClientWithDTO",
+      "kind": "error",
+      "stateChanging": true,
+      "preState": "seed",
+      "group": "soap-write",
+      "request": {
+        "method": "POST",
+        "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+        "headers": {
+          "Content-Type": "text/xml; charset=utf-8",
+          "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/updateClientWithDTO\""
+        },
+        "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateClientWithDTO xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pDTOClient><city>Christchurch</city><country>New Zealand</country><email>nobody@nowhere.co.nz</email><fax>64 3 000 0002</fax><name>Nobody Client</name><phone>64 3 000 0001</phone><street>1 Nowhere Street</street><website>www.nowhere.co.nz</website></pDTOClient></updateClientWithDTO></soap:Body></soap:Envelope>"
+      },
+      "expectedStatus": 200,
+      "expectedResultStatusCode": 404,
+      "description": "updateClientWithDTO with pDTOClient.name Nobody Client names no seeded client, so the DTOResult statusCode is 404 with \"Client Nobody Client not found\" [Erewhon/ErehwhonExternalInterfacesSchema.scm:6910-6913]."
+    },
+    {
+      "id": "REST-getCompany-03",
+      "operation": "Rest.getCompany",
+      "kind": "error",
+      "stateChanging": false,
+      "preState": "empty",
+      "group": "empty-state",
+      "request": {
+        "method": "GET",
+        "pathAndQuery": "/company",
+        "headers": {},
+        "bodyText": null
+      },
+      "expectedStatus": 500,
+      "description": "GET /company against the empty state, which has no company, returns 500 with the body null [Erewhon/ErehwhonExternalInterfacesSchema.scm:2470-2472, 3752-3776]."
+    }
+  ]
+}

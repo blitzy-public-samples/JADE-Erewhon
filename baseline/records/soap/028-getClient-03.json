@@ -1,0 +1,25 @@
+{
+  "order": 28,
+  "caseId": "SOAP-getClient-03",
+  "operation": "Soap.getClient",
+  "kind": "error",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getClient\""
+    },
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getClient xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Nobody Client</pName></getClient></soap:Body></soap:Envelope>"
+  },
+  "response": {
+    "status": 200,
+    "contentType": "text/xml; charset=utf-8",
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getClientResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getClientResult xsi:nil=\"true\" /></getClientResponse></soap:Body></soap:Envelope>",
+    "bodySha256": "9e690b312b0c2062d50de7634a220f189af70e197d4a5ce4781b1065560eeb13",
+    "bodyFile": null
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "order": 32,
+  "caseId": "SOAP-getPhoto-03",
+  "operation": "Soap.getPhoto",
+  "kind": "success",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getPhoto\""
+    },
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getPhoto xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>David Russel</pName></getPhoto></soap:Body></soap:Envelope>"
+  },
+  "response": {
+    "status": 200,
+    "contentType": "text/xml; charset=utf-8",
+    "bodyText": null,
+    "bodySha256": "54db33fef85ea1fc4b17683d2c8edf6513334c8374f72fa8dc2c11cffdf6d20c",
+    "bodyFile": "032-getPhoto-03.body.bin"
+  }
+}

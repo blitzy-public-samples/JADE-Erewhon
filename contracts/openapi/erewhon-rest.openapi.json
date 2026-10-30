@@ -1,0 +1,1353 @@
+{
+  "openapi": "3.1.1",
+  "info": {
+    "title": "Erewhon REST facade",
+    "version": "1.0.0"
+  },
+  "paths": {
+    "/agent/{pName}": {
+      "get": {
+        "tags": [
+          "Erewhon.Facade"
+        ],
+        "summary": "ErewhonRestService.getAgent",
+        "operationId": "getAgent",
+        "parameters": [
+          {
+            "name": "pName",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Agent found by exact name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DTOAgent"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No agent with that exact name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/allAgents": {
+      "get": {
+        "tags": [
+          "Erewhon.Facade"
+        ],
+        "summary": "ErewhonRestService.getAllAgents",
+        "operationId": "getAllAgents",
+        "responses": {
+          "200": {
+            "description": "All agents, in name order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DTOAgentArray"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/allClients": {
+      "get": {
+        "tags": [
+          "Erewhon.Facade"
+        ],
+        "summary": "ErewhonRestService.getAllClients",
+        "operationId": "getAllClients",
+        "responses": {
+          "200": {
+            "description": "All clients, in name order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DTOClientArray"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/allSales": {
+      "get": {
+        "tags": [
+          "Erewhon.Facade"
+        ],
+        "summary": "ErewhonRestService.getAllSales",
+        "operationId": "getAllSales",
+        "responses": {
+          "200": {
+            "description": "All sales, in (category prefix, code number) order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/DTORetailSale"
+                      },
+                      {
+                        "$ref": "#/components/schemas/DTOTenderSale"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/client/{pName}": {
+      "get": {
+        "tags": [
+          "Erewhon.Facade"
+        ],
+        "summary": "ErewhonRestService.getClient",
+        "operationId": "getClient",
+        "parameters": [
+          {
+            "name": "pName",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Client found by name after trimming blanks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DTOClient"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with the trimmed name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/company": {
+      "get": {
+        "tags": [
+          "Erewhon.Facade"
+        ],
+        "summary": "ErewhonRestService.getCompany",
+        "operationId": "getCompany",
+        "responses": {
+          "200": {
+            "description": "Company exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DTOCompany"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "No company",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/createAgent": {
+      "post": {
+        "tags": [
+          "Erewhon.Facade"
+        ],
+        "summary": "ErewhonRestService.postCreateAgent",
+        "operationId": "postCreateAgent",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DTOAgent"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Agent created; guid holds the new object's guid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DTOResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "AgentTA/AddressTA validation failed; allErrors holds the transaction-agent errors in order; The body is not a JSON object whose read members are strings or null (malformed JSON, invalid UTF-8, an empty body, a root other than an object, or a read member of another JSON kind), or a member name or read member's value holds an unpaired surrogate escape; rejected before the method body runs, with the literal null body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/DTOResult"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/createClient": {
+      "post": {
+        "tags": [
+          "Erewhon.Facade"
+        ],
+        "summary": "ErewhonRestService.postCreateClient",
+        "operationId": "postCreateClient",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DTOClient"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Client created; guid holds the new object's guid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DTOResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "ClientTA/AddressTA validation failed; allErrors holds the transaction-agent errors in order; The body is not a JSON object whose read members are strings or null (malformed JSON, invalid UTF-8, an empty body, a root other than an object, or a read member of another JSON kind), or a member name or read member's value holds an unpaired surrogate escape; rejected before the method body runs, with the literal null body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/DTOResult"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/createRetailSale/{pClient}/{pCodePrefix}/{pCodeNumber}": {
+      "post": {
+        "tags": [
+          "Erewhon.Facade"
+        ],
+        "summary": "ErewhonRestService.postCreateRetailSale",
+        "operationId": "postCreateRetailSale",
+        "parameters": [
+          {
+            "name": "pClient",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pCodePrefix",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pCodeNumber",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Retail sale created; guid holds the new object's guid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DTOResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Item is not a RetailItem; allErrors holds $ItemNotRetailItem (\"Item is not a Retail Item\"); RetailSaleTA validation failed; allErrors holds the transaction-agent errors in order; pCodeNumber is not an Integer segment (for example 18.0 or 1e2); rejected before the method body runs, with the literal null body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/DTOResult"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with that exact name; allErrors holds $ClientNotFound (\"Client not found\"); No item with that code number; allErrors holds $ItemNotFound (\"Item was not found\")",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DTOResult"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/createTender/{pClient}/{pCodePrefix}/{pCodeNumber}/{pOffer}": {
+      "post": {
+        "tags": [
+          "Erewhon.Facade"
+        ],
+        "summary": "ErewhonRestService.postCreateTender",
+        "operationId": "postCreateTender",
+        "parameters": [
+          {
+            "name": "pClient",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pCodePrefix",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pCodeNumber",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "pOffer",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "number",
+              "description": "decimal"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Tender created; guid holds the new object's guid",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DTOResult"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Item is not a TenderItem; allErrors holds $ItemNotTenderItem (\"Item is not a Tender Item\"); TenderTA validation failed; allErrors holds the transaction-agent errors in order; pCodeNumber is not an Integer segment (for example 18.0 or 1e2), or pOffer not a Decimal segment (for example 1e7); rejected before the method body runs, with the literal null body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/DTOResult"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No client with that exact name; allErrors holds $ClientNotFound (\"Client not found\"); No item with that code number; allErrors holds $ItemNotFound (\"Item was not found\")",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DTOResult"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/itemByCode/{pCodePrefix}/{pCodeNumber}": {
+      "get": {
+        "tags": [
+          "Erewhon.Facade"
+        ],
+        "summary": "ErewhonRestService.getItemByCode",
+        "operationId": "getItemByCode",
+        "parameters": [
+          {
+            "name": "pCodePrefix",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pCodeNumber",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Item found by code number; the prefix is validated but not used in the lookup",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/DTORetailItem"
+                    },
+                    {
+                      "$ref": "#/components/schemas/DTOTenderItem"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Code prefix empty or longer than 4 characters after trimming, or code number null; pCodeNumber is not an Integer segment (for example 18.0 or 1e2); rejected before the method body runs, with the literal null body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "null"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No item with that code number",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "null"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Item is neither a RetailItem nor a TenderItem",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/itemsByPrice/{pMinPrice}/{pMaxPrice}": {
+      "get": {
+        "tags": [
+          "Erewhon.Facade"
+        ],
+        "summary": "ErewhonRestService.getItemsByPrice",
+        "operationId": "getItemsByPrice",
+        "parameters": [
+          {
+            "name": "pMinPrice",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          },
+          {
+            "name": "pMaxPrice",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Items priced within the inclusive range, in code-number order; possibly empty",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/DTORetailItem"
+                      },
+                      {
+                        "$ref": "#/components/schemas/DTOTenderItem"
+                      }
+                    ]
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Minimum below 0, maximum below 0, or maximum below minimum; pMinPrice or pMaxPrice is not an Integer segment (for example 18.0 or 1e2); rejected before the method body runs, with the literal null body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sale/{pCodePrefix}/{pCodeNumber}": {
+      "get": {
+        "tags": [
+          "Erewhon.Facade"
+        ],
+        "summary": "ErewhonRestService.getSale",
+        "operationId": "getSale",
+        "parameters": [
+          {
+            "name": "pCodePrefix",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "pCodeNumber",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sale found by the untrimmed prefix and the code number",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/DTORetailSale"
+                    },
+                    {
+                      "$ref": "#/components/schemas/DTOTenderSale"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Code prefix empty or longer than 4 characters after trimming, or code number null; pCodeNumber is not an Integer segment (for example 18.0 or 1e2); rejected before the method body runs, with the literal null body",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "null"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No sale for that prefix and code number",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "null"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Sale is neither a RetailSale nor a TenderSale",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "DTOAgent": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          },
+          "country": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          },
+          "fax": {
+            "type": "string"
+          },
+          "guid": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "phone": {
+            "type": "string"
+          },
+          "street": {
+            "type": "string"
+          },
+          "website": {
+            "type": "string"
+          }
+        }
+      },
+      "DTOAgentArray": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/DTOAgent"
+        }
+      },
+      "DTOClient": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          },
+          "country": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          },
+          "fax": {
+            "type": "string"
+          },
+          "guid": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "phone": {
+            "type": "string"
+          },
+          "street": {
+            "type": "string"
+          },
+          "website": {
+            "type": "string"
+          }
+        }
+      },
+      "DTOClientArray": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/DTOClient"
+        }
+      },
+      "DTOCompany": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string"
+          },
+          "country": {
+            "type": "string"
+          },
+          "email": {
+            "type": "string"
+          },
+          "fax": {
+            "type": "string"
+          },
+          "guid": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "phone": {
+            "type": "string"
+          },
+          "street": {
+            "type": "string"
+          },
+          "website": {
+            "type": "string"
+          }
+        }
+      },
+      "DTOError": {
+        "type": "object",
+        "properties": {
+          "allErrors": {
+            "$ref": "#/components/schemas/StringArray"
+          },
+          "guid": {
+            "type": "string"
+          },
+          "statusCode": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "DTOItem": {
+        "type": "object",
+        "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOAgent"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "categoryPrefix": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "guid": {
+            "type": "string"
+          },
+          "itemCategory": {
+            "type": "string"
+          },
+          "listedDate": {
+            "pattern": "^/Date\\(-?\\d+([+-]\\d{4})?\\)/$",
+            "type": [
+              "null",
+              "string"
+            ],
+            "description": "msDate"
+          },
+          "name": {
+            "type": "string"
+          },
+          "number": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "photo": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "byteArray"
+          },
+          "price": {
+            "type": "number",
+            "description": "decimal"
+          },
+          "region": {
+            "type": "string"
+          },
+          "sale": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOSaleDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "DTOItemsArray": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/DTOItem"
+        }
+      },
+      "DTOName": {
+        "type": "object",
+        "properties": {
+          "guid": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "DTONameArray": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/DTOName"
+        }
+      },
+      "DTOObject": {
+        "type": "object",
+        "properties": {
+          "guid": {
+            "type": "string"
+          }
+        }
+      },
+      "DTOObjectArray": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/DTOObject"
+        }
+      },
+      "DTOPhoto": {
+        "type": "object",
+        "properties": {
+          "guid": {
+            "type": "string"
+          },
+          "photo": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "byteArray"
+          }
+        }
+      },
+      "DTOResult": {
+        "type": "object",
+        "properties": {
+          "allErrors": {
+            "$ref": "#/components/schemas/StringArray"
+          },
+          "allWarnings": {
+            "$ref": "#/components/schemas/StringArray"
+          },
+          "guid": {
+            "type": "string"
+          },
+          "statusCode": {
+            "type": "integer",
+            "format": "int32"
+          }
+        }
+      },
+      "DTORetailItem": {
+        "type": "object",
+        "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOAgent"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "categoryPrefix": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "guid": {
+            "type": "string"
+          },
+          "itemCategory": {
+            "type": "string"
+          },
+          "listedDate": {
+            "pattern": "^/Date\\(-?\\d+([+-]\\d{4})?\\)/$",
+            "type": [
+              "null",
+              "string"
+            ],
+            "description": "msDate"
+          },
+          "name": {
+            "type": "string"
+          },
+          "number": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "photo": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "byteArray"
+          },
+          "price": {
+            "type": "number",
+            "description": "decimal"
+          },
+          "region": {
+            "type": "string"
+          },
+          "sale": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOSaleDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "DTORetailSale": {
+        "type": "object",
+        "properties": {
+          "agentCommission": {
+            "type": "number",
+            "description": "decimal"
+          },
+          "client": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOClient"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guid": {
+            "type": "string"
+          },
+          "item": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOItem"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "timestamp": {
+            "pattern": "^/Date\\(-?\\d+([+-]\\d{4})?\\)/$",
+            "type": [
+              "null",
+              "string"
+            ],
+            "description": "msDate"
+          }
+        }
+      },
+      "DTORetailSaleDetail": {
+        "type": "object",
+        "properties": {
+          "agentCommission": {
+            "type": "number",
+            "description": "decimal"
+          },
+          "client": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOClient"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guid": {
+            "type": "string"
+          },
+          "price": {
+            "type": "number",
+            "description": "decimal"
+          },
+          "soldDate": {
+            "pattern": "^/Date\\(-?\\d+([+-]\\d{4})?\\)/$",
+            "type": [
+              "null",
+              "string"
+            ],
+            "description": "msDate"
+          }
+        }
+      },
+      "DTOSale": {
+        "type": "object",
+        "properties": {
+          "agentCommission": {
+            "type": "number",
+            "description": "decimal"
+          },
+          "client": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOClient"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guid": {
+            "type": "string"
+          },
+          "item": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOItem"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "DTOSaleArray": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/DTOSale"
+        }
+      },
+      "DTOSaleDetail": {
+        "type": "object",
+        "properties": {
+          "agentCommission": {
+            "type": "number",
+            "description": "decimal"
+          },
+          "client": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOClient"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guid": {
+            "type": "string"
+          }
+        }
+      },
+      "DTOTender": {
+        "type": "object",
+        "properties": {
+          "client": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOClient"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guid": {
+            "type": "string"
+          },
+          "offer": {
+            "type": "number",
+            "description": "decimal"
+          },
+          "tenderItem": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOTenderItem"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "timestamp": {
+            "pattern": "^/Date\\(-?\\d+([+-]\\d{4})?\\)/$",
+            "type": [
+              "null",
+              "string"
+            ],
+            "description": "msDate"
+          }
+        }
+      },
+      "DTOTenderItem": {
+        "type": "object",
+        "properties": {
+          "agent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOAgent"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "categoryPrefix": {
+            "type": "string"
+          },
+          "closureDate": {
+            "pattern": "^/Date\\(-?\\d+([+-]\\d{4})?\\)/$",
+            "type": [
+              "null",
+              "string"
+            ],
+            "description": "msDate"
+          },
+          "description": {
+            "type": "string"
+          },
+          "guid": {
+            "type": "string"
+          },
+          "itemCategory": {
+            "type": "string"
+          },
+          "listedDate": {
+            "pattern": "^/Date\\(-?\\d+([+-]\\d{4})?\\)/$",
+            "type": [
+              "null",
+              "string"
+            ],
+            "description": "msDate"
+          },
+          "name": {
+            "type": "string"
+          },
+          "number": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "photo": {
+            "type": [
+              "null",
+              "array"
+            ],
+            "items": {
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "description": "byteArray"
+          },
+          "price": {
+            "type": "number",
+            "description": "decimal"
+          },
+          "region": {
+            "type": "string"
+          },
+          "sale": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOSaleDetail"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "DTOTenderSale": {
+        "type": "object",
+        "properties": {
+          "agentCommission": {
+            "type": "number",
+            "description": "decimal"
+          },
+          "client": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOClient"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guid": {
+            "type": "string"
+          },
+          "item": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOItem"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "offer": {
+            "type": "number",
+            "description": "decimal"
+          },
+          "tender": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOTender"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "DTOTenderSaleDetail": {
+        "type": "object",
+        "properties": {
+          "agentCommission": {
+            "type": "number",
+            "description": "decimal"
+          },
+          "client": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DTOClient"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "guid": {
+            "type": "string"
+          },
+          "offer": {
+            "type": "number",
+            "description": "decimal"
+          },
+          "tenderDate": {
+            "pattern": "^/Date\\(-?\\d+([+-]\\d{4})?\\)/$",
+            "type": [
+              "null",
+              "string"
+            ],
+            "description": "msDate"
+          }
+        }
+      },
+      "StringArray": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Erewhon.Facade"
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "order": 16,
+  "caseId": "REST-getItemsByPrice-02",
+  "operation": "Rest.getItemsByPrice",
+  "kind": "success",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "GET",
+    "pathAndQuery": "/itemsByPrice/1/2",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 200,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "[]",
+    "bodySha256": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "bodyFile": null
+  }
+}

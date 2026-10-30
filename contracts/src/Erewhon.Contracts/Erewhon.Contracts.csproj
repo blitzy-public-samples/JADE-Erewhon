@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Shared contracts library for the facade, the stand-in and the harness, which each reference it
+    as ../../../contracts/src/Erewhon.Contracts/Erewhon.Contracts.csproj.
+
+    Target framework, runtime pin, nullable, implicit usings, central package management and lock
+    files are inherited from contracts/Directory.Build.props (../Erewhon.Strangler.props); do not
+    restate them here. contracts/ has no global.json, so build this project from inside standin/,
+    harness/ or facade/, never from the repository root or from contracts/.
+  -->
+  <PropertyGroup>
+    <RootNamespace>Erewhon.Contracts</RootNamespace>
+    <AssemblyName>Erewhon.Contracts</AssemblyName>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <!-- The listener matcher policy and request helpers need ASP.NET Core. The library takes no
+       NuGet package; the shared framework supplies everything it uses. -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
+
+  <!-- LogicalName must equal OperationCatalogue.ResourceName in Catalogue/OperationCatalogue.cs. -->
+  <ItemGroup>
+    <EmbeddedResource Include="../../operation-catalogue.json" LogicalName="Erewhon.Contracts.operation-catalogue.json" Link="operation-catalogue.json" />
+  </ItemGroup>
+
+</Project>

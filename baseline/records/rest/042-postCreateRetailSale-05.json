@@ -1,0 +1,22 @@
+{
+  "order": 42,
+  "caseId": "REST-postCreateRetailSale-05",
+  "operation": "Rest.postCreateRetailSale",
+  "kind": "error",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/createRetailSale/Brian%20Olsen/DEST/18",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 400,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"guid\":\"\",\"allErrors\":[\"The Item has already been sold\"],\"allWarnings\":[],\"statusCode\":400}",
+    "bodySha256": "2a8b887a44cae86e2312f712129c44097eacadfa772de481bdd6ebea67f11d2b",
+    "bodyFile": null
+  }
+}

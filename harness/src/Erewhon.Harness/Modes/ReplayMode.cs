@@ -1,0 +1,2362 @@
+using System.Globalization;
+using System.Text;
+using Erewhon.Contracts;
+using Erewhon.Contracts.Admin;
+using Erewhon.Contracts.Catalogue;
+using Erewhon.Harness.Baseline;
+using Erewhon.Harness.Cases;
+using Erewhon.Harness.Checks;
+using Erewhon.Harness.Compare;
+using Erewhon.Harness.Http;
+using Erewhon.Harness.Lifecycle;
+using Erewhon.Harness.Report;
+
+namespace Erewhon.Harness.Modes;
+
+/// <summary>
+/// The work of one <c>replay</c> run between start-up and the exit path: everything that observes the
+/// facade and the backend and records it in a <see cref="ReplayRunState"/>. <see cref="ReplayMode"/> owns
+/// what happens afterwards (report, shutdown, final line, exit code), so a body that throws or is cancelled
+/// can never skip it. <c>ReplayLifecycleTests</c> injects a fake body through this seam.
+/// </summary>
+public interface IReplayBody
+{
+    /// <summary>Runs the replay and records every observation in <paramref name="state"/>.</summary>
+    /// <param name="state">The run state the report is built from.</param>
+    /// <param name="ct">Cancels the run; <see cref="ReplayMode"/> records the cancellation as <c>CHK-EXCEPTION</c>.</param>
+    Task ExecuteAsync(ReplayRunState state, CancellationToken ct);
+}
+
+/// <summary>
+/// Everything one replay run observed, as the results report reads it (AAP 0.8.2): failing items, case
+/// results, the planned and captured cases, the separate checks and the run and baseline facts.
+/// </summary>
+/// <remarks>
+/// <para>A fresh instance already renders a valid report: every collection is empty, the facts say
+/// "unknown" and the baseline facts are <see cref="BaselineFacts.None"/>, because the report is built on
+/// every exit path, including one taken before the body recorded anything.</para>
+/// <para>Every member is guarded by one private lock and every collection getter returns a copy, so the
+/// report's snapshot never races a check that is still recording.</para>
+/// </remarks>
+public sealed class ReplayRunState : IReportSource
+{
+    private const string Unknown = "unknown";
+
+    private readonly Lock _gate = new();
+    private readonly List<FailureItem> _failures = [];
+    private readonly HashSet<(string ItemId, string Nature)> _failureKeys = [];
+    private readonly List<CaseResult> _cases = [];
+    private readonly Dictionary<string, CheckResult> _checks = new(StringComparer.Ordinal);
+    private Dictionary<string, IReadOnlyList<string>> _planned = new(StringComparer.Ordinal);
+    private Dictionary<string, IReadOnlyList<string>> _captured = new(StringComparer.Ordinal);
+
+    private RunFacts _facts = new(
+        DateTimeOffset.UtcNow,
+        Unknown,
+        FacadeFrameworkDescription: null,
+        SdkPin: null,
+        TargetRestUrl: "",
+        TargetSoapUrl: "",
+        BackendRestUrl: "",
+        BackendSoapUrl: "",
+        BackendAdminUrl: null,
+        StartingCommit: Unknown,
+        BaselineCommit: null,
+        FacadeCommit: null);
+
+    private BaselineFacts _baseline = BaselineFacts.None;
+    private ConformanceSummary? _conformance;
+    private JadeUnchangedSummary? _jadeUnchanged;
+    private bool _externalBackend;
+
+    /// <inheritdoc/>
+    /// <remarks>A snapshot in recording order; later recordings do not change it.</remarks>
+    public IReadOnlyList<FailureItem> Failures
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _failures.ToArray();
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>A snapshot in record order; later recordings do not change it.</remarks>
+    public IReadOnlyList<CaseResult> Cases
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _cases.ToArray();
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    public IReadOnlyDictionary<string, IReadOnlyList<string>> PlannedCasesByOperation
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return new Dictionary<string, IReadOnlyList<string>>(_planned, StringComparer.Ordinal).AsReadOnly();
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <remarks>A snapshot; a later <see cref="SetCaptured"/> does not change it.</remarks>
+    public IReadOnlyDictionary<string, IReadOnlyList<string>> CapturedCasesByOperation
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return new Dictionary<string, IReadOnlyList<string>>(_captured, StringComparer.Ordinal).AsReadOnly();
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    public IReadOnlyDictionary<string, CheckResult> Checks
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return new Dictionary<string, CheckResult>(_checks, StringComparer.Ordinal).AsReadOnly();
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <exception cref="ArgumentNullException">The value set is null.</exception>
+    public RunFacts Facts
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _facts;
+            }
+        }
+
+        set
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            lock (_gate)
+            {
+                _facts = value;
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <exception cref="ArgumentNullException">The value set is null.</exception>
+    public BaselineFacts Baseline
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _baseline;
+            }
+        }
+
+        set
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            lock (_gate)
+            {
+                _baseline = value;
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    public ConformanceSummary? Conformance
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _conformance;
+            }
+        }
+
+        set
+        {
+            lock (_gate)
+            {
+                _conformance = value;
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    public JadeUnchangedSummary? JadeUnchanged
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _jadeUnchanged;
+            }
+        }
+
+        set
+        {
+            lock (_gate)
+            {
+                _jadeUnchanged = value;
+            }
+        }
+    }
+
+    /// <inheritdoc/>
+    public bool ExternalBackend
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _externalBackend;
+            }
+        }
+
+        set
+        {
+            lock (_gate)
+            {
+                _externalBackend = value;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Records a failing item. An item whose (<c>ItemId</c>, <c>Nature</c>) pair is already recorded is
+    /// ignored, so the first one, with its detail, is kept; insertion order is preserved.
+    /// </summary>
+    /// <param name="item">The failing item.</param>
+    /// <returns>True when the item was recorded; false when its pair was already present.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="item"/> is null.</exception>
+    public bool AddFailure(FailureItem item)
+    {
+        ArgumentNullException.ThrowIfNull(item);
+        lock (_gate)
+        {
+            if (!_failureKeys.Add((item.ItemId, item.Nature)))
+            {
+                return false;
+            }
+
+            _failures.Add(item);
+            return true;
+        }
+    }
+
+    /// <summary>Records every item of <paramref name="items"/> through <see cref="AddFailure"/>, skipping nulls.</summary>
+    /// <param name="items">The failing items; null records nothing.</param>
+    public void AddFailures(IEnumerable<FailureItem?>? items)
+    {
+        if (items is null)
+        {
+            return;
+        }
+
+        foreach (var item in items)
+        {
+            if (item is not null)
+            {
+                AddFailure(item);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Records a case result, replacing an earlier result with the same case id (ordinal) in its place;
+    /// otherwise appends it.
+    /// </summary>
+    /// <param name="result">The case result.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="result"/> is null.</exception>
+    public void AddCase(CaseResult result)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        lock (_gate)
+        {
+            var index = _cases.FindIndex(existing => string.Equals(existing.CaseId, result.CaseId, StringComparison.Ordinal));
+            if (index >= 0)
+            {
+                _cases[index] = result;
+            }
+            else
+            {
+                _cases.Add(result);
+            }
+        }
+    }
+
+    /// <summary>Records a separate check's result, replacing an earlier one of the same <see cref="CheckResult.Name"/>.</summary>
+    /// <param name="result">The check result, named by a <see cref="CheckNames"/> value.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="result"/> is null.</exception>
+    /// <exception cref="ArgumentException">The result has a blank name.</exception>
+    public void SetCheck(CheckResult result)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        ArgumentException.ThrowIfNullOrWhiteSpace(result.Name, nameof(result));
+        lock (_gate)
+        {
+            _checks[result.Name] = result;
+        }
+    }
+
+    /// <summary>
+    /// Replaces the planned cases: catalogue operation id to its planned case ids in matrix order. The
+    /// lists are copied, so later changes to the caller's collections do not reach the report.
+    /// </summary>
+    /// <param name="plannedCaseIdsByOperation">The plan; blank keys are skipped and a null list reads as empty.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="plannedCaseIdsByOperation"/> is null.</exception>
+    public void SetPlanned(IReadOnlyDictionary<string, IReadOnlyList<string>> plannedCaseIdsByOperation)
+    {
+        ArgumentNullException.ThrowIfNull(plannedCaseIdsByOperation);
+
+        var copy = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
+        foreach (var (operation, ids) in plannedCaseIdsByOperation)
+        {
+            if (!string.IsNullOrWhiteSpace(operation))
+            {
+                copy[operation] = Array.AsReadOnly((ids ?? []).ToArray());
+            }
+        }
+
+        lock (_gate)
+        {
+            _planned = copy;
+        }
+    }
+
+    /// <summary>
+    /// Replaces the capture evidence: catalogue operation id to the case ids that have a baseline record,
+    /// in record order. The lists are copied, so later changes to the caller's collections do not reach
+    /// the report.
+    /// </summary>
+    /// <param name="capturedCaseIdsByOperation">The captured cases; blank keys are skipped and a null list reads as empty.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="capturedCaseIdsByOperation"/> is null.</exception>
+    public void SetCaptured(IReadOnlyDictionary<string, IReadOnlyList<string>> capturedCaseIdsByOperation)
+    {
+        ArgumentNullException.ThrowIfNull(capturedCaseIdsByOperation);
+
+        var copy = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
+        foreach (var (operation, ids) in capturedCaseIdsByOperation)
+        {
+            if (!string.IsNullOrWhiteSpace(operation))
+            {
+                copy[operation] = Array.AsReadOnly((ids ?? []).ToArray());
+            }
+        }
+
+        lock (_gate)
+        {
+            _captured = copy;
+        }
+    }
+}
+
+/// <summary>
+/// The <c>replay</c> mode's lifecycle owner (AAP 0.8.4): it runs the body, then on every exit path
+/// attempts the report, shuts the facade and the stand-in down, rewrites the report when cleanup added
+/// items, prints the final line as the harness's last line and returns 0 or 1.
+/// </summary>
+/// <remarks>
+/// <para>The body runs inside one <c>try</c>/<c>catch</c>/<c>finally</c>. The <c>catch</c> records any
+/// exception, cancellation included, as <c>CHK-EXCEPTION</c>. The <c>finally</c> runs the report attempt,
+/// the cleanup and the report rewrite, each inside its own <c>try</c>/<c>catch</c>, so a failure in one never
+/// skips the next. Cleanup never takes the run's token itself, so a cancelled run (SIGTERM) still shuts its
+/// components down; every wait is bounded by the shutdown client's own limits and, once the run is cancelled,
+/// each component's shutdown also by <see cref="CancelledShutdownLimit"/>, so a cancelled run reaches its final
+/// line within <see cref="CancelledExitBudget"/> whatever limits are configured. Each report write runs off
+/// the calling thread and is abandoned as failed, like a write that throws, when it has not finished within
+/// <see cref="ReportWriteLimit"/>, so a destination that stalls never keeps the run from its cleanup, its final
+/// line and its exit code. A blocked file-system call cannot be cancelled, so an abandoned write may still
+/// finish later; the printed report and the exit code 1 then remain the run's verdict.</para>
+/// <para>The exit code is 0 only when the last report write succeeded, the register documents every
+/// failing item, both those recorded here and those the report derives, and the report holds no captured
+/// case the replay left uncompared (<see cref="ResultsReport.UnaccountedCases"/>). <c>CHK-REPORT</c>,
+/// <c>CHK-SHUTDOWN</c> and <c>CHK-EXCEPTION</c> are never documentable, so any of them gives 1
+/// (AAP 0.7.7). No other value is returned, and <see cref="RunAsync"/> never throws.</para>
+/// <para>The mode writes only the report, through <see cref="IResultsReportWriter"/>; the body writes
+/// <c>artifacts/**</c>. Nothing here writes <c>baseline/**</c>, <c>contracts/**</c> or the register.</para>
+/// </remarks>
+public sealed class ReplayMode
+{
+    private const string LinePrefix = "replay: ";
+
+    // Never quoted: a configured URL may carry a password, and the outcome does not depend on its text.
+    private const string UnusableAdminUrl =
+        "admin URL is blank or not an absolute http(s) URL without user information, so the stop cannot be requested or confirmed";
+
+    // How long one report write may take before it is abandoned as failed (AAP 0.8.4: no exit path waits
+    // indefinitely). Publishing RESULTS.md takes milliseconds, so only a destination that stalls reaches it.
+    private const int DefaultReportWriteLimitSeconds = 30;
+
+    // How long the seed restoration closing an empty-state bracket (replay and capture) may still run once the
+    // run is cancelled, and likewise each component's shutdown when its configured limit is longer: each counts
+    // from the later of the cancellation and the step's own start, so neither depends on the configured request
+    // or shutdown limits.
+    internal const int CancelledRestorationLimitSeconds = 15;
+    internal const int CancelledShutdownLimitSeconds = 15;
+
+    // The harness's own ceiling on a report-write limit, int.MaxValue milliseconds (just under 25 days): a
+    // conservative choice below the longest timed wait Task.Delay accepts, not the framework's maximum.
+    private static readonly TimeSpan MaximumReportWriteLimit = TimeSpan.FromMilliseconds(int.MaxValue);
+
+    /// <summary>
+    /// The longest a cancelled replay spends between its cancellation and its final line, at the production
+    /// limits: a seed restoration in flight (15 s), the report attempt (30 s), the facade's and the stand-in's
+    /// shutdown (15 s each) and the report rewrite (30 s), 105 s in all. Every other wait of the body observes the
+    /// run's token. <c>harness/scripts/run-local.sh</c> (<c>HARNESS_STOP_SECONDS</c>) and
+    /// <c>docker-compose.yml</c> (the harness service's <c>stop_grace_period</c>) wait longer than this plus
+    /// <see cref="Program.SignalCancellation.CompletionLimit"/> before they kill the harness.
+    /// </summary>
+    internal static readonly TimeSpan CancelledExitBudget = TimeSpan.FromSeconds(
+        CancelledRestorationLimitSeconds
+        + DefaultReportWriteLimitSeconds
+        + (2 * CancelledShutdownLimitSeconds)
+        + DefaultReportWriteLimitSeconds);
+
+    private readonly TimeSpan _reportWriteLimit = TimeSpan.FromSeconds(DefaultReportWriteLimitSeconds);
+    private readonly TimeSpan _cancelledShutdownLimit = TimeSpan.FromSeconds(CancelledShutdownLimitSeconds);
+
+    private readonly HarnessOptions _options;
+    private readonly IReplayBody _body;
+    private readonly IResultsReportWriter _writer;
+    private readonly IComponentShutdown _shutdown;
+    private readonly KnownLimitationsRegister _register;
+    private readonly TextWriter _stdout;
+
+    // The last report that was built and rendered, written or not; it supplies the final line.
+    private ResultsReport? _lastReport;
+    private bool _lastWriteSucceeded;
+
+    /// <summary>Creates the mode.</summary>
+    /// <param name="options">The harness settings: report path and the facade and backend admin URLs.</param>
+    /// <param name="body">The replay work; <see cref="ReplayBody"/> in production.</param>
+    /// <param name="writer">Renders and writes <c>RESULTS.md</c>.</param>
+    /// <param name="shutdown">Shuts each component down and confirms its stop.</param>
+    /// <param name="register">The known-limitations register failing items are matched against.</param>
+    /// <param name="stdout">Where the mode's lines, a failed report's text and the final line go.</param>
+    /// <param name="startupFailures">
+    /// Items recorded before the mode existed, such as <c>CHK-EXCEPTION</c> for a configuration, catalogue
+    /// or register load failure; null for none.
+    /// </param>
+    /// <exception cref="ArgumentNullException">A required argument is null.</exception>
+    public ReplayMode(
+        HarnessOptions options,
+        IReplayBody body,
+        IResultsReportWriter writer,
+        IComponentShutdown shutdown,
+        KnownLimitationsRegister register,
+        TextWriter stdout,
+        IReadOnlyList<FailureItem>? startupFailures = null)
+    {
+        _options = options ?? throw new ArgumentNullException(nameof(options));
+        _body = body ?? throw new ArgumentNullException(nameof(body));
+        _writer = writer ?? throw new ArgumentNullException(nameof(writer));
+        _shutdown = shutdown ?? throw new ArgumentNullException(nameof(shutdown));
+        _register = register ?? throw new ArgumentNullException(nameof(register));
+        _stdout = stdout ?? throw new ArgumentNullException(nameof(stdout));
+
+        State = new ReplayRunState();
+        State.AddFailures(startupFailures);
+
+        // Seeded from the settings so a report written after an early failure still states the run facts
+        // and whether the backend is external; the body refines both.
+        State.Facts = ReplayBody.DescribeRun(options, DateTimeOffset.UtcNow, frameworkDescription: null, baselineCommit: null, facadeCommit: null);
+        State.ExternalBackend = string.IsNullOrWhiteSpace(options.Backend?.AdminUrl);
+    }
+
+    /// <summary>The run state the report is built from; tests read the recorded items from it.</summary>
+    public ReplayRunState State { get; }
+
+    /// <summary>
+    /// How long one report write may take before the mode abandons it and records <c>CHK-REPORT</c>
+    /// (<c>write-failed</c>); 30 s unless a test shortens it.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is not positive or is longer than <see cref="int.MaxValue"/> milliseconds.</exception>
+    internal TimeSpan ReportWriteLimit
+    {
+        get => _reportWriteLimit;
+        init => _reportWriteLimit = value > TimeSpan.Zero && value <= MaximumReportWriteLimit
+            ? value
+            : throw new ArgumentOutOfRangeException(
+                nameof(value),
+                value,
+                "The report-write limit must be positive and at most int.MaxValue milliseconds.");
+    }
+
+    /// <summary>
+    /// How long each component's shutdown may still run once the run is cancelled, counted from the later of
+    /// the cancellation and the shutdown's start, before the mode abandons it and records
+    /// <c>CHK-SHUTDOWN</c> (<c>still-running</c>); 15 s unless a test shortens it. It applies only when the
+    /// configured shutdown limit is longer: a shorter one runs as configured, on a token nothing cancels.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is not positive or is longer than <see cref="int.MaxValue"/> milliseconds.</exception>
+    internal TimeSpan CancelledShutdownLimit
+    {
+        get => _cancelledShutdownLimit;
+        init => _cancelledShutdownLimit = CancellationGrace.RequireLimit(value);
+    }
+
+    /// <summary>Runs the replay and its exit path. Call once per instance.</summary>
+    /// <param name="ct">
+    /// Cancels the body; the report and cleanup always run, and once it is cancelled each component's shutdown
+    /// is also bounded by <see cref="CancelledShutdownLimit"/>.
+    /// </param>
+    /// <returns>
+    /// 0 when the report was written, every failing item is documented and every captured case was
+    /// compared; otherwise 1.
+    /// </returns>
+    public async Task<int> RunAsync(CancellationToken ct)
+    {
+        try
+        {
+            await _body.ExecuteAsync(State, ct).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            RecordUnhandled(ex);
+        }
+        finally
+        {
+            await FinishAsync(ct).ConfigureAwait(false);
+        }
+
+        return Conclude();
+    }
+
+    // The three exit-path steps of AAP 0.8.4, each guarded on its own. The run's token never skips a step;
+    // once it is cancelled it only bounds each component's shutdown.
+    private async Task FinishAsync(CancellationToken run)
+    {
+        try
+        {
+            await AttemptReportAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            RecordReportFailure($"report attempt failed: {Describe(ex)}");
+        }
+
+        var countBefore = State.Failures.Count;
+        try
+        {
+            await ShutDownComponentsAsync(run).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // ShutDownAsync guards each component, so this is a fault outside both calls: it names no
+            // component and is recorded as the unhandled exception it is.
+            State.AddFailure(new FailureItem(FailureItemIds.Exception, FailureItemIds.ExceptionNature(ex), Detail: $"cleanup: {SafeMessage(ex)}"));
+            Print($"cleanup failed: {Describe(ex)}");
+        }
+
+        try
+        {
+            if (State.Failures.Count > countBefore)
+            {
+                Print("cleanup added failing items; rewriting the report");
+                await AttemptReportAsync().ConfigureAwait(false);
+            }
+        }
+        catch (Exception ex)
+        {
+            RecordReportFailure($"report rewrite failed: {Describe(ex)}");
+        }
+    }
+
+    private void RecordUnhandled(Exception ex)
+    {
+        try
+        {
+            State.AddFailure(new FailureItem(FailureItemIds.Exception, FailureItemIds.ExceptionNature(ex), Detail: SafeMessage(ex)));
+            Print($"unhandled {Describe(ex)}");
+        }
+        catch (Exception recordFailure)
+        {
+            // Only a fault in the recording itself reaches here; the item is still recorded, without detail.
+            State.AddFailure(new FailureItem(FailureItemIds.Exception, ex.GetType().FullName ?? ex.GetType().Name));
+            Print($"unhandled exception could not be described: {recordFailure.GetType().Name}");
+        }
+    }
+
+    // Builds, renders and writes the report. A write failure, a write abandoned at the report-write limit
+    // included, records CHK-REPORT and prints the full report text, rebuilt so it shows that item; a build or
+    // render failure records CHK-REPORT and prints the plain failure list. Neither throws.
+    private async Task AttemptReportAsync()
+    {
+        ResultsReport report;
+        string text;
+        try
+        {
+            report = ResultsReport.Build(State, _register, TryGetCatalogue());
+            text = _writer.Render(report);
+        }
+        catch (Exception ex)
+        {
+            _lastWriteSucceeded = false;
+            RecordReportFailure($"report could not be built or rendered: {Describe(ex)}");
+            PrintFailureList();
+            return;
+        }
+
+        _lastReport = report;
+        try
+        {
+            var path = _options.EffectiveReportPath;
+            await WriteWithinLimitAsync(path, text).ConfigureAwait(false);
+            _lastWriteSucceeded = true;
+            Print($"report written to {path}");
+            return;
+        }
+        catch (Exception ex)
+        {
+            _lastWriteSucceeded = false;
+            RecordReportFailure(SafeMessage(ex));
+            Print($"report could not be written ({Describe(ex)}); its full text follows");
+        }
+
+        try
+        {
+            var rebuilt = ResultsReport.Build(State, _register, TryGetCatalogue());
+            text = _writer.Render(rebuilt);
+            _lastReport = rebuilt;
+        }
+        catch (Exception ex)
+        {
+            Print($"report could not be rebuilt with the {FailureItemIds.Report} item ({Describe(ex)}); printing the text as first rendered");
+        }
+
+        WriteRaw(text);
+    }
+
+    // Runs the write off the calling thread and waits at most the report-write limit for it; the write's own
+    // exception is rethrown. A write still running at the limit is abandoned with a TimeoutException: a
+    // blocked file-system call cannot be cancelled, so it is left to end on its own, and the exception it may
+    // end with is observed, so it never surfaces as an unobserved task exception.
+    private async Task WriteWithinLimitAsync(string path, string text)
+    {
+        var write = Task.Run(() => _writer.Write(path, text));
+        using (var expiry = new CancellationTokenSource())
+        {
+            var limit = Task.Delay(_reportWriteLimit, expiry.Token);
+            if (await Task.WhenAny(write, limit).ConfigureAwait(false) == write)
+            {
+                await expiry.CancelAsync().ConfigureAwait(false);
+                await write.ConfigureAwait(false);
+                return;
+            }
+        }
+
+        _ = write.ContinueWith(
+            static abandoned => { _ = abandoned.Exception; },
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+        throw new TimeoutException(string.Create(
+            CultureInfo.InvariantCulture,
+            $"the report write did not finish within {_reportWriteLimit.TotalSeconds:0.###} s and was abandoned"));
+    }
+
+    private void RecordReportFailure(string detail)
+    {
+        _lastWriteSucceeded = false;
+        State.AddFailure(new FailureItem(FailureItemIds.Report, FailureItemIds.WriteFailed, Detail: detail));
+    }
+
+    // The facade always (it fronts the stand-in, so it goes first); the stand-in only when the backend has
+    // an admin URL. A blank Backend:AdminUrl marks an external backend, which is never shut down.
+    private async Task ShutDownComponentsAsync(CancellationToken run)
+    {
+        await ShutDownAsync(ShutdownTarget.FacadeComponent, _options.Target?.AdminUrl, run).ConfigureAwait(false);
+
+        var backendAdminUrl = _options.Backend?.AdminUrl;
+        if (string.IsNullOrWhiteSpace(backendAdminUrl))
+        {
+            Print("cleanup: the backend is external and is never shut down");
+            return;
+        }
+
+        await ShutDownAsync(ShutdownTarget.StandInComponent, backendAdminUrl, run).ConfigureAwait(false);
+    }
+
+    // The item is always named after the target's component, never after what the shutdown client
+    // returned, so the CHK-SHUTDOWN item of each component is the one recorded whatever the client does.
+    // A configured shutdown limit within CancelledShutdownLimit runs as configured, on a token nothing
+    // cancels. A longer one gets a token cancelled CancelledShutdownLimit after the later of the run's
+    // cancellation and this shutdown's start, so each component keeps a whole slice of its own of the
+    // cancelled exit budget, and an uncancelled run still waits the whole configured limit.
+    private async Task ShutDownAsync(string component, string? adminUrl, CancellationToken run)
+    {
+        try
+        {
+            if (!ShutdownTarget.TryCreate(component, adminUrl, out var target))
+            {
+                State.AddFailure(new FailureItem(FailureItemIds.Shutdown(component), FailureItemIds.StillRunning, Detail: UnusableAdminUrl));
+                Print($"cleanup: {component} {UnusableAdminUrl}");
+                return;
+            }
+
+            ShutdownOutcome? outcome;
+            var abandoned = false;
+            if (_options.ShutdownTimeout <= _cancelledShutdownLimit)
+            {
+                outcome = await _shutdown.ShutdownAsync(target, CancellationToken.None).ConfigureAwait(false);
+            }
+            else
+            {
+                using var grace = new CancellationGrace(run, _cancelledShutdownLimit);
+                outcome = await _shutdown.ShutdownAsync(target, grace.Token).ConfigureAwait(false);
+                abandoned = grace.Token.IsCancellationRequested;
+            }
+
+            if (outcome is null || !outcome.Stopped)
+            {
+                var detail = outcome?.Detail ?? "no shutdown outcome returned";
+                if (abandoned)
+                {
+                    var limit = string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"abandoned at the cancelled run's {_cancelledShutdownLimit.TotalSeconds:0.###} s shutdown limit");
+                    detail = $"{detail}; {limit}";
+                    Print($"cleanup: {component} shutdown {limit}");
+                }
+
+                State.AddFailure(new FailureItem(FailureItemIds.Shutdown(component), FailureItemIds.StillRunning, Detail: detail));
+            }
+        }
+        catch (Exception ex)
+        {
+            State.AddFailure(new FailureItem(FailureItemIds.Shutdown(component), FailureItemIds.StillRunning, Detail: SafeMessage(ex)));
+            Print($"cleanup: {component} shutdown failed: {Describe(ex)}");
+        }
+    }
+
+    // Exit code first, then the undocumented items, then the documented ones with the register entry that
+    // documents each, then the final line, which nothing may follow.
+    private int Conclude()
+    {
+        var exitCode = 1;
+        try
+        {
+            var undocumented = State.Failures.Where(item => !_register.IsDocumented(item)).ToList();
+            if (_lastReport is { } report)
+            {
+                foreach (var item in report.UndocumentedFailures)
+                {
+                    if (!undocumented.Any(known => known.ItemId == item.ItemId && known.Nature == item.Nature))
+                    {
+                        undocumented.Add(item);
+                    }
+                }
+            }
+
+            // Both the recorded items and the report's own verdict must hold: the report also derives items
+            // (a compared, non-equivalent case without a recorded nature), so its AllFailuresDocumented can be
+            // false where the recorded items alone look documented. A captured case the replay never compared
+            // is no failing item, yet it leaves its operation an undocumented difference, so it fails the run
+            // as well.
+            var unaccounted = _lastReport?.UnaccountedCases ?? [];
+            var allDocumented = undocumented.Count == 0 && unaccounted.Count == 0 && _lastReport is { AllFailuresDocumented: true };
+            exitCode = _lastWriteSucceeded && allDocumented ? 0 : 1;
+
+            Print(string.Create(
+                CultureInfo.InvariantCulture,
+                $"{undocumented.Count} undocumented failing item(s); report {(_lastWriteSucceeded ? "written" : "not written")}; exit {exitCode}"));
+            foreach (var item in undocumented)
+            {
+                Print($"  {FailureItemDisplay.Describe(item)}");
+            }
+
+            var documented = DocumentedFailures();
+            Print(string.Create(CultureInfo.InvariantCulture, $"{documented.Count} documented failing item(s)"));
+            foreach (var (item, entry) in documented)
+            {
+                Print($"  {FailureItemDisplay.Describe(item)} (documented: {entry.Id})");
+            }
+
+            if (unaccounted.Count > 0)
+            {
+                Print(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{unaccounted.Count} captured case(s) not compared, so their operations are undocumented differences: {string.Join(", ", unaccounted)}"));
+            }
+        }
+        catch (Exception ex)
+        {
+            exitCode = 1;
+            Print($"exit code could not be determined ({Describe(ex)}); exiting 1");
+        }
+
+        WriteRaw((_lastReport?.FinalLine ?? ResultsReport.FormatFinalLine(0, 0)) + Environment.NewLine);
+        try
+        {
+            _stdout.Flush();
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            // The final line was handed to the writer; a writer that cannot flush leaves only the exit code,
+            // which is still returned.
+            WriteFallback(ex);
+        }
+
+        return exitCode;
+    }
+
+    // The documented counterpart of Conclude's undocumented list, over the same items: the last report's
+    // documented failures in report order, then any recorded item the register documents that the report
+    // does not hold, each with the first entry, in file order, that documents it.
+    private List<(FailureItem Item, RegisterEntry Entry)> DocumentedFailures()
+    {
+        var documented = new List<(FailureItem Item, RegisterEntry Entry)>();
+        var listed = new HashSet<(string ItemId, string Nature)>();
+        foreach (var failure in _lastReport?.Failures ?? [])
+        {
+            if (failure is { Documented: true, Entry: { } entry } && listed.Add((failure.Item.ItemId, failure.Item.Nature)))
+            {
+                documented.Add((failure.Item, entry));
+            }
+        }
+
+        foreach (var item in State.Failures)
+        {
+            if (_register.FindEntry(item) is { } entry && listed.Add((item.ItemId, item.Nature)))
+            {
+                documented.Add((item, entry));
+            }
+        }
+
+        return documented;
+    }
+
+    private void PrintFailureList()
+    {
+        foreach (var item in State.Failures)
+        {
+            Print($"  {FailureItemDisplay.Describe(item)}");
+        }
+    }
+
+    private void Print(string line) => LifecycleConsole.WriteLine(_stdout, LinePrefix + line);
+
+    // Writes text exactly (the report's Markdown, the final line); a writer that fails falls back to
+    // standard error, so the evidence still reaches the operator.
+    private void WriteRaw(string text)
+    {
+        try
+        {
+            _stdout.Write(text.EndsWith('\n') ? text : text + Environment.NewLine);
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            WriteFallback(ex);
+            try
+            {
+                Console.Error.Write(text);
+            }
+            catch (Exception errorFailure) when (errorFailure is IOException or ObjectDisposedException)
+            {
+                // Standard error is unusable as well; the exit code still carries the verdict.
+                return;
+            }
+        }
+    }
+
+    private static void WriteFallback(Exception ex)
+    {
+        try
+        {
+            Console.Error.WriteLine($"{LinePrefix}console writer failed: {ex.GetType().Name}");
+        }
+        catch (Exception errorFailure) when (errorFailure is IOException or ObjectDisposedException)
+        {
+            // Standard error is unusable as well; the exit code still carries the verdict.
+            return;
+        }
+    }
+
+    // The report must build without the catalogue, so a catalogue that cannot be loaded, whatever the
+    // load threw, gives rows derived from the planned and replayed cases rather than no report. The load
+    // failure itself is already a startup CHK-EXCEPTION item recorded by Program.
+    private static OperationCatalogue? TryGetCatalogue()
+    {
+        try
+        {
+            return OperationCatalogue.Default;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    internal static string Describe(Exception ex) => $"{ex.GetType().FullName}: {SafeMessage(ex)}";
+
+    // A Message getter can itself throw; the type name then stands in for it.
+    internal static string SafeMessage(Exception ex)
+    {
+        try
+        {
+            return ex.Message;
+        }
+        catch (Exception)
+        {
+            return ex.GetType().FullName ?? ex.GetType().Name;
+        }
+    }
+}
+
+/// <summary>
+/// The production replay body (AAP 0.3.2.4, 0.7): waits for the facade and the stand-in, resets and
+/// confirms the stand-in, replays every baseline record through the facade in recorded order, compares
+/// each response with its record, runs the separate checks and records everything in the run state.
+/// </summary>
+/// <remarks>
+/// <para>Cases go to the facade (<c>Harness:Target:*</c>), exactly as recorded: method, raw path and
+/// query, the recorded headers and body, nothing added. The backend (<c>Harness:Backend:*</c>) is reached
+/// only for readiness, the reset and seed confirmation through its admin endpoints, and the WSDL contract
+/// check. An external backend (no admin URL) is never waited for or reset; the report records KL-SUB-NORESET.</para>
+/// <para>Readiness polls each admin <c>/health</c> up to the readiness limit, and a component that does not
+/// become ready is a <c>CHK-READY:&lt;component&gt;</c> item with nature <c>timeout</c>. The facade has no
+/// blank-URL exception: a blank <c>Harness:Target:AdminUrl</c> makes it not ready without a probe. No case
+/// is sent to a facade that is not ready; each is compared as <c>no-response:connect</c>.</para>
+/// <para>Every step runs inside a guard that records an exception as <c>CHK-EXCEPTION</c> and carries on,
+/// so one failing case or check never prevents the others. Only the caller's cancellation ends the body
+/// early, and <see cref="ReplayMode"/> still writes the report and shuts the components down.</para>
+/// <para>The discrepancies of every compared case are kept for the report, together at most
+/// <see cref="KeptEvidenceLimit"/> characters across the run, counted as <see cref="EvidenceBudget"/> counts
+/// them. A case whose discrepancies would take the run over that limit is refused with
+/// <see cref="InvalidDataException"/> before any of them is kept: its guard records <c>CHK-EXCEPTION</c>,
+/// the case keeps no result, discrepancy artifact or <c>d:</c> item, and the next case is still compared.
+/// Equivalent cases keep no discrepancy, so the limit never refuses one.</para>
+/// <para>Before any case is counted or compared, the records are reconciled with the manifest and the case
+/// matrix. A record of a case the manifest lists as not captured, or one the matrix does not plan at its
+/// position for its operation, is never compared or counted as captured. Those records, records without a
+/// manifest, records beside a <c>not-run</c> manifest, a manifest whose stated source is not
+/// <c>jade-standin</c> or whose stated label is not the baseline label text, a captured manifest that omits
+/// its source or its label, and a captured manifest without both seed facts are reported together as one
+/// <c>CHK-EXCEPTION</c>, and the other records are still compared.</para>
+/// <para>The body reads <c>baseline/**</c>, <c>harness/config/case-matrix.json</c> and the checked-in
+/// contracts, and writes only <c>artifacts/discrepancies/**</c> and <c>artifacts/replay/**</c> (the checks
+/// write their own <c>artifacts/openapi/**</c> and <c>artifacts/wsdl/**</c>). It never writes
+/// <c>baseline/**</c>, <c>contracts/**</c>, the register or anything under <c>Erewhon/</c>, and it never
+/// prints the final line, which belongs to <see cref="ReplayMode"/>.</para>
+/// </remarks>
+/// <param name="options">The harness settings.</param>
+/// <param name="catalogue">The operation catalogue; null when it could not be loaded, which fails the body at once.</param>
+/// <param name="register">
+/// The known-limitations register, the same instance <see cref="ReplayMode"/> matches failing items
+/// against; the stand-in conformance check's outcome is judged against it.
+/// </param>
+/// <param name="stdout">Where the body's console lines go.</param>
+/// <exception cref="ArgumentNullException">
+/// <paramref name="options"/>, <paramref name="register"/> or <paramref name="stdout"/> is null.
+/// </exception>
+public sealed class ReplayBody(
+    HarnessOptions options,
+    OperationCatalogue? catalogue,
+    KnownLimitationsRegister register,
+    TextWriter stdout) : IReplayBody
+{
+    private const string Unknown = "unknown";
+
+    // The setting the facade's /admin/info is read from, as reasons name it.
+    private const string TargetAdminUrlKey =
+        HarnessOptions.SectionName + ":" + nameof(HarnessOptions.Target) + ":" + nameof(HarnessEndpoints.AdminUrl);
+
+    private readonly HarnessOptions _options = options ?? throw new ArgumentNullException(nameof(options));
+    private readonly OperationCatalogue? _catalogue = catalogue;
+    private readonly KnownLimitationsRegister _register = register ?? throw new ArgumentNullException(nameof(register));
+    private readonly TextWriter _stdout = stdout ?? throw new ArgumentNullException(nameof(stdout));
+    private readonly TimeSpan _cancelledRestorationLimit = TimeSpan.FromSeconds(ReplayMode.CancelledRestorationLimitSeconds);
+    private readonly int _keptEvidenceLimit = HarnessOptions.EvidenceByteLimit;
+
+    /// <summary>
+    /// How long the seed restoration closing the empty-state bracket may still run once the run is cancelled,
+    /// counted from the later of the cancellation and the restoration's start, before it is abandoned and
+    /// recorded as <c>CHK-EXCEPTION</c>; 15 s unless a test shortens it.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is not positive or is longer than <see cref="int.MaxValue"/> milliseconds.</exception>
+    internal TimeSpan CancelledRestorationLimit
+    {
+        get => _cancelledRestorationLimit;
+        init => _cancelledRestorationLimit = CancellationGrace.RequireLimit(value);
+    }
+
+    /// <summary>
+    /// The most characters of discrepancy evidence one run keeps for its report across all its cases, counted
+    /// as <see cref="EvidenceBudget"/> counts them; <see cref="HarnessOptions.EvidenceByteLimit"/> unless a test
+    /// lowers it.
+    /// </summary>
+    /// <exception cref="ArgumentOutOfRangeException">The value is negative.</exception>
+    internal int KeptEvidenceLimit
+    {
+        get => _keptEvidenceLimit;
+        init
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            _keptEvidenceLimit = value;
+        }
+    }
+
+    /// <inheritdoc/>
+    /// <exception cref="ArgumentNullException"><paramref name="state"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">The operation catalogue is unavailable.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
+    public async Task ExecuteAsync(ReplayRunState state, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(state);
+        var catalogue = _catalogue ?? throw new InvalidOperationException("Operation catalogue unavailable");
+
+        using var runner = CaseRunner.FromOptions(_options);
+        using var reset = new StateReset(_options, _stdout);
+        var execution = new Execution(
+            _options, catalogue, _register, state, runner, reset, _stdout, _cancelledRestorationLimit, _keptEvidenceLimit, ct);
+        await execution.RunAsync().ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The run facts the report states, from the settings, what the run found and the SDK pin baked into
+    /// the harness at build time (<see cref="RunFacts.TryReadSdkPin"/>), so no repository file is read.
+    /// </summary>
+    /// <param name="options">The harness settings.</param>
+    /// <param name="utcDate">When the run started.</param>
+    /// <param name="frameworkDescription">The facade's framework description from its <c>/admin/info</c>; null when not read.</param>
+    /// <param name="baselineCommit">The commit that first added <c>baseline/manifest.json</c>; null when not found.</param>
+    /// <param name="facadeCommit">The commit that first added a <c>facade/</c> path; null when not found.</param>
+    /// <param name="frameworkUnavailable">
+    /// Why the framework description is unavailable, from <see cref="DescribeFacadeFramework"/>; null when it
+    /// was read or the read was not attempted.
+    /// </param>
+    /// <returns>The facts; never throws for any settings value.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="options"/> is null.</exception>
+    internal static RunFacts DescribeRun(
+        HarnessOptions options,
+        DateTimeOffset utcDate,
+        string? frameworkDescription,
+        string? baselineCommit,
+        string? facadeCommit,
+        string? frameworkUnavailable = null)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        return new RunFacts(
+            utcDate,
+            options.RecognisedExecutionMode ?? Unknown,
+            frameworkDescription,
+            RunFacts.TryReadSdkPin(),
+            options.Target?.RestBaseUrl ?? "",
+            options.Target?.SoapBaseUrl ?? "",
+            options.Backend?.RestBaseUrl ?? "",
+            options.Backend?.SoapBaseUrl ?? "",
+            options.Backend?.AdminUrl,
+            string.IsNullOrWhiteSpace(options.StartingCommit) ? Unknown : options.StartingCommit,
+            baselineCommit,
+            facadeCommit,
+            frameworkUnavailable);
+    }
+
+    /// <summary>
+    /// The facade's .NET version for the run facts, from one read of its <c>/admin/info</c>: the framework
+    /// description it gave, or why none is available, as the read observed it. The reason names the setting,
+    /// the outcome or the status code, and never quotes the URL or the response body.
+    /// </summary>
+    /// <param name="read">The outcome of <see cref="StateReset.ReadInfoOutcomeAsync"/> for <c>Harness:Target:AdminUrl</c>.</param>
+    /// <param name="requestLimit">The per-request limit the read was bounded by, which a timeout reason states.</param>
+    /// <returns>Exactly one non-null member: the description as given, or the reason it is unavailable.</returns>
+    internal static (string? Description, string? Unavailable) DescribeFacadeFramework(AdminInfoRead read, TimeSpan requestLimit)
+    {
+        const string info = "facade " + AdminRoutes.Info;
+        const string member = "frameworkDescription";
+
+        if (read.Info is { } answered)
+        {
+            return answered.FrameworkDescription switch
+            {
+                null => (null, $"{info} gave no {member}"),
+                var blank when string.IsNullOrWhiteSpace(blank) => (null, $"{info} gave a blank {member}"),
+                var description => (description, null),
+            };
+        }
+
+        var failure = read.Failure;
+        var reason = failure switch
+        {
+            StateReset.BlankUrlFailure => $"{TargetAdminUrlKey} is blank",
+            StateReset.InvalidUrlFailure => $"{TargetAdminUrlKey} is not an absolute http(s) URL without user information",
+            StateReset.ConnectFailure => $"{info} not reached",
+            StateReset.TimeoutFailure => string.Create(
+                CultureInfo.InvariantCulture, $"{info} gave no response within {requestLimit.TotalSeconds:0} s"),
+            StateReset.ResetFailure => $"{info} connection closed before a complete response",
+            StateReset.InvalidBodyFailure => $"{info} answer is not a JSON object whose strings can be decoded",
+            { Length: > 0 } status when status.All(char.IsAsciiDigit) => $"{info} answered HTTP {status}",
+            { Length: > 0 } other => $"{info} read failed ({other})",
+            _ => $"{info} read reported no outcome",
+        };
+        return (null, reason);
+    }
+
+    /// <summary>One run of the body: the per-run inputs, clients and findings, used by one thread at a time.</summary>
+    private sealed class Execution(
+        HarnessOptions options,
+        OperationCatalogue catalogue,
+        KnownLimitationsRegister register,
+        ReplayRunState state,
+        CaseRunner runner,
+        StateReset reset,
+        TextWriter stdout,
+        TimeSpan restorationLimit,
+        int keptEvidenceLimit,
+        CancellationToken ct)
+    {
+        private const string LinePrefix = "replay: ";
+        private const string DiscrepanciesDirectoryName = "discrepancies";
+        private const string ReplayDirectoryName = "replay";
+        private const string ObservedBodyExtension = ".body";
+        private const string ManifestName = "baseline/manifest.json";
+        private const string ConformanceName = "baseline/conformance.json";
+        private const string RulesName = "baseline/normalisation-rules.json";
+        private const string MatrixName = "harness/config/case-matrix.json";
+        private const string BaselineWsdlName = "baseline/wsdl/standin-ErewhonWebService.wsdl";
+        private const string IncompleteDetail = "the check did not complete";
+
+        // The characters of a recorded value, and of the message of a record that cannot be read, that an
+        // evidence problem quotes; a record can hold up to HarnessOptions.EvidenceByteLimit bytes.
+        private const int ExcerptLimit = 120;
+        private const int MessageExcerptLimit = 400;
+
+        private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
+        private readonly BaselineStore _store = new(options);
+
+        // The discrepancy evidence every compared case keeps for the report until it is written, charged one
+        // whole comparison at a time before any of the case is kept.
+        private readonly EvidenceBudget _keptEvidence = EvidenceBudget.OfReplayRun(keptEvidenceLimit);
+
+        // Evidence problems the manifest shows by itself, found when it is read and reported with the
+        // reconciliation of the records (ConfirmEvidenceAsync).
+        private readonly List<string> _manifestProblems = [];
+
+        // Planned cases whose record the reconciliation refused, with why; each is reported as not captured.
+        private readonly Dictionary<string, string> _refusedRecords = new(StringComparer.Ordinal);
+
+        private BaselineManifest? _manifest;
+
+        // True only when the read found no manifest file, as distinct from one that could not be read.
+        private bool _manifestAbsent;
+        private CaseMatrix? _matrix;
+        // Keys only, with no request, response or body: each record is read without its body when the evidence
+        // is confirmed and dropped once checked, then read again with its body, verified, when its case is
+        // replayed, and dropped when that case ends.
+        private IReadOnlyList<BaselineRecordKey> _keys = [];
+        private bool _recordsRead;
+        private ResetExpectations _expectations = ResetExpectations.None;
+        private Normaliser? _normaliser;
+        private ResponseComparer? _comparer;
+        private bool _facadeReady;
+        private string? _baselineCommit;
+        private string? _facadeCommit;
+
+        public async Task RunAsync()
+        {
+            PrintBaseline($"replay through the facade: {SourceLabels.BaselineLabel}");
+
+            // Step 0: run facts first, so a failure in any later step still reports them.
+            state.ExternalBackend = options.IsExternalBackend;
+            state.Facts = DescribeRun(options, _startedAt, frameworkDescription: null, baselineCommit: null, facadeCommit: null);
+            GuardSync("prepare artifacts", PrepareArtifacts);
+
+            // Step 1: readiness of the facade and, unless the backend is external, the stand-in.
+            await Guard("readiness", WaitForComponentsAsync).ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+
+            // Step 2: the manifest's seed facts, then the seed reset they are confirmed against.
+            await Guard($"read {ManifestName}", ReadManifestAsync).ConfigureAwait(false);
+            await Guard("reset at replay start", ResetAtStartAsync).ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+
+            // Step 3: the plan, the records, their reconciliation with the manifest and the plan, the counts
+            // and the normalisation rules.
+            GuardSync($"load {MatrixName}", LoadMatrix);
+            state.SetPlanned(PlannedByOperation());
+            await Guard("read baseline records", ReadRecordsAsync).ConfigureAwait(false);
+            await Guard("confirm the baseline evidence", ConfirmEvidenceAsync).ConfigureAwait(false);
+            GuardSync("count the baseline", () => state.Baseline = DescribeBaseline());
+            GuardSync("record not-captured cases", RecordNotCaptured);
+            await Guard($"load {RulesName}", LoadRulesAsync).ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+
+            // Step 4: every record, in recorded order.
+            await ReplayCasesAsync().ConfigureAwait(false);
+            ct.ThrowIfCancellationRequested();
+
+            // Step 5: the separate checks, then the final run facts.
+            await Guard("stand-in conformance check", ConformanceAsync).ConfigureAwait(false);
+            await Guard("OpenAPI drift check", OpenApiDriftAsync).ConfigureAwait(false);
+            await Guard("WSDL contract check", WsdlContractAsync).ConfigureAwait(false);
+            GuardSync("facade test results", ReadFacadeTests);
+            await Guard("JADE-unchanged check", JadeUnchangedAsync).ConfigureAwait(false);
+            await Guard("ordering evidence", OrderingAsync).ConfigureAwait(false);
+
+            var framework = await ReadFacadeFrameworkAsync().ConfigureAwait(false);
+            state.Facts = DescribeRun(
+                options, _startedAt, framework.Description, _baselineCommit, _facadeCommit, framework.Unavailable);
+        }
+
+        // Only discrepancies/ and replay/ are this run's to clear; facade-tests/ was written before
+        // replay started, and openapi/ and wsdl/ belong to their checks.
+        private void PrepareArtifacts()
+        {
+            var artifacts = ArtifactTree();
+            artifacts.RecreateDirectory(Path.Combine(options.ArtifactsDirectory, DiscrepanciesDirectoryName));
+            artifacts.RecreateDirectory(Path.Combine(options.ArtifactsDirectory, ReplayDirectoryName));
+        }
+
+        // Every artifact is cleared and written through directory handles anchored at the repository root, so
+        // nothing outside artifacts/ is ever deleted or written: a link at artifacts/ or at another directory on
+        // the way refuses the call before anything is deleted or written; a link at a directory being recreated,
+        // or anywhere inside it, is removed itself and never followed; a link at a file being written refuses the
+        // write; and a directory swapped for a link mid-way cannot redirect the handles already open.
+        private ConfinedTree ArtifactTree() => new(options.ResolvePath("."));
+
+        // Readiness probes nothing for a blank admin URL, because only an external backend has none. The
+        // facade always has an admin listener, so a blank Harness:Target:AdminUrl means its readiness can
+        // never be established: the facade is not ready, with the item a wait that ran out records.
+        private async Task WaitForComponentsAsync()
+        {
+            const string blankFacadeAdminUrl = "Harness:Target:AdminUrl is blank, so the facade's /health cannot be polled";
+
+            using var readiness = new Readiness(options, stdout);
+            Task<FailureItem?> facade;
+            if (string.IsNullOrWhiteSpace(options.Target.AdminUrl))
+            {
+                Print($"not ready: {ShutdownTarget.FacadeComponent} ({blankFacadeAdminUrl})");
+                facade = Task.FromResult<FailureItem?>(new FailureItem(
+                    FailureItemIds.Ready(ShutdownTarget.FacadeComponent),
+                    FailureItemIds.Timeout,
+                    Detail: blankFacadeAdminUrl));
+            }
+            else
+            {
+                facade = readiness.WaitAsync(ShutdownTarget.FacadeComponent, options.Target.AdminUrl, ct);
+            }
+
+            var standIn = options.IsExternalBackend
+                ? Task.FromResult<FailureItem?>(null)
+                : readiness.WaitAsync(ShutdownTarget.StandInComponent, options.Backend.AdminUrl, ct);
+
+            var notReady = await Task.WhenAll(facade, standIn).ConfigureAwait(false);
+            state.AddFailures(notReady);
+            _facadeReady = notReady[0] is null;
+            if (!_facadeReady)
+            {
+                Print($"the facade is not ready, so no case is sent and each is compared as {DiscrepancyKinds.NoResponse(NoResponseReasons.Connect)}");
+            }
+        }
+
+        // The manifest is the capture's completion record and holds the seed facts every reset is confirmed
+        // against, so its expectations are set here, before the start reset. A not-run manifest holds no seed
+        // facts, and only the generation, mutations and source are confirmed. Any other manifest has each fact
+        // it states confirmed; one it lacks or leaves blank cannot be, which is an evidence problem. So is
+        // provenance that is not shown: a manifest other than not-run that omits its source or its label (the
+        // hand-written not-run manifest holds neither), and any manifest whose stated source is not
+        // jade-standin or whose stated label is not the baseline label text. ConfirmEvidenceAsync reports them all,
+        // and an absent manifest, once the records are read.
+        private async Task ReadManifestAsync()
+        {
+            _manifest = await _store.TryReadManifestAsync(ct).ConfigureAwait(false);
+            if (_manifest is null)
+            {
+                _manifestAbsent = true;
+                PrintBaseline($"{ManifestName} absent: no seed facts to confirm");
+                return;
+            }
+
+            var manifest = _manifest;
+            var execution = manifest.CaptureExecution ?? "not recorded";
+            var missing = MissingSeedFacts(manifest);
+            _expectations = manifest.IsNotRun
+                ? ResetExpectations.None
+                : ResetExpectations.FromManifest(manifest.SeedSha256, manifest.ReferenceDate);
+
+            // An omitted member keeps its default value, so only a stated source or label can differ from it.
+            if (!manifest.IsNotRun && !manifest.SourceStated)
+            {
+                _manifestProblems.Add(
+                    $"{ManifestName} records capture execution {execution} but states no source, so the baseline is "
+                    + $"not shown to be stand-in output; a captured manifest states source '{SourceLabels.StandIn}', "
+                    + $"and only a {CaptureExecutionValues.NotRun} manifest omits it");
+            }
+
+            if (!string.Equals(manifest.Source, SourceLabels.StandIn, StringComparison.Ordinal))
+            {
+                _manifestProblems.Add(
+                    $"{ManifestName} has source '{manifest.Source}', but the baseline is stand-in output and is labelled "
+                    + $"'{SourceLabels.StandIn}' in every place");
+            }
+
+            if (!manifest.IsNotRun && !manifest.LabelStated)
+            {
+                _manifestProblems.Add(
+                    $"{ManifestName} records capture execution {execution} but states no label, so the baseline is "
+                    + "not shown to be stand-in output; a captured manifest carries the label text "
+                    + $"'{SourceLabels.BaselineLabel}', and only a {CaptureExecutionValues.NotRun} manifest omits it");
+            }
+
+            if (!string.Equals(manifest.Label, SourceLabels.BaselineLabel, StringComparison.Ordinal))
+            {
+                _manifestProblems.Add(
+                    $"{ManifestName} has label '{manifest.Label}', but the baseline is stand-in output and carries the "
+                    + $"label text '{SourceLabels.BaselineLabel}'");
+            }
+
+            if (missing.Count > 0)
+            {
+                _manifestProblems.Add(
+                    $"{ManifestName} records capture execution {execution} but leaves {string.Join(" and ", missing)} "
+                    + $"missing or blank, so the seed state cannot be confirmed; only a {CaptureExecutionValues.NotRun} "
+                    + "manifest holds no seed facts");
+            }
+
+            var seedFacts = manifest.IsNotRun
+                ? $"absent, as in every {CaptureExecutionValues.NotRun} manifest"
+                : missing.Count == 0
+                    ? "recorded; to be confirmed at every reset"
+                    : $"incomplete ({string.Join(" and ", missing)} missing or blank)";
+            PrintBaseline(string.Create(
+                CultureInfo.InvariantCulture,
+                $"{ManifestName}: source {(manifest.SourceStated ? manifest.Source : "not stated")}, capture execution {execution}, "
+                + $"{manifest.NotCaptured.Count} case(s) not captured, seed facts {seedFacts}"));
+        }
+
+        // The seed facts, by their JSON names, that a manifest other than not-run lacks or leaves blank.
+        // BaselineManifest.HasSeedFacts counts a blank value as present, which capture relies on; replay cannot
+        // confirm a blank fact, so it judges here whether each one is usable.
+        private static List<string> MissingSeedFacts(BaselineManifest manifest)
+        {
+            var missing = new List<string>(2);
+            if (manifest.IsNotRun)
+            {
+                return missing;
+            }
+
+            if (string.IsNullOrWhiteSpace(manifest.SeedSha256))
+            {
+                missing.Add("seedSha256");
+            }
+
+            if (string.IsNullOrWhiteSpace(manifest.ReferenceDate))
+            {
+                missing.Add("referenceDate");
+            }
+
+            return missing;
+        }
+
+        private async Task ResetAtStartAsync()
+        {
+            if (options.IsExternalBackend)
+            {
+                PrintBaseline($"external backend: no reset or seed confirmation ({KnownLimitationIds.SubNoReset})");
+                return;
+            }
+
+            await ResetAsync(ResetPoints.ReplayStart, AdminRoutes.ResetStateSeed).ConfigureAwait(false);
+        }
+
+        private async Task ResetAsync(string point, string resetState)
+        {
+            var result = await reset.ResetAsync(point, resetState, _expectations, ct).ConfigureAwait(false);
+            state.AddFailures(result.Failures);
+        }
+
+        private void LoadMatrix()
+        {
+            _matrix = CaseMatrix.Load(options.CaseMatrixPath, catalogue, options.ResolvePath("."));
+            Print(string.Create(
+                CultureInfo.InvariantCulture,
+                $"{MatrixName}: {_matrix.PlannedCaseCount} planned cases over {_matrix.PlannedOperationCount} operations"));
+        }
+
+        // Every catalogue operation, so the report has a row and a plan for all 22 even when the matrix
+        // could not be loaded.
+        private Dictionary<string, IReadOnlyList<string>> PlannedByOperation()
+        {
+            var planned = new Dictionary<string, IReadOnlyList<string>>(StringComparer.Ordinal);
+            foreach (var operation in catalogue.Operations)
+            {
+                planned[operation.Id] = _matrix is not null && _matrix.ByOperation.TryGetValue(operation.Id, out var cases)
+                    ? cases.Select(definition => definition.Id).ToArray()
+                    : [];
+            }
+
+            return planned;
+        }
+
+        // The capture evidence, recorded before any case is replayed, so a case that is never compared (no
+        // comparer, cancellation, a failed case step) is still reported as captured. ConfirmEvidenceAsync then
+        // removes every record the manifest or the plan does not account for and records the kept ones again,
+        // so only a record that is compared, or fails as its case, counts as captured.
+        private async Task ReadRecordsAsync()
+        {
+            _keys = await _store.ReadRecordIndexAsync(ct).ConfigureAwait(false);
+            _recordsRead = true;
+            state.SetCaptured(CapturedByOperation());
+            PrintBaseline(string.Create(
+                CultureInfo.InvariantCulture,
+                $"{_keys.Count} baseline record(s) read; each body is verified when its case is replayed"));
+        }
+
+        private Dictionary<string, IReadOnlyList<string>> CapturedByOperation() => _keys
+            .Where(key => !string.IsNullOrWhiteSpace(key.Operation))
+            .GroupBy(key => key.Operation, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => (IReadOnlyList<string>)group.Select(key => key.CaseId).ToArray(),
+                StringComparer.Ordinal);
+
+        // Reconciles the records with the manifest and the plan before anything is counted or compared, and
+        // reports every problem as one never-documentable CHK-EXCEPTION, so the run cannot exit 0 on unproven
+        // evidence; the kept records are still compared, and the report and cleanup still run.
+        //  - The manifest problems ReadManifestAsync found: a stated source other than jade-standin or label other
+        //    than the baseline label text, and a manifest other than not-run that omits its source or its label
+        //    or lacks a seed fact.
+        //  - Records without a manifest: capture publishes the manifest last, as its completion record, so the
+        //    capture is not shown complete and no seed fact can be confirmed. With neither, nothing was
+        //    captured and nothing is missing.
+        //  - A record of a case the manifest lists in notCaptured is removed, so the case is reported as not
+        //    captured and never as compared.
+        //  - Once the plan is loaded, a record of a case it does not plan, or at another position or of another
+        //    operation than it plans, is removed; a planned case whose record is removed is reported as not
+        //    captured.
+        //  - Every record the checks above keep is then read on its own, without its body, and dropped once
+        //    checked, so one record is held at a time. Replay sends the recorded request and brackets by the
+        //    recorded preState, so a record is removed when its preState is neither seed nor empty, the plan
+        //    loaded or not, and, once the plan is loaded, when its kind, stateChanging, preState or request
+        //    (method, pathAndQuery, headers, bodyText) is not its planned case's; a record that cannot be read
+        //    is removed too. A planned case whose record is removed is reported as not captured. Without the
+        //    plan, whose load already failed the run, only the preState is checked and the other records are
+        //    kept.
+        //  - Records beside a not-run manifest that remain after these removals: that fallback holds no record.
+        private async Task ConfirmEvidenceAsync()
+        {
+            var problems = new List<string>(_manifestProblems);
+            if (_manifestAbsent && _keys.Count > 0)
+            {
+                problems.Add(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{ManifestName} is absent although {_keys.Count} baseline record(s) were read; capture publishes "
+                    + $"it last, as its completion record, so the capture is not shown complete and no seed fact can be confirmed"));
+            }
+
+            var listed = (_manifest?.NotCaptured ?? [])
+                .Where(caseId => !string.IsNullOrWhiteSpace(caseId))
+                .ToHashSet(StringComparer.Ordinal);
+            var kept = new List<BaselineRecordKey>(_keys.Count);
+            foreach (var key in _keys)
+            {
+                var file = _store.DisplayRecordPath(key);
+                var removed = false;
+                if (listed.Contains(key.CaseId))
+                {
+                    problems.Add(
+                        $"{ManifestName} lists case {key.CaseId} in notCaptured, but {file} records it; the case is "
+                        + "reported as not captured and never compared");
+                    removed = true;
+                }
+
+                if (_matrix is not null && PlanProblem(_matrix, key, file) is { } planProblem)
+                {
+                    problems.Add(planProblem);
+                    if (!removed && _matrix.TryGetCase(key.CaseId, out _))
+                    {
+                        _refusedRecords[key.CaseId] = planProblem;
+                    }
+
+                    removed = true;
+                }
+
+                // Only a record the checks above keep is read, so a record they refused is named once.
+                if (!removed && await StatedRecordProblemAsync(key, file).ConfigureAwait(false) is { } recordProblem)
+                {
+                    problems.Add(recordProblem);
+                    if (_matrix is not null && _matrix.TryGetCase(key.CaseId, out _))
+                    {
+                        _refusedRecords[key.CaseId] = recordProblem;
+                    }
+
+                    removed = true;
+                }
+
+                if (!removed)
+                {
+                    kept.Add(key);
+                }
+            }
+
+            if (_manifest is { IsNotRun: true } && kept.Count > 0)
+            {
+                problems.Add(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{ManifestName} records capture execution {CaptureExecutionValues.NotRun}, which holds no record, "
+                    + $"but {kept.Count} record(s) remain: {string.Join(", ", kept.Select(_store.DisplayRecordPath))}"));
+            }
+
+            if (kept.Count != _keys.Count)
+            {
+                _keys = kept;
+                state.SetCaptured(CapturedByOperation());
+            }
+
+            if (problems.Count == 0)
+            {
+                return;
+            }
+
+            foreach (var problem in problems)
+            {
+                PrintBaseline($"baseline evidence: {problem}");
+            }
+
+            throw new InvalidDataException(string.Create(
+                CultureInfo.InvariantCulture,
+                $"The baseline evidence is incomplete or inconsistent ({problems.Count} problem(s)): {string.Join("; ", problems)}."));
+        }
+
+        // Why the plan refuses a record, or null when it plans the record's case at the record's position for
+        // the record's operation.
+        private static string? PlanProblem(CaseMatrix matrix, BaselineRecordKey key, string file)
+        {
+            if (!matrix.TryGetCase(key.CaseId, out var definition))
+            {
+                return $"{file} records case {key.CaseId}, which {MatrixName} does not plan; it is not compared";
+            }
+
+            var position = matrix.PositionOf(key.CaseId);
+            if (key.Order == position && string.Equals(key.Operation, definition.Operation, StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            return string.Create(
+                CultureInfo.InvariantCulture,
+                $"{file} records case {key.CaseId} at position {key.Order} of operation {key.Operation}, but {MatrixName} "
+                + $"plans it at position {position} of operation {definition.Operation}; it is not compared");
+        }
+
+        // Reads the one record a kept key names, without its body, and returns why what it states refuses it, or
+        // null when it holds. A record that can no longer be read is refused with why, so its case is reported
+        // as not captured rather than replayed; the caller's cancellation still ends the run.
+        private async Task<string?> StatedRecordProblemAsync(BaselineRecordKey key, string file)
+        {
+            BaselineRecord record;
+            try
+            {
+                record = await _store.ReadRecordAsync(key, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException or InvalidOperationException)
+            {
+                return $"{file} of case {key.CaseId} cannot be read again ({Excerpt(ReplayMode.SafeMessage(ex), MessageExcerptLimit)}); "
+                    + "it is not compared";
+            }
+
+            return StatedRecordProblem(_matrix, record, file);
+        }
+
+        // Why what a record states refuses it, or null when it holds: the one comparison the evidence
+        // confirmation and each case's replay apply. Replay sends the recorded request and brackets the case by
+        // its recorded preState, so:
+        //  - a preState other than seed or empty is refused whether or not the plan is loaded, because no reset
+        //    establishes it and no bracketing decision can rest on it;
+        //  - with the plan, the kind, stateChanging, preState and request must be the planned case's: method,
+        //    pathAndQuery and bodyText ordinally, a null bodyText equal only to null; the headers as HTTP compares
+        //    them, the same number of headers with every planned one present under a name equal ignoring case and
+        //    with an ordinally equal value, in any order.
+        // Each divergence names the recorded and the planned value. A value is quoted only as a bounded one-line
+        // excerpt, and a bodyText never, only its length and SHA-256 prefix, so a hand-edited record of any size
+        // keeps the detail short. PlanProblem has already matched the case, position and operation.
+        private static string? StatedRecordProblem(CaseMatrix? matrix, BaselineRecord record, string file)
+        {
+            CaseDefinition? planned = null;
+            if (matrix is not null && matrix.TryGetCase(record.CaseId, out var definition))
+            {
+                planned = definition;
+            }
+
+            var divergences = new List<string>();
+            if (planned is not null && !string.Equals(record.Kind, planned.Kind, StringComparison.Ordinal))
+            {
+                divergences.Add($"kind {Quoted(record.Kind)}, but {MatrixName} plans {Quoted(planned.Kind)}");
+            }
+
+            if (planned is not null && record.StateChanging != planned.StateChanging)
+            {
+                divergences.Add(
+                    $"stateChanging {JsonBoolean(record.StateChanging)}, but {MatrixName} plans {JsonBoolean(planned.StateChanging)}");
+            }
+
+            if (record.PreState is not (CasePreStates.Seed or CasePreStates.Empty))
+            {
+                var invalid = $"preState {Quoted(record.PreState)}, which is neither '{CasePreStates.Seed}' nor '{CasePreStates.Empty}'";
+                divergences.Add(planned is null ? invalid : $"{invalid}, but {MatrixName} plans {Quoted(planned.PreState)}");
+            }
+            else if (planned is not null && !string.Equals(record.PreState, planned.PreState, StringComparison.Ordinal))
+            {
+                divergences.Add($"preState {Quoted(record.PreState)}, but {MatrixName} plans {Quoted(planned.PreState)}");
+            }
+
+            if (planned is not null)
+            {
+                AddRequestDivergences(divergences, record.Request, planned.Request);
+            }
+
+            return divergences.Count == 0
+                ? null
+                : $"{file} records case {record.CaseId} with {string.Join(", and with ", divergences)}; it is not compared";
+        }
+
+        private static void AddRequestDivergences(List<string> divergences, BaselineRequest recorded, CaseRequest planned)
+        {
+            if (!string.Equals(recorded.Method, planned.Method, StringComparison.Ordinal))
+            {
+                divergences.Add($"request method {Quoted(recorded.Method)}, but {MatrixName} plans {Quoted(planned.Method)}");
+            }
+
+            if (!string.Equals(recorded.PathAndQuery, planned.PathAndQuery, StringComparison.Ordinal))
+            {
+                divergences.Add(
+                    $"request pathAndQuery {Quoted(recorded.PathAndQuery)}, but {MatrixName} plans {Quoted(planned.PathAndQuery)}");
+            }
+
+            if (!SameHeaders(recorded.Headers, planned.Headers))
+            {
+                divergences.Add(
+                    $"request headers {HeaderList(recorded.Headers)}, but {MatrixName} plans {HeaderList(planned.Headers)}");
+            }
+
+            if (!string.Equals(recorded.BodyText, planned.BodyText, StringComparison.Ordinal))
+            {
+                var plannedBody = planned.BodyText is null ? "none" : $"one of {BodyTextSummary(planned.BodyText)}";
+                divergences.Add(recorded.BodyText is null
+                    ? $"no request bodyText, but {MatrixName} plans {plannedBody}"
+                    : $"request bodyText of {BodyTextSummary(recorded.BodyText)}, but {MatrixName} plans {plannedBody}");
+            }
+        }
+
+        // Header names are case-insensitive in HTTP and their order carries no meaning, so the recorded headers
+        // equal the planned ones when there are as many and each planned header is present under a name equal
+        // ignoring case with an ordinally equal value. The planned names are distinct ignoring case (the matrix
+        // keys them so), so equal counts leave no recorded header unmatched. The headers are searched in order
+        // rather than through either dictionary's comparer, which the record's deserialisation does not fix.
+        private static bool SameHeaders(IReadOnlyDictionary<string, string> recorded, IReadOnlyDictionary<string, string> planned)
+        {
+            if (recorded.Count != planned.Count)
+            {
+                return false;
+            }
+
+            foreach (var (name, value) in planned)
+            {
+                if (!recorded.Any(header => string.Equals(header.Key, name, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(header.Value, value, StringComparison.Ordinal)))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        // The headers on one line as {name: 'value', ...} in their own order, each name and value cut as Quoted
+        // cuts a value, and the list cut once it passes ExcerptLimit characters, so a record of any number of
+        // headers keeps the detail short.
+        private static string HeaderList(IReadOnlyDictionary<string, string> headers)
+        {
+            var list = new StringBuilder("{");
+            foreach (var (name, value) in headers)
+            {
+                if (list.Length > 1)
+                {
+                    list.Append(", ");
+                }
+
+                if (list.Length > ExcerptLimit)
+                {
+                    list.Append('…');
+                    break;
+                }
+
+                list.Append(Excerpt(name, ExcerptLimit)).Append(": ").Append(Quoted(value));
+            }
+
+            return list.Append('}').ToString();
+        }
+
+        // A request body text, which can be as long as a record, is never quoted: its length and the first 16 hex
+        // digits of the SHA-256 of its UTF-8 bytes name it, and tell two bodies of the same length apart.
+        private static string BodyTextSummary(string text) => string.Create(
+            CultureInfo.InvariantCulture,
+            $"{text.Length} characters (SHA-256 {BaselineResponse.ComputeSha256Hex(Encoding.UTF8.GetBytes(text))[..16]}…)");
+
+        // A value as the evidence lines quote it: 'text' as Excerpt cuts it, or null for a member the record omits.
+        private static string Quoted(string? value) => value is null ? "null" : $"'{Excerpt(value, ExcerptLimit)}'";
+
+        private static string JsonBoolean(bool value) => value ? "true" : "false";
+
+        // The text on one line, cut after limit characters with an ellipsis, as FacadeTestResults cuts its
+        // excerpts: a hand-edited value of any length keeps an item's detail and its console line short. Each
+        // control character is shown as an escape (\n, \r, \t or \uXXXX) instead of being dropped, so a line break
+        // or a NUL stays visible, and the cut never falls between the two halves of a surrogate pair.
+        private static string Excerpt(string text, int limit)
+        {
+            var line = new StringBuilder(Math.Min(text.Length, limit) + 1);
+            var index = 0;
+            for (; index < text.Length && line.Length < limit; index++)
+            {
+                var character = text[index];
+                if (char.IsHighSurrogate(character) && line.Length == limit - 1)
+                {
+                    break;
+                }
+
+                switch (character)
+                {
+                    case '\n':
+                        line.Append("\\n");
+                        break;
+                    case '\r':
+                        line.Append("\\r");
+                        break;
+                    case '\t':
+                        line.Append("\\t");
+                        break;
+                    case var control when char.IsControl(control):
+                        line.Append(CultureInfo.InvariantCulture, $"\\u{(int)control:x4}");
+                        break;
+                    default:
+                        line.Append(character);
+                        break;
+                }
+            }
+
+            return index < text.Length ? line.Append('…').ToString() : line.ToString();
+        }
+
+        // The WSDL probe is guarded on its own: a WSDL whose read is refused (a link) or fails is recorded as
+        // CHK-EXCEPTION and counted as not captured, and every other baseline fact is still reported.
+        private BaselineFacts DescribeBaseline()
+        {
+            var manifest = _manifest;
+            var wsdlPresent = BaselineWsdlPresent();
+            return new BaselineFacts(
+                _matrix?.PlannedOperationCount ?? manifest?.Counts.PlannedOperations ?? 0,
+                _matrix?.PlannedCaseCount ?? manifest?.Counts.PlannedCases ?? 0,
+                _keys.Select(key => key.Operation).Distinct(StringComparer.Ordinal).Count(),
+                _keys.Count,
+                manifest?.NotCaptured ?? [],
+                wsdlPresent && (manifest is null || manifest.WsdlCaptured),
+                manifest is not null,
+                manifest?.CaptureExecution);
+        }
+
+        // False when the stand-in WSDL record is absent, or when probing it failed, which GuardSync records.
+        private bool BaselineWsdlPresent()
+        {
+            var present = false;
+            GuardSync($"read {BaselineWsdlName}", () => present = _store.WsdlExists);
+            return present;
+        }
+
+        // Works from the records ConfirmEvidenceAsync kept, so each case is reported once, as not captured or as
+        // compared, never as both. Every case the manifest's notCaptured lists is not captured, whether or not
+        // a record of it was found (ConfirmEvidenceAsync removed any such record). Beyond that list, a planned case
+        // without a kept record is also reported as not-captured: left unreported, its operation would read as
+        // a difference with no failing item behind it, and the exit code, which judges failing items only,
+        // would pass an undocumented gap. Its reason says when its record was refused against the plan rather
+        // than absent. Unlisted gaps are derived only from the record keys that were read, so a damaged record
+        // file is reported once, as the exception, rather than as every planned case. A damaged body does not
+        // stop its record from being indexed: its case is listed as recorded and reports the exception when it
+        // is replayed.
+        private void RecordNotCaptured()
+        {
+            var reasons = new List<(string CaseId, string Reason)>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var caseId in _manifest?.NotCaptured ?? [])
+            {
+                if (!string.IsNullOrWhiteSpace(caseId) && seen.Add(caseId))
+                {
+                    reasons.Add((caseId, $"listed in {ManifestName} notCaptured"));
+                }
+            }
+
+            if (_recordsRead && _matrix is not null)
+            {
+                var recorded = _keys.Select(key => key.CaseId).ToHashSet(StringComparer.Ordinal);
+                foreach (var definition in _matrix.Cases)
+                {
+                    if (!recorded.Contains(definition.Id) && seen.Add(definition.Id))
+                    {
+                        reasons.Add((definition.Id, _refusedRecords.TryGetValue(definition.Id, out var refusal)
+                            ? $"planned in {MatrixName}, but its baseline record was refused: {refusal}"
+                            : $"planned in {MatrixName} but has no baseline record"));
+                    }
+                }
+            }
+
+            foreach (var (caseId, reason) in reasons)
+            {
+                var operation = _matrix is not null && _matrix.TryGetCase(caseId, out var definition)
+                    ? definition.Operation
+                    : FailureItemIds.OperationIdFromCaseId(caseId);
+                state.AddFailure(new FailureItem(FailureItemIds.Case(caseId), FailureItemIds.NotCaptured, operation, reason));
+            }
+
+            if (reasons.Count > 0)
+            {
+                PrintBaseline(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{reasons.Count} planned case(s) not captured; each is reported as {FailureItemIds.NotCaptured}, never as compared"));
+            }
+        }
+
+        // The committed rules are the ones the baseline was captured under. Without the file the same two
+        // rules are derived from the catalogue, and a file that does not parse is reported and replaced the
+        // same way, so the cases are still compared.
+        private async Task LoadRulesAsync()
+        {
+            NormalisationRules? rules = null;
+            var absent = false;
+            await Guard($"parse {RulesName}", async () =>
+            {
+                var text = await _store.ReadNormalisationRulesAsync(ct).ConfigureAwait(false);
+                if (text is null)
+                {
+                    absent = true;
+                    return;
+                }
+
+                rules = NormalisationRules.Parse(text);
+                PrintBaseline($"normalisation rules: {RulesName}");
+            }).ConfigureAwait(false);
+
+            if (rules is null)
+            {
+                rules = NormalisationRules.FromCatalogue(catalogue);
+                PrintBaseline($"{RulesName} {(absent ? "absent" : "unusable")}: the normalisation rules are derived from the catalogue");
+            }
+
+            _normaliser = new Normaliser(rules);
+            _comparer = new ResponseComparer(catalogue, _normaliser);
+        }
+
+        private async Task ReplayCasesAsync()
+        {
+            if (_comparer is null)
+            {
+                Print(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"no comparer could be built, so none of the {_keys.Count} record(s) is compared"));
+                return;
+            }
+
+            // Each record and its body are read and verified once, inside the case's guard, and are unreachable
+            // once the iteration ends, so replay holds one baseline record and one body at a time. A record file
+            // changed or removed since it was indexed, or a body that is missing or does not hash to its
+            // bodySha256, becomes that case's CHK-EXCEPTION, and the other cases still run. So does a record whose
+            // statements no longer hold as the evidence confirmation held them (its preState and, with the plan,
+            // its kind, stateChanging, preState and request): it is read again here, so one rewritten since then is
+            // refused before any reset or request, and nothing of it is sent.
+            foreach (var key in _keys)
+            {
+                ct.ThrowIfCancellationRequested();
+                await Guard($"replay case {key.CaseId}", async () =>
+                {
+                    var entry = await _store.ReadEntryAsync(key, ct).ConfigureAwait(false);
+                    if (StatedRecordProblem(_matrix, entry.Record, _store.DisplayRecordPath(key)) is { } problem)
+                    {
+                        throw new InvalidDataException(
+                            $"The baseline record of case {key.CaseId} is refused before any reset or request: {problem}.");
+                    }
+
+                    await ReplayCaseAsync(entry, _comparer).ConfigureAwait(false);
+                }).ConfigureAwait(false);
+            }
+        }
+
+        // The empty-state case is bracketed by an empty reset before it and a seed reset after it, so no later
+        // state depends on it (AAP 0.7.3). The empty reset runs inside the protected block, so once it has
+        // started the seed reset runs whatever happens (the case failing, the run being cancelled included).
+        private async Task ReplayCaseAsync(BaselineEntry entry, ResponseComparer comparer)
+        {
+            var record = entry.Record;
+            var operation = catalogue.GetById(record.Operation);
+
+            // Each valid preState decides the bracket explicitly. The record was held to seed or empty when it was
+            // read for its case, so any other value is refused here as well, never replayed as seed.
+            var bracketed = record.PreState switch
+            {
+                CasePreStates.Empty => !options.IsExternalBackend,
+                CasePreStates.Seed => false,
+                _ => throw new InvalidDataException(
+                    $"Baseline case {record.CaseId} has preState {Quoted(record.PreState)}, which is neither "
+                    + $"'{CasePreStates.Seed}' nor '{CasePreStates.Empty}', so no reset establishes it."),
+            };
+
+            try
+            {
+                if (bracketed)
+                {
+                    await ResetAsync(ResetPoints.Before(record.CaseId), AdminRoutes.ResetStateEmpty).ConfigureAwait(false);
+                }
+
+                await CompareCaseAsync(entry, operation, comparer).ConfigureAwait(false);
+            }
+            finally
+            {
+                if (bracketed)
+                {
+                    await RestoreSeedAsync(record.CaseId).ConfigureAwait(false);
+                }
+            }
+        }
+
+        // The seed reset closing the empty-state bracket. Its token is not the run's: nothing cancels it while
+        // the run runs, so it still runs after the run was cancelled, and StateReset bounds each of its at most
+        // three admin requests by HarnessOptions.RequestTimeout. Once the run is cancelled it is cancelled
+        // restorationLimit after the later of the cancellation and the restoration's start, so a cancelled run
+        // never waits on it for longer, whatever the configured request limit. It never throws, so the case's
+        // own failure or the run's cancellation propagates unchanged: a mismatch is a CHK-RESET item like every
+        // other reset's, an abandoned restoration a CHK-EXCEPTION item that says so, and any other failure of
+        // the restore a CHK-EXCEPTION item of its own.
+        private async Task RestoreSeedAsync(string caseId)
+        {
+            using var grace = new CancellationGrace(ct, restorationLimit);
+            try
+            {
+                var result = await reset
+                    .ResetAsync(ResetPoints.After(caseId), AdminRoutes.ResetStateSeed, _expectations, grace.Token)
+                    .ConfigureAwait(false);
+                state.AddFailures(result.Failures);
+            }
+            catch (OperationCanceledException ex) when (grace.Token.IsCancellationRequested)
+            {
+                var detail = string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"seed restoration after {caseId} was abandoned {restorationLimit.TotalSeconds:0.###} s after the run was cancelled");
+                state.AddFailure(new FailureItem(FailureItemIds.Exception, FailureItemIds.ExceptionNature(ex), Detail: detail));
+                Print(detail);
+            }
+            catch (Exception ex)
+            {
+                RecordStepFailure($"seed restoration after {caseId}", ex);
+            }
+        }
+
+        private async Task CompareCaseAsync(BaselineEntry entry, OperationDescriptor operation, ResponseComparer comparer)
+        {
+            var record = entry.Record;
+            var observed = _facadeReady
+                ? await SendAsync(record, operation).ConfigureAwait(false)
+                : new ResponseSnapshot(null, null, ReadOnlyMemory<byte>.Empty, NoResponseReasons.Connect);
+            var baseline = new ResponseSnapshot(record.Response.Status, record.Response.ContentType, entry.Body);
+            var comparison = comparer.Compare(operation, baseline, observed);
+
+            // Evidence the run cannot keep for its report is refused before any of the case is kept: the
+            // InvalidDataException reaches the case's guard, which records CHK-EXCEPTION, and the case keeps no
+            // result, artifact or d: item.
+            _keptEvidence.ChargeComparison(comparison.Discrepancies);
+
+            string? nature = null;
+            if (!comparison.Equivalent)
+            {
+                // Prepared once, so the nature's signature and the artifact describe the same canonical list.
+                var canonical = DiscrepancySignature.Prepare(comparison.Discrepancies);
+                var item = new FailureItem(FailureItemIds.Case(record.CaseId), FailureItemIds.Diff(canonical.Signature), record.Operation);
+                nature = item.Nature;
+                var note = await WriteDiscrepancyArtifactAsync(item, canonical).ConfigureAwait(false);
+                state.AddFailure(note is null ? item : item with { Detail = note });
+            }
+
+            state.AddCase(new CaseResult(
+                record.CaseId,
+                record.Operation,
+                record.Order,
+                Compared: true,
+                comparison.Equivalent,
+                comparison.Discrepancies,
+                comparison.WellFormed,
+                comparison.StatusMatched,
+                record.Response.Status,
+                observed.Status,
+                nature));
+
+            var outcome = comparison.Equivalent
+                ? "equivalent"
+                : observed.NoResponse is { } reason
+                    ? $"differs ({nature}; no response: {reason})"
+                    : string.Create(CultureInfo.InvariantCulture, $"differs ({nature}; {comparison.Discrepancies.Count} discrepancies)");
+            PrintBaseline(string.Create(CultureInfo.InvariantCulture, $"{record.Order:000} {record.CaseId}: {outcome}"));
+        }
+
+        // The recorded request is sent unchanged to the facade listener of the operation's surface.
+        private async Task<ResponseSnapshot> SendAsync(BaselineRecord record, OperationDescriptor operation)
+        {
+            var baseUrl = operation.Surface switch
+            {
+                Surface.Rest => options.Target.RestBaseUrl,
+                Surface.Soap => options.Target.SoapBaseUrl,
+                _ => throw new InvalidDataException(
+                    $"Operation '{operation.Id}' of case {record.CaseId} has surface '{operation.Surface}', which no facade listener serves."),
+            };
+
+            var request = new CaseRequest(record.Request.Method, record.Request.PathAndQuery, record.Request.Headers, record.Request.BodyText);
+            var response = await runner.SendAsync(baseUrl, request, CaseRunner.RequestTimeoutOf(options), ct).ConfigureAwait(false);
+            if (response.Answered)
+            {
+                await SaveObservedBodyAsync(record, response.Body).ConfigureAwait(false);
+            }
+
+            return new ResponseSnapshot(response.Status, response.ContentType, response.Body, response.NoResponse);
+        }
+
+        // Diagnostic only: artifacts/replay/<rest|soap>/<record file stem>.body holds the observed bytes.
+        private async Task SaveObservedBodyAsync(BaselineRecord record, byte[] body)
+        {
+            try
+            {
+                var directory = Path.Combine(options.ArtifactsDirectory, ReplayDirectoryName, BaselineStore.SurfaceDirectoryName(record.CaseId));
+                var stem = Path.GetFileNameWithoutExtension(BaselineStore.RecordFileName(record));
+                await ArtifactTree().WriteFileAsync(Path.Combine(directory, stem + ObservedBodyExtension), body, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (IsArtifactFailure(ex))
+            {
+                Print($"observed body of {record.CaseId} not saved: {ReplayMode.Describe(ex)}");
+            }
+        }
+
+        // Writes artifacts/discrepancies/<itemId>.json. A failure to write it is returned as a note for the
+        // item's detail and never thrown, so the failing item itself is always recorded.
+        private async Task<string?> WriteDiscrepancyArtifactAsync(FailureItem item, CanonicalDiscrepancies canonical)
+        {
+            try
+            {
+                var directory = Path.Combine(options.ArtifactsDirectory, DiscrepanciesDirectoryName);
+                var path = Path.Combine(directory, DiscrepancySignature.ArtifactFileName(item.ItemId));
+                await ArtifactTree().WriteFileAsync(path, BaselineStore.SerializeDocument(canonical.ToArtifact(item)), ct).ConfigureAwait(false);
+                return null;
+            }
+            catch (Exception ex) when (IsArtifactFailure(ex))
+            {
+                var note = $"discrepancy artifact not written: {ReplayMode.Describe(ex)}";
+                Print($"{item.ItemId}: {note}");
+                return note;
+            }
+        }
+
+        private static bool IsArtifactFailure(Exception ex) =>
+            ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException
+                or InvalidDataException;
+
+        // Conformance is read from capture's result, never recomputed: the stand-in's conformance is a fact
+        // about the baseline, not about the facade. The result is still held to the catalogue before it
+        // counts: its members must be the catalogue's inventory, a member is unreachable-in-source exactly
+        // when the catalogue records it so, and its seed-token assertions must be the check's own. A result
+        // that disagrees is thrown, and the guard records the never-documentable CHK-EXCEPTION item, so no
+        // stored pass can close an unreachable member and no member or assertion can be dropped.
+        //
+        // Capture writes the conformance result beside the records it captured, so a captured baseline
+        // without it has lost mandatory evidence. That absence is thrown, and the guard records it as the
+        // CHK-EXCEPTION item no register entry can document, so the run cannot exit 0 on it. Only a baseline
+        // from which nothing was captured has no result to read: the hand-written not-run manifest, or no
+        // manifest at all, with no record. Such a baseline reports the check as not run and adds no item.
+        private async Task ConformanceAsync()
+        {
+            state.SetCheck(NotRun(CheckNames.Conformance, IncompleteDetail));
+            var node = await _store.TryReadConformanceAsync(ct).ConfigureAwait(false);
+            if (node is null)
+            {
+                if (_manifest is { IsNotRun: false } || _keys.Count > 0)
+                {
+                    const string detail = $"{ConformanceName} absent although the baseline was captured";
+                    state.SetCheck(NotRun(CheckNames.Conformance, detail));
+                    PrintBaseline($"conformance: {detail}; the stand-in conformance evidence is missing");
+                    throw new FileNotFoundException(
+                        $"{ConformanceName} is absent although the baseline was captured; capture writes the stand-in conformance result beside its records, so the conformance evidence is missing.",
+                        options.ConformancePath);
+                }
+
+                state.SetCheck(NotRun(CheckNames.Conformance, $"{ConformanceName} absent"));
+                PrintBaseline($"conformance: {ConformanceName} absent; not run");
+                return;
+            }
+
+            var result = ConformanceResult.Parse(node);
+            new ConformanceCheck(catalogue).Verify(result);
+            var check = result.ToCheckResult(register);
+            state.Conformance = result.Summary;
+            state.SetCheck(check);
+            state.AddFailures(result.Failures);
+
+            // The detail carries the verdict's reason: how many failing items the register documents and
+            // how many seed-token assertions hold.
+            PrintBaseline(string.IsNullOrWhiteSpace(check.Detail) ? DescribeConformance(check) : $"{DescribeConformance(check)}; {check.Detail}");
+        }
+
+        // The conformance check counts members, the members checked and passed the report states, so the
+        // line names them; its seed-token assertions are in the detail.
+        private static string DescribeConformance(CheckResult check) =>
+            string.Create(CultureInfo.InvariantCulture, $"check {check.Name}: {check.Outcome} ({check.Passed} of {check.Cases} members passed)");
+
+        private async Task OpenApiDriftAsync()
+        {
+            state.SetCheck(NotRun(CheckNames.OpenApiDrift, IncompleteDetail));
+            if (_normaliser is null)
+            {
+                RecordContractNotRun(CheckNames.OpenApiDrift, FailureItemIds.OpenApiDrift);
+                return;
+            }
+
+            var check = new OpenApiDriftCheck(options, new JsonSemanticComparer(catalogue, _normaliser), runner);
+            await RecordContractAsync(await check.RunAsync(ct).ConfigureAwait(false)).ConfigureAwait(false);
+        }
+
+        private async Task WsdlContractAsync()
+        {
+            state.SetCheck(NotRun(CheckNames.WsdlContract, IncompleteDetail));
+            if (_normaliser is null)
+            {
+                RecordContractNotRun(CheckNames.WsdlContract, FailureItemIds.WsdlContract);
+                return;
+            }
+
+            var check = new WsdlContractCheck(options, catalogue, new XmlSemanticComparer(catalogue, _normaliser), runner);
+            await RecordContractAsync(await check.RunAsync(ct).ConfigureAwait(false)).ConfigureAwait(false);
+        }
+
+        // Without normalisation rules neither semantic comparer exists; the check is reported as not run,
+        // the item its own not-run outcome would carry.
+        private void RecordContractNotRun(string checkName, string itemId)
+        {
+            const string detail = "no normalisation rules, so no semantic comparer could be built";
+            state.SetCheck(NotRun(checkName, detail));
+            state.AddFailure(new FailureItem(itemId, FailureItemIds.NotRun, Detail: detail));
+            Print($"check {checkName}: not-run ({detail})");
+        }
+
+        private async Task RecordContractAsync(ContractCheckResult result)
+        {
+            state.SetCheck(result.Result);
+            if (result.Failure is { } failure)
+            {
+                var item = failure;
+                if (result.Canonical is { } canonical)
+                {
+                    var note = await WriteDiscrepancyArtifactAsync(failure, canonical).ConfigureAwait(false);
+                    if (note is not null)
+                    {
+                        item = failure with { Detail = string.IsNullOrEmpty(failure.Detail) ? note : $"{failure.Detail}; {note}" };
+                    }
+                }
+
+                state.AddFailure(item);
+            }
+
+            Print(DescribeCheck(result.Result));
+        }
+
+        private void ReadFacadeTests()
+        {
+            foreach (var name in new[] { CheckNames.Routing, CheckNames.Failure, CheckNames.ListenerIsolation })
+            {
+                state.SetCheck(NotRun(name, IncompleteDetail));
+            }
+
+            var summary = new FacadeTestResults(options).Read();
+            state.SetCheck(summary.Routing);
+            state.SetCheck(summary.Failure);
+            state.SetCheck(summary.ListenerIsolation);
+            state.AddFailures(summary.Failures);
+            foreach (var check in new[] { summary.Routing, summary.Failure, summary.ListenerIsolation })
+            {
+                Print(DescribeCheck(check));
+            }
+        }
+
+        private async Task JadeUnchangedAsync()
+        {
+            state.SetCheck(NotRun(CheckNames.JadeUnchanged, IncompleteDetail));
+            var result = await new JadeUnchangedCheck(options).RunAsync(ct).ConfigureAwait(false);
+            state.SetCheck(result.Result);
+            state.JadeUnchanged = result.Summary;
+            state.AddFailures(result.Failures);
+            Print(DescribeCheck(result.Result));
+        }
+
+        private async Task OrderingAsync()
+        {
+            state.SetCheck(NotRun(CheckNames.Ordering, IncompleteDetail));
+            var result = await new OrderingEvidence(options).RunAsync(ct).ConfigureAwait(false);
+            state.SetCheck(result.Result);
+            if (result.Failure is { } failure)
+            {
+                state.AddFailure(failure);
+            }
+
+            _baselineCommit = result.BaselineCommit;
+            _facadeCommit = result.FacadeCommit;
+            Print(DescribeCheck(result.Result));
+        }
+
+        // A reported fact only: a read that yields no description leaves the .NET version unavailable, with
+        // the reason it observed and one console line, and no item is recorded for it. The read is bounded
+        // by the request limit.
+        private async Task<(string? Description, string? Unavailable)> ReadFacadeFrameworkAsync()
+        {
+            const string unavailableLine = "facade .NET version unavailable: ";
+
+            (string? Description, string? Unavailable) framework;
+            string? detail;
+            try
+            {
+                var read = await reset.ReadInfoOutcomeAsync(options.Target.AdminUrl, ct).ConfigureAwait(false);
+                framework = DescribeFacadeFramework(read, options.RequestTimeout);
+                detail = read.Detail;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                framework = (null, $"facade {AdminRoutes.Info} read failed ({FailureItemIds.ExceptionNature(ex)})");
+                detail = ReplayMode.SafeMessage(ex);
+            }
+
+            if (framework.Unavailable is { } reason)
+            {
+                Print(string.IsNullOrWhiteSpace(detail) ? unavailableLine + reason : $"{unavailableLine}{reason} ({detail})");
+            }
+
+            return framework;
+        }
+
+        private static CheckResult NotRun(string name, string detail) => new(name, CheckOutcomes.NotRun, 0, 0, detail);
+
+        private static string DescribeCheck(CheckResult check) =>
+            string.Create(CultureInfo.InvariantCulture, $"check {check.Name}: {check.Outcome} ({check.Passed} of {check.Cases} passed)");
+
+        // Records an exception as CHK-EXCEPTION and carries on, so one failing step never prevents the
+        // others; the caller's cancellation is the one exception that ends the body.
+        private async Task Guard(string what, Func<Task> step)
+        {
+            try
+            {
+                await step().ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                RecordStepFailure(what, ex);
+            }
+        }
+
+        private void GuardSync(string what, Action step)
+        {
+            try
+            {
+                step();
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                RecordStepFailure(what, ex);
+            }
+        }
+
+        private void RecordStepFailure(string what, Exception ex)
+        {
+            state.AddFailure(new FailureItem(FailureItemIds.Exception, FailureItemIds.ExceptionNature(ex), Detail: $"{what}: {ReplayMode.SafeMessage(ex)}"));
+            Print($"{what} failed: {ReplayMode.Describe(ex)}");
+        }
+
+        private void Print(string line) => LifecycleConsole.WriteLine(stdout, LinePrefix + line);
+
+        private void PrintBaseline(string line) => LifecycleConsole.WriteLine(stdout, $"{SourceLabels.ConsolePrefix} {line}");
+    }
+}
+
+/// <summary>
+/// The token of a step that must still run once the run is cancelled, yet not for ever: nothing cancels it
+/// while the run runs, and it is cancelled a fixed limit after the run's token is, counted from that
+/// cancellation, or from the grace's creation when the run was already cancelled. The seed restoration closing
+/// an empty-state bracket and each component's shutdown take one, so a cancelled run's exit path stays within
+/// <see cref="ReplayMode.CancelledExitBudget"/> whatever limits are configured.
+/// </summary>
+/// <remarks>Create one per step and dispose it when the step ends; the step owns it alone.</remarks>
+internal sealed class CancellationGrace : IDisposable
+{
+    // The harness's own ceiling on a grace, int.MaxValue milliseconds (just under 25 days): a conservative
+    // choice below the longest countdown CancelAfter accepts, not the framework's maximum.
+    private static readonly TimeSpan MaximumLimit = TimeSpan.FromMilliseconds(int.MaxValue);
+
+    private readonly CancellationTokenSource _source = new();
+    private readonly TimeSpan _limit;
+    private readonly CancellationTokenRegistration _registration;
+
+    /// <summary>Creates the grace of one step.</summary>
+    /// <param name="run">The run's token; one that can never be cancelled gives a token that never is.</param>
+    /// <param name="limit">How long the step may still run once the run is cancelled.</param>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="limit"/> is not positive or is longer than <see cref="int.MaxValue"/> milliseconds.</exception>
+    internal CancellationGrace(CancellationToken run, TimeSpan limit)
+    {
+        _limit = RequireLimit(limit);
+
+        // A token already cancelled runs the callback here and now, so the limit then counts from the step's start.
+        _registration = run.Register(static grace => ((CancellationGrace)grace!).StartCountdown(), this);
+    }
+
+    /// <summary>The step's token: cancelled the limit after the run's cancellation, and never before it.</summary>
+    internal CancellationToken Token => _source.Token;
+
+    /// <summary>
+    /// Returns <paramref name="limit"/> when it is a usable grace: positive and at most <see cref="int.MaxValue"/>
+    /// milliseconds.
+    /// </summary>
+    /// <param name="limit">The limit to check.</param>
+    /// <returns><paramref name="limit"/>.</returns>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="limit"/> is not positive or is longer than <see cref="int.MaxValue"/> milliseconds.</exception>
+    internal static TimeSpan RequireLimit(TimeSpan limit) =>
+        limit > TimeSpan.Zero && limit <= MaximumLimit
+            ? limit
+            : throw new ArgumentOutOfRangeException(
+                nameof(limit),
+                limit,
+                "A cancelled-run limit must be positive and at most int.MaxValue milliseconds.");
+
+    /// <summary>Ends the grace: the run's cancellation no longer reaches it, and its timer is released.</summary>
+    public void Dispose()
+    {
+        // The registration first: disposing it waits for a callback already running, so no callback reaches the
+        // source once the source is disposed.
+        _registration.Dispose();
+        _source.Dispose();
+    }
+
+    private void StartCountdown() => _source.CancelAfter(_limit);
+}

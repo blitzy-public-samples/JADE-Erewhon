@@ -1,0 +1,25 @@
+{
+  "order": 25,
+  "caseId": "SOAP-getAgentNames-01",
+  "operation": "Soap.getAgentNames",
+  "kind": "success",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getAgentNames\""
+    },
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getAgentNames xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"></getAgentNames></soap:Body></soap:Envelope>"
+  },
+  "response": {
+    "status": 200,
+    "contentType": "text/xml; charset=utf-8",
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getAgentNamesResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentNamesResult><DTOName><name>Airi Hamada</name></DTOName><DTOName><name>Angela Bettersfield</name></DTOName><DTOName><name>Hank Williams</name></DTOName><DTOName><name>Peter Smallsmith</name></DTOName><DTOName><name>Petra Petrovski</name></DTOName><DTOName><name>Pierre Lafayette</name></DTOName><DTOName><name>Suzie Wu</name></DTOName><DTOName><name>Tabai Tanivula</name></DTOName></getAgentNamesResult></getAgentNamesResponse></soap:Body></soap:Envelope>",
+    "bodySha256": "569bb732605ae1fa042afc61c56f08dca837acd21899cab91f14dfb93851fbd3",
+    "bodyFile": null
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "order": 21,
+  "caseId": "REST-getSale-03",
+  "operation": "Rest.getSale",
+  "kind": "error",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "GET",
+    "pathAndQuery": "/sale/INVALID/18",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 400,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "null",
+    "bodySha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+    "bodyFile": null
+  }
+}

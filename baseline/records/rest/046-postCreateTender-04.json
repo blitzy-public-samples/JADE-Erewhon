@@ -1,0 +1,22 @@
+{
+  "order": 46,
+  "caseId": "REST-postCreateTender-04",
+  "operation": "Rest.postCreateTender",
+  "kind": "error",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/createTender/Nobody%20Client/PROP/61/7000000.00",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 404,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"guid\":\"\",\"allErrors\":[\"Client not found\"],\"allWarnings\":[],\"statusCode\":404}",
+    "bodySha256": "9ba61e905e59098f8d23fa3fa82e87a3081a7dcc0dbb54eb2be73423a45ca52a",
+    "bodyFile": null
+  }
+}

@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Target framework, runtime pin, nullable, implicit usings, central package management and lock files
+    are inherited from harness/Directory.Build.props (which imports ../Erewhon.Strangler.props).
+    Run every dotnet command for this project from inside harness/, so that harness/global.json
+    selects the pinned SDK and the Microsoft.Testing.Platform test runner.
+  -->
+  <PropertyGroup>
+    <!-- xunit.v3 test projects are self-hosting executables on Microsoft.Testing.Platform. -->
+    <OutputType>Exe</OutputType>
+    <!-- Must match InternalsVisibleTo in ../../src/Erewhon.Harness/Erewhon.Harness.csproj. -->
+    <AssemblyName>Erewhon.Harness.Tests</AssemblyName>
+    <RootNamespace>Erewhon.Harness.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <!--
+    Version comes from the root Directory.Packages.props. Microsoft.NET.Test.Sdk and
+    xunit.runner.visualstudio are deliberately absent: VSTest-mode dotnet test is unsupported
+    for xunit.v3 4.x on the .NET 10 SDK.
+  -->
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+  </ItemGroup>
+
+  <!-- Erewhon.Contracts and the Microsoft.AspNetCore.App framework reference flow from the harness project. -->
+  <ItemGroup>
+    <ProjectReference Include="../../src/Erewhon.Harness/Erewhon.Harness.csproj" />
+  </ItemGroup>
+
+  <!-- xunit.v3 adds no implicit using of its own; the test classes rely on this one. -->
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+</Project>

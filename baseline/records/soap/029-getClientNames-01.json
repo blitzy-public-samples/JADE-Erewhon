@@ -1,0 +1,25 @@
+{
+  "order": 29,
+  "caseId": "SOAP-getClientNames-01",
+  "operation": "Soap.getClientNames",
+  "kind": "success",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getClientNames\""
+    },
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getClientNames xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"></getClientNames></soap:Body></soap:Envelope>"
+  },
+  "response": {
+    "status": 200,
+    "contentType": "text/xml; charset=utf-8",
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getClientNamesResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getClientNamesResult><DTOName><name>Andrew Fitzpatrick</name></DTOName><DTOName><name>Barbara Montenegro</name></DTOName><DTOName><name>Barry Ogen</name></DTOName><DTOName><name>Brian Olsen</name></DTOName><DTOName><name>Christine Montgomery</name></DTOName><DTOName><name>Christine Ronaldo</name></DTOName><DTOName><name>Christopher Burke</name></DTOName><DTOName><name>David Russel</name></DTOName><DTOName><name>Elaine Lee</name></DTOName><DTOName><name>Heather Bisset</name></DTOName><DTOName><name>Howard Ellis</name></DTOName><DTOName><name>Jane Phillippe</name></DTOName><DTOName><name>Levi Muir</name></DTOName><DTOName><name>Pauline Wild</name></DTOName><DTOName><name>Peggy Simpson</name></DTOName><DTOName><name>Peter Morrissey</name></DTOName><DTOName><name>Philip Jenkins</name></DTOName><DTOName><name>Roger Boeing</name></DTOName><DTOName><name>Sarah Bailey</name></DTOName><DTOName><name>Sean Hill</name></DTOName></getClientNamesResult></getClientNamesResponse></soap:Body></soap:Envelope>",
+    "bodySha256": "b0963abaf85396265ae9279fec0222cfd1daff176db71a72269a5a74e2d2cb3d",
+    "bodyFile": null
+  }
+}

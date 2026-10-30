@@ -1,0 +1,15 @@
+<Project>
+  <!--
+    Central package versions for the Erewhon strangler projects under contracts/, standin/,
+    harness/ and facade/. Central Package Management is switched on only by
+    Erewhon.Strangler.props, which only those projects import. This file holds PackageVersion
+    items only, so the existing Erewhon/ErewhonDotNetShop projects, which also see it, are
+    unaffected and keep their own PackageReference versions.
+  -->
+  <ItemGroup>
+    <PackageVersion Include="Microsoft.AspNetCore.Mvc.Testing" Version="10.0.14" />
+    <PackageVersion Include="Microsoft.AspNetCore.OpenApi" Version="10.0.14" />
+    <PackageVersion Include="xunit.v3" Version="4.0.2" />
+    <PackageVersion Include="Yarp.ReverseProxy" Version="2.3.0" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,4261 @@
+{
+  "catalogueVersion": "1.0.0",
+  "description": "Erewhon strangler operation catalogue: the 22 operations carried over from ErewhonRestService and ErewhonWebService (AAP 0.4.5). Schema lines refer to Erewhon/ErehwhonExternalInterfacesSchema.scm unless a field names another file.",
+  "sources": {
+    "referenceSchema": "Erewhon/ErehwhonExternalInterfacesSchema.scm",
+    "consumerSchema": "Erewhon/ErewhonWebServiceConsumerSchema.scm",
+    "applicationDefinitions": "Erewhon/ErehwhonExternalInterfacesSchema.ddx"
+  },
+  "addresses": {
+    "rest": {
+      "application": "ErewhonREST",
+      "port": 65000,
+      "portSource": "Erewhon/ErehwhonExternalInterfacesSchema.ddx:82",
+      "form": "direct",
+      "formatSuffixes": [
+        ".json",
+        ".xml",
+        ".jsonn"
+      ],
+      "defaultFormat": "json",
+      "contentType": "application/json; charset=utf-8"
+    },
+    "soap": {
+      "application": "WebServiceHTTP",
+      "port": 21001,
+      "portSource": "Erewhon/ErehwhonExternalInterfacesSchema.ddx:158",
+      "path": "/jade/jadehttp.dll",
+      "query": "WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+      "wsdlQueryKey": "wsdl",
+      "endpointSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:1724",
+      "serviceName": "ErewhonWebService",
+      "listName": "WebServiceHTTP",
+      "targetNamespace": "urn:JadeWebServices/WebServiceHTTP/",
+      "soapActionPrefix": "urn:JadeWebServices/WebServiceHTTP/",
+      "envelopeNamespace": "http://schemas.xmlsoap.org/soap/envelope/",
+      "soapVersion": "1.1",
+      "style": "document",
+      "use": "literal",
+      "wrapped": true,
+      "contentType": "text/xml; charset=utf-8",
+      "wsdlNamespaces": {
+        "http": "http://schemas.xmlsoap.org/wsdl/http/",
+        "soap": "http://schemas.xmlsoap.org/wsdl/soap/",
+        "xsd": "http://www.w3.org/2001/XMLSchema",
+        "tns": "urn:JadeWebServices/WebServiceHTTP/",
+        "mime": "http://schemas.xmlsoap.org/wsdl/mime/",
+        "wsdl": "http://schemas.xmlsoap.org/wsdl/",
+        "s1": "http://jadeworld.com/wsdl/types/"
+      },
+      "wsdlNamespacesSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:1713-1721"
+    }
+  },
+  "wireTypes": {
+    "String": {
+      "json": "string",
+      "xml": "{http://www.w3.org/2001/XMLSchema}string",
+      "source": "Erewhon/ErewhonWebServiceConsumerSchema.scm:236"
+    },
+    "Integer": {
+      "json": "integer",
+      "xml": "{http://www.w3.org/2001/XMLSchema}int",
+      "source": "Erewhon/ErewhonWebServiceConsumerSchema.scm:293"
+    },
+    "Decimal": {
+      "json": "decimal",
+      "xml": "{urn:JadeWebServices/WebServiceHTTP/}decimal",
+      "source": "Erewhon/ErewhonWebServiceConsumerSchema.scm:331"
+    },
+    "Date": {
+      "json": "msDate",
+      "xml": "{http://www.w3.org/2001/XMLSchema}date",
+      "source": "Erewhon/ErewhonWebServiceConsumerSchema.scm:419"
+    },
+    "TimeStamp": {
+      "json": "msDate",
+      "xml": "{http://www.w3.org/2001/XMLSchema}dateTime",
+      "source": "Erewhon/ErewhonWebServiceConsumerSchema.scm:346"
+    },
+    "Binary": {
+      "json": "byteArray",
+      "xml": "{http://www.w3.org/2001/XMLSchema}base64Binary",
+      "source": "Erewhon/ErewhonWebServiceConsumerSchema.scm:319"
+    }
+  },
+  "operations": [
+    {
+      "id": "Rest.getAgent",
+      "surface": "Rest",
+      "jadeClass": "ErewhonRestService",
+      "jadeMethod": "getAgent",
+      "schemaLine": 302,
+      "bodyLines": "2328-2355",
+      "returnType": "DTOAgent",
+      "stateChanging": false,
+      "parameters": [
+        {
+          "name": "pName",
+          "jadeType": "String",
+          "position": 0,
+          "location": "path"
+        }
+      ],
+      "rest": {
+        "verb": "GET",
+        "pathTemplate": "/agent/{pName}",
+        "requestContentType": null
+      },
+      "soap": null,
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": "HTTP_Success",
+          "resultStatusCode": null,
+          "bodyType": "DTOAgent",
+          "runtimeTypes": null,
+          "condition": "Agent found by exact name",
+          "sourceLines": "2348-2353"
+        },
+        {
+          "httpStatus": 404,
+          "constant": "HTTP_Not_Found",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "No agent with that exact name",
+          "sourceLines": "2343-2345"
+        }
+      ]
+    },
+    {
+      "id": "Rest.getAllAgents",
+      "surface": "Rest",
+      "jadeClass": "ErewhonRestService",
+      "jadeMethod": "getAllAgents",
+      "schemaLine": 303,
+      "bodyLines": "2356-2377",
+      "returnType": "DTOAgentArray",
+      "stateChanging": false,
+      "parameters": [],
+      "rest": {
+        "verb": "GET",
+        "pathTemplate": "/allAgents",
+        "requestContentType": null
+      },
+      "soap": null,
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": "HTTP_Success",
+          "resultStatusCode": null,
+          "bodyType": "DTOAgentArray",
+          "runtimeTypes": null,
+          "condition": "All agents, in name order",
+          "sourceLines": "2366-2375"
+        }
+      ]
+    },
+    {
+      "id": "Rest.getAllClients",
+      "surface": "Rest",
+      "jadeClass": "ErewhonRestService",
+      "jadeMethod": "getAllClients",
+      "schemaLine": 304,
+      "bodyLines": "2378-2399",
+      "returnType": "DTOClientArray",
+      "stateChanging": false,
+      "parameters": [],
+      "rest": {
+        "verb": "GET",
+        "pathTemplate": "/allClients",
+        "requestContentType": null
+      },
+      "soap": null,
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": "HTTP_Success",
+          "resultStatusCode": null,
+          "bodyType": "DTOClientArray",
+          "runtimeTypes": null,
+          "condition": "All clients, in name order",
+          "sourceLines": "2388-2397"
+        }
+      ]
+    },
+    {
+      "id": "Rest.getAllSales",
+      "surface": "Rest",
+      "jadeClass": "ErewhonRestService",
+      "jadeMethod": "getAllSales",
+      "schemaLine": 305,
+      "bodyLines": "2400-2434",
+      "returnType": "DTOSaleArray",
+      "stateChanging": false,
+      "parameters": [],
+      "rest": {
+        "verb": "GET",
+        "pathTemplate": "/allSales",
+        "requestContentType": null
+      },
+      "soap": null,
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": "HTTP_Success",
+          "resultStatusCode": null,
+          "bodyType": "DTOSaleArray",
+          "runtimeTypes": [
+            "DTORetailSale",
+            "DTOTenderSale"
+          ],
+          "condition": "All sales, in (category prefix, code number) order",
+          "sourceLines": "2410-2431"
+        }
+      ]
+    },
+    {
+      "id": "Rest.getClient",
+      "surface": "Rest",
+      "jadeClass": "ErewhonRestService",
+      "jadeMethod": "getClient",
+      "schemaLine": 306,
+      "bodyLines": "2435-2458",
+      "returnType": "DTOClient",
+      "stateChanging": false,
+      "parameters": [
+        {
+          "name": "pName",
+          "jadeType": "String",
+          "position": 0,
+          "location": "path"
+        }
+      ],
+      "rest": {
+        "verb": "GET",
+        "pathTemplate": "/client/{pName}",
+        "requestContentType": null
+      },
+      "soap": null,
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": "HTTP_Success",
+          "resultStatusCode": null,
+          "bodyType": "DTOClient",
+          "runtimeTypes": null,
+          "condition": "Client found by name after trimming blanks",
+          "sourceLines": "2444-2456"
+        },
+        {
+          "httpStatus": 404,
+          "constant": "HTTP_Not_Found",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "No client with the trimmed name",
+          "sourceLines": "2447-2449"
+        }
+      ]
+    },
+    {
+      "id": "Rest.getCompany",
+      "surface": "Rest",
+      "jadeClass": "ErewhonRestService",
+      "jadeMethod": "getCompany",
+      "schemaLine": 307,
+      "bodyLines": "2459-2482",
+      "returnType": "DTOCompany",
+      "stateChanging": false,
+      "parameters": [],
+      "rest": {
+        "verb": "GET",
+        "pathTemplate": "/company",
+        "requestContentType": null
+      },
+      "soap": null,
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": "HTTP_Success",
+          "resultStatusCode": null,
+          "bodyType": "DTOCompany",
+          "runtimeTypes": null,
+          "condition": "Company exists",
+          "sourceLines": "2475-2480"
+        },
+        {
+          "httpStatus": 500,
+          "constant": "HTTP_Server_Error",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "No company",
+          "sourceLines": "2470-2472"
+        }
+      ]
+    },
+    {
+      "id": "Rest.getItemByCode",
+      "surface": "Rest",
+      "jadeClass": "ErewhonRestService",
+      "jadeMethod": "getItemByCode",
+      "schemaLine": 308,
+      "bodyLines": "2483-2535",
+      "returnType": "DTOItem",
+      "stateChanging": false,
+      "parameters": [
+        {
+          "name": "pCodePrefix",
+          "jadeType": "String",
+          "position": 0,
+          "location": "path"
+        },
+        {
+          "name": "pCodeNumber",
+          "jadeType": "Integer",
+          "position": 1,
+          "location": "path"
+        }
+      ],
+      "rest": {
+        "verb": "GET",
+        "pathTemplate": "/itemByCode/{pCodePrefix}/{pCodeNumber}",
+        "requestContentType": null
+      },
+      "soap": null,
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": "HTTP_Success",
+          "resultStatusCode": null,
+          "bodyType": "DTOItem",
+          "runtimeTypes": [
+            "DTORetailItem",
+            "DTOTenderItem"
+          ],
+          "condition": "Item found by code number; the prefix is validated but not used in the lookup",
+          "sourceLines": "2517-2530"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "Code prefix empty or longer than 4 characters after trimming, or code number null",
+          "sourceLines": "2494-2506"
+        },
+        {
+          "httpStatus": 404,
+          "constant": "HTTP_Not_Found",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "No item with that code number",
+          "sourceLines": "2511-2514"
+        },
+        {
+          "httpStatus": 500,
+          "constant": "HTTP_Server_Error",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "Item is neither a RetailItem nor a TenderItem",
+          "sourceLines": "2532-2533"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "pCodeNumber is not an Integer segment (for example 18.0 or 1e2); rejected before the method body runs, with the literal null body",
+          "sourceLines": "308-310"
+        }
+      ]
+    },
+    {
+      "id": "Rest.getItemsByPrice",
+      "surface": "Rest",
+      "jadeClass": "ErewhonRestService",
+      "jadeMethod": "getItemsByPrice",
+      "schemaLine": 311,
+      "bodyLines": "2536-2597",
+      "returnType": "DTOItemsArray",
+      "stateChanging": false,
+      "parameters": [
+        {
+          "name": "pMinPrice",
+          "jadeType": "Integer",
+          "position": 0,
+          "location": "path"
+        },
+        {
+          "name": "pMaxPrice",
+          "jadeType": "Integer",
+          "position": 1,
+          "location": "path"
+        }
+      ],
+      "rest": {
+        "verb": "GET",
+        "pathTemplate": "/itemsByPrice/{pMinPrice}/{pMaxPrice}",
+        "requestContentType": null
+      },
+      "soap": null,
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": "HTTP_Success",
+          "resultStatusCode": null,
+          "bodyType": "DTOItemsArray",
+          "runtimeTypes": [
+            "DTORetailItem",
+            "DTOTenderItem"
+          ],
+          "condition": "Items priced within the inclusive range, in code-number order; possibly empty",
+          "sourceLines": "2569-2595"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "Minimum below 0, maximum below 0, or maximum below minimum",
+          "sourceLines": "2552-2567"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "pMinPrice or pMaxPrice is not an Integer segment (for example 18.0 or 1e2); rejected before the method body runs, with the literal null body",
+          "sourceLines": "311-313"
+        }
+      ]
+    },
+    {
+      "id": "Rest.getSale",
+      "surface": "Rest",
+      "jadeClass": "ErewhonRestService",
+      "jadeMethod": "getSale",
+      "schemaLine": 314,
+      "bodyLines": "2598-2651",
+      "returnType": "DTOSale",
+      "stateChanging": false,
+      "parameters": [
+        {
+          "name": "pCodePrefix",
+          "jadeType": "String",
+          "position": 0,
+          "location": "path"
+        },
+        {
+          "name": "pCodeNumber",
+          "jadeType": "Integer",
+          "position": 1,
+          "location": "path"
+        }
+      ],
+      "rest": {
+        "verb": "GET",
+        "pathTemplate": "/sale/{pCodePrefix}/{pCodeNumber}",
+        "requestContentType": null
+      },
+      "soap": null,
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": "HTTP_Success",
+          "resultStatusCode": null,
+          "bodyType": "DTOSale",
+          "runtimeTypes": [
+            "DTORetailSale",
+            "DTOTenderSale"
+          ],
+          "condition": "Sale found by the untrimmed prefix and the code number",
+          "sourceLines": "2633-2646"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "Code prefix empty or longer than 4 characters after trimming, or code number null",
+          "sourceLines": "2610-2622"
+        },
+        {
+          "httpStatus": 404,
+          "constant": "HTTP_Not_Found",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "No sale for that prefix and code number",
+          "sourceLines": "2627-2630"
+        },
+        {
+          "httpStatus": 500,
+          "constant": "HTTP_Server_Error",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "Sale is neither a RetailSale nor a TenderSale",
+          "sourceLines": "2648-2649"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "pCodeNumber is not an Integer segment (for example 18.0 or 1e2); rejected before the method body runs, with the literal null body",
+          "sourceLines": "314-316"
+        }
+      ]
+    },
+    {
+      "id": "Rest.postCreateAgent",
+      "surface": "Rest",
+      "jadeClass": "ErewhonRestService",
+      "jadeMethod": "postCreateAgent",
+      "schemaLine": 317,
+      "bodyLines": "2652-2691",
+      "returnType": "DTOResult",
+      "stateChanging": true,
+      "parameters": [
+        {
+          "name": "pAgent",
+          "jadeType": "DTOAgent",
+          "position": 0,
+          "location": "body"
+        }
+      ],
+      "rest": {
+        "verb": "POST",
+        "pathTemplate": "/createAgent",
+        "requestContentType": "application/json"
+      },
+      "soap": null,
+      "statuses": [
+        {
+          "httpStatus": 201,
+          "constant": "HTTP_Created",
+          "resultStatusCode": 201,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "Agent created; guid holds the new object's guid",
+          "sourceLines": "2684-2689"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": 400,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "AgentTA/AddressTA validation failed; allErrors holds the transaction-agent errors in order",
+          "sourceLines": "2677-2681"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "The body is not a JSON object whose read members are strings or null (malformed JSON, invalid UTF-8, an empty body, a root other than an object, or a read member of another JSON kind), or a member name or read member's value holds an unpaired surrogate escape; rejected before the method body runs, with the literal null body",
+          "sourceLines": "317-317"
+        }
+      ]
+    },
+    {
+      "id": "Rest.postCreateClient",
+      "surface": "Rest",
+      "jadeClass": "ErewhonRestService",
+      "jadeMethod": "postCreateClient",
+      "schemaLine": 318,
+      "bodyLines": "2692-2731",
+      "returnType": "DTOResult",
+      "stateChanging": true,
+      "parameters": [
+        {
+          "name": "pClient",
+          "jadeType": "DTOClient",
+          "position": 0,
+          "location": "body"
+        }
+      ],
+      "rest": {
+        "verb": "POST",
+        "pathTemplate": "/createClient",
+        "requestContentType": "application/json"
+      },
+      "soap": null,
+      "statuses": [
+        {
+          "httpStatus": 201,
+          "constant": "HTTP_Created",
+          "resultStatusCode": 201,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "Client created; guid holds the new object's guid",
+          "sourceLines": "2724-2729"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": 400,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "ClientTA/AddressTA validation failed; allErrors holds the transaction-agent errors in order",
+          "sourceLines": "2717-2721"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "The body is not a JSON object whose read members are strings or null (malformed JSON, invalid UTF-8, an empty body, a root other than an object, or a read member of another JSON kind), or a member name or read member's value holds an unpaired surrogate escape; rejected before the method body runs, with the literal null body",
+          "sourceLines": "318-318"
+        }
+      ]
+    },
+    {
+      "id": "Rest.postCreateRetailSale",
+      "surface": "Rest",
+      "jadeClass": "ErewhonRestService",
+      "jadeMethod": "postCreateRetailSale",
+      "schemaLine": 319,
+      "bodyLines": "2732-2796",
+      "returnType": "DTOResult",
+      "stateChanging": true,
+      "parameters": [
+        {
+          "name": "pClient",
+          "jadeType": "String",
+          "position": 0,
+          "location": "path"
+        },
+        {
+          "name": "pCodePrefix",
+          "jadeType": "String",
+          "position": 1,
+          "location": "path"
+        },
+        {
+          "name": "pCodeNumber",
+          "jadeType": "Integer",
+          "position": 2,
+          "location": "path"
+        }
+      ],
+      "rest": {
+        "verb": "POST",
+        "pathTemplate": "/createRetailSale/{pClient}/{pCodePrefix}/{pCodeNumber}",
+        "requestContentType": null
+      },
+      "soap": null,
+      "statuses": [
+        {
+          "httpStatus": 201,
+          "constant": "HTTP_Created",
+          "resultStatusCode": 201,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "Retail sale created; guid holds the new object's guid",
+          "sourceLines": "2789-2794"
+        },
+        {
+          "httpStatus": 404,
+          "constant": "HTTP_Not_Found",
+          "resultStatusCode": 404,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "No client with that exact name; allErrors holds $ClientNotFound (\"Client not found\")",
+          "sourceLines": "2750-2754"
+        },
+        {
+          "httpStatus": 404,
+          "constant": "HTTP_Not_Found",
+          "resultStatusCode": 404,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "No item with that code number; allErrors holds $ItemNotFound (\"Item was not found\")",
+          "sourceLines": "2760-2764"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": 400,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "Item is not a RetailItem; allErrors holds $ItemNotRetailItem (\"Item is not a Retail Item\")",
+          "sourceLines": "2768-2772"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": 400,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "RetailSaleTA validation failed; allErrors holds the transaction-agent errors in order",
+          "sourceLines": "2782-2786"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "pCodeNumber is not an Integer segment (for example 18.0 or 1e2); rejected before the method body runs, with the literal null body",
+          "sourceLines": "319-322"
+        }
+      ]
+    },
+    {
+      "id": "Rest.postCreateTender",
+      "surface": "Rest",
+      "jadeClass": "ErewhonRestService",
+      "jadeMethod": "postCreateTender",
+      "schemaLine": 323,
+      "bodyLines": "2797-2860",
+      "returnType": "DTOResult",
+      "stateChanging": true,
+      "parameters": [
+        {
+          "name": "pClient",
+          "jadeType": "String",
+          "position": 0,
+          "location": "path"
+        },
+        {
+          "name": "pCodePrefix",
+          "jadeType": "String",
+          "position": 1,
+          "location": "path"
+        },
+        {
+          "name": "pCodeNumber",
+          "jadeType": "Integer",
+          "position": 2,
+          "location": "path"
+        },
+        {
+          "name": "pOffer",
+          "jadeType": "Decimal",
+          "position": 3,
+          "location": "path"
+        }
+      ],
+      "rest": {
+        "verb": "POST",
+        "pathTemplate": "/createTender/{pClient}/{pCodePrefix}/{pCodeNumber}/{pOffer}",
+        "requestContentType": null
+      },
+      "soap": null,
+      "statuses": [
+        {
+          "httpStatus": 201,
+          "constant": "HTTP_Created",
+          "resultStatusCode": 201,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "Tender created; guid holds the new object's guid",
+          "sourceLines": "2853-2858"
+        },
+        {
+          "httpStatus": 404,
+          "constant": "HTTP_Not_Found",
+          "resultStatusCode": 404,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "No client with that exact name; allErrors holds $ClientNotFound (\"Client not found\")",
+          "sourceLines": "2815-2819"
+        },
+        {
+          "httpStatus": 404,
+          "constant": "HTTP_Not_Found",
+          "resultStatusCode": 404,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "No item with that code number; allErrors holds $ItemNotFound (\"Item was not found\")",
+          "sourceLines": "2825-2829"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": 400,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "Item is not a TenderItem; allErrors holds $ItemNotTenderItem (\"Item is not a Tender Item\")",
+          "sourceLines": "2833-2837"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": 400,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "TenderTA validation failed; allErrors holds the transaction-agent errors in order",
+          "sourceLines": "2846-2850"
+        },
+        {
+          "httpStatus": 400,
+          "constant": "HTTP_Bad_Request",
+          "resultStatusCode": null,
+          "bodyType": "null",
+          "runtimeTypes": null,
+          "condition": "pCodeNumber is not an Integer segment (for example 18.0 or 1e2), or pOffer not a Decimal segment (for example 1e7); rejected before the method body runs, with the literal null body",
+          "sourceLines": "323-327"
+        }
+      ]
+    },
+    {
+      "id": "Soap.getAgent",
+      "surface": "Soap",
+      "jadeClass": "ErewhonWebService",
+      "jadeMethod": "getAgent",
+      "schemaLine": 1148,
+      "bodyLines": "6528-6557",
+      "returnType": "DTOAgent",
+      "stateChanging": false,
+      "parameters": [
+        {
+          "name": "pName",
+          "jadeType": "String",
+          "position": 0,
+          "location": "element"
+        }
+      ],
+      "rest": null,
+      "soap": {
+        "action": "urn:JadeWebServices/WebServiceHTTP/getAgent",
+        "actionSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:1740",
+        "requestElement": "getAgent",
+        "responseElement": "getAgentResponse",
+        "resultElement": "getAgentResult",
+        "resultNillable": true,
+        "resultSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:511"
+      },
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": null,
+          "resultStatusCode": null,
+          "bodyType": "DTOAgent",
+          "runtimeTypes": null,
+          "condition": "Agent found by exact name",
+          "sourceLines": "6552-6555"
+        },
+        {
+          "httpStatus": 200,
+          "constant": null,
+          "resultStatusCode": null,
+          "bodyType": "nil",
+          "runtimeTypes": null,
+          "condition": "No agent with that exact name",
+          "sourceLines": "6548-6549"
+        }
+      ]
+    },
+    {
+      "id": "Soap.getAgentNames",
+      "surface": "Soap",
+      "jadeClass": "ErewhonWebService",
+      "jadeMethod": "getAgentNames",
+      "schemaLine": 1164,
+      "bodyLines": "6558-6586",
+      "returnType": "DTONameArray",
+      "stateChanging": false,
+      "parameters": [],
+      "rest": null,
+      "soap": {
+        "action": "urn:JadeWebServices/WebServiceHTTP/getAgentNames",
+        "actionSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:1756",
+        "requestElement": "getAgentNames",
+        "responseElement": "getAgentNamesResponse",
+        "resultElement": "getAgentNamesResult",
+        "resultNillable": true,
+        "resultSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:499"
+      },
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": null,
+          "resultStatusCode": null,
+          "bodyType": "DTONameArray",
+          "runtimeTypes": null,
+          "condition": "All agent names, in name order",
+          "sourceLines": "6576-6584"
+        }
+      ]
+    },
+    {
+      "id": "Soap.getClient",
+      "surface": "Soap",
+      "jadeClass": "ErewhonWebService",
+      "jadeMethod": "getClient",
+      "schemaLine": 1180,
+      "bodyLines": "6587-6616",
+      "returnType": "DTOClient",
+      "stateChanging": false,
+      "parameters": [
+        {
+          "name": "pName",
+          "jadeType": "String",
+          "position": 0,
+          "location": "element"
+        }
+      ],
+      "rest": null,
+      "soap": {
+        "action": "urn:JadeWebServices/WebServiceHTTP/getClient",
+        "actionSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:1772",
+        "requestElement": "getClient",
+        "responseElement": "getClientResponse",
+        "resultElement": "getClientResult",
+        "resultNillable": true,
+        "resultSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:557"
+      },
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": null,
+          "resultStatusCode": null,
+          "bodyType": "DTOClient",
+          "runtimeTypes": null,
+          "condition": "Client found by name after trimming blanks",
+          "sourceLines": "6605-6614"
+        },
+        {
+          "httpStatus": 200,
+          "constant": null,
+          "resultStatusCode": null,
+          "bodyType": "nil",
+          "runtimeTypes": null,
+          "condition": "No client with the trimmed name",
+          "sourceLines": "6607-6608"
+        }
+      ]
+    },
+    {
+      "id": "Soap.getClientNames",
+      "surface": "Soap",
+      "jadeClass": "ErewhonWebService",
+      "jadeMethod": "getClientNames",
+      "schemaLine": 1196,
+      "bodyLines": "6617-6645",
+      "returnType": "DTONameArray",
+      "stateChanging": false,
+      "parameters": [],
+      "rest": null,
+      "soap": {
+        "action": "urn:JadeWebServices/WebServiceHTTP/getClientNames",
+        "actionSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:1788",
+        "requestElement": "getClientNames",
+        "responseElement": "getClientNamesResponse",
+        "resultElement": "getClientNamesResult",
+        "resultNillable": true,
+        "resultSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:545"
+      },
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": null,
+          "resultStatusCode": null,
+          "bodyType": "DTONameArray",
+          "runtimeTypes": null,
+          "condition": "All client names, in name order",
+          "sourceLines": "6635-6643"
+        }
+      ]
+    },
+    {
+      "id": "Soap.getPhoto",
+      "surface": "Soap",
+      "jadeClass": "ErewhonWebService",
+      "jadeMethod": "getPhoto",
+      "schemaLine": 1212,
+      "bodyLines": "6646-6681",
+      "returnType": "DTOPhoto",
+      "stateChanging": false,
+      "parameters": [
+        {
+          "name": "pName",
+          "jadeType": "String",
+          "position": 0,
+          "location": "element"
+        }
+      ],
+      "rest": null,
+      "soap": {
+        "action": "urn:JadeWebServices/WebServiceHTTP/getPhoto",
+        "actionSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:1804",
+        "requestElement": "getPhoto",
+        "responseElement": "getPhotoResponse",
+        "resultElement": "getPhotoResult",
+        "resultNillable": true,
+        "resultSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:581"
+      },
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": null,
+          "resultStatusCode": null,
+          "bodyType": "DTOPhoto",
+          "runtimeTypes": null,
+          "condition": "Client found by exact name; photo of the last retail sale whose item has a photo, in sale-key order, or photo nil when none",
+          "sourceLines": "6671-6679"
+        },
+        {
+          "httpStatus": 200,
+          "constant": null,
+          "resultStatusCode": null,
+          "bodyType": "nil",
+          "runtimeTypes": null,
+          "condition": "No client with that exact name",
+          "sourceLines": "6667-6668"
+        }
+      ]
+    },
+    {
+      "id": "Soap.updateAgent",
+      "surface": "Soap",
+      "jadeClass": "ErewhonWebService",
+      "jadeMethod": "updateAgent",
+      "schemaLine": 1228,
+      "bodyLines": "6682-6753",
+      "returnType": "DTOResult",
+      "stateChanging": true,
+      "parameters": [
+        {
+          "name": "pName",
+          "jadeType": "String",
+          "position": 0,
+          "location": "element"
+        },
+        {
+          "name": "pStreet",
+          "jadeType": "String",
+          "position": 1,
+          "location": "element"
+        },
+        {
+          "name": "pCity",
+          "jadeType": "String",
+          "position": 2,
+          "location": "element"
+        },
+        {
+          "name": "pCountry",
+          "jadeType": "String",
+          "position": 3,
+          "location": "element"
+        },
+        {
+          "name": "pPhone",
+          "jadeType": "String",
+          "position": 4,
+          "location": "element"
+        },
+        {
+          "name": "pFax",
+          "jadeType": "String",
+          "position": 5,
+          "location": "element"
+        },
+        {
+          "name": "pEmail",
+          "jadeType": "String",
+          "position": 6,
+          "location": "element"
+        },
+        {
+          "name": "pWebsite",
+          "jadeType": "String",
+          "position": 7,
+          "location": "element"
+        }
+      ],
+      "rest": null,
+      "soap": {
+        "action": "urn:JadeWebServices/WebServiceHTTP/updateAgent",
+        "actionSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:1820",
+        "requestElement": "updateAgent",
+        "responseElement": "updateAgentResponse",
+        "resultElement": "updateAgentResult",
+        "resultNillable": true,
+        "resultSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:612"
+      },
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": "Status_Success",
+          "resultStatusCode": 200,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "Agent updated; guid is set but not exposed over SOAP",
+          "sourceLines": "6748-6751"
+        },
+        {
+          "httpStatus": 200,
+          "constant": "Error_Not_Found",
+          "resultStatusCode": 404,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "No agent with the exact name pName; allErrors holds $AgentNameNotFound (\"Agent <name> not found\")",
+          "sourceLines": "6720-6723"
+        },
+        {
+          "httpStatus": 200,
+          "constant": "Error_Bad_Request",
+          "resultStatusCode": 400,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "AgentTA validation failed; allErrors holds the transaction-agent errors in order",
+          "sourceLines": "6742-6745"
+        }
+      ]
+    },
+    {
+      "id": "Soap.updateAgentWithDTO",
+      "surface": "Soap",
+      "jadeClass": "ErewhonWebService",
+      "jadeMethod": "updateAgentWithDTO",
+      "schemaLine": 1252,
+      "bodyLines": "6754-6811",
+      "returnType": "DTOResult",
+      "stateChanging": true,
+      "parameters": [
+        {
+          "name": "pDTOAgent",
+          "jadeType": "DTOAgent",
+          "position": 0,
+          "location": "element"
+        }
+      ],
+      "rest": null,
+      "soap": {
+        "action": "urn:JadeWebServices/WebServiceHTTP/updateAgentWithDTO",
+        "actionSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:1836",
+        "requestElement": "updateAgentWithDTO",
+        "responseElement": "updateAgentWithDTOResponse",
+        "resultElement": "updateAgentWithDTOResult",
+        "resultNillable": true,
+        "resultSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:636"
+      },
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": "Status_Success",
+          "resultStatusCode": 200,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "Agent updated; guid is set but not exposed over SOAP",
+          "sourceLines": "6806-6809"
+        },
+        {
+          "httpStatus": 200,
+          "constant": "Error_Not_Found",
+          "resultStatusCode": 404,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "No agent with the exact name pDTOAgent.name; allErrors holds $AgentNameNotFound (\"Agent <name> not found\")",
+          "sourceLines": "6778-6781"
+        },
+        {
+          "httpStatus": 200,
+          "constant": "Error_Bad_Request",
+          "resultStatusCode": 400,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "AgentTA validation failed; allErrors holds the transaction-agent errors in order",
+          "sourceLines": "6800-6803"
+        }
+      ]
+    },
+    {
+      "id": "Soap.updateClient",
+      "surface": "Soap",
+      "jadeClass": "ErewhonWebService",
+      "jadeMethod": "updateClient",
+      "schemaLine": 1268,
+      "bodyLines": "6812-6885",
+      "returnType": "DTOResult",
+      "stateChanging": true,
+      "parameters": [
+        {
+          "name": "pName",
+          "jadeType": "String",
+          "position": 0,
+          "location": "element"
+        },
+        {
+          "name": "pStreet",
+          "jadeType": "String",
+          "position": 1,
+          "location": "element"
+        },
+        {
+          "name": "pCity",
+          "jadeType": "String",
+          "position": 2,
+          "location": "element"
+        },
+        {
+          "name": "pCountry",
+          "jadeType": "String",
+          "position": 3,
+          "location": "element"
+        },
+        {
+          "name": "pPhone",
+          "jadeType": "String",
+          "position": 4,
+          "location": "element"
+        },
+        {
+          "name": "pFax",
+          "jadeType": "String",
+          "position": 5,
+          "location": "element"
+        },
+        {
+          "name": "pEmail",
+          "jadeType": "String",
+          "position": 6,
+          "location": "element"
+        },
+        {
+          "name": "pWebsite",
+          "jadeType": "String",
+          "position": 7,
+          "location": "element"
+        }
+      ],
+      "rest": null,
+      "soap": {
+        "action": "urn:JadeWebServices/WebServiceHTTP/updateClient",
+        "actionSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:1852",
+        "requestElement": "updateClient",
+        "responseElement": "updateClientResponse",
+        "resultElement": "updateClientResult",
+        "resultNillable": true,
+        "resultSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:667"
+      },
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": "Status_Success",
+          "resultStatusCode": 200,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "Client updated; guid is set but not exposed over SOAP",
+          "sourceLines": "6880-6883"
+        },
+        {
+          "httpStatus": 200,
+          "constant": "Error_Not_Found",
+          "resultStatusCode": 404,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "No client with the exact name pName; allErrors holds $ClientNameNotFound (\"Client <name> not found\")",
+          "sourceLines": "6851-6854"
+        },
+        {
+          "httpStatus": 200,
+          "constant": "Error_Bad_Request",
+          "resultStatusCode": 400,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "ClientTA validation failed; allErrors holds the transaction-agent errors in order",
+          "sourceLines": "6873-6876"
+        }
+      ]
+    },
+    {
+      "id": "Soap.updateClientWithDTO",
+      "surface": "Soap",
+      "jadeClass": "ErewhonWebService",
+      "jadeMethod": "updateClientWithDTO",
+      "schemaLine": 1292,
+      "bodyLines": "6886-6942",
+      "returnType": "DTOResult",
+      "stateChanging": true,
+      "parameters": [
+        {
+          "name": "pDTOClient",
+          "jadeType": "DTOClient",
+          "position": 0,
+          "location": "element"
+        }
+      ],
+      "rest": null,
+      "soap": {
+        "action": "urn:JadeWebServices/WebServiceHTTP/updateClientWithDTO",
+        "actionSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:1868",
+        "requestElement": "updateClientWithDTO",
+        "responseElement": "updateClientWithDTOResponse",
+        "resultElement": "updateClientWithDTOResult",
+        "resultNillable": true,
+        "resultSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:691"
+      },
+      "statuses": [
+        {
+          "httpStatus": 200,
+          "constant": "Status_Success",
+          "resultStatusCode": 200,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "Client updated; guid is set but not exposed over SOAP",
+          "sourceLines": "6937-6940"
+        },
+        {
+          "httpStatus": 200,
+          "constant": "Error_Not_Found",
+          "resultStatusCode": 404,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "No client with the exact name pDTOClient.name; allErrors holds $ClientNameNotFound (\"Client <name> not found\")",
+          "sourceLines": "6910-6913"
+        },
+        {
+          "httpStatus": 200,
+          "constant": "Error_Bad_Request",
+          "resultStatusCode": 400,
+          "bodyType": "DTOResult",
+          "runtimeTypes": null,
+          "condition": "ClientTA validation failed; allErrors holds the transaction-agent errors in order",
+          "sourceLines": "6931-6934"
+        }
+      ]
+    }
+  ],
+  "dtos": [
+    {
+      "name": "DTOObject",
+      "superclass": "Object",
+      "abstract": true,
+      "typeHeaderLine": 8,
+      "schemaLine": 98,
+      "soapExposed": true,
+      "soapExposureLine": 1860,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": null,
+          "evidence": null,
+          "note": null
+        }
+      ]
+    },
+    {
+      "name": "DTOAgent",
+      "superclass": "DTOObject",
+      "abstract": false,
+      "typeHeaderLine": 9,
+      "schemaLine": 107,
+      "soapExposed": true,
+      "soapExposureLine": 1795,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": "N1",
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2092",
+            "Soap": null
+          },
+          "note": null
+        },
+        {
+          "name": "city",
+          "declaredIn": "DTOAgent",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 51,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 110,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1795",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2107",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2107"
+          },
+          "note": null
+        },
+        {
+          "name": "country",
+          "declaredIn": "DTOAgent",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 51,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 111,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1795",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2108",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2108"
+          },
+          "note": null
+        },
+        {
+          "name": "email",
+          "declaredIn": "DTOAgent",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 61,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 112,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1795",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2111",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2111"
+          },
+          "note": null
+        },
+        {
+          "name": "fax",
+          "declaredIn": "DTOAgent",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 26,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 113,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1795",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2110",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2110"
+          },
+          "note": null
+        },
+        {
+          "name": "name",
+          "declaredIn": "DTOAgent",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 81,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 114,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1795",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2105",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2105"
+          },
+          "note": null
+        },
+        {
+          "name": "phone",
+          "declaredIn": "DTOAgent",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 26,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 115,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1795",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2109",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2109"
+          },
+          "note": null
+        },
+        {
+          "name": "street",
+          "declaredIn": "DTOAgent",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 51,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 116,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1795",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2106",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2106"
+          },
+          "note": null
+        },
+        {
+          "name": "website",
+          "declaredIn": "DTOAgent",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 61,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 117,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1795",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2112",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2112"
+          },
+          "note": null
+        }
+      ]
+    },
+    {
+      "name": "DTOClient",
+      "superclass": "DTOObject",
+      "abstract": false,
+      "typeHeaderLine": 10,
+      "schemaLine": 121,
+      "soapExposed": true,
+      "soapExposureLine": 1807,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": "N1",
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2092",
+            "Soap": null
+          },
+          "note": null
+        },
+        {
+          "name": "city",
+          "declaredIn": "DTOClient",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 51,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 124,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1807",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2127",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2127"
+          },
+          "note": null
+        },
+        {
+          "name": "country",
+          "declaredIn": "DTOClient",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 51,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 125,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1807",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2128",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2128"
+          },
+          "note": null
+        },
+        {
+          "name": "email",
+          "declaredIn": "DTOClient",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 61,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 126,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1807",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2131",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2131"
+          },
+          "note": null
+        },
+        {
+          "name": "fax",
+          "declaredIn": "DTOClient",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 26,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 127,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1807",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2130",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2130"
+          },
+          "note": null
+        },
+        {
+          "name": "name",
+          "declaredIn": "DTOClient",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 81,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 128,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1807",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2125",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2125"
+          },
+          "note": null
+        },
+        {
+          "name": "phone",
+          "declaredIn": "DTOClient",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 26,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 129,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1807",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2129",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2129"
+          },
+          "note": null
+        },
+        {
+          "name": "street",
+          "declaredIn": "DTOClient",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 51,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 130,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1807",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2126",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2126"
+          },
+          "note": null
+        },
+        {
+          "name": "website",
+          "declaredIn": "DTOClient",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 61,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 131,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1807",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2132",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2132"
+          },
+          "note": null
+        }
+      ]
+    },
+    {
+      "name": "DTOCompany",
+      "superclass": "DTOObject",
+      "abstract": false,
+      "typeHeaderLine": 11,
+      "schemaLine": 135,
+      "soapExposed": true,
+      "soapExposureLine": 1819,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": "N1",
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2092",
+            "Soap": null
+          },
+          "note": null
+        },
+        {
+          "name": "city",
+          "declaredIn": "DTOCompany",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 51,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 138,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1819",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2147",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "country",
+          "declaredIn": "DTOCompany",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 51,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 139,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1819",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2148",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "email",
+          "declaredIn": "DTOCompany",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 61,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 140,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1819",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2151",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "fax",
+          "declaredIn": "DTOCompany",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 26,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 141,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1819",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2150",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "name",
+          "declaredIn": "DTOCompany",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 81,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 142,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1819",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2145",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "phone",
+          "declaredIn": "DTOCompany",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 26,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 143,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1819",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2149",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "street",
+          "declaredIn": "DTOCompany",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 51,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 144,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1819",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2146",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "website",
+          "declaredIn": "DTOCompany",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 61,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 145,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1819",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2152",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        }
+      ]
+    },
+    {
+      "name": "DTOError",
+      "superclass": "DTOObject",
+      "abstract": false,
+      "typeHeaderLine": 12,
+      "schemaLine": 149,
+      "soapExposed": true,
+      "soapExposureLine": 1831,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2326-2868",
+            "Soap": null
+          },
+          "note": "no method creates it"
+        },
+        {
+          "name": "allErrors",
+          "declaredIn": "DTOError",
+          "kind": "collection",
+          "jadeType": "StringArray",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 152,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1831",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}ArrayOfString",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2326-2868",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "no method creates it"
+        },
+        {
+          "name": "statusCode",
+          "declaredIn": "DTOError",
+          "kind": "attribute",
+          "jadeType": "Integer",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 153,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1831",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}int",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2326-2868",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "no method creates it"
+        }
+      ]
+    },
+    {
+      "name": "DTOItem",
+      "superclass": "DTOObject",
+      "abstract": false,
+      "typeHeaderLine": 13,
+      "schemaLine": 155,
+      "soapExposed": true,
+      "soapExposureLine": 1837,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2092",
+            "Soap": null
+          },
+          "note": null
+        },
+        {
+          "name": "agent",
+          "declaredIn": "DTOItem",
+          "kind": "reference",
+          "jadeType": "DTOAgent",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 168,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOAgent",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2166-2167",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "categoryPrefix",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 5,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 158,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2156-2177",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "never assigned by the DTOItem population (2156-2177)"
+        },
+        {
+          "name": "description",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 159,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2170",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "itemCategory",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 41,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 160,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2174",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "listedDate",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "Date",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 161,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}date",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2171",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "name",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 31,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 162,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2175",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "number",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "Integer",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 163,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}int",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2169",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "photo",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "Binary",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 164,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}base64Binary",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2156-2177",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "never assigned by the DTOItem population (2156-2177)"
+        },
+        {
+          "name": "price",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "Decimal",
+          "length": null,
+          "precision": 12,
+          "scale": 2,
+          "schemaLine": 165,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}decimal",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2172",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "region",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 81,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 166,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2173",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "sale",
+          "declaredIn": "DTOItem",
+          "kind": "reference",
+          "jadeType": "DTOSaleDetail",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 169,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOSaleDetail",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2190",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "reachable only through subclass instances (DTORetailItem 2190, DTOTenderItem 2209); DTOSale.item is a plain DTOItem without sale (2229)"
+        }
+      ]
+    },
+    {
+      "name": "DTORetailItem",
+      "superclass": "DTOItem",
+      "abstract": false,
+      "typeHeaderLine": 14,
+      "schemaLine": 173,
+      "soapExposed": true,
+      "soapExposureLine": 1871,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2092",
+            "Soap": null
+          },
+          "note": null
+        },
+        {
+          "name": "agent",
+          "declaredIn": "DTOItem",
+          "kind": "reference",
+          "jadeType": "DTOAgent",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 168,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOAgent",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2166-2167",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "categoryPrefix",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 5,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 158,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2156-2177",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "never assigned by the DTOItem population (2156-2177)"
+        },
+        {
+          "name": "description",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 159,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2170",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "itemCategory",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 41,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 160,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2174",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "listedDate",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "Date",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 161,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}date",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2171",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "name",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 31,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 162,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2175",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "number",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "Integer",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 163,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}int",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2169",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "photo",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "Binary",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 164,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}base64Binary",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2156-2177",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "never assigned by the DTOItem population (2156-2177)"
+        },
+        {
+          "name": "price",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "Decimal",
+          "length": null,
+          "precision": 12,
+          "scale": 2,
+          "schemaLine": 165,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}decimal",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2172",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "region",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 81,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 166,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2173",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "sale",
+          "declaredIn": "DTOItem",
+          "kind": "reference",
+          "jadeType": "DTOSaleDetail",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 169,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOSaleDetail",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2190",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "created as DTORetailSaleDetail when the item is sold (2190)"
+        }
+      ]
+    },
+    {
+      "name": "DTOTenderItem",
+      "superclass": "DTOItem",
+      "abstract": false,
+      "typeHeaderLine": 15,
+      "schemaLine": 178,
+      "soapExposed": true,
+      "soapExposureLine": 1906,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2092",
+            "Soap": null
+          },
+          "note": null
+        },
+        {
+          "name": "agent",
+          "declaredIn": "DTOItem",
+          "kind": "reference",
+          "jadeType": "DTOAgent",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 168,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOAgent",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2166-2167",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "categoryPrefix",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 5,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 158,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2156-2177",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "never assigned by the DTOItem population (2156-2177)"
+        },
+        {
+          "name": "description",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 159,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2170",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "itemCategory",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 41,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 160,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2174",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "listedDate",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "Date",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 161,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}date",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2171",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "name",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 31,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 162,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2175",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "number",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "Integer",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 163,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}int",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2169",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "photo",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "Binary",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 164,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}base64Binary",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2156-2177",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "never assigned by the DTOItem population (2156-2177)"
+        },
+        {
+          "name": "price",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "Decimal",
+          "length": null,
+          "precision": 12,
+          "scale": 2,
+          "schemaLine": 165,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}decimal",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2172",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "region",
+          "declaredIn": "DTOItem",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 81,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 166,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2173",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "sale",
+          "declaredIn": "DTOItem",
+          "kind": "reference",
+          "jadeType": "DTOSaleDetail",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 169,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1837",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOSaleDetail",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2209",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "created as the declared plain DTOSaleDetail when the item is sold (2209), never as DTOTenderSaleDetail"
+        },
+        {
+          "name": "closureDate",
+          "declaredIn": "DTOTenderItem",
+          "kind": "attribute",
+          "jadeType": "Date",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 181,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1906",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}date",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2205",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        }
+      ]
+    },
+    {
+      "name": "DTOName",
+      "superclass": "DTOObject",
+      "abstract": false,
+      "typeHeaderLine": 16,
+      "schemaLine": 185,
+      "soapExposed": true,
+      "soapExposureLine": 1852,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2326-2868",
+            "Soap": null
+          },
+          "note": "created only by SOAP bodies (6579, 6638)"
+        },
+        {
+          "name": "name",
+          "declaredIn": "DTOName",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 81,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 188,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1852",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2326-2868",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6580"
+          },
+          "note": "created only by SOAP bodies (6579, 6638)"
+        }
+      ]
+    },
+    {
+      "name": "DTOPhoto",
+      "superclass": "DTOObject",
+      "abstract": false,
+      "typeHeaderLine": 17,
+      "schemaLine": 190,
+      "soapExposed": true,
+      "soapExposureLine": 1866,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2326-2868",
+            "Soap": null
+          },
+          "note": "created only by SOAP bodies (6671)"
+        },
+        {
+          "name": "photo",
+          "declaredIn": "DTOPhoto",
+          "kind": "attribute",
+          "jadeType": "Binary",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 193,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1866",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}base64Binary",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2326-2868",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6675"
+          },
+          "note": "created only by SOAP bodies (6671)"
+        }
+      ]
+    },
+    {
+      "name": "DTOResult",
+      "superclass": "DTOObject",
+      "abstract": false,
+      "typeHeaderLine": 18,
+      "schemaLine": 195,
+      "soapExposed": true,
+      "soapExposureLine": null,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": "N1",
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2686",
+            "Soap": null
+          },
+          "note": "assigned on success paths only (2686, 2726, 2791, 2855); never exposed over SOAP"
+        },
+        {
+          "name": "allErrors",
+          "declaredIn": "DTOResult",
+          "kind": "collection",
+          "jadeType": "StringArray",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 198,
+          "soapExposed": true,
+          "soapExposureSource": "KL-SOAP-DTORESULT",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}ArrayOfString",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2679",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6722"
+          },
+          "note": "SOAP exposure assumed: DTOResult is absent from the WebServiceHTTP list (KL-SOAP-DTORESULT)"
+        },
+        {
+          "name": "allWarnings",
+          "declaredIn": "DTOResult",
+          "kind": "collection",
+          "jadeType": "StringArray",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 199,
+          "soapExposed": true,
+          "soapExposureSource": "KL-SOAP-DTORESULT",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}ArrayOfString",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2326-2868",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "never assigned by any in-scope body; serialised as an empty collection; SOAP exposure assumed (KL-SOAP-DTORESULT)"
+        },
+        {
+          "name": "statusCode",
+          "declaredIn": "DTOResult",
+          "kind": "attribute",
+          "jadeType": "Integer",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 200,
+          "soapExposed": true,
+          "soapExposureSource": "KL-SOAP-DTORESULT",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}int",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "reachable"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2680",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6721"
+          },
+          "note": "SOAP exposure assumed: DTOResult is absent from the WebServiceHTTP list (KL-SOAP-DTORESULT)"
+        }
+      ]
+    },
+    {
+      "name": "DTOSale",
+      "superclass": "DTOObject",
+      "abstract": false,
+      "typeHeaderLine": 19,
+      "schemaLine": 202,
+      "soapExposed": true,
+      "soapExposureLine": 1885,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": "N1",
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2092",
+            "Soap": null
+          },
+          "note": "DTOSale is never created directly; reachable through DTORetailSale and DTOTenderSale instances"
+        },
+        {
+          "name": "agentCommission",
+          "declaredIn": "DTOSale",
+          "kind": "attribute",
+          "jadeType": "Decimal",
+          "length": null,
+          "precision": 12,
+          "scale": 2,
+          "schemaLine": 205,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1885",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}decimal",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2224",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "DTOSale is never created directly; reachable through DTORetailSale and DTOTenderSale instances"
+        },
+        {
+          "name": "client",
+          "declaredIn": "DTOSale",
+          "kind": "reference",
+          "jadeType": "DTOClient",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 207,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1885",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOClient",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2226-2227",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "DTOSale is never created directly; reachable through DTORetailSale and DTOTenderSale instances"
+        },
+        {
+          "name": "item",
+          "declaredIn": "DTOSale",
+          "kind": "reference",
+          "jadeType": "DTOItem",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 208,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1885",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOItem",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2229-2230",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "DTOSale is never created directly; reachable through DTORetailSale and DTOTenderSale instances"
+        }
+      ]
+    },
+    {
+      "name": "DTORetailSale",
+      "superclass": "DTOSale",
+      "abstract": false,
+      "typeHeaderLine": 20,
+      "schemaLine": 212,
+      "soapExposed": true,
+      "soapExposureLine": 1874,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": "N1",
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2092",
+            "Soap": null
+          },
+          "note": null
+        },
+        {
+          "name": "agentCommission",
+          "declaredIn": "DTOSale",
+          "kind": "attribute",
+          "jadeType": "Decimal",
+          "length": null,
+          "precision": 12,
+          "scale": 2,
+          "schemaLine": 205,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1885",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}decimal",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2224",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "client",
+          "declaredIn": "DTOSale",
+          "kind": "reference",
+          "jadeType": "DTOClient",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 207,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1885",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOClient",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2226-2227",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "item",
+          "declaredIn": "DTOSale",
+          "kind": "reference",
+          "jadeType": "DTOItem",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 208,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1885",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOItem",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2229-2230",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "timestamp",
+          "declaredIn": "DTORetailSale",
+          "kind": "attribute",
+          "jadeType": "TimeStamp",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 215,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1874",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}dateTime",
+          "normalisation": "N2",
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2243",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        }
+      ]
+    },
+    {
+      "name": "DTOTenderSale",
+      "superclass": "DTOSale",
+      "abstract": false,
+      "typeHeaderLine": 21,
+      "schemaLine": 219,
+      "soapExposed": true,
+      "soapExposureLine": 1911,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": "N1",
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2092",
+            "Soap": null
+          },
+          "note": null
+        },
+        {
+          "name": "agentCommission",
+          "declaredIn": "DTOSale",
+          "kind": "attribute",
+          "jadeType": "Decimal",
+          "length": null,
+          "precision": 12,
+          "scale": 2,
+          "schemaLine": 205,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1885",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}decimal",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2224",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "client",
+          "declaredIn": "DTOSale",
+          "kind": "reference",
+          "jadeType": "DTOClient",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 207,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1885",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOClient",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2226-2227",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "item",
+          "declaredIn": "DTOSale",
+          "kind": "reference",
+          "jadeType": "DTOItem",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 208,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1885",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOItem",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2229-2230",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "offer",
+          "declaredIn": "DTOTenderSale",
+          "kind": "attribute",
+          "jadeType": "Decimal",
+          "length": null,
+          "precision": 12,
+          "scale": 2,
+          "schemaLine": 222,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1911",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}decimal",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2247-2259",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "never assigned by the DTOTenderSale population (2247-2259)"
+        },
+        {
+          "name": "tender",
+          "declaredIn": "DTOTenderSale",
+          "kind": "reference",
+          "jadeType": "DTOTender",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 224,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1911",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOTender",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2256-2257",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        }
+      ]
+    },
+    {
+      "name": "DTOSaleDetail",
+      "superclass": "DTOObject",
+      "abstract": false,
+      "typeHeaderLine": 22,
+      "schemaLine": 228,
+      "soapExposed": true,
+      "soapExposureLine": 1892,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": "N1",
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2092",
+            "Soap": null
+          },
+          "note": null
+        },
+        {
+          "name": "agentCommission",
+          "declaredIn": "DTOSaleDetail",
+          "kind": "attribute",
+          "jadeType": "Decimal",
+          "length": null,
+          "precision": 12,
+          "scale": 2,
+          "schemaLine": 236,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1892",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}decimal",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2273",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "client",
+          "declaredIn": "DTOSaleDetail",
+          "kind": "reference",
+          "jadeType": "DTOClient",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 238,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1892",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOClient",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2270-2271",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        }
+      ]
+    },
+    {
+      "name": "DTORetailSaleDetail",
+      "superclass": "DTOSaleDetail",
+      "abstract": false,
+      "typeHeaderLine": 23,
+      "schemaLine": 242,
+      "soapExposed": true,
+      "soapExposureLine": 1879,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": "N1",
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2092",
+            "Soap": null
+          },
+          "note": null
+        },
+        {
+          "name": "agentCommission",
+          "declaredIn": "DTOSaleDetail",
+          "kind": "attribute",
+          "jadeType": "Decimal",
+          "length": null,
+          "precision": 12,
+          "scale": 2,
+          "schemaLine": 236,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1892",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}decimal",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2273",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "client",
+          "declaredIn": "DTOSaleDetail",
+          "kind": "reference",
+          "jadeType": "DTOClient",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 238,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1892",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOClient",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2270-2271",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "price",
+          "declaredIn": "DTORetailSaleDetail",
+          "kind": "attribute",
+          "jadeType": "Decimal",
+          "length": null,
+          "precision": 12,
+          "scale": 2,
+          "schemaLine": 245,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1879",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}decimal",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2287",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "soldDate",
+          "declaredIn": "DTORetailSaleDetail",
+          "kind": "attribute",
+          "jadeType": "TimeStamp",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 246,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1879",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}dateTime",
+          "normalisation": "N2",
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2286",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        }
+      ]
+    },
+    {
+      "name": "DTOTenderSaleDetail",
+      "superclass": "DTOSaleDetail",
+      "abstract": false,
+      "typeHeaderLine": 24,
+      "schemaLine": 250,
+      "soapExposed": true,
+      "soapExposureLine": 1917,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": "N1",
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2209",
+            "Soap": null
+          },
+          "note": "class never created (2209)"
+        },
+        {
+          "name": "agentCommission",
+          "declaredIn": "DTOSaleDetail",
+          "kind": "attribute",
+          "jadeType": "Decimal",
+          "length": null,
+          "precision": 12,
+          "scale": 2,
+          "schemaLine": 236,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1892",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}decimal",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2209",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "class never created (2209)"
+        },
+        {
+          "name": "client",
+          "declaredIn": "DTOSaleDetail",
+          "kind": "reference",
+          "jadeType": "DTOClient",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 238,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1892",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOClient",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2209",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "class never created (2209)"
+        },
+        {
+          "name": "offer",
+          "declaredIn": "DTOTenderSaleDetail",
+          "kind": "attribute",
+          "jadeType": "Decimal",
+          "length": null,
+          "precision": 12,
+          "scale": 2,
+          "schemaLine": 253,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1917",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}decimal",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2209",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "class never created (2209)"
+        },
+        {
+          "name": "tenderDate",
+          "declaredIn": "DTOTenderSaleDetail",
+          "kind": "attribute",
+          "jadeType": "TimeStamp",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 254,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1917",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}dateTime",
+          "normalisation": "N2",
+          "reachability": {
+            "Rest": "unreachable-in-source",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2209",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": "class never created (2209)"
+        }
+      ]
+    },
+    {
+      "name": "DTOTender",
+      "superclass": "DTOObject",
+      "abstract": false,
+      "typeHeaderLine": 25,
+      "schemaLine": 258,
+      "soapExposed": true,
+      "soapExposureLine": 1898,
+      "properties": [
+        {
+          "name": "guid",
+          "declaredIn": "DTOObject",
+          "kind": "attribute",
+          "jadeType": "String",
+          "length": 39,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 103,
+          "soapExposed": false,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1860",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}string",
+          "normalisation": "N1",
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "not-exposed"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2092",
+            "Soap": null
+          },
+          "note": null
+        },
+        {
+          "name": "client",
+          "declaredIn": "DTOTender",
+          "kind": "reference",
+          "jadeType": "DTOClient",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 264,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1898",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOClient",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2314-2315",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "offer",
+          "declaredIn": "DTOTender",
+          "kind": "attribute",
+          "jadeType": "Decimal",
+          "length": null,
+          "precision": 12,
+          "scale": 2,
+          "schemaLine": 261,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1898",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}decimal",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2317",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "tenderItem",
+          "declaredIn": "DTOTender",
+          "kind": "reference",
+          "jadeType": "DTOTenderItem",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 265,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1898",
+          "xmlType": "{urn:JadeWebServices/WebServiceHTTP/}DTOTenderItem",
+          "normalisation": null,
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2319-2320",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        },
+        {
+          "name": "timestamp",
+          "declaredIn": "DTOTender",
+          "kind": "attribute",
+          "jadeType": "TimeStamp",
+          "length": null,
+          "precision": null,
+          "scale": null,
+          "schemaLine": 262,
+          "soapExposed": true,
+          "soapExposureSource": "Erewhon/ErehwhonExternalInterfacesSchema.scm:1898",
+          "xmlType": "{http://www.w3.org/2001/XMLSchema}dateTime",
+          "normalisation": "N2",
+          "reachability": {
+            "Rest": "reachable",
+            "Soap": "unreachable-in-source"
+          },
+          "evidence": {
+            "Rest": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2322",
+            "Soap": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+          },
+          "note": null
+        }
+      ]
+    }
+  ],
+  "arrays": [
+    {
+      "name": "DTOObjectArray",
+      "superclass": "ObjectArray",
+      "itemType": "DTOObject",
+      "builtIn": false,
+      "typeHeaderLine": 61,
+      "membershipLine": 68,
+      "soapExposed": true,
+      "soapExposureLine": 1863,
+      "soapTypeName": "ArrayOfDTOObject",
+      "soapItemElement": "DTOObject",
+      "soapTypeSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:150"
+    },
+    {
+      "name": "DTOAgentArray",
+      "superclass": "DTOObjectArray",
+      "itemType": "DTOAgent",
+      "builtIn": false,
+      "typeHeaderLine": 62,
+      "membershipLine": 69,
+      "soapExposed": false,
+      "soapExposureLine": null,
+      "soapTypeName": null,
+      "soapItemElement": null,
+      "soapTypeSource": null
+    },
+    {
+      "name": "DTOClientArray",
+      "superclass": "DTOObjectArray",
+      "itemType": "DTOClient",
+      "builtIn": false,
+      "typeHeaderLine": 63,
+      "membershipLine": 70,
+      "soapExposed": false,
+      "soapExposureLine": null,
+      "soapTypeName": null,
+      "soapItemElement": null,
+      "soapTypeSource": null
+    },
+    {
+      "name": "DTOItemsArray",
+      "superclass": "DTOObjectArray",
+      "itemType": "DTOItem",
+      "builtIn": false,
+      "typeHeaderLine": 64,
+      "membershipLine": 71,
+      "soapExposed": false,
+      "soapExposureLine": null,
+      "soapTypeName": null,
+      "soapItemElement": null,
+      "soapTypeSource": null
+    },
+    {
+      "name": "DTONameArray",
+      "superclass": "DTOObjectArray",
+      "itemType": "DTOName",
+      "builtIn": false,
+      "typeHeaderLine": 65,
+      "membershipLine": 72,
+      "soapExposed": true,
+      "soapExposureLine": 1857,
+      "soapTypeName": "ArrayOfDTOName",
+      "soapItemElement": "DTOName",
+      "soapTypeSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:149"
+    },
+    {
+      "name": "DTOSaleArray",
+      "superclass": "DTOObjectArray",
+      "itemType": "DTOSale",
+      "builtIn": false,
+      "typeHeaderLine": 66,
+      "membershipLine": 73,
+      "soapExposed": false,
+      "soapExposureLine": null,
+      "soapTypeName": null,
+      "soapItemElement": null,
+      "soapTypeSource": null
+    },
+    {
+      "name": "StringArray",
+      "superclass": null,
+      "itemType": "String",
+      "builtIn": true,
+      "typeHeaderLine": null,
+      "membershipLine": null,
+      "soapExposed": true,
+      "soapExposureLine": 1929,
+      "soapTypeName": "ArrayOfString",
+      "soapItemElement": "String",
+      "soapTypeSource": "Erewhon/ErewhonWebServiceConsumerSchema.scm:148"
+    }
+  ],
+  "statusConstants": [
+    {
+      "surface": "Rest",
+      "name": "HTTP_Bad_Request",
+      "value": 400,
+      "schemaLine": 293,
+      "reachability": "reachable",
+      "evidence": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2498"
+    },
+    {
+      "surface": "Rest",
+      "name": "HTTP_Conflict",
+      "value": 409,
+      "schemaLine": 294,
+      "reachability": "unreachable-in-source",
+      "evidence": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2326-2868"
+    },
+    {
+      "surface": "Rest",
+      "name": "HTTP_Created",
+      "value": 201,
+      "schemaLine": 295,
+      "reachability": "reachable",
+      "evidence": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2684"
+    },
+    {
+      "surface": "Rest",
+      "name": "HTTP_Forbidden",
+      "value": 403,
+      "schemaLine": 296,
+      "reachability": "unreachable-in-source",
+      "evidence": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2326-2868"
+    },
+    {
+      "surface": "Rest",
+      "name": "HTTP_Not_Found",
+      "value": 404,
+      "schemaLine": 297,
+      "reachability": "reachable",
+      "evidence": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2344"
+    },
+    {
+      "surface": "Rest",
+      "name": "HTTP_Server_Error",
+      "value": 500,
+      "schemaLine": 298,
+      "reachability": "reachable",
+      "evidence": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2471"
+    },
+    {
+      "surface": "Rest",
+      "name": "HTTP_Success",
+      "value": 200,
+      "schemaLine": 299,
+      "reachability": "reachable",
+      "evidence": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2348"
+    },
+    {
+      "surface": "Rest",
+      "name": "HTTP_Unauthorized",
+      "value": 401,
+      "schemaLine": 300,
+      "reachability": "unreachable-in-source",
+      "evidence": "Erewhon/ErehwhonExternalInterfacesSchema.scm:2326-2868"
+    },
+    {
+      "surface": "Soap",
+      "name": "Error_Bad_Request",
+      "value": 400,
+      "schemaLine": 1139,
+      "reachability": "reachable",
+      "evidence": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6744"
+    },
+    {
+      "surface": "Soap",
+      "name": "Error_Conflict",
+      "value": 409,
+      "schemaLine": 1140,
+      "reachability": "unreachable-in-source",
+      "evidence": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+    },
+    {
+      "surface": "Soap",
+      "name": "Error_Forbidden",
+      "value": 403,
+      "schemaLine": 1141,
+      "reachability": "unreachable-in-source",
+      "evidence": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+    },
+    {
+      "surface": "Soap",
+      "name": "Error_Not_Found",
+      "value": 404,
+      "schemaLine": 1142,
+      "reachability": "reachable",
+      "evidence": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6721"
+    },
+    {
+      "surface": "Soap",
+      "name": "Error_Server_Error",
+      "value": 500,
+      "schemaLine": 1143,
+      "reachability": "unreachable-in-source",
+      "evidence": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+    },
+    {
+      "surface": "Soap",
+      "name": "Error_Unauthorized",
+      "value": 403,
+      "schemaLine": 1144,
+      "reachability": "unreachable-in-source",
+      "evidence": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+    },
+    {
+      "surface": "Soap",
+      "name": "Status_Created",
+      "value": 201,
+      "schemaLine": 1145,
+      "reachability": "unreachable-in-source",
+      "evidence": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6528-6942"
+    },
+    {
+      "surface": "Soap",
+      "name": "Status_Success",
+      "value": 200,
+      "schemaLine": 1146,
+      "reachability": "reachable",
+      "evidence": "Erewhon/ErehwhonExternalInterfacesSchema.scm:6748"
+    }
+  ]
+}

@@ -1,0 +1,543 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Modelled by the JADE stand-in on JADE 2022 default conventions; not captured from live JADE -->
+<wsdl:definitions xmlns:wsdl="http://schemas.xmlsoap.org/wsdl/" xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:tns="urn:JadeWebServices/WebServiceHTTP/" targetNamespace="urn:JadeWebServices/WebServiceHTTP/" name="ErewhonWebService">
+  <wsdl:types>
+    <xsd:schema targetNamespace="urn:JadeWebServices/WebServiceHTTP/" elementFormDefault="qualified">
+      <xsd:simpleType name="decimal">
+        <xsd:restriction base="xsd:decimal">
+          <xsd:totalDigits value="12" />
+          <xsd:fractionDigits value="2" />
+        </xsd:restriction>
+      </xsd:simpleType>
+      <xsd:complexType name="DTOObject" abstract="true">
+        <xsd:sequence />
+      </xsd:complexType>
+      <xsd:complexType name="DTOAgent">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOObject">
+            <xsd:sequence>
+              <xsd:element minOccurs="0" maxOccurs="1" name="city" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="country" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="email" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="fax" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="name" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="phone" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="street" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="website" type="xsd:string" />
+            </xsd:sequence>
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="DTOClient">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOObject">
+            <xsd:sequence>
+              <xsd:element minOccurs="0" maxOccurs="1" name="city" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="country" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="email" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="fax" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="name" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="phone" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="street" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="website" type="xsd:string" />
+            </xsd:sequence>
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="DTOCompany">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOObject">
+            <xsd:sequence>
+              <xsd:element minOccurs="0" maxOccurs="1" name="city" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="country" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="email" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="fax" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="name" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="phone" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="street" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="website" type="xsd:string" />
+            </xsd:sequence>
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="DTOError">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOObject">
+            <xsd:sequence>
+              <xsd:element minOccurs="1" maxOccurs="1" name="allErrors" nillable="true" type="tns:ArrayOfString" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="statusCode" type="xsd:int" />
+            </xsd:sequence>
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="DTOItem">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOObject">
+            <xsd:sequence>
+              <xsd:element minOccurs="1" maxOccurs="1" name="agent" nillable="true" type="tns:DTOAgent" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="categoryPrefix" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="description" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="itemCategory" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="listedDate" type="xsd:date" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="name" type="xsd:string" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="number" type="xsd:int" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="photo" nillable="true" type="xsd:base64Binary" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="price" type="tns:decimal" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="region" type="xsd:string" />
+              <xsd:element minOccurs="1" maxOccurs="1" name="sale" nillable="true" type="tns:DTOSaleDetail" />
+            </xsd:sequence>
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="DTORetailItem">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOItem">
+            <xsd:sequence />
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="DTOTenderItem">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOItem">
+            <xsd:sequence>
+              <xsd:element minOccurs="0" maxOccurs="1" name="closureDate" type="xsd:date" />
+            </xsd:sequence>
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="DTOName">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOObject">
+            <xsd:sequence>
+              <xsd:element minOccurs="0" maxOccurs="1" name="name" type="xsd:string" />
+            </xsd:sequence>
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="DTOPhoto">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOObject">
+            <xsd:sequence>
+              <xsd:element minOccurs="0" maxOccurs="1" name="photo" nillable="true" type="xsd:base64Binary" />
+            </xsd:sequence>
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="DTOResult">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOObject">
+            <xsd:sequence>
+              <xsd:element minOccurs="1" maxOccurs="1" name="allErrors" nillable="true" type="tns:ArrayOfString" />
+              <xsd:element minOccurs="1" maxOccurs="1" name="allWarnings" nillable="true" type="tns:ArrayOfString" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="statusCode" type="xsd:int" />
+            </xsd:sequence>
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="DTOSale">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOObject">
+            <xsd:sequence>
+              <xsd:element minOccurs="0" maxOccurs="1" name="agentCommission" type="tns:decimal" />
+              <xsd:element minOccurs="1" maxOccurs="1" name="client" nillable="true" type="tns:DTOClient" />
+              <xsd:element minOccurs="1" maxOccurs="1" name="item" nillable="true" type="tns:DTOItem" />
+            </xsd:sequence>
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="DTORetailSale">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOSale">
+            <xsd:sequence>
+              <xsd:element minOccurs="0" maxOccurs="1" name="timestamp" type="xsd:dateTime" />
+            </xsd:sequence>
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="DTOTenderSale">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOSale">
+            <xsd:sequence>
+              <xsd:element minOccurs="0" maxOccurs="1" name="offer" type="tns:decimal" />
+              <xsd:element minOccurs="1" maxOccurs="1" name="tender" nillable="true" type="tns:DTOTender" />
+            </xsd:sequence>
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="DTOSaleDetail">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOObject">
+            <xsd:sequence>
+              <xsd:element minOccurs="0" maxOccurs="1" name="agentCommission" type="tns:decimal" />
+              <xsd:element minOccurs="1" maxOccurs="1" name="client" nillable="true" type="tns:DTOClient" />
+            </xsd:sequence>
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="DTORetailSaleDetail">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOSaleDetail">
+            <xsd:sequence>
+              <xsd:element minOccurs="0" maxOccurs="1" name="price" type="tns:decimal" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="soldDate" type="xsd:dateTime" />
+            </xsd:sequence>
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="DTOTenderSaleDetail">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOSaleDetail">
+            <xsd:sequence>
+              <xsd:element minOccurs="0" maxOccurs="1" name="offer" type="tns:decimal" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="tenderDate" type="xsd:dateTime" />
+            </xsd:sequence>
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="DTOTender">
+        <xsd:complexContent>
+          <xsd:extension base="tns:DTOObject">
+            <xsd:sequence>
+              <xsd:element minOccurs="1" maxOccurs="1" name="client" nillable="true" type="tns:DTOClient" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="offer" type="tns:decimal" />
+              <xsd:element minOccurs="1" maxOccurs="1" name="tenderItem" nillable="true" type="tns:DTOTenderItem" />
+              <xsd:element minOccurs="0" maxOccurs="1" name="timestamp" type="xsd:dateTime" />
+            </xsd:sequence>
+          </xsd:extension>
+        </xsd:complexContent>
+      </xsd:complexType>
+      <xsd:complexType name="ArrayOfDTOObject">
+        <xsd:sequence>
+          <xsd:element minOccurs="0" maxOccurs="unbounded" name="DTOObject" nillable="true" type="tns:DTOObject" />
+        </xsd:sequence>
+      </xsd:complexType>
+      <xsd:complexType name="ArrayOfDTOName">
+        <xsd:sequence>
+          <xsd:element minOccurs="0" maxOccurs="unbounded" name="DTOName" nillable="true" type="tns:DTOName" />
+        </xsd:sequence>
+      </xsd:complexType>
+      <xsd:complexType name="ArrayOfString">
+        <xsd:sequence>
+          <xsd:element minOccurs="0" maxOccurs="unbounded" name="String" type="xsd:string" />
+        </xsd:sequence>
+      </xsd:complexType>
+      <xsd:element name="getAgent">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element minOccurs="1" maxOccurs="1" name="pName" type="xsd:string" />
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="getAgentResponse">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element minOccurs="1" maxOccurs="1" name="getAgentResult" nillable="true" type="tns:DTOAgent" />
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="getAgentNames">
+        <xsd:complexType>
+          <xsd:sequence />
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="getAgentNamesResponse">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element minOccurs="1" maxOccurs="1" name="getAgentNamesResult" nillable="true" type="tns:ArrayOfDTOName" />
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="getClient">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element minOccurs="1" maxOccurs="1" name="pName" type="xsd:string" />
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="getClientResponse">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element minOccurs="1" maxOccurs="1" name="getClientResult" nillable="true" type="tns:DTOClient" />
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="getClientNames">
+        <xsd:complexType>
+          <xsd:sequence />
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="getClientNamesResponse">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element minOccurs="1" maxOccurs="1" name="getClientNamesResult" nillable="true" type="tns:ArrayOfDTOName" />
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="getPhoto">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element minOccurs="1" maxOccurs="1" name="pName" type="xsd:string" />
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="getPhotoResponse">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element minOccurs="1" maxOccurs="1" name="getPhotoResult" nillable="true" type="tns:DTOPhoto" />
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="updateAgent">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element minOccurs="1" maxOccurs="1" name="pName" type="xsd:string" />
+            <xsd:element minOccurs="1" maxOccurs="1" name="pStreet" type="xsd:string" />
+            <xsd:element minOccurs="1" maxOccurs="1" name="pCity" type="xsd:string" />
+            <xsd:element minOccurs="1" maxOccurs="1" name="pCountry" type="xsd:string" />
+            <xsd:element minOccurs="1" maxOccurs="1" name="pPhone" type="xsd:string" />
+            <xsd:element minOccurs="1" maxOccurs="1" name="pFax" type="xsd:string" />
+            <xsd:element minOccurs="1" maxOccurs="1" name="pEmail" type="xsd:string" />
+            <xsd:element minOccurs="1" maxOccurs="1" name="pWebsite" type="xsd:string" />
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="updateAgentResponse">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element minOccurs="1" maxOccurs="1" name="updateAgentResult" nillable="true" type="tns:DTOResult" />
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="updateAgentWithDTO">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element minOccurs="1" maxOccurs="1" name="pDTOAgent" nillable="true" type="tns:DTOAgent" />
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="updateAgentWithDTOResponse">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element minOccurs="1" maxOccurs="1" name="updateAgentWithDTOResult" nillable="true" type="tns:DTOResult" />
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="updateClient">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element minOccurs="1" maxOccurs="1" name="pName" type="xsd:string" />
+            <xsd:element minOccurs="1" maxOccurs="1" name="pStreet" type="xsd:string" />
+            <xsd:element minOccurs="1" maxOccurs="1" name="pCity" type="xsd:string" />
+            <xsd:element minOccurs="1" maxOccurs="1" name="pCountry" type="xsd:string" />
+            <xsd:element minOccurs="1" maxOccurs="1" name="pPhone" type="xsd:string" />
+            <xsd:element minOccurs="1" maxOccurs="1" name="pFax" type="xsd:string" />
+            <xsd:element minOccurs="1" maxOccurs="1" name="pEmail" type="xsd:string" />
+            <xsd:element minOccurs="1" maxOccurs="1" name="pWebsite" type="xsd:string" />
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="updateClientResponse">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element minOccurs="1" maxOccurs="1" name="updateClientResult" nillable="true" type="tns:DTOResult" />
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="updateClientWithDTO">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element minOccurs="1" maxOccurs="1" name="pDTOClient" nillable="true" type="tns:DTOClient" />
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+      <xsd:element name="updateClientWithDTOResponse">
+        <xsd:complexType>
+          <xsd:sequence>
+            <xsd:element minOccurs="1" maxOccurs="1" name="updateClientWithDTOResult" nillable="true" type="tns:DTOResult" />
+          </xsd:sequence>
+        </xsd:complexType>
+      </xsd:element>
+    </xsd:schema>
+  </wsdl:types>
+  <wsdl:message name="getAgentSoapIn">
+    <wsdl:part name="parameters" element="tns:getAgent" />
+  </wsdl:message>
+  <wsdl:message name="getAgentSoapOut">
+    <wsdl:part name="parameters" element="tns:getAgentResponse" />
+  </wsdl:message>
+  <wsdl:message name="getAgentNamesSoapIn">
+    <wsdl:part name="parameters" element="tns:getAgentNames" />
+  </wsdl:message>
+  <wsdl:message name="getAgentNamesSoapOut">
+    <wsdl:part name="parameters" element="tns:getAgentNamesResponse" />
+  </wsdl:message>
+  <wsdl:message name="getClientSoapIn">
+    <wsdl:part name="parameters" element="tns:getClient" />
+  </wsdl:message>
+  <wsdl:message name="getClientSoapOut">
+    <wsdl:part name="parameters" element="tns:getClientResponse" />
+  </wsdl:message>
+  <wsdl:message name="getClientNamesSoapIn">
+    <wsdl:part name="parameters" element="tns:getClientNames" />
+  </wsdl:message>
+  <wsdl:message name="getClientNamesSoapOut">
+    <wsdl:part name="parameters" element="tns:getClientNamesResponse" />
+  </wsdl:message>
+  <wsdl:message name="getPhotoSoapIn">
+    <wsdl:part name="parameters" element="tns:getPhoto" />
+  </wsdl:message>
+  <wsdl:message name="getPhotoSoapOut">
+    <wsdl:part name="parameters" element="tns:getPhotoResponse" />
+  </wsdl:message>
+  <wsdl:message name="updateAgentSoapIn">
+    <wsdl:part name="parameters" element="tns:updateAgent" />
+  </wsdl:message>
+  <wsdl:message name="updateAgentSoapOut">
+    <wsdl:part name="parameters" element="tns:updateAgentResponse" />
+  </wsdl:message>
+  <wsdl:message name="updateAgentWithDTOSoapIn">
+    <wsdl:part name="parameters" element="tns:updateAgentWithDTO" />
+  </wsdl:message>
+  <wsdl:message name="updateAgentWithDTOSoapOut">
+    <wsdl:part name="parameters" element="tns:updateAgentWithDTOResponse" />
+  </wsdl:message>
+  <wsdl:message name="updateClientSoapIn">
+    <wsdl:part name="parameters" element="tns:updateClient" />
+  </wsdl:message>
+  <wsdl:message name="updateClientSoapOut">
+    <wsdl:part name="parameters" element="tns:updateClientResponse" />
+  </wsdl:message>
+  <wsdl:message name="updateClientWithDTOSoapIn">
+    <wsdl:part name="parameters" element="tns:updateClientWithDTO" />
+  </wsdl:message>
+  <wsdl:message name="updateClientWithDTOSoapOut">
+    <wsdl:part name="parameters" element="tns:updateClientWithDTOResponse" />
+  </wsdl:message>
+  <wsdl:portType name="ErewhonWebServiceSoap">
+    <wsdl:operation name="getAgent">
+      <wsdl:input message="tns:getAgentSoapIn" />
+      <wsdl:output message="tns:getAgentSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="getAgentNames">
+      <wsdl:input message="tns:getAgentNamesSoapIn" />
+      <wsdl:output message="tns:getAgentNamesSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="getClient">
+      <wsdl:input message="tns:getClientSoapIn" />
+      <wsdl:output message="tns:getClientSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="getClientNames">
+      <wsdl:input message="tns:getClientNamesSoapIn" />
+      <wsdl:output message="tns:getClientNamesSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="getPhoto">
+      <wsdl:input message="tns:getPhotoSoapIn" />
+      <wsdl:output message="tns:getPhotoSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="updateAgent">
+      <wsdl:input message="tns:updateAgentSoapIn" />
+      <wsdl:output message="tns:updateAgentSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="updateAgentWithDTO">
+      <wsdl:input message="tns:updateAgentWithDTOSoapIn" />
+      <wsdl:output message="tns:updateAgentWithDTOSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="updateClient">
+      <wsdl:input message="tns:updateClientSoapIn" />
+      <wsdl:output message="tns:updateClientSoapOut" />
+    </wsdl:operation>
+    <wsdl:operation name="updateClientWithDTO">
+      <wsdl:input message="tns:updateClientWithDTOSoapIn" />
+      <wsdl:output message="tns:updateClientWithDTOSoapOut" />
+    </wsdl:operation>
+  </wsdl:portType>
+  <wsdl:binding name="ErewhonWebServiceSoap" type="tns:ErewhonWebServiceSoap">
+    <soap:binding transport="http://schemas.xmlsoap.org/soap/http" style="document" />
+    <wsdl:operation name="getAgent">
+      <soap:operation soapAction="urn:JadeWebServices/WebServiceHTTP/getAgent" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="getAgentNames">
+      <soap:operation soapAction="urn:JadeWebServices/WebServiceHTTP/getAgentNames" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="getClient">
+      <soap:operation soapAction="urn:JadeWebServices/WebServiceHTTP/getClient" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="getClientNames">
+      <soap:operation soapAction="urn:JadeWebServices/WebServiceHTTP/getClientNames" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="getPhoto">
+      <soap:operation soapAction="urn:JadeWebServices/WebServiceHTTP/getPhoto" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="updateAgent">
+      <soap:operation soapAction="urn:JadeWebServices/WebServiceHTTP/updateAgent" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="updateAgentWithDTO">
+      <soap:operation soapAction="urn:JadeWebServices/WebServiceHTTP/updateAgentWithDTO" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="updateClient">
+      <soap:operation soapAction="urn:JadeWebServices/WebServiceHTTP/updateClient" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+    <wsdl:operation name="updateClientWithDTO">
+      <soap:operation soapAction="urn:JadeWebServices/WebServiceHTTP/updateClientWithDTO" style="document" />
+      <wsdl:input>
+        <soap:body use="literal" />
+      </wsdl:input>
+      <wsdl:output>
+        <soap:body use="literal" />
+      </wsdl:output>
+    </wsdl:operation>
+  </wsdl:binding>
+  <wsdl:service name="ErewhonWebService">
+    <wsdl:port name="ErewhonWebServiceSoap" binding="tns:ErewhonWebServiceSoap">
+      <soap:address location="http://127.0.0.1:15001/jade/jadehttp.dll?WebServiceHTTP&amp;serviceName=ErewhonWebService&amp;listName=WebServiceHTTP" />
+    </wsdl:port>
+  </wsdl:service>
+</wsdl:definitions>

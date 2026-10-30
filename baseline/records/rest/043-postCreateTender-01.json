@@ -1,0 +1,22 @@
+{
+  "order": 43,
+  "caseId": "REST-postCreateTender-01",
+  "operation": "Rest.postCreateTender",
+  "kind": "success",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/createTender/Brian%20Olsen/PROP/59/2600000.00",
+    "headers": {},
+    "bodyText": null
+  },
+  "response": {
+    "status": 201,
+    "contentType": "application/json; charset=utf-8",
+    "bodyText": "{\"guid\":\"{00000000-0000-4000-8000-0000000000eb}\",\"allErrors\":[],\"allWarnings\":[],\"statusCode\":201}",
+    "bodySha256": "13571ca778b3424ff9bac78f73287d78f1da4d3fbbeabe21cfc5270b1d8d0dfa",
+    "bodyFile": null
+  }
+}

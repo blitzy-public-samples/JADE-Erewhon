@@ -1,0 +1,25 @@
+{
+  "order": 50,
+  "caseId": "SOAP-updateAgentWithDTO-01",
+  "operation": "Soap.updateAgentWithDTO",
+  "kind": "success",
+  "stateChanging": true,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/updateAgentWithDTO\""
+    },
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateAgentWithDTO xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pDTOAgent><city>Kyoto</city><country>Japan</country><email>airi@yippe.co.jp</email><fax>81 4 2845 6362</fax><name>Airi Hamada</name><phone>81 4 8586 7273</phone><street>200 Kawaramachi Street</street><website>www.yippe.co.jp</website></pDTOAgent></updateAgentWithDTO></soap:Body></soap:Envelope>"
+  },
+  "response": {
+    "status": 200,
+    "contentType": "text/xml; charset=utf-8",
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><updateAgentWithDTOResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><updateAgentWithDTOResult><allErrors /><allWarnings /><statusCode>200</statusCode></updateAgentWithDTOResult></updateAgentWithDTOResponse></soap:Body></soap:Envelope>",
+    "bodySha256": "608cc6c1b632b139cfb334b39a7019a2e4b7a5637952d5dd7dd9334f0c33d4d2",
+    "bodyFile": null
+  }
+}

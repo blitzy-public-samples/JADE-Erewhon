@@ -1,0 +1,1605 @@
+// Hosts the facade under test on real loopback Kestrel listeners and builds the requests the routing,
+// failure-behaviour and listener-isolation tests send to it. The facade picks the endpoint for a request
+// by the socket it arrived on (HttpContext.Connection.LocalPort), so only real sockets are evidence: the
+// in-memory TestServer client of WebApplicationFactory is never created here, and every request goes
+// through the raw client of CreateRawClient to RestBaseAddress, SoapBaseAddress or AdminBaseAddress.
+//
+// Every operation fact a request carries (verb, path template, parameters, SOAP action, request element,
+// endpoint path and query, namespaces, content type) is read from OperationCatalogue.Default; only the
+// sample parameter values are chosen here.
+//
+// Facade test failures are identified across runs by a signature over the exception type, the failing
+// line and the assertion message, so every assertion and exception message raised here is a fixed
+// literal: no port, URL, elapsed time, configuration value or inner exception message.
+
+using System.Diagnostics;
+using System.Globalization;
+using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Xml;
+using Erewhon.Contracts.Catalogue;
+using Erewhon.Facade.Forwarding;
+using Erewhon.Facade.Routing;
+using Erewhon.Facade.Soap;
+using Microsoft.AspNetCore.Connections;
+using Microsoft.AspNetCore.Hosting;
+using Microsoft.AspNetCore.Hosting.Server;
+using Microsoft.AspNetCore.Hosting.Server.Features;
+using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Configuration.EnvironmentVariables;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
+using Yarp.ReverseProxy.Forwarder;
+
+// The facade tests bind real sockets and assert on elapsed times, and WebApplicationFactory captures the
+// facade's host through hosting diagnostics that every host built in the process raises, so no two tests
+// may run at once. This is the only parallelisation setting in the assembly. It is xunit.v3's
+// Parallelization attribute rather than CollectionBehavior(DisableTestParallelization = true), which
+// xunit.v3 4.x marks obsolete as an error (CS0619).
+[assembly: Xunit.v3.Parallelization(Mode = Xunit.Sdk.ParallelMode.None)]
+
+namespace Erewhon.Facade.Tests.Support;
+
+/// <summary>The routing targets and extra settings one facade instance starts with.</summary>
+/// <remarks>
+/// <c>RoutingOptionsValidator</c> requires every referenced target to have the base URL of each surface it
+/// serves, and the default target (<c>backend</c>) to have both, so a <c>stub</c> target named by a routing
+/// override should be given both <see cref="StubRestBaseUrl"/> and <see cref="StubSoapBaseUrl"/>.
+/// </remarks>
+public sealed class FacadeTestSettings
+{
+    /// <summary><c>Routing:Targets:backend:RestBaseUrl</c>, for example a stub's <c>RestBaseUrl</c>.</summary>
+    public required string BackendRestBaseUrl { get; init; }
+
+    /// <summary><c>Routing:Targets:backend:SoapBaseUrl</c>, for example a stub's <c>SoapBaseUrl</c>.</summary>
+    public required string BackendSoapBaseUrl { get; init; }
+
+    /// <summary><c>Routing:Targets:stub:RestBaseUrl</c>; the target is defined only when a URL is supplied.</summary>
+    public string? StubRestBaseUrl { get; init; }
+
+    /// <summary><c>Routing:Targets:stub:SoapBaseUrl</c>; the target is defined only when a URL is supplied.</summary>
+    public string? StubSoapBaseUrl { get; init; }
+
+    /// <summary>
+    /// Further configuration keys, applied after every other setting so that they win, for example
+    /// <c>Settings = { ["Routing:Operations:Rest:getCompany"] = "stub" }</c>. Keys are matched
+    /// case-insensitively, as configuration keys are, so an entry replaces the value a typed property or
+    /// the factory gives the same key however it is spelled, for example <c>backend:timeoutseconds</c>
+    /// over <see cref="BackendTimeoutSeconds"/>. An entry that moves a listener off its allocated loopback
+    /// port (<c>Facade:BindAddress</c> or a <c>Facade:*Port</c>) fails the start.
+    /// </summary>
+    public Dictionary<string, string?> Settings { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary><c>Backend:TimeoutSeconds</c>; the facade's own default (30) applies when null.</summary>
+    public int? BackendTimeoutSeconds { get; init; }
+
+    /// <summary>
+    /// <c>Facade:WsdlPath</c>. When null, a path that does not exist is used, so the facade starts with
+    /// <c>wsdl: absent</c> and forwards WSDL requests to the default target.
+    /// </summary>
+    public string? WsdlPath { get; init; }
+
+    /// <summary>
+    /// A logger provider added to the facade's logging, for example a <see cref="LogCapture"/>; null adds
+    /// none. It is registered after the facade's own logging set-up, which clears every other provider,
+    /// and the facade's configured level filters apply to it. The caller owns it.
+    /// </summary>
+    public ILoggerProvider? LoggerProvider { get; init; }
+
+    /// <summary>
+    /// The chain policy the facade validates an https target's certificate with, for example
+    /// <see cref="TestCertificates.CreateTrustPolicy"/>, which trusts the test certificate authority alone;
+    /// null keeps the platform's default trust, as in production. The certificate must name the target's
+    /// host either way.
+    /// </summary>
+    public X509ChainPolicy? BackendCertificateChainPolicy { get; init; }
+}
+
+// TestCertificates sits here, beside FacadeTestSettings.BackendCertificateChainPolicy, which hands its
+// trust policy to a facade on real sockets.
+//
+// Certificates for the https backends of the forwarding tests: one certificate authority created in
+// memory for the test run, the server certificates it issues, and the chain policy through which a facade
+// trusts that authority alone (FacadeTestSettings.BackendCertificateChainPolicy). Everything is made with
+// System.Security.Cryptography: no certificate file, certificate store or package is used, and nothing is
+// added to the machine's trust, so a facade that keeps the platform's default trust rejects every
+// certificate issued here.
+/// <summary>
+/// The test certificate authority and the server certificates it issues for loopback https backends.
+/// </summary>
+public static class TestCertificates
+{
+    // TLS Web Server Authentication (RFC 5280, section 4.2.1.12).
+    private const string ServerAuthenticationOid = "1.3.6.1.5.5.7.3.1";
+
+    // A host name under the reserved .invalid domain, which no target is ever addressed by.
+    private const string OtherHostName = "backend.invalid";
+
+    private static readonly Lazy<X509Certificate2> Authority = new(CreateAuthority, LazyThreadSafetyMode.ExecutionAndPublication);
+
+    private static readonly Lazy<X509Certificate2> Loopback = new(
+        () => Issue(static names => names.AddIpAddress(IPAddress.Loopback)),
+        LazyThreadSafetyMode.ExecutionAndPublication);
+
+    private static readonly Lazy<X509Certificate2> OtherHost = new(
+        () => Issue(static names => names.AddDnsName(OtherHostName)),
+        LazyThreadSafetyMode.ExecutionAndPublication);
+
+    /// <summary>
+    /// A server certificate, with its private key, for the IP address 127.0.0.1, which a target addressed
+    /// as <c>https://127.0.0.1:&lt;port&gt;</c> is validated against.
+    /// </summary>
+    public static X509Certificate2 LoopbackServer => Loopback.Value;
+
+    /// <summary>
+    /// A server certificate, with its private key, issued by the same authority for the host name
+    /// <c>backend.invalid</c> alone, so it names no loopback target.
+    /// </summary>
+    public static X509Certificate2 OtherHostServer => OtherHost.Value;
+
+    /// <summary>
+    /// Creates a chain policy that trusts the test authority as its only root and checks no revocation,
+    /// because the authority publishes none; the certificate's host name is still validated by the TLS
+    /// client. Each call returns a new policy, which the caller may change.
+    /// </summary>
+    /// <returns>The policy.</returns>
+    public static X509ChainPolicy CreateTrustPolicy()
+    {
+        var policy = new X509ChainPolicy
+        {
+            TrustMode = X509ChainTrustMode.CustomRootTrust,
+            RevocationMode = X509RevocationMode.NoCheck,
+        };
+        policy.CustomTrustStore.Add(X509CertificateLoader.LoadCertificate(Authority.Value.RawData));
+        return policy;
+    }
+
+    // A self-signed certificate authority with its private key, valid from a day ago for 30 days, which
+    // may issue end-entity certificates only.
+    private static X509Certificate2 CreateAuthority()
+    {
+        using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var request = new CertificateRequest("CN=Erewhon facade test authority", key, HashAlgorithmName.SHA256);
+        request.CertificateExtensions.Add(new X509BasicConstraintsExtension(
+            certificateAuthority: true, hasPathLengthConstraint: true, pathLengthConstraint: 0, critical: true));
+        request.CertificateExtensions.Add(new X509KeyUsageExtension(
+            X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign, critical: true));
+        request.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(request.PublicKey, critical: false));
+
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        using X509Certificate2 created = request.CreateSelfSigned(now.AddDays(-1), now.AddDays(30));
+        return X509CertificateLoader.LoadPkcs12(created.Export(X509ContentType.Pkcs12), password: null);
+    }
+
+    // A server certificate issued by the authority for the subject alternative names addNames adds, with
+    // its private key, valid from a day ago for seven days, which lies inside the authority's validity. It
+    // is loaded from its PKCS #12 form, so its key does not depend on the key object created here.
+    private static X509Certificate2 Issue(Action<SubjectAlternativeNameBuilder> addNames)
+    {
+        var names = new SubjectAlternativeNameBuilder();
+        addNames(names);
+        X509Certificate2 authority = Authority.Value;
+        using var key = ECDsa.Create(ECCurve.NamedCurves.nistP256);
+        var request = new CertificateRequest("CN=Erewhon facade test backend", key, HashAlgorithmName.SHA256);
+        request.CertificateExtensions.Add(new X509BasicConstraintsExtension(
+            certificateAuthority: false, hasPathLengthConstraint: false, pathLengthConstraint: 0, critical: true));
+        request.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature, critical: true));
+        request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension([new Oid(ServerAuthenticationOid)], critical: false));
+        request.CertificateExtensions.Add(names.Build());
+        request.CertificateExtensions.Add(X509AuthorityKeyIdentifierExtension.CreateFromCertificate(
+            authority, includeKeyIdentifier: true, includeIssuerAndSerial: false));
+
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        byte[] serialNumber = RandomNumberGenerator.GetBytes(16);
+        serialNumber[0] &= 0x7F;
+        using X509Certificate2 issued = request.Create(authority, now.AddDays(-1), now.AddDays(7), serialNumber);
+        using X509Certificate2 withKey = issued.CopyWithPrivateKey(key);
+        return X509CertificateLoader.LoadPkcs12(withKey.Export(X509ContentType.Pkcs12), password: null);
+    }
+}
+
+/// <summary>
+/// The facade (<c>Erewhon.Facade</c>'s <c>Program</c>) running in this process on three real Kestrel
+/// listeners on 127.0.0.1, one per facade listener, each on a port that was free when the factory was
+/// created.
+/// </summary>
+/// <remarks>
+/// <para>
+/// Start a facade through <see cref="StartAsync"/>, which constructs, starts and verifies an instance.
+/// Start every <c>StubBackend</c> the facade should reach before calling it, never concurrently with it:
+/// <c>WebApplicationFactory</c> intercepts host building while the facade's entry point runs, and a host
+/// built elsewhere at that moment could be captured in place of the facade's.
+/// </para>
+/// <para>
+/// The facade's own <c>ConfigureKestrel</c> callback binds its listeners from the <c>Facade:*Port</c>
+/// settings this factory supplies, replacing the dynamic URL that <c>UseKestrel()</c> sets.
+/// <see cref="StartAsync"/> verifies the bound addresses. Disposal stops the host, within the facade's own
+/// 5 s shutdown timeout, and releases the ports; a host whose start failed has already been disposed by
+/// <see cref="CreateHost"/>.
+/// </para>
+/// </remarks>
+public sealed class FacadeFactory : WebApplicationFactory<global::Program>
+{
+    private const string LoopbackHost = "127.0.0.1";
+    private const int MaxStartAttempts = 3;
+    private const int MaxPortDraws = 32;
+
+    // A raw client gives up after this long, so a facade that hangs fails the test instead of stalling it.
+    private static readonly TimeSpan RawClientTimeout = TimeSpan.FromSeconds(15);
+
+    // One start attempt may take this long. No request timeout applies before the facade listens, so an
+    // entry point or hosted service that blocks would otherwise stall the whole suite; past this limit the
+    // test fails with a fixed message instead. A healthy start takes well under a second. A start-up that
+    // blocks costs one such limit, because every later start fails at once while the abandoned attempt is
+    // in flight (_abandonedStarts), however many tests start a facade. The suite therefore finishes, and
+    // writes the TRX naming each failure, well inside the 600 s suite limit of tests/run-tests.sh, which
+    // stops the run without a TRX. An abandoned attempt that ends, and whose factory is then disposed,
+    // lets later starts run again.
+    private static readonly TimeSpan StartupTimeout = TimeSpan.FromSeconds(20);
+
+    // Start attempts abandoned on the start-up limit or the token whose StartServer has not yet ended or
+    // whose factory is not yet disposed. While one is in flight a new start would wait out a limit of its
+    // own, and a host it builds could be captured by the host-building interception WebApplicationFactory
+    // may still hold for the abandoned attempt, so StartAsync fails at once instead. Changed only through
+    // Interlocked.
+    private static int _abandonedStarts;
+
+    private readonly KeyValuePair<string, string?>[] _settings;
+    private readonly ILoggerProvider? _loggerProvider;
+    private readonly X509ChainPolicy? _backendCertificateChainPolicy;
+
+    /// <summary>
+    /// Draws three distinct free loopback ports and prepares the facade's settings. The facade is not
+    /// started; <see cref="StartAsync"/> constructs, starts and verifies an instance.
+    /// </summary>
+    /// <param name="settings">The routing targets and extra settings.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="settings"/> is null.</exception>
+    public FacadeFactory(FacadeTestSettings settings)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        (RestPort, SoapPort, AdminPort) = DrawDistinctPorts();
+        RestBaseAddress = LoopbackAddress(RestPort);
+        SoapBaseAddress = LoopbackAddress(SoapPort);
+        AdminBaseAddress = LoopbackAddress(AdminPort);
+        _settings = BuildSettings(settings, RestPort, SoapPort, AdminPort);
+        _loggerProvider = settings.LoggerProvider;
+        _backendCertificateChainPolicy = settings.BackendCertificateChainPolicy;
+    }
+
+    /// <summary>The port of the REST listener (<c>Facade:RestPort</c>) on 127.0.0.1.</summary>
+    public int RestPort { get; }
+
+    /// <summary>The port of the SOAP listener (<c>Facade:SoapPort</c>) on 127.0.0.1.</summary>
+    public int SoapPort { get; }
+
+    /// <summary>The port of the admin listener (<c>Facade:AdminPort</c>) on 127.0.0.1.</summary>
+    public int AdminPort { get; }
+
+    /// <summary><c>http://127.0.0.1:&lt;RestPort&gt;/</c>.</summary>
+    public Uri RestBaseAddress { get; }
+
+    /// <summary><c>http://127.0.0.1:&lt;SoapPort&gt;/</c>.</summary>
+    public Uri SoapBaseAddress { get; }
+
+    /// <summary><c>http://127.0.0.1:&lt;AdminPort&gt;/</c>.</summary>
+    public Uri AdminBaseAddress { get; }
+
+    /// <summary>
+    /// Starts the facade on real Kestrel listeners and returns once it has bound exactly
+    /// <see cref="RestPort"/>, <see cref="SoapPort"/> and <see cref="AdminPort"/> on 127.0.0.1. A port taken
+    /// by another process between drawing and binding is retried with fresh ports, up to three attempts.
+    /// Each attempt must finish within a 20 s start-up limit, and none begins while an earlier abandoned
+    /// attempt is still in flight.
+    /// </summary>
+    /// <param name="settings">The routing targets and extra settings.</param>
+    /// <param name="ct">
+    /// Cancels start-up, before an attempt begins or while one runs. An attempt that cancellation or the
+    /// start-up limit abandons keeps running until the facade's synchronous start-up returns, and its
+    /// factory is disposed only then; until that disposal has ended, every start fails at once.
+    /// </param>
+    /// <returns>The started factory; the caller disposes it.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="settings"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// An earlier start attempt, abandoned on the start-up limit or on cancellation, has not yet ended and
+    /// had its factory disposed, so no factory was constructed; every attempt found a port in use; or the
+    /// facade bound other addresses than the ones allocated.
+    /// </exception>
+    /// <exception cref="TimeoutException">An attempt did not finish within the start-up limit.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
+    public static async Task<FacadeFactory> StartAsync(FacadeTestSettings settings, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+
+        for (int attempt = 1; attempt <= MaxStartAttempts; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            if (Volatile.Read(ref _abandonedStarts) > 0)
+            {
+                throw new InvalidOperationException("an earlier facade start-up is still running");
+            }
+
+            var factory = new FacadeFactory(settings);
+            Task? start = null;
+            try
+            {
+                factory.UseKestrel();
+
+                // StartServer runs the facade's entry point and starts its host synchronously. Nothing can
+                // interrupt it once it runs: the start-up limit and the token end only this wait for it.
+                start = Task.Run(factory.StartServer, ct);
+                await start.WaitAsync(StartupTimeout, ct);
+                factory.VerifyBinding();
+                return factory;
+            }
+            catch (Exception exception) when (start is not null && WaitEndedFirst(start, exception))
+            {
+                // Disposing now would race the start-up still in flight.
+                DisposeWhenFinished(start, factory);
+                if (exception is OperationCanceledException)
+                {
+                    throw;
+                }
+
+                throw new TimeoutException("facade did not start within the start-up limit");
+            }
+            catch (Exception exception) when (IsAddressInUse(exception))
+            {
+                await factory.DisposeAsync();
+            }
+            catch
+            {
+                await factory.DisposeAsync();
+                throw;
+            }
+        }
+
+        throw new InvalidOperationException("facade could not bind free loopback ports");
+    }
+
+    /// <summary>
+    /// Creates a client for the facade's real sockets: no proxy (an environment <c>HTTP_PROXY</c> must
+    /// never intercept loopback calls), no redirects, no cookies, no decompression, and a 15 s timeout.
+    /// It has no base address; requests carry absolute URIs built from the base addresses.
+    /// </summary>
+    /// <returns>A new client; the caller disposes it.</returns>
+    public HttpClient CreateRawClient() =>
+        new(
+            new SocketsHttpHandler
+            {
+                UseProxy = false,
+                AllowAutoRedirect = false,
+                UseCookies = false,
+                AutomaticDecompression = DecompressionMethods.None,
+            },
+            disposeHandler: true)
+        {
+            Timeout = RawClientTimeout,
+        };
+
+    /// <summary>
+    /// Sends <paramref name="request"/>, reads the whole response body and returns the response with the
+    /// time from just before sending to just after the body was read. The request is disposed afterwards.
+    /// </summary>
+    /// <param name="client">A client from <see cref="CreateRawClient"/>.</param>
+    /// <param name="request">The request, for example from <see cref="PreparedRequest.ToMessage"/>.</param>
+    /// <param name="ct">The test's cancellation token.</param>
+    /// <returns>The response status, content type, headers, body bytes and elapsed time.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="client"/> or <paramref name="request"/> is null.</exception>
+    /// <remarks>
+    /// A transport failure (connection refused or reset, or no response within the client's timeout) fails
+    /// the test with a fixed message naming only the exception type. Cancellation of <paramref name="ct"/>
+    /// propagates as <see cref="OperationCanceledException"/>.
+    /// </remarks>
+    public static async Task<RawResponse> SendAsync(HttpClient client, HttpRequestMessage request, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(client);
+        ArgumentNullException.ThrowIfNull(request);
+
+        using (request)
+        {
+            try
+            {
+                var stopwatch = Stopwatch.StartNew();
+                using HttpResponseMessage response = await client.SendAsync(request, HttpCompletionOption.ResponseContentRead, ct);
+                byte[] body = await response.Content.ReadAsByteArrayAsync(ct);
+                stopwatch.Stop();
+
+                return new RawResponse(
+                    (int)response.StatusCode,
+                    response.Content.Headers.ContentType?.MediaType,
+                    response.Content.Headers.ContentType?.CharSet,
+                    MergeHeaders(response),
+                    body,
+                    stopwatch.Elapsed);
+            }
+            catch (Exception exception) when (IsTransportFailure(exception, ct))
+            {
+                Assert.Fail("facade request failed at the transport level (" + exception.GetType().Name + ")");
+                throw new UnreachableException();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Sends one body-less HTTP/1.1 request whose request line is written byte for byte as given, over a
+    /// new TCP connection to 127.0.0.1:<paramref name="port"/>, and returns the response. It sends what
+    /// <see cref="HttpClient"/> cannot: a method token in any letter case, an absolute-form or asterisk-form
+    /// target, and dot segments or escapes that must stay as written.
+    /// </summary>
+    /// <param name="port">A facade listener port, for example <see cref="RestPort"/>.</param>
+    /// <param name="requestLine">
+    /// The request line without its CRLF, for example <c>get /company HTTP/1.1</c>: printable ASCII and spaces.
+    /// </param>
+    /// <param name="host">The <c>Host</c> header value, for example the authority of <see cref="RestBaseAddress"/>.</param>
+    /// <param name="ct">The test's cancellation token.</param>
+    /// <returns>The response status, content type, headers, body bytes and elapsed time.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="requestLine"/> or <paramref name="host"/> is null.</exception>
+    /// <exception cref="ArgumentException">
+    /// <paramref name="requestLine"/> or <paramref name="host"/> is empty or holds a character other than
+    /// printable ASCII and space.
+    /// </exception>
+    /// <remarks>
+    /// The request carries only <c>Host</c> and <c>Connection: close</c>, so the facade closes the
+    /// connection after its response, and the response ends at the end of the stream. The body is
+    /// returned as it arrived, with no transfer coding removed. A connection failure, no response within
+    /// 15 s, or a response without a status line and complete header section fails the test with a fixed
+    /// message. Cancellation of <paramref name="ct"/> propagates as <see cref="OperationCanceledException"/>.
+    /// </remarks>
+    public static async Task<RawResponse> SendRawAsync(int port, string requestLine, string host, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(requestLine);
+        ArgumentNullException.ThrowIfNull(host);
+        if (!IsRawHeadText(requestLine) || !IsRawHeadText(host))
+        {
+            throw new ArgumentException("raw request line and host must be non-empty printable ASCII");
+        }
+
+        byte[] head = Encoding.ASCII.GetBytes(requestLine + "\r\nHost: " + host + "\r\nConnection: close\r\n\r\n");
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeout.CancelAfter(RawClientTimeout);
+
+        byte[] received;
+        var stopwatch = Stopwatch.StartNew();
+        try
+        {
+            using var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+            await socket.ConnectAsync(new IPEndPoint(IPAddress.Loopback, port), timeout.Token);
+            await using var stream = new NetworkStream(socket, ownsSocket: true);
+            await stream.WriteAsync(head, timeout.Token);
+
+            using var response = new MemoryStream();
+            await stream.CopyToAsync(response, timeout.Token);
+            received = response.ToArray();
+        }
+        catch (Exception exception) when (exception is SocketException or IOException
+            || (exception is OperationCanceledException && !ct.IsCancellationRequested))
+        {
+            Assert.Fail("raw facade request failed at the transport level (" + exception.GetType().Name + ")");
+            throw new UnreachableException();
+        }
+
+        stopwatch.Stop();
+        return ParseRawResponse(received, stopwatch.Elapsed);
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// <para>
+    /// Runs the facade as in production, never in the factory's default Development environment, whose
+    /// developer exception page would answer in place of a forwarded response. Each setting is applied
+    /// twice, with the same deduplicated pairs: as a host setting, which reaches the facade's builder
+    /// through its arguments, and as an in-memory application configuration source, added last, so it
+    /// also wins over the facade's <c>appsettings.json</c>.
+    /// </para>
+    /// <para>
+    /// The facade reads no environment variable: every environment-variable source, plain or with the
+    /// <c>ASPNETCORE_</c> or <c>DOTNET_</c> prefix, is removed from its application configuration here and
+    /// from the host settings in <see cref="CreateHost"/>. Each test owns the configuration it asserts on,
+    /// so a <c>Routing__*</c>, <c>Backend__*</c> or <c>Facade__*</c> variable exported in the shell that runs
+    /// the tests, such as a rerouting of one operation, cannot change the routing table, deadline or
+    /// listeners of the facade under test. The facade then reads its shipped <c>appsettings.json</c> and
+    /// this factory's settings alone.
+    /// </para>
+    /// <para>
+    /// A <see cref="FacadeTestSettings.LoggerProvider"/> is registered here, after the facade's entry point
+    /// has replaced the default logging providers.
+    /// </para>
+    /// <para>
+    /// A <see cref="FacadeTestSettings.BackendCertificateChainPolicy"/> is given to the facade's forwarder:
+    /// a registration made here, after the entry point's own, builds the singleton
+    /// <see cref="BackendForwarder"/> from the same services with that policy.
+    /// </para>
+    /// </remarks>
+    protected override void ConfigureWebHost(IWebHostBuilder builder)
+    {
+        builder.UseEnvironment(Environments.Production);
+        foreach ((string key, string? value) in _settings)
+        {
+            builder.UseSetting(key, value);
+        }
+
+        builder.ConfigureAppConfiguration((_, configuration) =>
+        {
+            RemoveEnvironmentVariables(configuration);
+            configuration.AddInMemoryCollection(_settings);
+        });
+
+        if (_loggerProvider is { } loggerProvider)
+        {
+            builder.ConfigureServices(services => services.AddSingleton(loggerProvider));
+        }
+
+        if (_backendCertificateChainPolicy is { } chainPolicy)
+        {
+            builder.ConfigureServices(services => services.AddSingleton(provider => new BackendForwarder(
+                provider.GetRequiredService<IHttpForwarder>(),
+                provider.GetRequiredService<OperationRouter>(),
+                provider.GetRequiredService<PassThroughTransformer>(),
+                provider.GetRequiredService<SoapFaultWriter>(),
+                provider.GetRequiredService<ILogger<BackendForwarder>>(),
+                chainPolicy)));
+        }
+    }
+
+    /// <inheritdoc />
+    /// <remarks>
+    /// <para>
+    /// The web host builder of <c>WebApplicationFactory</c> reads the <c>ASPNETCORE_</c>-prefixed
+    /// environment variables into the host settings, which become the facade's command-line arguments
+    /// when the host is built and would outrank its <c>appsettings.json</c>. They are removed from those
+    /// settings before the build, as <see cref="ConfigureWebHost"/> explains.
+    /// </para>
+    /// <para>
+    /// The base factory keeps a host only once it has started, so a host whose start fails, for example on
+    /// a <c>Facade:WsdlPath</c> that cannot be resolved, is disposed here and the failure rethrown
+    /// unchanged. The facade's entry point is finished with the host by then: its failure reaches the start
+    /// only once it has completed, and a host its <c>RunAsync</c> already disposed, as after a port found in
+    /// use, is disposed again harmlessly.
+    /// </para>
+    /// </remarks>
+    protected override IHost CreateHost(IHostBuilder builder)
+    {
+        ArgumentNullException.ThrowIfNull(builder);
+        builder.ConfigureHostConfiguration(RemoveEnvironmentVariables);
+        var recorder = new BuiltHostRecorder(builder);
+        try
+        {
+            return base.CreateHost(recorder);
+        }
+        catch
+        {
+            if (recorder.BuiltHost is { } host)
+            {
+                DisposeHost(host);
+            }
+
+            throw;
+        }
+    }
+
+    // As RunAsync does, the asynchronous form is used when the host offers it. Blocking on it is safe here:
+    // CreateHost already blocks on the host's start, and the host's own Dispose blocks the same way.
+    private static void DisposeHost(IHost host)
+    {
+        if (host is IAsyncDisposable asyncDisposable)
+        {
+            asyncDisposable.DisposeAsync().AsTask().GetAwaiter().GetResult();
+        }
+        else
+        {
+            host.Dispose();
+        }
+    }
+
+    // Removes every environment-variable source from a configuration and keeps every other source in its
+    // place. The facade's application configuration holds them as sources of their own. The host
+    // settings hold the ASPNETCORE_-prefixed variables as one provider of a chained configuration, whose
+    // other providers, the host settings this factory and WebApplicationFactory supply, are chained again
+    // without it; they stay owned by the configuration they came from.
+    private static void RemoveEnvironmentVariables(IConfigurationBuilder configuration)
+    {
+        IList<IConfigurationSource> sources = configuration.Sources;
+        for (int index = sources.Count - 1; index >= 0; index--)
+        {
+            switch (sources[index])
+            {
+                case EnvironmentVariablesConfigurationSource:
+                    sources.RemoveAt(index);
+                    break;
+
+                case ChainedConfigurationSource { Configuration: IConfigurationRoot chained }
+                    when chained.Providers.Any(provider => provider is EnvironmentVariablesConfigurationProvider):
+                    sources[index] = new ChainedConfigurationSource
+                    {
+                        Configuration = new ConfigurationRoot(
+                            [.. chained.Providers.Where(provider => provider is not EnvironmentVariablesConfigurationProvider)]),
+                        ShouldDisposeConfiguration = false,
+                    };
+                    break;
+            }
+        }
+    }
+
+    private void VerifyBinding()
+    {
+        ICollection<string>? addresses = Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()?.Addresses;
+        var expected = new HashSet<int> { RestPort, SoapPort, AdminPort };
+        var bound = new HashSet<int>();
+        bool matches = addresses is not null && addresses.Count == expected.Count;
+        foreach (string address in addresses ?? [])
+        {
+            if (Uri.TryCreate(address, UriKind.Absolute, out Uri? uri)
+                && string.Equals(uri.Host, LoopbackHost, StringComparison.Ordinal))
+            {
+                bound.Add(uri.Port);
+            }
+            else
+            {
+                matches = false;
+            }
+        }
+
+        if (!matches || !bound.SetEquals(expected))
+        {
+            throw new InvalidOperationException("facade did not bind the allocated listener ports");
+        }
+    }
+
+    // The settings the facade starts with, one value per key, with keys matched case-insensitively as
+    // configuration keys are: the allocated ports, the loopback bind address and the WSDL path, then the
+    // typed properties, then every extra setting, each replacing the value an earlier step gave its key
+    // however the key is spelled. ConfigureWebHost applies exactly these pairs through both of its
+    // channels, and its in-memory source rejects a key given twice.
+    private static KeyValuePair<string, string?>[] BuildSettings(FacadeTestSettings settings, int restPort, int soapPort, int adminPort)
+    {
+        var values = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["Facade:RestPort"] = restPort.ToString(CultureInfo.InvariantCulture),
+            ["Facade:SoapPort"] = soapPort.ToString(CultureInfo.InvariantCulture),
+            ["Facade:AdminPort"] = adminPort.ToString(CultureInfo.InvariantCulture),
+            ["Facade:BindAddress"] = LoopbackHost,
+            ["Facade:WsdlPath"] = settings.WsdlPath ?? Path.Combine(AppContext.BaseDirectory, "no-wsdl", "ErewhonWebService.wsdl"),
+            ["Routing:Targets:backend:RestBaseUrl"] = settings.BackendRestBaseUrl,
+            ["Routing:Targets:backend:SoapBaseUrl"] = settings.BackendSoapBaseUrl,
+        };
+
+        if (settings.StubRestBaseUrl is not null)
+        {
+            values["Routing:Targets:stub:RestBaseUrl"] = settings.StubRestBaseUrl;
+        }
+
+        if (settings.StubSoapBaseUrl is not null)
+        {
+            values["Routing:Targets:stub:SoapBaseUrl"] = settings.StubSoapBaseUrl;
+        }
+
+        if (settings.BackendTimeoutSeconds is int timeoutSeconds)
+        {
+            values["Backend:TimeoutSeconds"] = timeoutSeconds.ToString(CultureInfo.InvariantCulture);
+        }
+
+        foreach ((string key, string? value) in settings.Settings)
+        {
+            values[key] = value;
+        }
+
+        return [.. values];
+    }
+
+    private static (int RestPort, int SoapPort, int AdminPort) DrawDistinctPorts()
+    {
+        var drawn = new List<int>(3);
+        for (int draw = 0; drawn.Count < 3; draw++)
+        {
+            if (draw == MaxPortDraws)
+            {
+                throw new InvalidOperationException("facade could not draw three distinct free loopback ports");
+            }
+
+            int port = StubBackend.GetClosedLoopbackPort();
+            if (!drawn.Contains(port))
+            {
+                drawn.Add(port);
+            }
+        }
+
+        return (drawn[0], drawn[1], drawn[2]);
+    }
+
+    private static Uri LoopbackAddress(int port) =>
+        new(string.Create(CultureInfo.InvariantCulture, $"http://{LoopbackHost}:{port}/"), UriKind.Absolute);
+
+    // Kestrel reports a taken port as an IOException ("Failed to bind to address ...: address already in
+    // use") wrapping AddressInUseException, and the host may wrap that again.
+    private static bool IsAddressInUse(Exception exception)
+    {
+        var pending = new Stack<Exception>();
+        var seen = new HashSet<Exception>(ReferenceEqualityComparer.Instance);
+        pending.Push(exception);
+        while (pending.TryPop(out Exception? current))
+        {
+            if (!seen.Add(current))
+            {
+                continue;
+            }
+
+            if (current is AddressInUseException
+                || current is SocketException { SocketErrorCode: SocketError.AddressAlreadyInUse }
+                || (current is IOException && current.Message.Contains("address already in use", StringComparison.OrdinalIgnoreCase)))
+            {
+                return true;
+            }
+
+            if (current is AggregateException aggregate)
+            {
+                foreach (Exception inner in aggregate.InnerExceptions)
+                {
+                    pending.Push(inner);
+                }
+            }
+            else if (current.InnerException is { } inner)
+            {
+                pending.Push(inner);
+            }
+        }
+
+        return false;
+    }
+
+    // True when the wait for a start attempt ended on its own start-up limit or token, so StartServer may
+    // still be running; false when the wait rethrew the attempt's own failure or cancellation.
+    private static bool WaitEndedFirst(Task start, Exception exception) =>
+        exception is TimeoutException or OperationCanceledException
+        && !start.IsCanceled
+        && !(start.Exception is { } failure && failure.InnerExceptions.Contains(exception));
+
+    // Disposes the factory of an abandoned start attempt once StartServer returns or throws, never while it
+    // runs, and holds _abandonedStarts from now until that disposal has ended, whatever its outcome.
+    // Nothing awaits either task, and the test that abandoned the attempt has already failed, so reading
+    // the attempt's exception and the disposal's observes a failed start or disposal, and neither surfaces
+    // later as an unobserved task exception.
+    private static void DisposeWhenFinished(Task start, FacadeFactory factory)
+    {
+        Interlocked.Increment(ref _abandonedStarts);
+        _ = start.ContinueWith<Task>(
+                async finished =>
+                {
+                    try
+                    {
+                        _ = finished.Exception;
+                        await factory.DisposeAsync();
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref _abandonedStarts);
+                    }
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.None,
+                TaskScheduler.Default)
+            .Unwrap()
+            .ContinueWith(
+                disposal =>
+                {
+                    _ = disposal.Exception;
+                },
+                CancellationToken.None,
+                TaskContinuationOptions.None,
+                TaskScheduler.Default);
+    }
+
+    private static bool IsTransportFailure(Exception exception, CancellationToken ct) =>
+        exception is HttpRequestException or IOException
+        || (exception is OperationCanceledException && !ct.IsCancellationRequested);
+
+    private static bool IsRawHeadText(string text) =>
+        text.Length > 0 && text.All(c => c is >= ' ' and <= '~');
+
+    // The status line, the header fields and the bytes after the empty line of a response read to the end
+    // of its connection; a repeated header name keeps every value in received order.
+    private static RawResponse ParseRawResponse(byte[] received, TimeSpan elapsed)
+    {
+        int headEnd = received.AsSpan().IndexOf("\r\n\r\n"u8);
+        if (headEnd < 0)
+        {
+            Assert.Fail("raw facade response has no complete header section");
+            throw new UnreachableException();
+        }
+
+        string[] lines = Encoding.Latin1.GetString(received, 0, headEnd).Split("\r\n");
+        string[] statusLine = lines[0].Split(' ', 3);
+        if (statusLine.Length < 2
+            || !statusLine[0].StartsWith("HTTP/", StringComparison.Ordinal)
+            || statusLine[1].Length != 3
+            || !int.TryParse(statusLine[1], NumberStyles.None, CultureInfo.InvariantCulture, out int status))
+        {
+            Assert.Fail("raw facade response has no valid status line");
+            throw new UnreachableException();
+        }
+
+        var headers = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        foreach (string line in lines.Skip(1))
+        {
+            int colon = line.IndexOf(':', StringComparison.Ordinal);
+            if (colon <= 0)
+            {
+                Assert.Fail("raw facade response has a malformed header line");
+                throw new UnreachableException();
+            }
+
+            string name = line[..colon];
+            string value = line[(colon + 1)..].Trim(' ', '\t');
+            headers[name] = headers.TryGetValue(name, out string[]? existing) ? [.. existing, value] : [value];
+        }
+
+        MediaTypeHeaderValue? contentType =
+            headers.TryGetValue("Content-Type", out string[]? contentTypes)
+            && MediaTypeHeaderValue.TryParse(contentTypes[0], out MediaTypeHeaderValue? parsed)
+                ? parsed
+                : null;
+
+        return new RawResponse(status, contentType?.MediaType, contentType?.CharSet, headers, received[(headEnd + 4)..], elapsed);
+    }
+
+    // Response and content headers in one case-insensitive map, values as received on the wire (the
+    // non-validated view never reformats them); a name present in both keeps both sets of values.
+    private static Dictionary<string, string[]> MergeHeaders(HttpResponseMessage response)
+    {
+        var merged = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+        AddHeaders(merged, response.Headers.NonValidated);
+        AddHeaders(merged, response.Content.Headers.NonValidated);
+        return merged;
+    }
+
+    private static void AddHeaders(Dictionary<string, string[]> merged, HttpHeadersNonValidated headers)
+    {
+        foreach ((string name, HeaderStringValues values) in headers)
+        {
+            string[] copied = [.. values];
+            merged[name] = merged.TryGetValue(name, out string[]? existing) ? [.. existing, .. copied] : copied;
+        }
+    }
+
+    // Passes every call through to the factory's host builder and keeps the host its Build returns, so
+    // that CreateHost can dispose a host the base implementation built but could not start.
+    private sealed class BuiltHostRecorder : IHostBuilder
+    {
+        private readonly IHostBuilder _inner;
+
+        public BuiltHostRecorder(IHostBuilder inner) => _inner = inner;
+
+        public IHost? BuiltHost { get; private set; }
+
+        public IDictionary<object, object> Properties => _inner.Properties;
+
+        public IHost Build() => BuiltHost = _inner.Build();
+
+        public IHostBuilder ConfigureAppConfiguration(Action<HostBuilderContext, IConfigurationBuilder> configureDelegate)
+        {
+            _inner.ConfigureAppConfiguration(configureDelegate);
+            return this;
+        }
+
+        public IHostBuilder ConfigureContainer<TContainerBuilder>(Action<HostBuilderContext, TContainerBuilder> configureDelegate)
+        {
+            _inner.ConfigureContainer(configureDelegate);
+            return this;
+        }
+
+        public IHostBuilder ConfigureHostConfiguration(Action<IConfigurationBuilder> configureDelegate)
+        {
+            _inner.ConfigureHostConfiguration(configureDelegate);
+            return this;
+        }
+
+        public IHostBuilder ConfigureServices(Action<HostBuilderContext, IServiceCollection> configureDelegate)
+        {
+            _inner.ConfigureServices(configureDelegate);
+            return this;
+        }
+
+        public IHostBuilder UseServiceProviderFactory<TContainerBuilder>(IServiceProviderFactory<TContainerBuilder> factory)
+            where TContainerBuilder : notnull
+        {
+            _inner.UseServiceProviderFactory(factory);
+            return this;
+        }
+
+        public IHostBuilder UseServiceProviderFactory<TContainerBuilder>(Func<HostBuilderContext, IServiceProviderFactory<TContainerBuilder>> factory)
+            where TContainerBuilder : notnull
+        {
+            _inner.UseServiceProviderFactory(factory);
+            return this;
+        }
+    }
+}
+
+/// <summary>One response from the facade exactly as the raw client received it.</summary>
+/// <param name="Status">The HTTP status code.</param>
+/// <param name="MediaType">The media type of <c>Content-Type</c>, for example <c>application/problem+json</c>; null when absent.</param>
+/// <param name="CharSet">The <c>charset</c> parameter of <c>Content-Type</c>; null when absent.</param>
+/// <param name="Headers">
+/// Every response and content header, keyed case-insensitively, with values as received; a name present
+/// in both sets keeps both sets of values.
+/// </param>
+/// <param name="Body">The response body bytes.</param>
+/// <param name="Elapsed">The time from just before the request was sent to just after the body was read.</param>
+public sealed record RawResponse(
+    int Status,
+    string? MediaType,
+    string? CharSet,
+    IReadOnlyDictionary<string, string[]> Headers,
+    byte[] Body,
+    TimeSpan Elapsed)
+{
+    /// <summary>The body decoded as UTF-8.</summary>
+    public string BodyText => Encoding.UTF8.GetString(Body);
+
+    /// <summary>Returns the first value of the named header, matched case-insensitively, or null.</summary>
+    public string? Header(string name)
+    {
+        if (Headers.TryGetValue(name, out string[]? values))
+        {
+            return values.Length > 0 ? values[0] : null;
+        }
+
+        // FacadeFactory builds Headers with a case-insensitive comparer; a dictionary supplied through
+        // the public constructor may not have one.
+        foreach ((string key, string[] candidate) in Headers)
+        {
+            if (string.Equals(key, name, StringComparison.OrdinalIgnoreCase))
+            {
+                return candidate.Length > 0 ? candidate[0] : null;
+            }
+        }
+
+        return null;
+    }
+}
+
+/// <summary>
+/// A request for one catalogue operation at its normal address, ready to be sent to any of the facade's
+/// sockets. Built by <see cref="OperationRequests"/>.
+/// </summary>
+/// <param name="Operation">The catalogue operation the request calls.</param>
+/// <param name="Method">The HTTP method.</param>
+/// <param name="PathAndQuery">
+/// The request target, already escaped, which a backend receives unchanged as its raw target, for
+/// example <c>/agent/Sample</c>.
+/// </param>
+/// <param name="Body">The request body bytes; null for a request without content.</param>
+/// <param name="ContentType">The exact <c>Content-Type</c> value sent with <paramref name="Body"/>; null without a body.</param>
+/// <param name="SoapAction">The exact <c>SOAPAction</c> value, quotes included; null to send no <c>SOAPAction</c> header.</param>
+public sealed record PreparedRequest(
+    OperationDescriptor Operation,
+    HttpMethod Method,
+    string PathAndQuery,
+    byte[]? Body,
+    string? ContentType,
+    string? SoapAction)
+{
+    /// <summary>
+    /// Creates a new HTTP/1.1 message for this request against <paramref name="baseAddress"/>. Headers are
+    /// added verbatim, without validation or reformatting.
+    /// </summary>
+    /// <param name="baseAddress">The socket to send to, for example <see cref="FacadeFactory.RestBaseAddress"/>.</param>
+    /// <param name="host">
+    /// A <c>Host</c> header value to send in place of the base address's authority, for example to forge
+    /// another listener's port; null keeps the default.
+    /// </param>
+    /// <returns>A fresh message on every call; <see cref="FacadeFactory.SendAsync"/> disposes it.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="baseAddress"/> is null.</exception>
+    public HttpRequestMessage ToMessage(Uri baseAddress, string? host = null)
+    {
+        ArgumentNullException.ThrowIfNull(baseAddress);
+
+        var message = new HttpRequestMessage(Method, new Uri(baseAddress, PathAndQuery))
+        {
+            Version = HttpVersion.Version11,
+            VersionPolicy = HttpVersionPolicy.RequestVersionExact,
+        };
+
+        if (Body is not null)
+        {
+            var content = new ByteArrayContent(Body);
+            if (ContentType is not null)
+            {
+                content.Headers.TryAddWithoutValidation("Content-Type", ContentType);
+            }
+
+            message.Content = content;
+        }
+
+        if (SoapAction is not null)
+        {
+            message.Headers.TryAddWithoutValidation("SOAPAction", SoapAction);
+        }
+
+        if (host is not null)
+        {
+            message.Headers.Host = host;
+        }
+
+        return message;
+    }
+}
+
+/// <summary>
+/// Builds a deterministic request for any catalogue operation from <see cref="OperationCatalogue.Default"/>
+/// alone. Parameter values are fixed samples that need no escaping, so the raw target a backend receives
+/// equals <see cref="PreparedRequest.PathAndQuery"/> byte for byte.
+/// </summary>
+public static class OperationRequests
+{
+    private const string StringSample = "Sample";
+    private const string IntegerSample = "1";
+    private const string DecimalSample = "1.00";
+
+    // The fallback content type of a REST body; the catalogue names application/json for both body operations.
+    private const string JsonContentType = "application/json";
+
+    // The DTO member the SOAP body sets for a DTO parameter, mirroring DtoJsonBody.
+    private const string DtoNameElement = "name";
+
+    // The REST DTO request body, UTF-8 without a BOM: a DTOAgent or DTOClient holding only a name.
+    private static readonly byte[] DtoJsonBody = "{\"name\":\"Sample\"}"u8.ToArray();
+
+    /// <summary>Builds the request for <paramref name="operation"/> on its own surface.</summary>
+    /// <param name="operation">A catalogue operation.</param>
+    /// <returns>The REST or SOAP request.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="operation"/> is null.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">The operation's surface is neither REST nor SOAP.</exception>
+    public static PreparedRequest For(OperationDescriptor operation)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        return operation.Surface switch
+        {
+            Surface.Rest => ForRest(operation),
+            Surface.Soap => ForSoap(operation),
+            _ => throw new ArgumentOutOfRangeException(nameof(operation), "operation surface is neither Rest nor Soap"),
+        };
+    }
+
+    /// <summary>
+    /// Builds the REST request: the binding's verb, and its path template with each path parameter
+    /// replaced by a sample for its JADE type (<c>String</c> <c>Sample</c>, <c>Integer</c> <c>1</c>,
+    /// <c>Decimal</c> <c>1.00</c>). A body parameter becomes the UTF-8 JSON body <c>{"name":"Sample"}</c>
+    /// with the binding's request content type.
+    /// </summary>
+    /// <param name="operation">A REST catalogue operation.</param>
+    /// <returns>The request, for example <c>GET /agent/Sample</c> or <c>POST /createTender/Sample/Sample/1/1.00</c>.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="operation"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The operation has no REST binding, a parameter is not carried in the path or body, or a path
+    /// template placeholder names no path parameter.
+    /// </exception>
+    public static PreparedRequest ForRest(OperationDescriptor operation)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        RestBinding rest = operation.Rest ?? throw new InvalidOperationException("operation has no REST binding");
+
+        string path = rest.PathTemplate;
+        byte[]? body = null;
+        string? contentType = null;
+        foreach (ParameterDescriptor parameter in operation.Parameters.OrderBy(parameter => parameter.Position))
+        {
+            switch (parameter.Location)
+            {
+                case ParameterLocation.Path:
+                    path = path.Replace(
+                        "{" + parameter.Name + "}", Uri.EscapeDataString(SampleFor(parameter.JadeType)), StringComparison.Ordinal);
+                    break;
+                case ParameterLocation.Body:
+                    body = [.. DtoJsonBody];
+                    contentType = rest.RequestContentType ?? JsonContentType;
+                    break;
+                default:
+                    throw new InvalidOperationException("REST operation parameter is carried neither in the path nor in the body");
+            }
+        }
+
+        if (path.Contains('{', StringComparison.Ordinal))
+        {
+            throw new InvalidOperationException("unresolved path template placeholder");
+        }
+
+        return new PreparedRequest(
+            operation, new HttpMethod(rest.Verb.ToUpperInvariant()), path, body, contentType, SoapAction: null);
+    }
+
+    /// <summary>
+    /// Builds the SOAP request: <c>POST</c> to the catalogue's SOAP endpoint path and query with the
+    /// catalogue's SOAP content type, the operation's quoted <c>SOAPAction</c>, and a SOAP 1.1
+    /// document/literal wrapped envelope holding the request element with one sample child per parameter
+    /// in signature order; a DTO parameter holds a single <c>name</c> member.
+    /// </summary>
+    /// <param name="operation">A SOAP catalogue operation.</param>
+    /// <param name="includeSoapAction">False to send no <c>SOAPAction</c> header, so only the body names the operation.</param>
+    /// <returns>The request.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="operation"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The operation has no SOAP binding, or a parameter is not carried as a request child element.
+    /// </exception>
+    public static PreparedRequest ForSoap(OperationDescriptor operation, bool includeSoapAction = true)
+    {
+        ArgumentNullException.ThrowIfNull(operation);
+        SoapBinding soap = operation.Soap ?? throw new InvalidOperationException("operation has no SOAP binding");
+        OperationCatalogue catalogue = OperationCatalogue.Default;
+        SoapAddress address = catalogue.Addresses.Soap;
+
+        return new PreparedRequest(
+            operation,
+            HttpMethod.Post,
+            address.EndpointPathAndQuery,
+            BuildEnvelope(catalogue, address, soap, operation.Parameters),
+            address.ContentType,
+            includeSoapAction ? "\"" + soap.Action + "\"" : null);
+    }
+
+    private static byte[] BuildEnvelope(
+        OperationCatalogue catalogue, SoapAddress address, SoapBinding soap, IReadOnlyList<ParameterDescriptor> parameters)
+    {
+        var settings = new XmlWriterSettings
+        {
+            Encoding = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false),
+            OmitXmlDeclaration = true,
+            Indent = false,
+            CloseOutput = false,
+        };
+
+        using var stream = new MemoryStream();
+        using (var writer = XmlWriter.Create(stream, settings))
+        {
+            writer.WriteStartElement("soap", "Envelope", address.EnvelopeNamespace);
+            writer.WriteStartElement("soap", "Body", address.EnvelopeNamespace);
+
+            // The wrapper declares the message namespace as the default, which its children inherit.
+            writer.WriteStartElement(soap.RequestElement, address.TargetNamespace);
+            foreach (ParameterDescriptor parameter in parameters.OrderBy(parameter => parameter.Position))
+            {
+                if (parameter.Location != ParameterLocation.Element)
+                {
+                    throw new InvalidOperationException("SOAP operation parameter is not carried as a request element");
+                }
+
+                writer.WriteStartElement(parameter.Name, address.TargetNamespace);
+                if (catalogue.TryGetDto(parameter.JadeType, out _))
+                {
+                    writer.WriteElementString(DtoNameElement, address.TargetNamespace, StringSample);
+                }
+                else
+                {
+                    writer.WriteString(SampleFor(parameter.JadeType));
+                }
+
+                writer.WriteEndElement();
+            }
+
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+            writer.WriteEndElement();
+        }
+
+        return stream.ToArray();
+    }
+
+    private static string SampleFor(string jadeType) => jadeType switch
+    {
+        "Integer" => IntegerSample,
+        "Decimal" => DecimalSample,
+        _ => StringSample,
+    };
+}
+
+// LogCapture sits here, beside FacadeTestSettings.LoggerProvider, which hands it to a facade on real
+// sockets.
+//
+// Captures the log entries a facade writes during a test, so that a test can assert on BackendForwarder's
+// per-call line (event 1001, BackendCall) and on the absence of error-level output. Hand an instance to
+// FacadeTestSettings.LoggerProvider for a facade on real sockets, or to a LoggerFactory for a forwarder
+// constructed directly.
+//
+// Facade test failures are identified across runs by a signature over the exception type, the failing
+// line and the assertion message, so every message raised here is a fixed literal.
+/// <summary>One log entry as the facade wrote it.</summary>
+/// <param name="Category">The logger category, for example <c>Erewhon.Facade.Forwarding.BackendForwarder</c>.</param>
+/// <param name="Level">The entry's level.</param>
+/// <param name="EventId">The entry's event id.</param>
+/// <param name="State">The structured values of the entry, keyed by placeholder name.</param>
+/// <param name="Message">The formatted message.</param>
+/// <param name="Exception">The exception logged with the entry, if any.</param>
+public sealed record CapturedLog(
+    string Category,
+    LogLevel Level,
+    EventId EventId,
+    IReadOnlyDictionary<string, object?> State,
+    string Message,
+    Exception? Exception)
+{
+    /// <summary>Returns the structured value of the named placeholder, or null when the entry has none.</summary>
+    public object? Value(string name) => State.TryGetValue(name, out object? value) ? value : null;
+}
+
+/// <summary>
+/// An <see cref="ILoggerProvider"/> that keeps every entry it receives in memory, in the order written.
+/// The facade's own level filters still decide which entries reach it.
+/// </summary>
+public sealed class LogCapture : ILoggerProvider
+{
+    /// <summary>The event id of BackendForwarder's per-call line.</summary>
+    public const int BackendCallEventId = 1001;
+
+    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(20);
+
+    private readonly Lock _gate = new();
+    private readonly List<CapturedLog> _entries = [];
+
+    /// <summary>A snapshot of every entry received so far.</summary>
+    public IReadOnlyList<CapturedLog> Entries
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return _entries.ToArray();
+            }
+        }
+    }
+
+    /// <summary>A snapshot of the per-call lines (event 1001) received so far.</summary>
+    public IReadOnlyList<CapturedLog> BackendCalls => Entries.Where(entry => entry.EventId.Id == BackendCallEventId).ToArray();
+
+    /// <summary>
+    /// Waits until at least <paramref name="count"/> per-call lines have been received and returns them;
+    /// fails the test when they have not arrived within <paramref name="bound"/>.
+    /// </summary>
+    /// <param name="count">The number of lines to wait for.</param>
+    /// <param name="bound">How long to wait.</param>
+    /// <param name="ct">The test's cancellation token.</param>
+    /// <returns>Every per-call line received.</returns>
+    public async Task<IReadOnlyList<CapturedLog>> WaitForBackendCallsAsync(int count, TimeSpan bound, CancellationToken ct)
+    {
+        var deadline = DateTime.UtcNow + bound;
+        while (true)
+        {
+            IReadOnlyList<CapturedLog> calls = BackendCalls;
+            if (calls.Count >= count)
+            {
+                return calls;
+            }
+
+            if (DateTime.UtcNow >= deadline)
+            {
+                Assert.Fail("expected backend call log lines did not arrive in time");
+            }
+
+            await Task.Delay(PollInterval, ct);
+        }
+    }
+
+    /// <inheritdoc />
+    public ILogger CreateLogger(string categoryName) => new CapturingLogger(this, categoryName);
+
+    /// <inheritdoc />
+    public void Dispose()
+    {
+        // Entries stay readable after the host that wrote them has stopped.
+    }
+
+    private void Add(CapturedLog entry)
+    {
+        lock (_gate)
+        {
+            _entries.Add(entry);
+        }
+    }
+
+    private sealed class CapturingLogger(LogCapture owner, string category) : ILogger
+    {
+        public IDisposable? BeginScope<TState>(TState state)
+            where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => logLevel != LogLevel.None;
+
+        public void Log<TState>(LogLevel logLevel, EventId eventId, TState state, Exception? exception, Func<TState, Exception?, string> formatter)
+        {
+            var values = new Dictionary<string, object?>(StringComparer.Ordinal);
+            if (state is IEnumerable<KeyValuePair<string, object?>> pairs)
+            {
+                foreach ((string name, object? value) in pairs)
+                {
+                    values[name] = value;
+                }
+            }
+
+            owner.Add(new CapturedLog(category, logLevel, eventId, values, formatter(state, exception), exception));
+        }
+    }
+}
+
+// RawSocketClient sits here, beside the facade host whose REST and SOAP sockets it calls.
+//
+// Raw HTTP/1.1 over a plain TCP socket, for the requests HttpClient cannot send: an upload that trickles
+// one byte at a time while the response is read, a chunked upload that is never completed while the
+// response is read, an upload cut short by closing the socket, and a caller that disconnects before the
+// response. HttpClient sends a whole request body before it reads any response, and never sends less
+// body than it declares.
+//
+// Facade test failures are identified across runs by a signature over the exception type, the failing
+// line and the assertion message, so every message raised here is a fixed literal: no port, URL, elapsed
+// time or byte count.
+/// <summary>A response read from a raw socket.</summary>
+/// <param name="Status">The status code of the status line.</param>
+/// <param name="Body">The body bytes, as many as <c>Content-Length</c> declares.</param>
+/// <param name="Elapsed">The time from the end of the request head to the end of the body.</param>
+public sealed record RawSocketResponse(int Status, byte[] Body, TimeSpan Elapsed)
+{
+    /// <summary>The body decoded as UTF-8.</summary>
+    public string BodyText => Encoding.UTF8.GetString(Body);
+}
+
+/// <summary>Sends raw HTTP/1.1 requests whose bodies arrive late, short or never.</summary>
+public static class RawSocketClient
+{
+    // A response that has not arrived by then fails the test instead of stalling it.
+    private static readonly TimeSpan ResponseBound = TimeSpan.FromSeconds(15);
+
+    private static readonly byte[] HeadTerminator = "\r\n\r\n"u8.ToArray();
+
+    /// <summary>
+    /// Sends a <c>POST</c> head declaring <paramref name="declaredLength"/> body bytes, then one body byte
+    /// per <paramref name="interval"/>, never completing the body, and reads the response while the bytes
+    /// trickle. The upload stops when the response has been read or the connection closes.
+    /// </summary>
+    /// <param name="baseAddress">The facade socket, for example <c>FacadeFactory.RestBaseAddress</c>.</param>
+    /// <param name="pathAndQuery">The request target.</param>
+    /// <param name="contentType">The <c>Content-Type</c> value.</param>
+    /// <param name="declaredLength">The <c>Content-Length</c> value; at least 2, so the body is never completed.</param>
+    /// <param name="interval">The pause before each body byte.</param>
+    /// <param name="ct">The test's cancellation token.</param>
+    /// <returns>The response, with the time from the end of the head to the end of the body.</returns>
+    public static async Task<RawSocketResponse> SendTrickledUploadAsync(
+        Uri baseAddress, string pathAndQuery, string contentType, int declaredLength, TimeSpan interval, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(baseAddress);
+        ArgumentOutOfRangeException.ThrowIfLessThan(declaredLength, 2);
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(baseAddress.Host, baseAddress.Port, ct);
+        NetworkStream stream = client.GetStream();
+        await stream.WriteAsync(Head("POST", baseAddress, pathAndQuery, contentType, declaredLength), ct);
+        var stopwatch = Stopwatch.StartNew();
+
+        using var stopUpload = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task upload = TrickleAsync(stream, declaredLength - 1, interval, stopUpload.Token);
+        try
+        {
+            (int status, byte[] body) = await ReadResponseAsync(stream, ct);
+            stopwatch.Stop();
+            return new RawSocketResponse(status, body, stopwatch.Elapsed);
+        }
+        finally
+        {
+            await stopUpload.CancelAsync();
+            await upload;
+        }
+    }
+
+    /// <summary>
+    /// Sends a <c>POST</c> head with <c>Transfer-Encoding: chunked</c> and no <c>Expect</c>, then
+    /// <paramref name="bodyLength"/> body bytes in 64 KiB chunks as fast as the facade takes them, never
+    /// sending the terminating chunk, and reads the response while the upload is under way. The upload
+    /// stops when the response has been read or the connection closes, so a response arrives only if the
+    /// facade answers before the body is complete.
+    /// </summary>
+    /// <param name="baseAddress">The facade socket, for example <c>FacadeFactory.RestBaseAddress</c>.</param>
+    /// <param name="pathAndQuery">The request target.</param>
+    /// <param name="headers">Further request headers, for example <c>Content-Type</c> and <c>SOAPAction</c>.</param>
+    /// <param name="bodyLength">How many body bytes to send; the body is never completed.</param>
+    /// <param name="ct">The test's cancellation token.</param>
+    /// <returns>The response, with the time from the end of the head to the end of the body.</returns>
+    public static async Task<RawSocketResponse> SendUnfinishedChunkedUploadAsync(
+        Uri baseAddress, string pathAndQuery, IReadOnlyList<KeyValuePair<string, string>> headers, long bodyLength, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(baseAddress);
+        ArgumentNullException.ThrowIfNull(headers);
+        ArgumentOutOfRangeException.ThrowIfNegative(bodyLength);
+
+        var head = new StringBuilder();
+        head.Append(CultureInfo.InvariantCulture, $"POST {pathAndQuery} HTTP/1.1\r\nHost: {baseAddress.Authority}\r\n");
+        foreach ((string name, string value) in headers)
+        {
+            head.Append(CultureInfo.InvariantCulture, $"{name}: {value}\r\n");
+        }
+
+        head.Append("Transfer-Encoding: chunked\r\n\r\n");
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(baseAddress.Host, baseAddress.Port, ct);
+        NetworkStream stream = client.GetStream();
+        await stream.WriteAsync(Encoding.ASCII.GetBytes(head.ToString()), ct);
+        var stopwatch = Stopwatch.StartNew();
+
+        using var stopUpload = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        Task upload = SendChunksAsync(stream, bodyLength, stopUpload.Token);
+        try
+        {
+            (int status, byte[] body) = await ReadResponseAsync(stream, ct);
+            stopwatch.Stop();
+            return new RawSocketResponse(status, body, stopwatch.Elapsed);
+        }
+        finally
+        {
+            await stopUpload.CancelAsync();
+            await upload;
+        }
+    }
+
+    /// <summary>
+    /// Sends a request head, and for a declared body the first <paramref name="sentBodyLength"/> bytes of
+    /// it, then closes the socket after <paramref name="closeAfter"/> without reading any response.
+    /// </summary>
+    /// <param name="baseAddress">The facade socket.</param>
+    /// <param name="method">The request method.</param>
+    /// <param name="pathAndQuery">The request target.</param>
+    /// <param name="contentType">The <c>Content-Type</c> value; null with no declared body.</param>
+    /// <param name="declaredLength">The <c>Content-Length</c> value; 0 for a request without a body.</param>
+    /// <param name="sentBodyLength">How many of the declared body bytes are sent; less than declared truncates the upload.</param>
+    /// <param name="closeAfter">How long to wait before closing the socket.</param>
+    /// <param name="ct">The test's cancellation token.</param>
+    public static async Task SendAndCloseAsync(
+        Uri baseAddress,
+        string method,
+        string pathAndQuery,
+        string? contentType,
+        int declaredLength,
+        int sentBodyLength,
+        TimeSpan closeAfter,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(baseAddress);
+        ArgumentOutOfRangeException.ThrowIfNegative(declaredLength);
+        ArgumentOutOfRangeException.ThrowIfNegative(sentBodyLength);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(sentBodyLength, declaredLength);
+
+        using var client = new TcpClient();
+        await client.ConnectAsync(baseAddress.Host, baseAddress.Port, ct);
+        NetworkStream stream = client.GetStream();
+        await stream.WriteAsync(Head(method, baseAddress, pathAndQuery, contentType, declaredLength), ct);
+        if (sentBodyLength > 0)
+        {
+            byte[] body = new byte[sentBodyLength];
+            Array.Fill(body, (byte)'x');
+            await stream.WriteAsync(body, ct);
+        }
+
+        await Task.Delay(closeAfter, ct);
+        client.Close();
+    }
+
+    private static byte[] Head(string method, Uri baseAddress, string pathAndQuery, string? contentType, int declaredLength)
+    {
+        var head = new StringBuilder();
+        head.Append(CultureInfo.InvariantCulture, $"{method} {pathAndQuery} HTTP/1.1\r\nHost: {baseAddress.Authority}\r\n");
+        if (declaredLength > 0)
+        {
+            if (contentType is not null)
+            {
+                head.Append(CultureInfo.InvariantCulture, $"Content-Type: {contentType}\r\n");
+            }
+
+            head.Append(CultureInfo.InvariantCulture, $"Content-Length: {declaredLength}\r\n");
+        }
+
+        head.Append("\r\n");
+        return Encoding.ASCII.GetBytes(head.ToString());
+    }
+
+    private static async Task TrickleAsync(Stream stream, int count, TimeSpan interval, CancellationToken ct)
+    {
+        byte[] one = "x"u8.ToArray();
+        try
+        {
+            for (int sent = 0; sent < count; sent++)
+            {
+                await Task.Delay(interval, ct);
+                await stream.WriteAsync(one, ct);
+            }
+        }
+        catch (Exception exception) when (exception is OperationCanceledException or IOException or ObjectDisposedException)
+        {
+            // Stopped once the response was read, or the facade closed the connection: the upload ends here.
+        }
+    }
+
+    // Sends the chunks of an upload that never ends, then waits until the response has been read.
+    private static async Task SendChunksAsync(Stream stream, long bodyLength, CancellationToken ct)
+    {
+        const int ChunkLength = 64 * 1024;
+        byte[] chunk = Chunk(ChunkLength);
+        try
+        {
+            for (long sent = 0; sent < bodyLength; sent += ChunkLength)
+            {
+                int length = (int)Math.Min(ChunkLength, bodyLength - sent);
+                await stream.WriteAsync(length == ChunkLength ? chunk : Chunk(length), ct);
+            }
+
+            await Task.Delay(Timeout.InfiniteTimeSpan, ct);
+        }
+        catch (Exception exception) when (exception is OperationCanceledException or IOException or ObjectDisposedException)
+        {
+            // Stopped once the response was read, or the facade closed the connection: the upload ends here.
+        }
+
+        // One chunk of the chunked transfer coding: hexadecimal size, CRLF, data, CRLF.
+        static byte[] Chunk(int length) =>
+            [.. Encoding.ASCII.GetBytes(length.ToString("X", CultureInfo.InvariantCulture) + "\r\n"), .. Enumerable.Repeat((byte)'x', length), .. "\r\n"u8];
+    }
+
+    // Reads one response with a Content-Length body; chunked responses are not expected from these tests.
+    private static async Task<(int Status, byte[] Body)> ReadResponseAsync(Stream stream, CancellationToken ct)
+    {
+        using var bound = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        bound.CancelAfter(ResponseBound);
+        using var received = new MemoryStream();
+        byte[] buffer = new byte[4096];
+        try
+        {
+            int headEnd;
+            while ((headEnd = received.GetBuffer().AsSpan(0, (int)received.Length).IndexOf(HeadTerminator)) < 0)
+            {
+                int read = await stream.ReadAsync(buffer, bound.Token);
+                Assert.True(read > 0, "facade closed the connection before a complete response head");
+                received.Write(buffer, 0, read);
+            }
+
+            string[] lines = Encoding.ASCII.GetString(received.GetBuffer(), 0, headEnd).Split("\r\n");
+            string[] statusLine = lines[0].Split(' ', 3);
+            int status = -1;
+            Assert.True(
+                statusLine.Length >= 2 && int.TryParse(statusLine[1], NumberStyles.None, CultureInfo.InvariantCulture, out status),
+                "response status line is malformed");
+
+            int contentLength = -1;
+            foreach (string line in lines.Skip(1))
+            {
+                int colon = line.IndexOf(':', StringComparison.Ordinal);
+                if (colon > 0
+                    && line.AsSpan(0, colon).Trim().Equals("Content-Length", StringComparison.OrdinalIgnoreCase)
+                    && int.TryParse(line.AsSpan(colon + 1).Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out int length))
+                {
+                    contentLength = length;
+                }
+            }
+
+            Assert.True(contentLength >= 0, "response has no Content-Length");
+
+            int bodyStart = headEnd + HeadTerminator.Length;
+            while (received.Length - bodyStart < contentLength)
+            {
+                int read = await stream.ReadAsync(buffer, bound.Token);
+                Assert.True(read > 0, "facade closed the connection before the response body was complete");
+                received.Write(buffer, 0, read);
+            }
+
+            return (status, received.GetBuffer().AsSpan(bodyStart, contentLength).ToArray());
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            Assert.Fail("no complete response arrived within 15 s");
+            throw new UnreachableException();
+        }
+        catch (IOException)
+        {
+            Assert.Fail("connection failed while the response was read");
+            throw new UnreachableException();
+        }
+    }
+}

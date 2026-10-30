@@ -1,0 +1,25 @@
+{
+  "order": 26,
+  "caseId": "SOAP-getClient-01",
+  "operation": "Soap.getClient",
+  "kind": "success",
+  "stateChanging": false,
+  "preState": "seed",
+  "source": "jade-standin",
+  "request": {
+    "method": "POST",
+    "pathAndQuery": "/jade/jadehttp.dll?WebServiceHTTP&serviceName=ErewhonWebService&listName=WebServiceHTTP",
+    "headers": {
+      "Content-Type": "text/xml; charset=utf-8",
+      "SOAPAction": "\"urn:JadeWebServices/WebServiceHTTP/getClient\""
+    },
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getClient xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><pName>Pauline Wild</pName></getClient></soap:Body></soap:Envelope>"
+  },
+  "response": {
+    "status": 200,
+    "contentType": "text/xml; charset=utf-8",
+    "bodyText": "<?xml version=\"1.0\" encoding=\"utf-8\"?><soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xmlns:xsd=\"http://www.w3.org/2001/XMLSchema\"><soap:Body><getClientResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getClientResult><city>Christchurch</city><country>New Zealand</country><email>wild@more.co.nz</email><fax>64 3 834 7172</fax><name>Pauline Wild</name><phone>64 3 923 1010</phone><street>24c Dryside Place</street><website /></getClientResult></getClientResponse></soap:Body></soap:Envelope>",
+    "bodySha256": "c16e46c1619b5e3583c8f3f686ec0704ac6d757c6046bf8e330737d51a52af5f",
+    "bodyFile": null
+  }
+}
