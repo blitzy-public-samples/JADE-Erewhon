@@ -4380,7 +4380,13 @@ public sealed partial class KnownLimitationsRegisterTests
     private const string OverlongExitCode = "777777777777777777777777777777777777777777777777777777777777";
     private const string OverlongExcerpt = "'7777777777777777777777777777777777777777…'";
 
+    // The mode of a planted FIFO: rw-rw-rw- before the umask.
+    private const uint FifoMode = 0b110_110_110;
+
     private static readonly XNamespace TrxNamespace = "http://microsoft.com/schemas/VisualStudio/TeamTest/2010";
+
+    // How long a Read may take before it counts as blocked; a refused file is refused at once.
+    private static readonly TimeSpan PromptReadLimit = TimeSpan.FromSeconds(10);
 
     // ---- Positive control ----------------------------------------------------------------------
 
@@ -4890,10 +4896,189 @@ public sealed partial class KnownLimitationsRegisterTests
             item.Detail);
     }
 
+    // ---- Links, special files and oversized files ----------------------------------------------
+
+    /// <summary>
+    /// Each result file, as <see cref="Read_LinkSpecialOrOversizedFile_IsRefusedPromptly"/> names it, crossed
+    /// with each kind of entry planted at its name.
+    /// </summary>
+    public static TheoryData<string, string> RefusedResultFiles()
+    {
+        var data = new TheoryData<string, string>();
+        foreach (var file in new[] { "trx", "exit-code", "xunit-xml", "unneeded-xunit-xml" })
+        {
+            foreach (var kind in new[] { "fifo", "link-to-fifo", "link-to-file", "oversized" })
+            {
+                data.Add(file, kind);
+            }
+        }
+
+        return data;
+    }
+
+    // A FIFO, a link to a FIFO, a link to a valid file outside the results directory, and a sparse file one
+    // byte over its limit are each refused at once: never waited on, followed or read in full. The refusal is
+    // the file's usual unreadable problem, and the other two files are valid, so it is the only problem. An
+    // xunit XML file that no failed result needs stays no problem. Read runs on a pool thread under a
+    // deadline, so a read that blocks fails the test instead of hanging it.
+    [Theory]
+    [MemberData(nameof(RefusedResultFiles))]
+    public async Task Read_LinkSpecialOrOversizedFile_IsRefusedPromptly(string file, string kind)
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "the facade test results are read only on Linux");
+        var ct = TestContext.Current.CancellationToken;
+        var (name, byteLimit, validContent) = file switch
+        {
+            "trx" => (FacadeTestResults.TrxFileName, FacadeTestResults.ResultsFileByteLimit, AllPassedTrx()),
+            "exit-code" => (FacadeTestResults.ExitCodeFileName, FacadeTestResults.ExitCodeByteLimit, "0"),
+            "xunit-xml" => (FacadeTestResults.XunitXmlFileName, FacadeTestResults.ResultsFileByteLimit, OneFailedXunitXml()),
+            "unneeded-xunit-xml" => (FacadeTestResults.XunitXmlFileName, FacadeTestResults.ResultsFileByteLimit, XunitXml(AllPassedResults())),
+            _ => throw new ArgumentOutOfRangeException(nameof(file), file, "unknown result file"),
+        };
+        if (file != "trx")
+        {
+            WriteTrx(file == "xunit-xml" ? OneFailedTrx() : AllPassedTrx());
+        }
+
+        if (file != "exit-code")
+        {
+            WriteExitCode(file == "xunit-xml" ? "2" : "0");
+        }
+
+        var path = Temp.PathOf($"artifacts/facade-tests/{name}");
+        PlantRefusedFile(path, kind, byteLimit, validContent);
+
+        var summary = await Task.Run(() => Read(), ct).WaitAsync(PromptReadLimit, ct);
+
+        var refusal = path + kind switch
+        {
+            "fifo" => " is not a regular file (a FIFO)",
+            "oversized" => string.Create(CultureInfo.InvariantCulture, $" exceeds the {byteLimit}-byte limit"),
+            _ => " is a symbolic link, which is never followed",
+        };
+        switch (file)
+        {
+            case "trx":
+                AssertThreeNotRunChecks(summary);
+                Assert.Equal($"TRX file unreadable: {refusal}", AssertSingleTrxItem(summary).Detail);
+                Assert.Equal(0, summary.ExitCode);
+                break;
+            case "exit-code":
+                AssertAllPassedCounts(summary);
+                Assert.Equal($"exit-code file unreadable: {refusal}", AssertSingleTrxItem(summary).Detail);
+                Assert.Null(summary.ExitCode);
+                break;
+            case "xunit-xml":
+                AssertUntypedFailure(summary, $"{UntypedPrefix}xunit XML results unreadable: {refusal}");
+                Assert.Equal(2, summary.ExitCode);
+                break;
+            default:
+                AssertAllPassedCounts(summary);
+                Assert.Empty(summary.Failures);
+                Assert.Equal(0, summary.ExitCode);
+                break;
+        }
+    }
+
+    // A directory at the TRX file's name is unreadable, not absent, in the wording the other two files use.
+    [Fact]
+    public void Read_TrxDirectory_GivesUnreadableItemAndThreeNotRunChecks()
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "the facade test results are read only on Linux");
+        WriteExitCode("0");
+        var trxPath = Temp.PathOf($"artifacts/facade-tests/{FacadeTestResults.TrxFileName}");
+        Directory.CreateDirectory(trxPath);
+
+        var summary = Read();
+
+        AssertThreeNotRunChecks(summary);
+        Assert.Equal($"TRX file unreadable: {trxPath} is a directory", AssertSingleTrxItem(summary).Detail);
+    }
+
+    // The results directory, or the artifacts directory above it, replaced by a link to a directory of valid
+    // results is never followed, and replaced by a file is never read, so every file is unreadable for that
+    // reason and nothing from the link's target counts.
+    [Theory]
+    [InlineData("artifacts/facade-tests", true, "is a symbolic link, which is never followed")]
+    [InlineData("artifacts", true, "is a symbolic link, which is never followed")]
+    [InlineData("artifacts/facade-tests", false, "is not a directory")]
+    public async Task Read_ResultsDirectoryBehindALinkOrAFile_ReadsNothing(string component, bool link, string expectedReason)
+    {
+        Assert.SkipUnless(OperatingSystem.IsLinux(), "the facade test results are read only on Linux");
+        var ct = TestContext.Current.CancellationToken;
+        Temp.Write($"outside/facade-tests/{FacadeTestResults.TrxFileName}", AllPassedTrx());
+        Temp.Write($"outside/facade-tests/{FacadeTestResults.ExitCodeFileName}", "0");
+        Temp.Write($"outside/facade-tests/{FacadeTestResults.XunitXmlFileName}", XunitXml(AllPassedResults()));
+        var componentPath = Temp.PathOf(component);
+        if (link)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(componentPath)!);
+            Directory.CreateSymbolicLink(componentPath, Temp.PathOf(component == "artifacts" ? "outside" : "outside/facade-tests"));
+        }
+        else
+        {
+            Temp.Write(component, "not a directory");
+        }
+
+        var summary = await Task.Run(() => Read(), ct).WaitAsync(PromptReadLimit, ct);
+
+        AssertThreeNotRunChecks(summary);
+        var reason = $"{componentPath} {expectedReason}";
+        Assert.Equal(
+            $"TRX file unreadable: {Temp.PathOf($"artifacts/facade-tests/{FacadeTestResults.TrxFileName}")}: {reason}; "
+                + $"exit-code file unreadable: {Temp.PathOf($"artifacts/facade-tests/{FacadeTestResults.ExitCodeFileName}")}: {reason}",
+            AssertSingleTrxItem(summary).Detail);
+        Assert.Null(summary.ExitCode);
+    }
 
     // ---- Helpers -------------------------------------------------------------------------------
 
     private FacadeTestSummary Read() => new FacadeTestResults(new HarnessOptions { RepoRoot = Temp.Root }).Read();
+
+    // Plants at path a FIFO, a link to a FIFO or to a file holding validContent (both outside the results
+    // directory), or a sparse file one byte longer than byteLimit.
+    private void PlantRefusedFile(string path, string kind, int byteLimit, string validContent)
+    {
+        var outsideName = $"outside/{Path.GetFileName(path)}";
+        switch (kind)
+        {
+            case "fifo":
+                MakeFifo(path);
+                break;
+            case "link-to-fifo":
+                Directory.CreateDirectory(Temp.PathOf("outside"));
+                MakeFifo(Temp.PathOf(outsideName));
+                File.CreateSymbolicLink(path, Temp.PathOf(outsideName));
+                break;
+            case "link-to-file":
+                File.CreateSymbolicLink(path, Temp.Write(outsideName, validContent));
+                break;
+            case "oversized":
+                using (var handle = File.OpenHandle(path, FileMode.CreateNew, FileAccess.Write))
+                {
+                    RandomAccess.SetLength(handle, byteLimit + 1L);
+                }
+
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(kind), kind, "unknown kind of refused file");
+        }
+    }
+
+    private static void MakeFifo(string path)
+    {
+        if (MkFifo(path, FifoMode) != 0)
+        {
+            var errno = Marshal.GetLastPInvokeError();
+            Assert.Fail($"mkfifo could not make {path}: {Marshal.GetPInvokeErrorMessage(errno)}");
+        }
+    }
+
+    // mkfifo(3) from the Linux C library. The path is passed as UTF-8, the bytes the kernel reads, despite
+    // CA2101, which asks for the UTF-16 of Windows APIs; DllImport, not the LibraryImport that SYSLIB1054
+    // suggests, because its generated marshalling needs unsafe code, which this project does not enable.
+    [DllImport("libc", EntryPoint = "mkfifo", SetLastError = true)]
+    private static extern int MkFifo([MarshalAs(UnmanagedType.LPUTF8Str)] string path, uint mode);
 
     private void WriteTrx(string trxXml) =>
         Temp.Write($"artifacts/facade-tests/{FacadeTestResults.TrxFileName}", trxXml);

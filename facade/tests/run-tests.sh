@@ -11,12 +11,29 @@
 # in those files.
 #
 # Before any dotnet command the previous run's three files are removed and must be gone, and exit-code
-# is created afresh holding the non-integer marker `running`, which the harness reads as unverified until
-# the runner status replaces it. When the old files survive or exit-code cannot be created, nothing runs
-# and status 1 is recorded wherever exit-code is still writable. Only what this run creates or writes
-# is made writable, so a later local run can replace the results of a root-run container: a results
-# directory this run creates gets that mode as it is created, exit-code and this run's TRX and xunit XML
-# get it once written, and an existing results directory keeps its owner's mode.
+# is published afresh holding the non-integer marker `running`, which the harness reads as unverified
+# until the runner status replaces it. When the old files survive or exit-code cannot be published,
+# nothing runs and status 1 is recorded wherever exit-code can still be published.
+#
+# dotnet test writes its TRX and xunit XML into a private staging directory (mktemp -d in TMPDIR,
+# default /tmp; mode 0700, outside the repository, removed when the script exits), never into the
+# results directory. A directory is private only while no other user can rename entries on its path,
+# so the staging directory is used only when the physical TMPDIR directory and every directory above it
+# are each owned by root or the effective user and either sticky or writable by neither group nor
+# others; otherwise it is removed, nothing runs and status 1 is recorded. Everything that reaches the
+# results directory, the marker, every status, the TRX and the xunit XML, goes through one publication
+# step, which works from inside the results directory with relative names only. It writes the content
+# to a fresh dot-prefixed name holding 64 random bits, which the creating open makes exclusively (it
+# fails on any entry already there, a symlink included), and then renames that name over the final one,
+# which replaces whatever entry is there without following it. The script never opens an existing entry
+# of the results directory for writing, never truncates one and never changes a mode by path, so a
+# symlink planted there cannot redirect a write or a mode change of this (in the container, root)
+# process to another file. The TRX and xunit XML are published before the status, so a reader that sees
+# this run's status also sees this run's TRX.
+#
+# A later local run can replace the results of a root-run container: a results directory this run
+# creates is made 0777 as it is created, every published file is created 0666 by its own creating open,
+# and an existing results directory keeps its owner's mode.
 #
 # Usage: run-tests.sh [-h | --help]. Any other argument is reported and nothing runs.
 #
@@ -29,6 +46,9 @@
 #                            taken from the caller's working directory. It must be a dedicated
 #                            directory: /, the facade directory or any ancestor of it, and the root of a
 #                            git work tree are refused and left untouched.
+#   TMPDIR                   where the staging directory is made; default /tmp. It and every directory
+#                            above it must be owned by root or the effective user and be sticky or
+#                            writable by neither group nor others, or nothing runs and exit-code holds 1.
 
 set -u
 set -o pipefail
@@ -68,6 +88,9 @@ Environment:
                            taken from the caller's working directory. It must be a dedicated
                            directory: /, the facade directory or any ancestor of it, and the root of
                            a git work tree are refused and left untouched.
+  TMPDIR                   where the staging directory is made; default /tmp. It and every directory
+                           above it must be owned by root or the effective user and be sticky or
+                           writable by neither group nor others, or nothing runs and $EXIT_CODE_NAME holds 1.
 
 The script always exits 0; the test outcome travels in $EXIT_CODE_NAME and $TRX_NAME.
 EOF
@@ -109,7 +132,9 @@ RESULTS_DIR="${FACADE_TEST_RESULTS_DIR:-$DEFAULT_RESULTS_DIR}"
 # path afterwards, so nothing put in its place later can have its mode changed. That mkdir fails with
 # EEXIST for anything already there (a directory in any spelling, one ending in `..` or `.` included,
 # or a symlink to anything), which keeps the mode its owner set. Intermediate directories are created
-# with the caller's umask.
+# with the caller's umask. Anyone may add, replace or remove entries of a 0777 directory, and that
+# reaches nothing outside it: this script only creates fresh names there exclusively and renames them
+# (publish, below) or unlinks names, none of which follows a symlink found there.
 mkdir -p -- "$(dirname -- "$RESULTS_DIR")"
 (umask 0 && mkdir -- "$RESULTS_DIR") 2>/dev/null
 # The physical path is the one checked below, so a symlink cannot disguise a refused directory.
@@ -119,7 +144,7 @@ if [ ! -d "$RESULTS_DIR" ] || ! RESULTS_PHYSICAL_DIR="$(cd -- "$RESULTS_DIR" && 
 fi
 RESULTS_DIR="$RESULTS_PHYSICAL_DIR"
 
-# The script removes, writes and shares files in the results directory, so an override naming a
+# The script removes and publishes files in the results directory, so an override naming a
 # directory that holds other work is refused before anything in it changes: the filesystem root, the
 # facade directory or any ancestor of it (a checkout root and above), and the root of a git work tree
 # (/repo in the container).
@@ -140,25 +165,80 @@ TRX_PATH="$RESULTS_DIR/$TRX_NAME"
 XML_PATH="$RESULTS_DIR/$XML_NAME"
 EXIT_CODE_PATH="$RESULTS_DIR/$EXIT_CODE_NAME"
 
-# share <file>: leaves a file this run wrote writable for later local runs, because the container runs
-# as root. A symlink is never followed, so nothing outside the results changes mode.
-share() {
-    if [ -f "$1" ] && [ ! -L "$1" ]; then
-        chmod a+rw -- "$1" 2>/dev/null || true
+# The directory that passed the checks above is held open from here on, and every publication enters
+# it through this descriptor, so each one lands in that directory even if its path is changed later.
+# Where the descriptor cannot be opened, publications enter the directory by its physical path.
+RESULTS_FD=""
+{ exec {RESULTS_FD}<"$RESULTS_DIR"; } 2>/dev/null || RESULTS_FD=""
+
+# enter_results_dir: makes the results directory the working directory, through the held descriptor
+# (/proc/<pid>/fd/<n>) where /proc provides it and by its physical path otherwise. False unless the
+# directory entered is the checked one, at its checked path.
+enter_results_dir() {
+    if [ -z "$RESULTS_FD" ] || ! cd -P -- "/proc/$$/fd/$RESULTS_FD" 2>/dev/null; then
+        cd -P -- "$RESULTS_DIR" 2>/dev/null || return 1
     fi
+    [ "$(pwd -P)" = "$RESULTS_DIR" ]
 }
 
-# write_status <status>: puts <status> in exit-code, only where that writes no symlink and nothing but
-# a plain file: exit-code is absent, or a regular, writable file. False when the status was not written.
+# random_name_part: prints 16 hex digits (64 bits) from the kernel's random number generator, through
+# bash's SRANDOM (getrandom(2), bash 5.1 and later) or else /dev/urandom. False when neither yields them.
+random_name_part() {
+    local part=""
+    if [ "${BASH_VERSINFO[0]}" -gt 5 ] || { [ "${BASH_VERSINFO[0]}" -eq 5 ] && [ "${BASH_VERSINFO[1]}" -ge 1 ]; }; then
+        printf -v part '%08x%08x' "$SRANDOM" "$SRANDOM"
+    else
+        part="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+    fi
+    [[ "$part" =~ ^[0-9a-f]{16}$ ]] || return 1
+    printf '%s\n' "$part"
+}
+
+# publish <name> <command> [<argument>...]: makes <name> in the results directory a new regular file,
+# mode 0666, holding what the command prints; the only way anything is written there. It works from
+# inside the results directory (enter_results_dir) with relative names only, in a subshell, so the
+# script's own working directory, umask and options are unchanged:
+#   - the temporary name .<name>.<random_name_part> is refused when any entry, a dangling symlink
+#     included, is already there;
+#   - it is created under noclobber and umask 0, so mode 0666 comes from the creating open itself. For a
+#     name with no entry, bash's noclobber open is O_CREAT|O_EXCL, which never follows a symlink and
+#     fails on any entry that appears in between. The random part keeps anyone from placing in advance
+#     the one kind of entry that noclobber opens without O_EXCL, a non-regular one;
+#   - the command writes through the descriptor of that creating open, which is then closed;
+#   - mv -fT renames the temporary name over <name>: rename(2) replaces a file or symlink there without
+#     following it, and fails on a directory.
+# No existing entry is opened for writing, truncated or has its mode changed. On a failure after the
+# creation the temporary name is unlinked. False when <name> was not published.
+publish() {
+    local name="$1"
+    shift
+    (
+        enter_results_dir || exit 1
+        part="$(random_name_part)" || exit 1
+        temp=".$name.$part"
+        if [ -e "$temp" ] || [ -L "$temp" ]; then
+            exit 1
+        fi
+        umask 0
+        set -o noclobber
+        exec {out}>"$temp" || exit 1
+        if ! "$@" >&"$out"; then
+            exec {out}>&-
+            rm -f -- "$temp"
+            exit 1
+        fi
+        exec {out}>&-
+        if ! mv -fT -- "$temp" "$name"; then
+            rm -f -- "$temp"
+            exit 1
+        fi
+    ) 2>/dev/null
+}
+
+# write_status <status>: publishes <status> as exit-code, replacing the marker or an earlier status.
+# False when the status was not published.
 write_status() {
-    if [ -L "$EXIT_CODE_PATH" ]; then
-        return 1
-    fi
-    if [ -e "$EXIT_CODE_PATH" ] && { [ ! -f "$EXIT_CODE_PATH" ] || [ ! -w "$EXIT_CODE_PATH" ]; }; then
-        return 1
-    fi
-    { printf '%s\n' "$1" >"$EXIT_CODE_PATH"; } 2>/dev/null || return 1
-    share "$EXIT_CODE_PATH"
+    publish "$EXIT_CODE_NAME" printf '%s\n' "$1"
 }
 
 # record <status>: replaces the marker in exit-code with the runner status. Should that fail, the
@@ -171,18 +251,19 @@ record() {
 
 # A stale TRX, xunit XML or status must never be read as this run's evidence. All three are removed and
 # must then be gone (a directory or a dangling symlink in their place counts as present), and exit-code
-# is created afresh holding the marker; noclobber keeps that write from going through a file or symlink
-# that appeared in between. Until all of that holds, no dotnet command runs.
+# is published afresh holding the marker; publication replaces, without following, anything that
+# appeared at exit-code in between. Until all of that holds, no dotnet command runs. The removal is
+# rm -f, an unlink, which never follows a symlink.
 rm -f -- "$TRX_PATH" "$XML_PATH" "$EXIT_CODE_PATH" 2>/dev/null
 fresh_failure=""
 if [ -e "$TRX_PATH" ] || [ -L "$TRX_PATH" ] || [ -e "$XML_PATH" ] || [ -L "$XML_PATH" ] ||
     [ -e "$EXIT_CODE_PATH" ] || [ -L "$EXIT_CODE_PATH" ]; then
     fresh_failure="stale evidence could not be cleared from $RESULTS_DIR"
-elif ! (set -o noclobber && printf '%s\n' "$RUNNING_MARKER" >"$EXIT_CODE_PATH") 2>/dev/null; then
+elif ! publish "$EXIT_CODE_NAME" printf '%s\n' "$RUNNING_MARKER"; then
     fresh_failure="$RESULTS_DIR is not writable"
 fi
 if [ -n "$fresh_failure" ]; then
-    # A stale passing status is replaced by 1 wherever exit-code can still be written.
+    # A stale passing status is replaced by 1 wherever exit-code can still be published.
     if write_status 1; then
         status_note="status 1 recorded in $EXIT_CODE_PATH"
     else
@@ -191,7 +272,96 @@ if [ -n "$fresh_failure" ]; then
     echo "facade-tests: error: $fresh_failure; the results in $RESULTS_DIR are not from this run; $status_note; tests not run" >&2
     exit 0
 fi
-share "$EXIT_CODE_PATH"
+
+# dotnet test writes into a private staging directory, never into the results directory, and
+# publish_result publishes what it wrote from there. mktemp -d makes it mode 0700 in the physical
+# directory TMPDIR names (default /tmp; a relative TMPDIR is taken from the caller's working
+# directory), outside the repository, so its path is absolute and holds no symlink. Another user who can
+# rename entries of that directory or of any directory above it could move the staging directory away
+# and put a symlink at its path, redirecting this (in the container, root) process's writes and the
+# removal below. So, as soon as it is created and before any dotnet command, every directory from the
+# physical TMPDIR up to / must be owned by root or the effective user and be either sticky or writable
+# by neither group nor others (rename_risk). Only root and the effective user can then change any of
+# them, so the checked path keeps naming this run's directory. When one fails the check, the staging
+# directory, still empty, is removed by rmdir, which removes no symlink and no non-empty directory,
+# status 1 is recorded and nothing runs. Should it not be created, nothing runs either. The EXIT trap
+# removes it on every exit of the script, including one on a TERM, INT or HUP outside the test run.
+STAGING_DIR=""
+STAGING_PRIVATE=0
+
+# remove_staging: removes the staging directory, as the EXIT trap and when its path fails the check:
+# with rm -rf once its path has passed the check, and before that only with rmdir, so nothing that may
+# belong to someone else is ever removed.
+remove_staging() {
+    if [ -z "$STAGING_DIR" ]; then
+        return 0
+    fi
+    if [ "$STAGING_PRIVATE" -eq 1 ]; then
+        rm -rf -- "$STAGING_DIR"
+    else
+        rmdir -- "$STAGING_DIR" 2>/dev/null
+    fi
+}
+trap remove_staging EXIT
+
+# rename_risk <directory>: prints why users other than root and the effective user can rename entries
+# of <directory>, an absolute physical path, and prints nothing when they cannot: it is a directory, not
+# a symlink, owned by root or the effective user, and it is sticky or writable by neither its group nor
+# others. stat -c '%a %u' prints the mode in octal with its special digit (1777, 2777) and the owner's
+# uid, alike in GNU coreutils and uutils.
+rename_risk() {
+    local mode_owner mode owner
+    if [ -L "$1" ] || [ ! -d "$1" ]; then
+        echo "$1 is not a directory"
+        return 0
+    fi
+    mode_owner="$(stat -c '%a %u' -- "$1" 2>/dev/null)"
+    mode="${mode_owner%% *}"
+    owner="${mode_owner#* }"
+    if ! [[ "$mode" =~ ^[0-7]{1,4}$ && "$owner" =~ ^[0-9]+$ ]]; then
+        echo "the mode and owner of $1 cannot be read"
+    elif [ "$owner" -ne 0 ] && [ "$owner" -ne "$EUID" ]; then
+        echo "$1 is owned by uid $owner, neither root nor the effective user"
+    elif (((8#$mode & 8#1000) == 0 && (8#$mode & 8#022) != 0)); then
+        echo "$1 is group- or world-writable without the sticky bit (mode $mode)"
+    fi
+}
+
+TMPDIR_PHYSICAL=""
+if ! TMPDIR_PHYSICAL="$(cd -P -- "${TMPDIR:-/tmp}" 2>/dev/null && pwd -P)" || [ -z "$TMPDIR_PHYSICAL" ] ||
+    ! STAGING_DIR="$(mktemp -d -- "${TMPDIR_PHYSICAL%/}/facade-tests.XXXXXXXXXX" 2>/dev/null)" ||
+    [ -z "$STAGING_DIR" ] || [ ! -d "$STAGING_DIR" ]; then
+    STAGING_DIR=""
+    if write_status 1; then
+        status_note="status 1 recorded in $EXIT_CODE_PATH"
+    else
+        status_note="no status could be recorded"
+    fi
+    echo "facade-tests: error: cannot create a private staging directory under ${TMPDIR:-/tmp}; $status_note; tests not run" >&2
+    exit 0
+fi
+staging_risk=""
+checked_dir="$TMPDIR_PHYSICAL"
+while [ -z "$staging_risk" ]; do
+    staging_risk="$(rename_risk "$checked_dir")"
+    if [ "$checked_dir" = "/" ]; then
+        break
+    fi
+    checked_dir="${checked_dir%/*}"
+    checked_dir="${checked_dir:-/}"
+done
+if [ -n "$staging_risk" ]; then
+    remove_staging
+    STAGING_DIR=""
+    if write_status 1; then
+        status_note="status 1 recorded in $EXIT_CODE_PATH"
+    else
+        status_note="no status could be recorded"
+    fi
+    echo "facade-tests: error: TMPDIR ${TMPDIR:-/tmp} lets other users rename entries on the staging directory's path: $staging_risk; set TMPDIR to a private directory; $status_note; tests not run" >&2
+    exit 0
+fi
+STAGING_PRIVATE=1
 
 if [ -z "$FACADE_DIR" ] || ! cd -- "$FACADE_DIR"; then
     record 1
@@ -265,14 +435,14 @@ run_bounded() {
 # The xunit.v3 options are given without a `--` separator. On SDK 10.0.403, `dotnet test` in
 # Microsoft.Testing.Platform mode rejects `-- ... --results-directory <dir>` when <dir> exists (it
 # exits 1 with "Specifying a directory for 'dotnet test' should be via '--project' or '--solution'."
-# and writes no TRX), and <dir> always exists here; without the separator the options still reach
-# the test application.
+# and writes no TRX), and <dir>, the staging directory, always exists here; without the separator the
+# options still reach the test application.
 #
 # On the .NET 8 fallback (KL-SUB-DOTNET, VSTest runner) the run line becomes:
-#   run_bounded dotnet test tests/Erewhon.Facade.Tests/Erewhon.Facade.Tests.csproj -c Release --no-restore --logger "trx;LogFileName=facade-tests.trx" --results-directory "$RESULTS_DIR"
+#   run_bounded dotnet test tests/Erewhon.Facade.Tests/Erewhon.Facade.Tests.csproj -c Release --no-restore --logger "trx;LogFileName=facade-tests.trx" --results-directory "$STAGING_DIR"
 run_bounded dotnet test --project "$TEST_PROJECT" -c Release --no-restore \
     --report-xunit-trx --report-xunit-trx-filename "$TRX_NAME" \
-    --report-xunit-xml --report-xunit-xml-filename "$XML_NAME" --results-directory "$RESULTS_DIR"
+    --report-xunit-xml --report-xunit-xml-filename "$XML_NAME" --results-directory "$STAGING_DIR"
 case "$STOPPED_BY" in
     limit)
         echo "facade-tests: dotnet test exceeded the ${SUITE_LIMIT_SECONDS} s suite limit and was stopped" >&2
@@ -286,15 +456,37 @@ if [ -n "$STOPPED_BY" ] && [ "$rc" -eq 0 ]; then
     rc=124
 fi
 
+# publish_result <name>: publishes the file <name> that dotnet test wrote into the staging directory,
+# when it wrote one there as a regular file, and warns when that publication fails. False when <name>
+# was not published.
+publish_result() {
+    local staged="$STAGING_DIR/$1"
+    if [ ! -f "$staged" ] || [ -L "$staged" ]; then
+        return 1
+    fi
+    if ! publish "$1" cat -- "$staged"; then
+        echo "facade-tests: warning: dotnet test wrote $1, but it could not be published to $RESULTS_DIR/$1" >&2
+        return 1
+    fi
+}
+
+# The staging directory is this run's own, so each file in it, or its absence, is this run's. The TRX
+# and xunit XML are published before the status, so a reader that sees this run's status also sees
+# this run's TRX.
+trx_published=0
+xml_published=0
+if publish_result "$TRX_NAME"; then
+    trx_published=1
+fi
+if publish_result "$XML_NAME"; then
+    xml_published=1
+fi
 record "$rc"
-# The stale TRX and xunit XML were removed before the run, so each one here, or its absence, is this run's.
-share "$TRX_PATH"
-share "$XML_PATH"
 echo "facade-tests: dotnet test exited $rc; results in $RESULTS_DIR"
-if [ ! -f "$TRX_PATH" ]; then
+if [ "$trx_published" -eq 0 ]; then
     echo "facade-tests: warning: $TRX_PATH was not written; the harness reports CHK-FACADE-TRX missing" >&2
 fi
-if [ ! -f "$XML_PATH" ]; then
+if [ "$xml_published" -eq 0 ]; then
     echo "facade-tests: warning: $XML_PATH was not written; the harness cannot record failed tests' exception types" >&2
 fi
 exit 0
