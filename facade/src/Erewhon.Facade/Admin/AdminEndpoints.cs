@@ -6,6 +6,7 @@ using Erewhon.Contracts.Hosting;
 using Erewhon.Facade.Routing;
 using Erewhon.Facade.Soap;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
 
 namespace Erewhon.Facade.Admin;
 
@@ -27,6 +28,11 @@ namespace Erewhon.Facade.Admin;
 /// the local-process runner binds it to loopback, and by listener isolation. Nothing here forwards to a
 /// backend.
 /// </para>
+/// <para>
+/// Every response the application sends on the admin socket, the OpenAPI document and its 404 included,
+/// carries <c>X-Content-Type-Options: nosniff</c>, added by <see cref="UseAdminResponseHeaders"/>. REST
+/// and SOAP responses, forwarded or built by the facade, are left untouched.
+/// </para>
 /// <para>The class holds no state; every response is built from the current services.</para>
 /// </remarks>
 public static partial class AdminEndpoints
@@ -39,6 +45,9 @@ public static partial class AdminEndpoints
 
     private const string PlainTextContentType = "text/plain; charset=utf-8";
     private const string JsonContentType = "application/json; charset=utf-8";
+
+    // The X-Content-Type-Options value that stops a client from sniffing an admin body as another type.
+    private const string NoSniff = "nosniff";
 
     // The same pattern as the REST and SOAP catch-alls; ListenerPortMatcherPolicy keeps only the one whose
     // listener owns the socket. MapFallback is not used: its nonfile constraint skips paths with a dot.
@@ -144,6 +153,56 @@ public static partial class AdminEndpoints
             .ExcludeFromDescription();
 
         return endpoints;
+    }
+
+    /// <summary>
+    /// Adds <c>X-Content-Type-Options: nosniff</c> to every response the application sends for a request
+    /// that arrived on the admin socket, the framework-served OpenAPI document and its 404 included.
+    /// Requests and responses on the REST and SOAP sockets pass through untouched.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The admin socket is told apart as <see cref="ListenerPortMatcherPolicy"/> tells it apart: by
+    /// <see cref="ConnectionInfo.LocalPort"/> against <see cref="ListenerPorts.AdminPort"/>, read afresh for
+    /// every request, and never by the <c>Host</c> header or any other request header. A port of 0 means
+    /// "not configured" and matches no socket, the in-memory test server's local port of 0 included.
+    /// </para>
+    /// <para>
+    /// The header is set as the response starts, so a handler or middleware further down that clears the
+    /// response, as an exception page does, cannot drop it. The bodiless responses Kestrel writes itself,
+    /// a 400 for a malformed request or the 500 that replaces an unhandled exception, are not the
+    /// application's and do not carry it.
+    /// </para>
+    /// <para>Register it ahead of the endpoint middleware that runs the admin endpoints.</para>
+    /// </remarks>
+    /// <param name="app">The application's request pipeline builder.</param>
+    /// <returns><paramref name="app"/>, for chaining.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="app"/> is null.</exception>
+    /// <exception cref="InvalidOperationException">The options services that provide <see cref="IOptionsMonitor{TOptions}"/> of <see cref="ListenerPorts"/> are not registered.</exception>
+    public static IApplicationBuilder UseAdminResponseHeaders(this IApplicationBuilder app)
+    {
+        ArgumentNullException.ThrowIfNull(app);
+
+        // Only the monitor is resolved here; reading the ports now would report a bad port layout from
+        // this call instead of from the ListenerPorts start-up validation.
+        var ports = app.ApplicationServices.GetRequiredService<IOptionsMonitor<ListenerPorts>>();
+
+        return app.Use((context, next) =>
+        {
+            var adminPort = ports.CurrentValue.AdminPort;
+            if (adminPort > 0 && context.Connection.LocalPort == adminPort)
+            {
+                context.Response.OnStarting(
+                    static state =>
+                    {
+                        ((HttpResponse)state).Headers.XContentTypeOptions = NoSniff;
+                        return Task.CompletedTask;
+                    },
+                    context.Response);
+            }
+
+            return next(context);
+        });
     }
 
     /// <summary>

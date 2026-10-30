@@ -20,7 +20,9 @@ namespace Erewhon.StandIn.Admin;
 /// Every endpoint here, the catch-all included, is dispatched only for requests that arrive on the
 /// admin socket (<see cref="ListenerKind.Admin"/>), whatever <c>Host</c> header they carry. The
 /// listener has no authentication because nothing publishes it: Compose keeps it on the internal
-/// network and the local-process runner binds it to loopback.
+/// network and the local-process runner binds it to loopback. Every response written here, the
+/// empty 404 and 202 included, carries <c>X-Content-Type-Options: nosniff</c>; responses on the
+/// business listeners do not.
 /// </para>
 /// <para>
 /// The class holds no state. <see cref="StandInState"/> serialises resets and request handlers
@@ -31,6 +33,7 @@ public static partial class AdminEndpoints
 {
     private const string PlainTextContentType = "text/plain; charset=utf-8";
     private const string JsonContentType = "application/json; charset=utf-8";
+    private const string NoSniff = "nosniff";
 
     // A plain Map catch-all: the framework's fallback mapping adds a nonfile constraint that skips
     // dotted paths such as /company.json.
@@ -204,9 +207,11 @@ public static partial class AdminEndpoints
         WriteAsync(response, statusCode, PlainTextContentType, Encoding.UTF8.GetBytes(text), cancellationToken);
 
     /// <summary>
-    /// Sets the status, the exact <c>Content-Type</c> (none when <paramref name="contentType"/> is
-    /// null) and <c>Content-Length</c>, then writes the body asynchronously; Kestrel disallows
-    /// synchronous body writes.
+    /// Sets the status, <c>X-Content-Type-Options: nosniff</c>, the exact <c>Content-Type</c> (none
+    /// when <paramref name="contentType"/> is null) and <c>Content-Length</c>, then writes the body
+    /// asynchronously; Kestrel disallows synchronous body writes. The nosniff header stops a browser
+    /// that reaches the admin port from MIME-sniffing an admin body, such as the text/plain reset
+    /// rejection, as a type that it would render or execute.
     /// </summary>
     private static Task WriteAsync(
         HttpResponse response,
@@ -216,6 +221,7 @@ public static partial class AdminEndpoints
         CancellationToken cancellationToken)
     {
         response.StatusCode = statusCode;
+        response.Headers.XContentTypeOptions = NoSniff;
         if (contentType is not null)
         {
             response.ContentType = contentType;

@@ -32,12 +32,24 @@ namespace Erewhon.Facade.Tests;
 /// <summary>
 /// Shows on real Kestrel listeners that admin paths are served only on the admin socket, that REST
 /// operations are dispatched on the REST socket whatever the <c>Host</c> header says, and that each public
-/// socket's unmatched requests reach that socket's own catch-all.
+/// socket's unmatched requests reach that socket's own catch-all. Admin-socket responses carry
+/// <c>X-Content-Type-Options: nosniff</c>; responses forwarded from a public socket carry none.
 /// </summary>
 /// <remarks>
+/// <para>
 /// Every test gets its own facade and stubs. Target <c>backend</c> (the default target) is stub A and
-/// target <c>stub</c> is stub B, with only REST <c>getCompany</c> routed to <c>stub</c>, so a request that
-/// reaches the <c>getCompany</c> endpoint is observable at B and anything a catch-all forwards arrives at A.
+/// target <c>stub</c> is stub B, with only REST <c>getCompany</c> routed to <c>stub</c>. On the REST
+/// socket, whichever endpoint routing selects, a request is forwarded to the target of the operation
+/// <c>RestOperationMatcher</c> resolves from its verb and raw path, and to the default target when it
+/// resolves to none; the SOAP catch-all forwards to the default target. So <c>GET /company</c> on the REST
+/// socket resolves to <c>getCompany</c> and arrives at B, while the admin paths sent to the REST and SOAP
+/// sockets, and <c>GET /company</c> sent to the SOAP socket, match no operation on that surface and
+/// arrive at A.
+/// </para>
+/// <para>
+/// The stubs never send <c>X-Content-Type-Options</c>, so on a forwarded response any value would be the
+/// facade's own.
+/// </para>
 /// </remarks>
 public sealed class ListenerIsolationTests : IAsyncLifetime
 {
@@ -53,6 +65,13 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
 
     // The admin health body, as Admin/AdminEndpoints.cs writes it.
     private const string HealthyBody = "ok";
+
+    // The header Admin/AdminEndpoints.cs adds to every admin-socket response, and its only value.
+    private const string ContentTypeOptionsHeader = "X-Content-Type-Options";
+    private const string NoSniff = "nosniff";
+
+    // A document name the facade does not register; the OpenAPI handler reads it from the query string.
+    private const string UnknownOpenApiDocumentQuery = "?documentName=not-a-document";
 
     private const string JsonMediaType = "application/json";
     private const string OpenApiVersionMember = "openapi";
@@ -188,6 +207,7 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
         Assert.True(
             response.Body.AsSpan().SequenceEqual(forwarded.ResponseBody),
             $"{label}: facade response body differs from the bytes stub {Backend.Id} sent");
+        AssertNoContentTypeOptions(response, label);
 
         // The facade is still serving on both the admin and the REST sockets.
         Backend.ClearLog();
@@ -195,11 +215,13 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
 
         RawResponse health = await SendAsync(Facade.AdminBaseAddress, HttpMethod.Get, AdminRoutes.Health, host: null);
         Assert.Equal(200, health.Status);
+        AssertNoSniff(health, $"{label}, then admin socket GET {AdminRoutes.Health}");
 
         string followUp = $"{label}, then REST socket {GetCompanyRequest.Method.Method} {GetCompanyRequest.PathAndQuery}";
         RawResponse company = await SendAsync(GetCompanyRequest, Facade.RestBaseAddress, host: null);
         Assert.Equal(200, company.Status);
         Assert.Equal(RerouteStubId, company.Header(StubIdHeader));
+        AssertNoContentTypeOptions(company, followUp);
         StubRequest dispatched = SingleRequest(Reroute, followUp, StubListener.Rest);
         AssertRequest(dispatched, Reroute, StubListener.Rest, GetCompanyRequest.Method.Method, GetCompanyRequest.PathAndQuery, followUp);
         AssertNoRequests(Backend, followUp);
@@ -222,13 +244,18 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
 
         RawResponse response = await SendAsync(GetCompanyRequest, Facade.RestBaseAddress, HostFor(hostVariant));
 
-        // Only the getCompany endpoint routes to stub B; any catch-all would have forwarded to stub A.
+        // Arriving at stub B shows the REST listener handled the request and resolved it to getCompany, the
+        // only operation routed there: the SOAP catch-all would have forwarded it to stub A, and the admin
+        // catch-all forwards nothing.
         StubRequest dispatched = SingleRequest(Reroute, label);
         AssertRequest(dispatched, Reroute, StubListener.Rest, GetCompanyRequest.Method.Method, GetCompanyRequest.PathAndQuery, label);
         AssertNoRequests(Backend, label);
 
         Assert.Equal(200, response.Status);
         Assert.Equal(RerouteStubId, response.Header(StubIdHeader));
+
+        // The admin-port variant shows the header follows the socket, never the Host header.
+        AssertNoContentTypeOptions(response, label);
     }
 
     [Fact]
@@ -238,29 +265,35 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
 
         RawResponse response = await SendAsync(GetCompanyRequest, Facade.SoapBaseAddress, host: null);
 
-        // The REST getCompany endpoint would have routed to stub B; the SOAP catch-all forwards to the
-        // default target's SOAP base URL.
+        // On the REST socket this request resolves to getCompany and would reach stub B; the SOAP socket has
+        // no operation at this path, so its catch-all forwards it to the default target's SOAP base URL.
         StubRequest forwarded = SingleRequest(Backend, label);
         AssertRequest(forwarded, Backend, StubListener.Soap, GetCompanyRequest.Method.Method, GetCompanyRequest.PathAndQuery, label);
         AssertNoRequests(Reroute, label);
 
         Assert.Equal(200, response.Status);
         Assert.Equal(BackendStubId, response.Header(StubIdHeader));
+        AssertNoContentTypeOptions(response, label);
     }
 
     [Fact]
     public async Task HealthAnswersOnAdminSocket()
     {
+        string label = $"admin socket GET {AdminRoutes.Health}";
+
         RawResponse response = await SendAsync(Facade.AdminBaseAddress, HttpMethod.Get, AdminRoutes.Health, host: null);
 
         Assert.Equal(200, response.Status);
         Assert.Equal(HealthyBody, response.BodyText);
-        AssertNothingForwarded($"admin socket GET {AdminRoutes.Health}");
+        AssertNoSniff(response, label);
+        AssertNothingForwarded(label);
     }
 
     [Fact]
     public async Task OpenApiDocumentAnswersOnAdminSocket()
     {
+        string label = $"admin socket GET {AdminRoutes.OpenApiDocument}";
+
         RawResponse response = await SendAsync(Facade.AdminBaseAddress, HttpMethod.Get, AdminRoutes.OpenApiDocument, host: null);
 
         Assert.Equal(200, response.Status);
@@ -274,12 +307,23 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
                 "OpenAPI document has no top-level openapi string member");
         }
 
-        AssertNothingForwarded($"admin socket GET {AdminRoutes.OpenApiDocument}");
+        AssertNoSniff(response, label);
+
+        // The framework's OpenAPI handler writes its own 404 for a document name it does not know.
+        string unknownLabel = $"{label} for an unknown document name";
+        RawResponse unknown = await SendAsync(
+            Facade.AdminBaseAddress, HttpMethod.Get, AdminRoutes.OpenApiDocument + UnknownOpenApiDocumentQuery, host: null);
+        Assert.Equal(404, unknown.Status);
+        AssertNoSniff(unknown, unknownLabel);
+
+        AssertNothingForwarded(label);
     }
 
     [Fact]
     public async Task AdminInfoAnswersOnAdminSocket()
     {
+        string label = $"admin socket GET {AdminRoutes.Info}";
+
         RawResponse response = await SendAsync(Facade.AdminBaseAddress, HttpMethod.Get, AdminRoutes.Info, host: null);
 
         Assert.Equal(200, response.Status);
@@ -294,7 +338,8 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
                 "admin info has no non-empty frameworkDescription string member");
         }
 
-        AssertNothingForwarded($"admin socket GET {AdminRoutes.Info}");
+        AssertNoSniff(response, label);
+        AssertNothingForwarded(label);
     }
 
     // "/company" is a catalogue REST path: on the admin socket it is not an operation.
@@ -311,6 +356,7 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
         Assert.True(
             response.Body.Length == 0,
             $"{label}: admin catch-all answered 404 with a non-empty body, expected an empty body");
+        AssertNoSniff(response, label);
         AssertNothingForwarded(label);
     }
 
@@ -318,6 +364,26 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
     {
         AssertNoRequests(Backend, label);
         AssertNoRequests(Reroute, label);
+    }
+
+    // Asserts that an admin-socket response carries X-Content-Type-Options once, with exactly the value
+    // nosniff; the message names only the expected header.
+    private static void AssertNoSniff(RawResponse response, string label)
+    {
+        Assert.True(
+            response.Headers.TryGetValue(ContentTypeOptionsHeader, out string[]? values)
+                && values.Length == 1
+                && string.Equals(response.Header(ContentTypeOptionsHeader), NoSniff, StringComparison.Ordinal),
+            $"{label}: response does not carry {ContentTypeOptionsHeader}: {NoSniff} exactly once");
+    }
+
+    // Asserts that a response forwarded from a public socket carries no X-Content-Type-Options: the facade
+    // adds the header only on the admin socket and passes the stub's headers through unchanged.
+    private static void AssertNoContentTypeOptions(RawResponse response, string label)
+    {
+        Assert.True(
+            response.Header(ContentTypeOptionsHeader) is null,
+            $"{label}: forwarded response carries {ContentTypeOptionsHeader}, expected none");
     }
 
     // Asserts that the stub recorded exactly one request, on any listener or only on the one given, and

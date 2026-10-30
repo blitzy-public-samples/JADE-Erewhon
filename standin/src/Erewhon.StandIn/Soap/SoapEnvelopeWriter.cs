@@ -23,8 +23,9 @@ namespace Erewhon.StandIn.Soap;
 /// declared once on the envelope in that order, members follow catalogue order, values use the
 /// invariant culture, and nothing here reads a clock or keeps state between calls, so the class is safe
 /// for concurrent use. A success envelope carries no stand-in label, comment or extra element; only
-/// Fault strings name the stand-in. Status code and headers belong to the caller, which sets only
-/// <c>Content-Type</c> to <see cref="ContentType"/>.
+/// Fault strings name the stand-in. The writer returns only the envelope bytes, and the caller owns the
+/// HTTP response: it sets the status code, <c>Content-Type</c> to <see cref="ContentType"/> and
+/// <c>Content-Length</c> to the body length.
 /// </para>
 /// </remarks>
 public static class SoapEnvelopeWriter
@@ -62,7 +63,8 @@ public static class SoapEnvelopeWriter
     /// <c>&lt;?xml version="1.0" encoding="utf-8"?&gt;</c> and the first byte is <c>0x3C</c>; no
     /// indentation; <c>\n</c> line breaks (the bodies written here carry a stored carriage return as the
     /// character reference <c>&amp;#xD;</c> instead, so that a parser reads it back); character checking
-    /// on; the output stream left open.
+    /// on, which the bodies written here never trip, because each character XML 1.0 cannot carry is
+    /// written as U+FFFD; the output stream left open.
     /// </summary>
     /// <remarks>
     /// The instance is read-only, so no caller can change the bytes another caller gets: assigning any
@@ -92,13 +94,14 @@ public static class SoapEnvelopeWriter
     /// <see cref="DtoArray"/> of that array type, or null, which writes <c>&lt;ResultElement xsi:nil="true" /&gt;</c>.
     /// </param>
     /// <returns>The UTF-8 body bytes.</returns>
+    /// <remarks>
+    /// A value holding a character XML 1.0 cannot carry, such as U+0001, U+000B or U+FFFF, is written
+    /// with that character as U+FFFD (KL-SOAP-XML-CHARACTERS).
+    /// </remarks>
     /// <exception cref="ArgumentNullException"><paramref name="operation"/> is null.</exception>
     /// <exception cref="ArgumentException">
     /// <paramref name="operation"/> has no SOAP binding, or <paramref name="result"/> is neither null, a
-    /// node of the operation's return type nor an array of it. The <see cref="XmlWriter"/> also throws it,
-    /// through <see cref="Settings"/>' character checking, when a value in the tree holds a character XML 1.0
-    /// cannot represent, such as U+0001, U+000B or U+FFFF; no envelope can carry such a value, so it is
-    /// neither replaced nor skipped.
+    /// node of the operation's return type nor an array of it.
     /// </exception>
     /// <exception cref="InvalidOperationException"><paramref name="result"/> is null and the binding's result is not nillable.</exception>
     /// <exception cref="NotSupportedException">
@@ -169,7 +172,7 @@ public static class SoapEnvelopeWriter
     /// <param name="faultCode"><see cref="FaultCodeClient"/> or <see cref="FaultCodeServer"/>.</param>
     /// <param name="faultString">
     /// The reason; <c>jade-standin: </c> is prepended unless it already starts with
-    /// <see cref="FaultStringPrefix"/>.
+    /// <see cref="FaultStringPrefix"/>. A character XML 1.0 cannot carry is written as U+FFFD.
     /// </param>
     /// <returns>The UTF-8 body bytes, which the caller sends with HTTP 500 and <see cref="ContentType"/>.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="faultCode"/> or <paramref name="faultString"/> is null.</exception>
@@ -187,9 +190,9 @@ public static class SoapEnvelopeWriter
                 $"Fault code '{faultCode}' is neither '{FaultCodeClient}' nor '{FaultCodeServer}'.", nameof(faultCode));
         }
 
-        var text = faultString.StartsWith(FaultStringPrefix, StringComparison.Ordinal)
+        var text = ReplaceNonXmlCharacters(faultString.StartsWith(FaultStringPrefix, StringComparison.Ordinal)
             ? faultString
-            : $"{FaultStringPrefix} {faultString}";
+            : $"{FaultStringPrefix} {faultString}");
 
         using var stream = new MemoryStream();
         using (var writer = XmlWriter.Create(stream, Settings))
@@ -385,28 +388,61 @@ public static class SoapEnvelopeWriter
     // empty-element tag: WriteString("") would close the start tag and give <street></street> instead.
     // Each carriage return is written as the character reference &#xD;, because Settings' line-break
     // handling turns a literal CR, alone or in CR LF, into LF, and a parser would read a literal CR as
-    // LF anyway; the reference reads back as the stored CR. LF and tab are written as they are.
+    // LF anyway; the reference reads back as the stored CR. LF and tab are written as they are. Each
+    // character XML 1.0 cannot carry, which a value a REST create stored may hold, is written as U+FFFD,
+    // so one such value never fails a whole envelope (KL-SOAP-XML-CHARACTERS).
     private static void WriteText(XmlWriter writer, string elementName, string text)
     {
+        var value = ReplaceNonXmlCharacters(text);
         writer.WriteStartElement(string.Empty, elementName, ServiceNamespace);
         var start = 0;
-        for (var index = text.IndexOf('\r'); index >= 0; index = text.IndexOf('\r', start))
+        for (var index = value.IndexOf('\r'); index >= 0; index = value.IndexOf('\r', start))
         {
             if (index > start)
             {
-                writer.WriteString(text[start..index]);
+                writer.WriteString(value[start..index]);
             }
 
             writer.WriteCharEntity('\r');
             start = index + 1;
         }
 
-        if (start < text.Length)
+        if (start < value.Length)
         {
-            writer.WriteString(text[start..]);
+            writer.WriteString(value[start..]);
         }
 
         writer.WriteEndElement();
+    }
+
+    // Returns the text with each character XML 1.0 cannot carry (a control character other than tab, LF
+    // and CR, a lone surrogate, U+FFFE or U+FFFF) replaced by U+FFFD; a high surrogate followed by its
+    // low surrogate is a valid pair and is kept. Text that needs no replacement is returned itself, so
+    // valid text costs no allocation and reaches the writer unchanged.
+    private static string ReplaceNonXmlCharacters(string text)
+    {
+        StringBuilder? replaced = null;
+        for (var i = 0; i < text.Length; i++)
+        {
+            var c = text[i];
+            if (char.IsHighSurrogate(c) && i + 1 < text.Length && XmlConvert.IsXmlSurrogatePair(text[i + 1], c))
+            {
+                replaced?.Append(c).Append(text[i + 1]);
+                i++;
+                continue;
+            }
+
+            if (XmlConvert.IsXmlChar(c))
+            {
+                replaced?.Append(c);
+                continue;
+            }
+
+            replaced ??= new StringBuilder(text.Length).Append(text, 0, i);
+            replaced.Append('\uFFFD');
+        }
+
+        return replaced?.ToString() ?? text;
     }
 
     private static void WriteNil(XmlWriter writer, string elementName)

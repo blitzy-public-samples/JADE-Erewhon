@@ -618,7 +618,9 @@ public static class RestEndpoints
         }
 
         // Path parameters first, in signature order, then the one body parameter; null when any value
-        // does not convert, which the pipeline answers with 400 and null before the state is touched.
+        // does not convert, which the pipeline answers with 400 and null without running the business
+        // handler. A state-changing request rejected this way is still counted in the mutation count,
+        // which moves the clock.
         private static async Task<RestArguments?> ReadArgumentsAsync(
             HttpRequest request,
             OperationBinding binding,

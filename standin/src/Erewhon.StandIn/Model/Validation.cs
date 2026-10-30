@@ -4,7 +4,7 @@ using System.Text.RegularExpressions;
 namespace Erewhon.StandIn.Model;
 
 /// <summary>
-/// JADE <c>ValidationType_*</c> constants (<c>Erewhon/ErewhonModelSchema.scm</c> 2606-2609): the kind
+/// JADE <c>ValidationType_*</c> constants (<c>Erewhon/ErewhonModelSchema.scm</c> 2605-2608): the kind
 /// of persist a transaction agent validates for.
 /// </summary>
 public enum ValidationType

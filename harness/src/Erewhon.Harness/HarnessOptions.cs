@@ -482,6 +482,89 @@ internal sealed class ConfinedTree
     }
 
     /// <summary>
+    /// Publishes <paramref name="bytes"/> at <paramref name="path"/> as one complete regular file without blocking,
+    /// replacing the regular file that was there as <see cref="PublishFile(string, ReadOnlySpan{byte})"/> does, but
+    /// creating no directory except the file's own.
+    /// </summary>
+    /// <remarks>
+    /// <para>The root and every directory between it and the file's own directory must already exist: each is
+    /// opened without being created, so a missing one fails the call and nothing is built in its place. Only the
+    /// file's own directory is made, through its parent's handle, when it is missing; a file directly below the
+    /// root creates no directory at all. A link or a non-directory on the way is refused, never followed.</para>
+    /// <para>The entry at the target is examined with <c>statx</c> without following a link and is never opened:
+    /// only a missing entry or a regular file is replaced, and a directory, a link or any other kind of entry is
+    /// refused and left in place. The bytes go to a new temporary file in the target's directory, a dot-prefixed
+    /// unique name created exclusively without following a link, are flushed to disk, and <c>renameat</c> then
+    /// moves the file over the target inside the same directory handle. A reader sees the previous file or the
+    /// complete new one, never a part-written one. Whatever fails after the temporary file was created, it is
+    /// removed again through that handle and the previous file stays as it was.</para>
+    /// <para>A token cancelled before the call leaves the tree untouched; one cancelled before the rename leaves
+    /// the previous file in place.</para>
+    /// </remarks>
+    /// <param name="path">The file to publish, strictly below the root.</param>
+    /// <param name="bytes">The file's complete content.</param>
+    /// <param name="cancellationToken">Cancels the call before the write, the write itself and the publication.</param>
+    /// <exception cref="ArgumentException"><paramref name="path"/> is null, empty or not a usable path.</exception>
+    /// <exception cref="IOException">
+    /// <paramref name="path"/> is not strictly below the root, the root or a directory above the file's own
+    /// directory does not exist, a directory on the way is a symbolic link or not a directory, the target is a
+    /// directory or another entry that is not a regular file, or the file cannot be examined, created, written,
+    /// flushed or moved into place.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">The operating system denies access on the way.</exception>
+    /// <exception cref="PlatformNotSupportedException">
+    /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown.
+    /// </exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public async Task PublishFileAsync(string path, ReadOnlyMemory<byte> bytes, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var flags = RequireLinuxTraversal();
+        var target = Resolve(path);
+        var name = target.Segments[^1];
+        using var directory = OpenOwnDirectory(target, flags);
+        RequireRegularFileOrNothing(directory, name, target.FullPath);
+
+        // A fixed-length name, so a target name of any allowed length leaves a valid temporary name.
+        var temporaryName = string.Create(CultureInfo.InvariantCulture, $".{Guid.NewGuid():N}.publishing");
+        var descriptor = Native.OpenAt(directory, temporaryName, flags.CreateFile, Native.NewFileMode);
+        if (descriptor < 0)
+        {
+            throw Failure(Marshal.GetLastPInvokeError(), "create the temporary file for", target.FullPath);
+        }
+
+        var published = false;
+        try
+        {
+            using (var handle = new SafeFileHandle(descriptor, ownsHandle: true))
+            {
+                await RandomAccess.WriteAsync(handle, bytes, fileOffset: 0, cancellationToken).ConfigureAwait(false);
+
+                // On disk before the rename, so the name never holds a file whose content a crash could still lose.
+                RandomAccess.FlushToDisk(handle);
+            }
+
+            cancellationToken.ThrowIfCancellationRequested();
+            if (Native.RenameAt(directory, temporaryName, directory, name) != 0)
+            {
+                var errno = Marshal.GetLastPInvokeError();
+                throw errno == Native.EISDIR ? IsDirectory(target.FullPath) : Failure(errno, "publish", target.FullPath);
+            }
+
+            published = true;
+        }
+        finally
+        {
+            if (!published)
+            {
+                // As in PublishFile: the call's own entry in a directory it holds open, so the removal only fails
+                // when the directory itself became unwritable, and the failure already being raised stands.
+                _ = Native.UnlinkAt(directory, temporaryName, flags: 0);
+            }
+        }
+    }
+
+    /// <summary>
     /// Publishes <paramref name="bytes"/> at <paramref name="path"/> as one complete new regular file, creating the
     /// missing directories above it, unless a regular file is already there, which is kept as it is.
     /// </summary>
@@ -789,9 +872,10 @@ internal sealed class ConfinedTree
             : [];
 
     // Examines a publication's target entry, refusing a directory or any other entry that is not a regular file,
-    // a link included: PublishFile replaces only a regular file, and PublishNewFileAsync keeps only one. statx
-    // with AT_SYMLINK_NOFOLLOW reads the entry's type without following a link or opening the entry, so a FIFO or
-    // a device there cannot block the call. Returns true for a regular file and false for a missing entry.
+    // a link included: PublishFile and PublishFileAsync replace only a regular file, and PublishNewFileAsync keeps
+    // only one. statx with AT_SYMLINK_NOFOLLOW reads the entry's type without following a link or opening the
+    // entry, so a FIFO or a device there cannot block the call. Returns true for a regular file and false for a
+    // missing entry.
     private bool RequireRegularFileOrNothing(DirectoryHandle directory, string name, string path)
     {
         Span<byte> status = stackalloc byte[Native.StatxSize];
@@ -834,6 +918,26 @@ internal sealed class ConfinedTree
             component = Path.Join(component, target.Segments[index]);
             using var parent = directory;
             directory = OpenComponent(parent, target.Segments[index], component, target.FullPath, create, flags);
+        }
+
+        return directory;
+    }
+
+    // Opens the directory that holds target for PublishFileAsync, as OpenDirectory opens it, but creating only that
+    // directory: the root and every directory between it and the target's own are opened without being created,
+    // so a missing one fails the call, and the target's own directory, when it lies below the root, is made
+    // through its parent's handle when it is missing. The caller disposes the handle.
+    private DirectoryHandle OpenOwnDirectory(ConfinedPath target, TraversalFlags flags)
+    {
+        var depth = target.Segments.Length - 1;
+        var directory = OpenRoot(create: false, flags) ?? throw Missing(target.FullPath, _root);
+        var component = _root;
+        for (var index = 0; index < depth; index++)
+        {
+            component = Path.Join(component, target.Segments[index]);
+            using var parent = directory;
+            directory = OpenComponent(parent, target.Segments[index], component, target.FullPath, create: index == depth - 1, flags)
+                ?? throw Missing(target.FullPath, component);
         }
 
         return directory;
@@ -946,6 +1050,10 @@ internal sealed class ConfinedTree
 
     private IOException NotRegularFile(string path) =>
         new($"ConfinedTree could not publish '{Display(path)}': it is not a regular file, so it is left in place.");
+
+    private IOException Missing(string path, string directory) =>
+        new($"ConfinedTree could not publish '{Display(path)}': the directory '{Display(directory)}' does not exist, "
+            + "and only the file's own directory is ever created.");
 
     // An operating-system error as the exception .NET raises for it, naming the path relative to the root.
     private Exception Failure(int errno, string action, string path)

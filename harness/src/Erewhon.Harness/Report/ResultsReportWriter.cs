@@ -1555,9 +1555,19 @@ public sealed class ResultsReportWriter : IResultsReportWriter
             $"- **{PlainText(entry.Id)}** ({PlainText(entry.Category)}{operation}) — Not done / why: {Sentence(entry.Reason)} Done instead: {Sentence(entry.ActionTaken)} Attempts: {entry.Attempts}. Documents {documents} failing item(s).");
     }
 
+    // A fixed run guide. Its prerequisites, defaults and write effects restate docker-compose.yml, .env,
+    // harness/scripts/run-local.sh, HarnessOptions, the capture, export-openapi and replay modes and the
+    // component SDK and runtime pins, so a change to any of them changes this text as well. Sub-parts are
+    // bold-led paragraphs, never headings or block quotes, so the report's heading and banner lines stay
+    // exactly the section headings and the banner.
     private static void RenderHowToRun(MarkdownBuilder md)
     {
         md.Line("## How to run").Blank();
+
+        md.Line("**Prerequisites.**").Blank();
+        md.Line("- Container mode: Docker with Docker Compose v2.20 or later, because `docker-compose.yml` uses `depends_on.required: false`, and free host ports 65000 and 21001, which the facade publishes. With older Compose, or without Docker, use the local-process mode (`harness/scripts/run-local.sh replay`).");
+        md.Line("- Local-process mode and the `dotnet test` commands: the .NET SDK 10.0.403 exactly, pinned with `rollForward: disable` in `facade/global.json`, `standin/global.json` and `harness/global.json`, which also select the Microsoft.Testing.Platform test runner; and the shared runtimes `Microsoft.NETCore.App` and `Microsoft.AspNetCore.App` 10.0.14, pinned by `RuntimeFrameworkVersion` 10.0.14 and `RollForward` `Disable` in `Erewhon.Strangler.props`.");
+        md.Line("- Local-process mode also: Linux with Bash 4.4 or later; on `PATH`, the tools `harness/scripts/run-local.sh` checks before it starts (`dotnet`, `setsid`, `ss`, `flock`, `grep`, `tee`, `env`, `sed`, `tail`, `sleep`, `mkdir`, `rm`, `basename`, `dirname`); and free loopback ports on `127.0.0.1`: 15000, 15001 and 15090 for the stand-in (`capture`, `replay`) and 65000, 21001 and 9090 for the facade (`export-openapi`, `replay`).").Blank();
 
         md.Line("Start the stand-in, the facade and the harness, and replay the baseline through the facade:").Blank();
         md.Code("docker compose up --build");
@@ -1565,11 +1575,53 @@ public sealed class ResultsReportWriter : IResultsReportWriter
         md.Line("Point the facade at another backend (no stand-in, so no state reset):").Blank();
         md.Code("COMPOSE_PROFILES= BACKEND_REST_URL=http://<host>:65000 BACKEND_SOAP_URL=http://<host>:21001 BACKEND_ADMIN_URL= docker compose up --build");
 
-        md.Line("Without Docker, capture, export the OpenAPI description or replay with local processes:").Blank();
+        md.Line("**Configuration.** Under Docker, Compose takes each variable from the shell, then from `.env`, then from its default in `docker-compose.yml` where it has one, so a value set in the shell overrides `.env`, as in the example above. `harness/scripts/run-local.sh` never reads `.env`: it takes each variable from the shell, or uses its local default.").Blank();
+        md.Header("Variable", "Type", "Default under Docker", "Default locally", "Purpose");
+        md.Row(
+            Code("COMPOSE_PROFILES"),
+            "profile list",
+            $"{Code("standin")} (from `.env`)",
+            "not read",
+            "Selects the Compose profiles: `standin` starts the JADE stand-in as the backend; empty starts no stand-in, for an external backend.");
+        md.Row(
+            Code("BACKEND_REST_URL"),
+            "URL",
+            $"{Code("http://standin:65000")} (from `.env`; no Compose default)",
+            $"{Code("http://127.0.0.1:15000")}, the stand-in the script starts (also when empty)",
+            "Where the facade forwards REST calls. In replay it is also the harness's backend REST URL, named under Run facts. `capture` ignores it and records from the stand-in it starts.");
+        md.Row(
+            Code("BACKEND_SOAP_URL"),
+            "URL",
+            $"{Code("http://standin:21001")} (from `.env`; no Compose default)",
+            $"{Code("http://127.0.0.1:15001")}, the stand-in the script starts (also when empty)",
+            "Where the facade forwards SOAP calls. In replay it is also the harness's backend SOAP URL, named under Run facts, from which the backend WSDL is fetched. `capture` ignores it and records from the stand-in it starts.");
+        md.Row(
+            Code("BACKEND_ADMIN_URL"),
+            "URL, or explicitly empty",
+            $"{Code("http://standin:9090")} (from `.env`; also when unset)",
+            $"{Code("http://127.0.0.1:15090")} (when unset)",
+            "The backend admin URL through which the harness resets the backend, confirms its seed state and shuts it down. Explicitly empty marks an external backend: no state reset, no seed confirmation and no backend shutdown by the harness (KL-SUB-NORESET).");
+        md.Row(
+            Code("BACKEND_TIMEOUT_SECONDS"),
+            "integer seconds, greater than 0",
+            $"{Code("30")} (from `.env`; also when unset or blank)",
+            $"{Code("30")} (also when unset or blank)",
+            "The facade's deadline for each backend call (`Backend:TimeoutSeconds`). When it expires, REST callers get status 504 \"Backend timed out\" and SOAP callers a SOAP Fault \"Backend timed out\".");
+        md.Row(
+            Code("HARNESS_REPORT_PATH"),
+            "file path",
+            $"{Code("/repo/RESULTS.md")} (Compose default; also when blank; `/repo` is the checkout's bind mount)",
+            $"{Code("<repository>/RESULTS.md")} (also when blank)",
+            "Where replay writes the report; under Docker, `run-complete` also prints its final line from there. A relative path resolves against the repository root. The path must lie strictly below the repository root (below `/repo` under Docker): replay refuses any other path as a failed report write (CHK-REPORT) and exits 1.");
+        md.Blank();
+
+        md.Line("**Routine verification without Docker.** `replay` is the local-process form of `docker compose up --build`: it builds the components, runs the facade tests, starts the stand-in and the facade on loopback and replays the committed baseline through the facade. Apart from build output under each project's `bin/` and `obj/`, and a project's `packages.lock.json`, which its unlocked restore writes only when the file is missing or a package version has changed, it writes only the report (`RESULTS.md`, or `HARNESS_REPORT_PATH`) and `artifacts/**`, never `baseline/**` or a contract file:").Blank();
+        md.Code("harness/scripts/run-local.sh replay");
+
+        md.Line("**Deliberate evidence regeneration.** `capture` and `export-openapi` are not verification steps: they replace the committed evidence that replay checks, so run them only to generate it initially or to regenerate it on purpose. `capture` withdraws `baseline/manifest.json`, clears `baseline/records/**` and rewrites `baseline/**` (records, manifest, captured WSDL, normalisation rules and `conformance.json`) from the stand-in it starts, and writes `contracts/wsdl/ErewhonWebService.wsdl` only when that file is absent. `export-openapi` replaces `contracts/openapi/erewhon-rest.openapi.json` with the live facade's OpenAPI document. Commit or back up the current evidence first, and review the result with `git status -- baseline contracts` and `git diff -- baseline contracts` before committing an intentional evidence change:").Blank();
         md.Code(
             "harness/scripts/run-local.sh capture",
-            "harness/scripts/run-local.sh export-openapi",
-            "harness/scripts/run-local.sh replay");
+            "harness/scripts/run-local.sh export-openapi");
 
         md.Line("Run the facade and harness tests. Each `dotnet` command must run inside its component directory, so that the component's `global.json` SDK and test-runner pins apply:").Blank();
         md.Code(

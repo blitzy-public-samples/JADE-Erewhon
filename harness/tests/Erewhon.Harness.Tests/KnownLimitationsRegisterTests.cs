@@ -980,8 +980,6 @@ public sealed partial class KnownLimitationsRegisterTests : IDisposable
         }
     }
 
-    // ---- Helpers --------------------------------------------------------------------------------
-
     private static RegisterEntry Entry(params (string itemId, string nature)[] pairs) =>
         new(
             "KL-TEST-DIFFERENCE",
@@ -1856,6 +1854,74 @@ public sealed partial class KnownLimitationsRegisterTests : IDisposable
             },
             Lines(text).Where(line => line.StartsWith('#') || line.StartsWith('>')));
         Assert.Contains("docker compose up --build", SectionLines(text, "## How to run"));
+    }
+
+    [Fact]
+    public void Render_HowToRun_StatesPrerequisitesConfigurationAndWhatEachCommandWrites()
+    {
+        var lines = NonBlank(SectionLines(RenderReport(BuildReport(FourResultsRun.Source(), FourResultsRun.Entries())), "## How to run"));
+
+        // The prerequisites lead the section, before any command.
+        Assert.Equal("**Prerequisites.**", lines[0]);
+        Assert.StartsWith("- Container mode: Docker with Docker Compose v2.20 or later", lines[1], StringComparison.Ordinal);
+        Assert.StartsWith("- Local-process mode and the `dotnet test` commands: the .NET SDK 10.0.403 exactly", lines[2], StringComparison.Ordinal);
+        Assert.StartsWith("- Local-process mode also: Linux with Bash 4.4 or later", lines[3], StringComparison.Ordinal);
+
+        // One configuration row per public variable, in order, with its type and both defaults.
+        var rows = TableBody(lines).Select(row => row[2..^2].Split(" | ")).ToArray();
+        Assert.Equal(
+            new[]
+            {
+                ("`COMPOSE_PROFILES`", "profile list", "`standin` (from `.env`)", "not read"),
+                ("`BACKEND_REST_URL`", "URL", "`http://standin:65000` (from `.env`; no Compose default)", "`http://127.0.0.1:15000`, the stand-in the script starts (also when empty)"),
+                ("`BACKEND_SOAP_URL`", "URL", "`http://standin:21001` (from `.env`; no Compose default)", "`http://127.0.0.1:15001`, the stand-in the script starts (also when empty)"),
+                ("`BACKEND_ADMIN_URL`", "URL, or explicitly empty", "`http://standin:9090` (from `.env`; also when unset)", "`http://127.0.0.1:15090` (when unset)"),
+                ("`BACKEND_TIMEOUT_SECONDS`", "integer seconds, greater than 0", "`30` (from `.env`; also when unset or blank)", "`30` (also when unset or blank)"),
+                ("`HARNESS_REPORT_PATH`", "file path", "`/repo/RESULTS.md` (Compose default; also when blank; `/repo` is the checkout's bind mount)", "`<repository>/RESULTS.md` (also when blank)"),
+            },
+            rows.Select(cells => (cells[0], cells[1], cells[2], cells[3])));
+        var purposes = rows.ToDictionary(cells => cells[0], cells => Assert.Single(cells[4..]), StringComparer.Ordinal);
+        Assert.Contains("no state reset, no seed confirmation and no backend shutdown by the harness (KL-SUB-NORESET)", purposes["`BACKEND_ADMIN_URL`"], StringComparison.Ordinal);
+        Assert.Contains("REST callers get status 504 \"Backend timed out\" and SOAP callers a SOAP Fault \"Backend timed out\"", purposes["`BACKEND_TIMEOUT_SECONDS`"], StringComparison.Ordinal);
+        Assert.Contains("must lie strictly below the repository root (below `/repo` under Docker): replay refuses any other path as a failed report write (CHK-REPORT) and exits 1", purposes["`HARNESS_REPORT_PATH`"], StringComparison.Ordinal);
+
+        // Every required command, each exactly once and in this order; a bold lead stands for its paragraph.
+        string[] ordered =
+        [
+            "docker compose up --build",
+            "COMPOSE_PROFILES= BACKEND_REST_URL=http://<host>:65000 BACKEND_SOAP_URL=http://<host>:21001 BACKEND_ADMIN_URL= docker compose up --build",
+            "**Configuration.**",
+            "**Routine verification without Docker.**",
+            "harness/scripts/run-local.sh replay",
+            "**Deliberate evidence regeneration.**",
+            "harness/scripts/run-local.sh capture",
+            "harness/scripts/run-local.sh export-openapi",
+            "(cd facade && dotnet test --project tests/Erewhon.Facade.Tests/Erewhon.Facade.Tests.csproj)",
+            "(cd harness && dotnet test --project tests/Erewhon.Harness.Tests/Erewhon.Harness.Tests.csproj)",
+        ];
+        var positions = ordered
+            .Select(expected => Assert.Single(
+                Enumerable.Range(0, lines.Length),
+                index => expected.StartsWith("**", StringComparison.Ordinal)
+                    ? lines[index].StartsWith(expected + " ", StringComparison.Ordinal)
+                    : string.Equals(lines[index], expected, StringComparison.Ordinal)))
+            .ToArray();
+        Assert.Equal(positions.Order(), positions);
+        Assert.Contains("a value set in the shell overrides `.env`", lines[positions[2]], StringComparison.Ordinal);
+
+        // Replay is routine and stands alone in its block; capture and export-openapi follow the warning
+        // that names what each replaces.
+        var replay = positions[4];
+        Assert.Equal(new[] { "```sh", "```" }, new[] { lines[replay - 1], lines[replay + 1] });
+        Assert.EndsWith(
+            "Apart from build output under each project's `bin/` and `obj/`, and a project's `packages.lock.json`, which its unlocked restore writes only when the file is missing or a package version has changed, it writes only the report (`RESULTS.md`, or `HARNESS_REPORT_PATH`) and `artifacts/**`, never `baseline/**` or a contract file:",
+            lines[positions[3]],
+            StringComparison.Ordinal);
+        var deliberate = lines[positions[5]];
+        Assert.Contains("`capture` withdraws `baseline/manifest.json`, clears `baseline/records/**` and rewrites `baseline/**`", deliberate, StringComparison.Ordinal);
+        Assert.Contains("writes `contracts/wsdl/ErewhonWebService.wsdl` only when that file is absent", deliberate, StringComparison.Ordinal);
+        Assert.Contains("`export-openapi` replaces `contracts/openapi/erewhon-rest.openapi.json` with the live facade's OpenAPI document", deliberate, StringComparison.Ordinal);
+        Assert.Contains("Commit or back up the current evidence first", deliberate, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -5070,8 +5136,6 @@ public sealed partial class KnownLimitationsRegisterTests
         Assert.Null(summary.ExitCode);
     }
 
-    // ---- Helpers -------------------------------------------------------------------------------
-
     private FacadeTestSummary Read() => new FacadeTestResults(new HarnessOptions { RepoRoot = Temp.Root }).Read();
 
     // Plants at path a FIFO, a link to a FIFO or to a file holding validContent (both outside the results
@@ -5781,8 +5845,6 @@ public sealed partial class KnownLimitationsRegisterTests
         Assert.Equal(CheckOutcomes.Fail, result.Result.Outcome);
     }
 
-    // ---- Helpers -------------------------------------------------------------------------------
-
     private JadeUnchangedCheck ScriptedJadeUnchangedCheck(ScriptedGit git, string startingCommit = StartingCommit) =>
         new(new HarnessOptions { RepoRoot = Temp.Root, StartingCommit = startingCommit }, git.Runner);
 
@@ -6105,7 +6167,8 @@ public sealed partial class KnownLimitationsRegisterTests
         Assert.Equal(CheckOutcomes.Fail, result.Result.Outcome);
         Assert.Equal(FailureItemIds.NotAncestor, result.Failure?.Nature);
 
-        // The detail names both commits, whose ids change with the time they were made, so it is not shown.
+        // The detail also names both commits by id, a hash of each fixture commit's content, so only its fixed
+        // sentence is checked and the detail is not shown.
         Assert.True(
             result.Failure?.Detail?.Contains("is not an ancestor of the first facade commit", StringComparison.Ordinal) == true,
             "The detail must state that the baseline commit is not an ancestor of the first facade commit.");
@@ -6131,11 +6194,10 @@ public sealed partial class KnownLimitationsRegisterTests
         AssertOrderingNotRun(result, "is a shallow clone");
     }
 
-    // ---- Helpers -------------------------------------------------------------------------------
-
     private OrderingEvidence ScriptedOrderingEvidence(ScriptedGit git) => new(new HarnessOptions { RepoRoot = Temp.Root }, git.Runner);
 
-    // A real commit's id hashes the time it was made, so the ids are compared with fixed messages.
+    // A real commit's id hashes the fixture commit's tree, parents, message and fixed identity and dates, so
+    // the ids are compared with fixed messages that name each commit's role rather than its id.
     private static void AssertRealCommits(OrderingResult result, string baseline, string facade)
     {
         Assert.True(

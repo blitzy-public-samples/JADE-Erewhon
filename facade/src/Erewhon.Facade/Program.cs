@@ -213,8 +213,11 @@ try
     // never stops the facade: WSDL requests are then forwarded to the default target unchanged.
     app.Services.GetRequiredService<WsdlDocument>();
 
-    // Only the implicit routing and endpoint middleware runs; every endpoint is bound to its own listener.
+    // Besides the implicit routing and endpoint middleware, only the admin-socket header middleware runs:
+    // it adds X-Content-Type-Options to admin responses and leaves REST and SOAP requests and responses
+    // untouched. Every endpoint is bound to its own listener.
     var catalogue = app.Services.GetRequiredService<OperationCatalogue>();
+    app.UseAdminResponseHeaders();
     app.MapRestEndpoints(catalogue);
     app.MapSoapEndpoints();
     app.MapAdminEndpoints();

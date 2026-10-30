@@ -17,9 +17,14 @@ namespace Erewhon.Harness.Modes;
 /// once after the facade commit and again for each regeneration in the correction window. Replay never
 /// writes the contract; its drift check only compares the live document against it.</para>
 /// <para>The document is written exactly as received, never reformatted or re-serialised, so the
-/// checked-in file is what the facade serves. It is written to a temporary file in the target directory
-/// and moved over the target, so a failed fetch or write leaves any existing contract untouched. No other
-/// file is written, and no directory is created except <c>contracts/openapi</c> itself.</para>
+/// checked-in file is what the facade serves. It is published through directory handles rooted at the
+/// repository (<see cref="ConfinedTree.PublishFileAsync"/>): each directory on the way is opened without
+/// following a link, so a linked <c>contracts</c>, <c>contracts/openapi</c> or contract file is refused and
+/// left in place, and nothing outside the repository is written. Only <c>contracts/openapi</c> may be
+/// created; a <c>contracts</c> directory that is gone by the write fails the export and is not recreated.
+/// The bytes go to a temporary file in <c>contracts/openapi</c> that one rename moves over the contract, so
+/// a reader sees the old file or the complete new one, and a failed fetch or write leaves the previous
+/// contract untouched. No other file is written.</para>
 /// <para><c>Harness:RepoRoot</c> must name the repository: a root with no <c>contracts</c> directory, for
 /// example a mistyped root or the default <c>/repo</c> outside a container, is refused with exit code 1
 /// before readiness, so no request is sent and nothing is created.</para>
@@ -151,8 +156,13 @@ public sealed class ExportOpenApiMode(HarnessOptions options, TextWriter stdout)
             return 1;
         }
 
+        // The received bytes, published through directory handles rooted at the repository: only
+        // contracts/openapi may be created, a link on the way or at the target is refused, and the previous
+        // contract is replaced in one rename or left as it was.
         var target = _options.ContractsOpenApiPath;
-        await WriteAtomicallyAsync(target, response.Body, ct).ConfigureAwait(false);
+        await new ConfinedTree(_options.ResolvePath("."))
+            .PublishFileAsync(target, response.Body, ct)
+            .ConfigureAwait(false);
         Print(string.Create(CultureInfo.InvariantCulture, $"wrote {response.Body.Length} bytes to {target}"));
         return 0;
     }
@@ -177,56 +187,6 @@ public sealed class ExportOpenApiMode(HarnessOptions options, TextWriter stdout)
         {
             error = ex.Message;
             return false;
-        }
-    }
-
-    // The temporary file sits in the target's directory so the move is a same-volume rename, which
-    // replaces the target in one step: the contract is either the old file or the complete new one.
-    private static async Task WriteAtomicallyAsync(string target, byte[] bytes, CancellationToken ct)
-    {
-        var directory = Path.GetDirectoryName(target)
-            ?? throw new IOException($"The contract path '{target}' has no directory.");
-        if (!Directory.Exists(directory))
-        {
-            // Only the openapi/ leaf is ever created. Directory.CreateDirectory also creates missing
-            // ancestors, so it is called only once the parent, contracts/, is known to exist; a parent that
-            // has gone since the repository check means the root is no longer the repository.
-            var parent = Path.GetDirectoryName(directory);
-            if (parent is null || !Directory.Exists(parent))
-            {
-                throw new IOException(
-                    $"The contract directory '{directory}' cannot be created: its parent '{parent}' is not a directory.");
-            }
-
-            Directory.CreateDirectory(directory);
-        }
-
-        var temporary = Path.Combine(
-            directory,
-            string.Create(CultureInfo.InvariantCulture, $".{Path.GetFileName(target)}.{Guid.NewGuid():N}.tmp"));
-        try
-        {
-            await using (var stream = new FileStream(
-                temporary,
-                FileMode.CreateNew,
-                FileAccess.Write,
-                FileShare.None,
-                bufferSize: 4096,
-                FileOptions.Asynchronous))
-            {
-                await stream.WriteAsync(bytes, ct).ConfigureAwait(false);
-                stream.Flush(flushToDisk: true);
-            }
-
-            File.Move(temporary, target, overwrite: true);
-        }
-        finally
-        {
-            // Only reached with the file still present when the write or the move failed.
-            if (File.Exists(temporary))
-            {
-                File.Delete(temporary);
-            }
         }
     }
 

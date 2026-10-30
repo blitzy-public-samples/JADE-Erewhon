@@ -901,8 +901,6 @@ public sealed partial class BinaryComparerTests
         Assert.Equal(JsonValueKind.Null, response.GetProperty("bodyFile").ValueKind);
     }
 
-    // ---- Helpers -----------------------------------------------------------------------------------
-
     private static BaselineRecord Record(string caseId, string operation) => new(
         1,
         caseId,
@@ -2318,9 +2316,6 @@ public sealed partial class BinaryComparerTests
 
         Assert.True(Directory.Exists(Full(file)));
     }
-
-
-    // ---- Helpers ------------------------------------------------------------------------------------
 
     private static BaselineRecord NewRecord(
         int order,

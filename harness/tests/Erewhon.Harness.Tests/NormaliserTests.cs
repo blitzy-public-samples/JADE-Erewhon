@@ -506,7 +506,8 @@ public sealed partial class NormaliserTests : IDisposable
         Assert.Equal(_rules.ToJsonNode().ToJsonString(), parsed.ToJsonNode().ToJsonString());
     }
 
-    // Encoding.UTF8 strips a leading byte order mark, so a file saved by an editor that adds one still loads.
+    // File.ReadAllText in NormalisationRules.Load reads through a StreamReader that drops a leading byte order
+    // mark, so a file saved by an editor that adds one still loads.
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
@@ -804,8 +805,6 @@ public sealed partial class NormaliserTests : IDisposable
         Assert.Equal(DiscrepancyValue.Literal(lookalikeLiteral), _normaliser.ToValue(N1, Slot(GuidLookalike), syntax));
         Assert.Equal(DiscrepancyValue.Literal(nullLiteral), _normaliser.ToValue(N1, NormalisedSlot.Null, syntax));
     }
-
-    // ---- Helpers --------------------------------------------------------------------------------
 
     private void AssertUnequalBothWays(string rule, WireSyntax syntax, NormalisedSlot other)
     {
@@ -1677,9 +1676,12 @@ public sealed partial class NormaliserTests
 
     /// <summary>
     /// A collection of DTO items is valid only when every item is the array's item element in the target
-    /// namespace with no or a valid <c>xsi:type</c>. The real catalogue has no SOAP collection of DTOs, so
-    /// these rows run against <see cref="TypedSoapCatalogue"/>, in which <c>DTOResult.allWarnings</c> is a
-    /// reachable <c>DTONameArray</c>.
+    /// namespace with no or a valid <c>xsi:type</c>. Item validity is judged on a collection-valued DTO
+    /// property, and no DTO property of the real catalogue holds a collection of DTOs: its
+    /// collection-valued properties are <c>StringArray</c>, and the <c>DTONameArray</c> that
+    /// <c>getAgentNames</c> and <c>getClientNames</c> return is the SOAP result itself, not a property
+    /// value. These rows therefore run against <see cref="TypedSoapCatalogue"/>, in which
+    /// <c>DTOResult.allWarnings</c> is a reachable <c>DTONameArray</c>.
     /// </summary>
     [Theory]
     [InlineData("<DTOName><name>Hank Williams</name></DTOName>", Pass)]
@@ -1776,8 +1778,6 @@ public sealed partial class NormaliserTests
 
     private static BaselineRecord SoapBodyRecord(string operation, string body) =>
         Record($"SOAP-{operation["Soap.".Length..]}-01", operation, 200, "text/xml; charset=utf-8", body);
-
-    // ---- Helpers --------------------------------------------------------------------------------
 
     private ConformanceResult Run(params BaselineRecord[] records) => _check.Run(records, NoBodyFile);
 

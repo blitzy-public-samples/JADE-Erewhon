@@ -8,7 +8,8 @@ namespace Erewhon.StandIn.Model;
 /// Every attribute holds the value <c>AddressTA</c> assigned, already trimmed and validated there;
 /// this class neither trims nor validates. The empty string is the JADE null string, so a seed
 /// token <c>null</c> reaches here as <c>""</c>. The declared JADE lengths are documented but not
-/// enforced: every seed value is well within them, and no planned case sends a longer one.
+/// enforced: every seed value is well within them, and no planned case sends a longer one
+/// (KL-STANDIN-STRING-LENGTHS).
 /// </remarks>
 public sealed class Address : PersistentModel
 {

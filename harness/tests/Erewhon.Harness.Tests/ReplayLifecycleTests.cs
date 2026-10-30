@@ -21,15 +21,14 @@ using Erewhon.Harness.Lifecycle;
 using Erewhon.Harness.Modes;
 using Erewhon.Harness.Report;
 using Microsoft.AspNetCore.Builder;
-using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Hosting.Server;
 using Microsoft.AspNetCore.Hosting.Server.Features;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Configuration.EnvironmentVariables;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 
 namespace Erewhon.Harness.Tests;
 
@@ -62,6 +61,8 @@ namespace Erewhon.Harness.Tests;
 /// report to the configured path; the cancellation Main hands SIGTERM and SIGINT to, whose completion
 /// passes the mode's exit code through or gives exit code 1 within its bound; and the supervisors that
 /// send SIGTERM, which wait longer than the cancelled exit budget and that bound before they kill it.
+/// It also checks that <see cref="LoopbackHost"/>, which builds every in-process web host of these tests, listens
+/// on 127.0.0.1 only, whatever listener settings the process environment holds.
 /// </summary>
 /// <remarks>
 /// No failure message shows a value that varies between runs: a temporary path, the run date, a measured
@@ -2050,8 +2051,6 @@ public sealed partial class ReplayLifecycleTests
         }
     }
 
-    // ---- Helpers --------------------------------------------------------------------------------
-
     private static HarnessOptions ShutdownOptions(int shutdownSeconds, int requestSeconds = 1) => new()
     {
         ShutdownTimeoutSeconds = shutdownSeconds,
@@ -2976,8 +2975,6 @@ public sealed partial class ReplayLifecycleTests
         return "{" + string.Join(",", members.Select(pair => $"\"{pair.Name}\":{pair.ValueJson}")) + "}";
     }
 
-    // ---- Helpers --------------------------------------------------------------------------------
-
     private static HttpResponseMessage ResetAccepted() => new(HttpStatusCode.OK);
 
     private static HttpResponseMessage Json(JsonObject body) => new(HttpStatusCode.OK)
@@ -3875,18 +3872,14 @@ public sealed partial class ReplayLifecycleTests
         public static async Task<BracketStandInStub> StartAsync(HangPoint hang, string seedSha256, CancellationToken ct)
         {
             var stub = new BracketStandInStub(hang, seedSha256);
-            var builder = WebApplication.CreateSlimBuilder();
-            builder.Logging.ClearProviders();
-            builder.Services.Configure<HostOptions>(options => options.ShutdownTimeout = ShutdownLimit);
-            builder.WebHost.ConfigureKestrel(kestrel => kestrel.Listen(IPAddress.Loopback, 0));
+            var builder = LoopbackHost.CreateBuilder(ShutdownLimit);
 
             var app = builder.Build();
             app.Run(stub.HandleAsync);
             try
             {
                 await app.StartAsync(ct);
-                var address = app.Services.GetRequiredService<IServer>().Features.GetRequiredFeature<IServerAddressesFeature>().Addresses.Single();
-                stub.BaseUrl = new Uri(address).GetLeftPart(UriPartial.Authority);
+                stub.BaseUrl = LoopbackHost.BoundAddress(app).GetLeftPart(UriPartial.Authority);
                 stub._app = app;
                 return stub;
             }
@@ -4370,7 +4363,7 @@ public sealed partial class ReplayLifecycleTests
     }
 
     // Capture passes its stand-in prefix, so its ready and not-ready lines carry it; replay and
-    // export-openapi pass none, and their lines start with the outcome as before.
+    // export-openapi pass none, so their lines start with the outcome.
     [Theory]
     [InlineData(SourceLabels.ConsolePrefix + " ", true)]
     [InlineData(SourceLabels.ConsolePrefix + " ", false)]
@@ -4454,8 +4447,6 @@ public sealed partial class ReplayLifecycleTests
         Assert.Empty(admin.Requests);
         Assert.Equal(1, writer.Attempts);
     }
-
-    // ---- Helpers --------------------------------------------------------------------------------
 
     private static HarnessOptions ConsoleOptions()
     {
@@ -5270,7 +5261,7 @@ public sealed partial class ReplayLifecycleTests
         /// <summary>The contract is written under the repository root.</summary>
         Written,
 
-        /// <summary><c>contracts/openapi</c> under the repository root is a file, so creating the contract directory throws.</summary>
+        /// <summary><c>contracts/openapi</c> under the repository root is a file, so opening the contract directory throws.</summary>
         WriteFailed,
     }
 
@@ -5362,11 +5353,19 @@ public sealed partial class ReplayLifecycleTests
         Assert.Equal(2, lines.Count);
         Assert.Equal("export-openapi: waiting up to 10 s for the facade admin listener", lines[0]);
         var line = lines[1];
-        AssertEscaped(line, expectedStart, ModeRedacted(LifecycleConsole.Display(root)));
         if (outcome == ExportOutcome.Written)
         {
+            AssertEscaped(line, expectedStart, ModeRedacted(LifecycleConsole.Display(root)));
             Assert.Equal(ModeRedacted($"{expectedStart}{LifecycleConsole.Display(options.ContractsOpenApiPath)}"), line);
             Assert.Equal("{}", await File.ReadAllTextAsync(options.ContractsOpenApiPath, ct));
+        }
+        else
+        {
+            // The confined write names the refused entry relative to the repository root, so the line quotes no
+            // part of the hostile root and stays one inert line.
+            const string refusal = "ConfinedTree could not open 'contracts/openapi': it is not a directory.";
+            AssertEscaped(line, expectedStart, refusal);
+            Assert.Equal($"{expectedStart}IOException: {refusal}", line);
         }
     }
 
@@ -5423,8 +5422,6 @@ public sealed partial class ReplayLifecycleTests
                 line);
         }
     }
-
-    // ---- Helpers --------------------------------------------------------------------------------
 
     // The text with ModeDiagnosticsRoot, a plain path that Display keeps as it is, replaced by
     // ModeDiagnosticsRootToken, which no mode prints. Both sides of a comparison go through it, so it holds
@@ -5490,11 +5487,117 @@ public sealed partial class ReplayLifecycleTests
     }
 }
 
+// ---- Fixture hosts ------------------------------------------------------------------------------
+// Every in-process web host of the harness tests is built by LoopbackHost, and listens on 127.0.0.1 and
+// nowhere else whatever listener settings the process environment holds. The test sets process environment
+// variables, which anything else in the process that read its environment meanwhile would see, so it lives in
+// this class, whose collection xunit runs on its own, and it restores each variable before it ends.
+public sealed partial class ReplayLifecycleTests
+{
+    // Bound the fixture host's graceful stop and its one request, so neither can leave the test waiting.
+    private static readonly TimeSpan FixtureShutdownLimit = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan FixtureRequestLimit = TimeSpan.FromSeconds(30);
+
+    /// <summary>The ambient listener setting a fixture host test places in the process environment.</summary>
+    public enum AmbientListener
+    {
+        /// <summary>A <c>Kestrel:Endpoints</c> entry, which a configured host binds beside its explicit listener.</summary>
+        KestrelEndpoint,
+
+        /// <summary>
+        /// <c>ASPNETCORE_URLS</c> with <c>ASPNETCORE_PREFERHOSTINGURLS</c>, which a configured host binds instead of its
+        /// explicit listener.
+        /// </summary>
+        PreferredHostingUrl,
+    }
+
+    [Theory]
+    [InlineData(AmbientListener.KestrelEndpoint)]
+    [InlineData(AmbientListener.PreferredHostingUrl)]
+    public async Task LoopbackHost_ListensOnlyOnItsLoopbackListener_WhateverTheEnvironmentConfigures(AmbientListener ambient)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var ambientPort = ClosedPorts.Take(1)[0];
+        var ambientUrl = string.Create(CultureInfo.InvariantCulture, $"http://{IPAddress.Any}:{ambientPort}");
+        (string Name, string Value)[] settings = ambient switch
+        {
+            AmbientListener.KestrelEndpoint => [("Kestrel__Endpoints__Ambient__Url", ambientUrl)],
+            AmbientListener.PreferredHostingUrl => [("ASPNETCORE_URLS", ambientUrl), ("ASPNETCORE_PREFERHOSTINGURLS", "true")],
+            _ => throw new ArgumentOutOfRangeException(nameof(ambient), ambient, null),
+        };
+        var originals = settings.Select(setting => (setting.Name, Value: Environment.GetEnvironmentVariable(setting.Name))).ToArray();
+        try
+        {
+            foreach (var (name, value) in settings)
+            {
+                Environment.SetEnvironmentVariable(name, value);
+            }
+
+            await using var app = LoopbackHost.CreateBuilder(FixtureShutdownLimit).Build();
+            app.Run(context =>
+            {
+                context.Response.StatusCode = StatusCodes.Status204NoContent;
+                return Task.CompletedTask;
+            });
+            await app.StartAsync(ct);
+            try
+            {
+                var addresses = app.Services.GetRequiredService<IServer>().Features.GetRequiredFeature<IServerAddressesFeature>().Addresses;
+                Assert.True(addresses.Count == 1, "the host is bound to exactly one address");
+                var bound = new Uri(addresses.Single());
+                Assert.True(
+                    bound.Host == IPAddress.Loopback.ToString() && bound.Port > 0,
+                    "the host's only address is 127.0.0.1 with an assigned port");
+                Assert.True(LoopbackHost.BoundAddress(app) == bound, "the loopback host reports the host's only address");
+
+                // A proxy from the environment must not intercept the loopback request.
+                using var http = new HttpClient(
+                    new SocketsHttpHandler { UseProxy = false, AllowAutoRedirect = false, UseCookies = false },
+                    disposeHandler: true)
+                {
+                    Timeout = FixtureRequestLimit,
+                };
+                using var response = await http.GetAsync(bound, ct);
+                Assert.Equal(HttpStatusCode.NoContent, response.StatusCode);
+
+                // A wildcard listener on the ambient port would accept a loopback connection.
+                using var probe = new TcpClient();
+                var refused = await Assert.ThrowsAsync<SocketException>(async () => await probe.ConnectAsync(IPAddress.Loopback, ambientPort, ct));
+                Assert.Equal(SocketError.ConnectionRefused, refused.SocketErrorCode);
+
+                // No configuration provider reads the environment or a file, so neither the variables set here
+                // nor a later change to an appsettings file reaches the host.
+                Assert.False(
+                    ConfigurationProviders((IConfigurationRoot)app.Configuration)
+                        .Any(provider => provider is EnvironmentVariablesConfigurationProvider or FileConfigurationProvider),
+                    "the host's configuration reads neither the environment nor a file");
+            }
+            finally
+            {
+                await app.StopAsync(CancellationToken.None);
+            }
+        }
+        finally
+        {
+            foreach (var (name, value) in originals)
+            {
+                Environment.SetEnvironmentVariable(name, value);
+            }
+        }
+    }
+
+    // Every provider of the configuration, with each chained configuration replaced by its own providers.
+    private static IEnumerable<IConfigurationProvider> ConfigurationProviders(IConfigurationRoot configuration) =>
+        configuration.Providers.SelectMany(provider => provider is ChainedConfigurationProvider { Configuration: IConfigurationRoot chained }
+            ? ConfigurationProviders(chained)
+            : [provider]);
+}
+
 /// <summary>
 /// The test collection of <see cref="ReplayLifecycleTests"/>. Its standard-error test replaces the process-wide
-/// <see cref="Console.Error"/>, so xunit runs this collection on its own, after every parallel collection and
-/// never beside a test of another class. This is a collection definition only, with no tests of its own, so
-/// the harness test project keeps its six test classes.
+/// <see cref="Console.Error"/>, and its fixture host test sets process environment variables, so xunit runs this
+/// collection on its own, after every parallel collection and never beside a test of another class. This is a
+/// collection definition only, with no tests of its own, so the harness test project keeps its six test classes.
 /// </summary>
 [CollectionDefinition(Name, DisableParallelization = true)]
 public sealed class ProcessWideConsoleCollection
@@ -5573,18 +5676,14 @@ internal sealed class CaptureStandInStub : IAsyncDisposable
         string seedSha256, string referenceDate, bool failEmptyReset, byte[]? wsdl, CancellationToken ct)
     {
         var stub = new CaptureStandInStub(seedSha256, referenceDate, failEmptyReset, wsdl);
-        var builder = WebApplication.CreateSlimBuilder();
-        builder.Logging.ClearProviders();
-        builder.Services.Configure<HostOptions>(options => options.ShutdownTimeout = ShutdownLimit);
-        builder.WebHost.ConfigureKestrel(kestrel => kestrel.Listen(IPAddress.Loopback, 0));
+        var builder = LoopbackHost.CreateBuilder(ShutdownLimit);
 
         var app = builder.Build();
         app.Run(stub.HandleAsync);
         try
         {
             await app.StartAsync(ct);
-            var address = app.Services.GetRequiredService<IServer>().Features.GetRequiredFeature<IServerAddressesFeature>().Addresses.Single();
-            stub.BaseUrl = new Uri(address).GetLeftPart(UriPartial.Authority);
+            stub.BaseUrl = LoopbackHost.BoundAddress(app).GetLeftPart(UriPartial.Authority);
             stub._app = app;
             return stub;
         }
@@ -6313,8 +6412,6 @@ public sealed partial class ReplayLifecycleTests
         Assert.False(DiscrepancySignature.TryArtifactFileName(itemId, out var fileName), "An unusable item id must name no artifact.");
         Assert.Null(fileName);
     }
-
-    // ---- Helpers ------------------------------------------------------------------------------------
 
     // 251 ASCII characters, or 126 two-byte characters, give a name of 256 or 257 UTF-8 bytes with ".json".
     private static string? UnusableItemId(string form) => form switch

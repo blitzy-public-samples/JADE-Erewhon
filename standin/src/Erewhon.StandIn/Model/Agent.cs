@@ -125,7 +125,6 @@ public sealed class Agent : PersistentModel
         CommissionRate? existing = AllCommissionRates.GetAtKey(CategoryNameOf(rate));
         if (ReferenceEquals(existing, rate))
         {
-            // The agent already uses the supplied rate.
             return;
         }
 

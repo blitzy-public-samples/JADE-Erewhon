@@ -806,8 +806,6 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
                 ? runtime
                 : null;
 
-        // Attributes.
-
         /// <summary>
         /// Compares the attributes of two elements as sets by expanded name, each side's QName values resolved
         /// in that side's scope, and reports each value as <see cref="AttributeLiteral"/> shows it.
@@ -962,8 +960,6 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
         private static string ExpandedName(XNamespace ns, string local) =>
             ns == XNamespace.None ? local : $"{{{ns.NamespaceName}}}{local}";
 
-        // Text.
-
         /// <summary>
         /// Compares the direct text of two elements run by run, where run k is the text between element
         /// children k-1 and k, ordinally and with no trimming or collapsing. A difference is reported at
@@ -1064,8 +1060,6 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
 
             return true;
         }
-
-        // Child elements.
 
         /// <summary>
         /// Compares the child elements of two elements: name groups as an unordered set, and the elements of
@@ -1354,8 +1348,6 @@ public sealed class XmlSemanticComparer(OperationCatalogue catalogue, Normaliser
 
             return ambiguous;
         }
-
-        // Normalisation.
 
         /// <summary>
         /// The normalisation rule a child of a DTO element of runtime class <paramref name="dto"/> follows,

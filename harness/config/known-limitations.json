@@ -51,7 +51,7 @@
       "category": "assumption",
       "operation": null,
       "matches": [],
-      "reason": "_restServicesOptions 2 is unexplained [Erewhon/ErehwhonExternalInterfacesSchema.ddx:87], so JADE's default Microsoft JSON is assumed: \\/Date(ms)\\/ in UTC (_webDefaultTimeZone Etc/UTC [Erewhon/ErehwhonExternalInterfacesSchema.ddx:92]), __type for subclasses, nulls included, Binary as a byte array, Decimal with two decimals, and the null string as \"\". XML and JSONN, whether selected by a .xml/.jsonn suffix or by Accept, are neither modelled nor characterised (the stand-in answers 501).",
+      "reason": "_restServicesOptions 2 is unexplained [Erewhon/ErehwhonExternalInterfacesSchema.ddx:87], so JADE's default Microsoft JSON is assumed: \\/Date(ms)\\/ in UTC (_webDefaultTimeZone Etc/UTC [Erewhon/ErehwhonExternalInterfacesSchema.ddx:92]), __type for subclasses, nulls included, Binary as a byte array, Decimal with two decimals, and the null string as \"\". XML and JSONN, whether selected by a .xml/.jsonn suffix or by Accept, are neither modelled nor characterised. A request with a .xml or .jsonn suffix gets 501 with the plain-text body jade-standin: output format not modelled. The stand-in ignores Accept, so an unsuffixed or .json request gets JSON whatever Accept names. JADE gives a suffix precedence over headers, so only an unsuffixed request differs: there JADE would let Accept select XML or JSONN (AAP 0.7.1).",
       "attempts": 0,
       "actionTaken": "The characterised forms are unsuffixed requests with no Accept header, and the .json suffix. The facade forwards every form, suffix and header unchanged."
     },
@@ -74,6 +74,15 @@
       "actionTaken": "The stand-in writes allErrors, allWarnings and statusCode (no guid), and conformance inventories DTOResult on SOAP with those members."
     },
     {
+      "id": "KL-SOAP-XML-CHARACTERS",
+      "category": "assumption",
+      "operation": null,
+      "matches": [],
+      "reason": "JADE's SOAP form for a stored String holding a character XML 1.0 cannot carry (a control character other than tab, LF and CR, a lone surrogate, U+FFFE or U+FFFF) is not recorded in the repository. postCreateAgent and postCreateClient copy every DTOAgent or DTOClient member of the JSON body into AgentTA or ClientTA and AddressTA [Erewhon/ErehwhonExternalInterfacesSchema.scm:2652-2691, 2692-2731], and a JSON string carries such a character as an escape such as \\u0001. No AgentTA, ClientTA or AddressTA rule rejects one [Erewhon/ErewhonModelSchema.scm:9823-9884, 10154-10204, 10550-10598]: they check only that the values are present, that the name is not taken and that the email matches EmailRegEx, which an email holding such a character fails [Erewhon/ErewhonModelSchema.scm:140, 9876-9879]. A SOAP request cannot carry such a character, because the XML request parser rejects it.",
+      "attempts": 0,
+      "actionTaken": "The stand-in stores the value as the TA rules leave it and returns it unchanged over REST, JSON-escaped. Every SOAP response writes each such character as U+FFFD and keeps valid surrogate pairs, so getAgentNames, getClientNames, getAgent and getClient stay well-formed SOAP 1.1 for every caller. Names are compared exactly, so a SOAP getAgent or getClient for the U+FFFD form of such a name finds no match and returns a nil result. The baseline was re-captured from the corrected stand-in: every record is byte-identical, and baseline/manifest.json's captureCommit names the corrected stand-in's commit."
+    },
+    {
       "id": "KL-STANDIN-DATE",
       "category": "assumption",
       "operation": null,
@@ -87,9 +96,9 @@
       "category": "assumption",
       "operation": "Soap.getPhoto",
       "matches": [],
-      "reason": "Photos load through app.loadPicture [Erewhon/ErewhonModelSchema.scm:8657], whose stored byte form is not visible. The test constant TestPhoto begins FF D8 FF E0 (JPEG) [Erewhon/ErehwhonExternalInterfacesSchema.scm:340].",
+      "reason": "Photos load through app.loadPicture [Erewhon/ErewhonModelSchema.scm:8657], whose stored byte form is not visible. The test constant TestPhoto begins FF D8 FF E0 (JPEG) [Erewhon/ErehwhonExternalInterfacesSchema.scm:340]. The sources also disagree on which photo is returned: the getPhoto method header says it finds the first available photo [Erewhon/ErehwhonExternalInterfacesSchema.scm:6652], but its loop assigns every photo it meets, so the photo of the last retail sale with a photo wins [Erewhon/ErehwhonExternalInterfacesSchema.scm:6673-6677], in the (dateSold, prefix, code) order of the client's allRetailSales [Erewhon/ErewhonModelSchema.scm:3241, 5195-5200].",
       "attempts": 0,
-      "actionTaken": "The raw JPEG file bytes are returned base64-encoded and compared byte for byte."
+      "actionTaken": "The raw JPEG file bytes are returned base64-encoded and compared byte for byte. On the disagreement the stand-in follows the code (last), as GetPhoto in standin/src/Erewhon.StandIn/Soap/SoapEndpoint.cs does, and case SOAP-getPhoto-02 expects Elaine Lee's last sale by date, retail item 11 [Erewhon/DataFiles/RetailSales.txt:1, 6, 13]. The JADE loop, the case and its baseline record are unchanged."
     },
     {
       "id": "KL-STANDIN-ROUNDING",
@@ -107,7 +116,16 @@
       "matches": [],
       "reason": "The seed facts (AAP 0.9.4, 0.7.3) state 160 tenders [Erewhon/DataFiles/Tenders.txt:1-160], tender sales closed at load for PROP/70, ANQU/80, ANQU/92 and DEST/106, and getAllSales returning 19 retail and 4 tender sales. That disagrees with the model schema: loadTenders persists every row through TenderTA [Erewhon/ErewhonModelSchema.scm:8852-8927], which rejects a tender whose item is already closed [Erewhon/ErewhonModelSchema.scm:13910-13914], that is whose closure date is before the current date [Erewhon/ErewhonModelSchema.scm:7207-7222]. Every seed date is offset equally, so item 80 (Settee, closure November 29 1999 [Erewhon/DataFiles/TenderItems.txt:22]), item 92 (Coffee Mill, November 19 1999 [Erewhon/DataFiles/TenderItems.txt:34]) and item 106 (Camel trekking, December 12 1999 [Erewhon/DataFiles/TenderItems.txt:48]) close before the reference date, while item 70 (Castle, January 1 2000 [Erewhon/DataFiles/TenderItems.txt:12]) closes on it and is still open when its tenders load. The 60 rows on items 80, 92 and 106 [Erewhon/DataFiles/Tenders.txt:21-40, 81-100, 141-160] are rejected with \"The Tender Item has already closed\" [Erewhon/ErewhonModelSchema.scm:2872].",
       "attempts": 0,
-      "actionTaken": "TenderTA is ported as written and never bypassed, so the stand-in loads 100 tenders and closes one tender sale at load: PROP/70, won by Philip Jenkins with 6500931.00 [Erewhon/DataFiles/Tenders.txt:137], the highest of the item's 20 tenders [Erewhon/DataFiles/Tenders.txt:121-140]. ANQU/80, ANQU/92 and DEST/106 stay unsold, so getSale returns 404 for each, and items 64, 86, 98 and 100 stay open. getAllSales returns the 19 retail sales and the 1 tender sale, which case REST-getAllSales-01 describes. The outcome does not depend on the reference date, because every seed date shifts equally."
+      "actionTaken": "TenderTA is ported as written and never bypassed, so the stand-in loads 100 tenders and closes one tender sale at load: PROP/70, won by the seeded client whose offer [Erewhon/DataFiles/Tenders.txt:137] is the highest of the item's 20 tenders [Erewhon/DataFiles/Tenders.txt:121-140]. ANQU/80, ANQU/92 and DEST/106 stay unsold, so getSale returns 404 for each, and items 64, 86, 98 and 100 stay open. getAllSales returns the 19 retail sales and the 1 tender sale, which case REST-getAllSales-01 describes. The outcome does not depend on the reference date, because every seed date shifts equally."
+    },
+    {
+      "id": "KL-STANDIN-STRING-LENGTHS",
+      "category": "assumption",
+      "operation": null,
+      "matches": [],
+      "reason": "The model schema declares a String length on every attribute the REST creates and the SOAP updates assign: AgentTA and ClientTA name String[81] [Erewhon/ErewhonModelSchema.scm:3739, 3765]; AddressTA street, city and country String[51], phone and fax String[26], and email and webSite String[61] [Erewhon/ErewhonModelSchema.scm:3714-3720]. Agent, Client and Address declare the same lengths [Erewhon/ErewhonModelSchema.scm:3175-3181, 3199, 3239], and so do DTOAgent and DTOClient [Erewhon/ErehwhonExternalInterfacesSchema.scm:110-117, 124-131]. JADE raises an exception when a longer value is assigned, and how that exception reaches a REST or SOAP caller is not recorded in the repository. No seed agent or client value is longer than 24 characters [Erewhon/DataFiles/Agents.txt:1-8; Erewhon/DataFiles/Clients.txt:1-20], and no planned case sends a value near a limit.",
+      "attempts": 0,
+      "actionTaken": "The stand-in does not model the limits. postCreateAgent, postCreateClient, updateAgent, updateAgentWithDTO, updateClient and updateClientWithDTO store an over-length value in full, after the same trimming as any other value, and answer as for any other value, so the size of a record is bounded only by the stand-in's request-body limit, Kestrel's default of 30,000,000 bytes. Each declared length is documented on the stand-in model property that holds the value."
     },
     {
       "id": "KL-FACADE-REQUEST-HEAD",

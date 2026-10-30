@@ -20,7 +20,6 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 
 namespace Erewhon.Harness.Tests;
 
@@ -2711,7 +2710,62 @@ public sealed partial class XmlSemanticComparerTests
 
 // ---- Support types of the contract check tests --------------------------------------------------
 // The loopback stub and the closed ports serve the WSDL contract check tests above and the OpenAPI drift
-// check tests in JsonSemanticComparerTests; they are internal support types, not test classes.
+// check tests in JsonSemanticComparerTests; they are internal support types, not test classes. The loopback
+// host builds every in-process web host of the harness tests, this stub included.
+
+/// <summary>
+/// Builds the in-process web hosts of the harness tests so that each listens on 127.0.0.1 and an ephemeral
+/// port and nowhere else, and checks that a started host is bound to that one address.
+/// </summary>
+internal static class LoopbackHost
+{
+    private const string LoopbackAddress = "127.0.0.1";
+
+    /// <summary>
+    /// Creates a builder whose host listens only on 127.0.0.1 and a port the system assigns, and whose graceful
+    /// stop is bounded by <paramref name="shutdownLimit"/>.
+    /// </summary>
+    /// <param name="shutdownLimit">The host's shutdown timeout.</param>
+    /// <returns>The builder, to which the caller adds its handler before it builds and starts the host.</returns>
+    public static WebApplicationBuilder CreateBuilder(TimeSpan shutdownLimit)
+    {
+        // The empty builder reads no configuration: no environment variable, appsettings file or command-line
+        // argument reaches it, so neither a Kestrel:Endpoints entry nor ASPNETCORE_URLS with
+        // ASPNETCORE_PREFERHOSTINGURLS can add a listener or replace this one. It binds no Kestrel endpoint
+        // loader and watches no configuration file, so no later reload can add one either, and it adds no
+        // logging provider. The only listener is the explicit loopback one below.
+        var builder = WebApplication.CreateEmptyBuilder(new WebApplicationOptions
+        {
+            Args = [],
+            EnvironmentName = Environments.Production,
+            ContentRootPath = AppContext.BaseDirectory,
+        });
+        builder.Services.Configure<HostOptions>(options => options.ShutdownTimeout = shutdownLimit);
+        builder.WebHost.UseKestrelCore().ConfigureKestrel(kestrel => kestrel.Listen(IPAddress.Loopback, 0));
+        return builder;
+    }
+
+    /// <summary>
+    /// The address a started host listens on, once it is confirmed to be the host's only address and to be
+    /// 127.0.0.1 with an assigned port.
+    /// </summary>
+    /// <param name="app">A host built from <see cref="CreateBuilder"/> and started.</param>
+    /// <returns>The bound address, <c>http://127.0.0.1:&lt;port&gt;</c>.</returns>
+    /// <exception cref="InvalidOperationException">The host is bound to any other set of addresses.</exception>
+    public static Uri BoundAddress(WebApplication app)
+    {
+        var addresses = app.Services.GetRequiredService<IServer>().Features.Get<IServerAddressesFeature>()?.Addresses;
+        if (addresses is not { Count: 1 }
+            || !Uri.TryCreate(addresses.First(), UriKind.Absolute, out var address)
+            || !string.Equals(address.Host, LoopbackAddress, StringComparison.Ordinal)
+            || address.Port <= 0)
+        {
+            throw new InvalidOperationException("the test host did not bind exactly one loopback address");
+        }
+
+        return address;
+    }
+}
 
 /// <summary>
 /// An in-process HTTP/1.1 server on 127.0.0.1 and an ephemeral port that answers one exact request target with a
@@ -2753,10 +2807,7 @@ internal sealed class LoopbackStub : IAsyncDisposable
     /// <returns>The running stub, which the caller disposes.</returns>
     public static async Task<LoopbackStub> StartAsync(string pathAndQuery, int status, byte[] body, CancellationToken ct)
     {
-        var builder = WebApplication.CreateSlimBuilder();
-        builder.Logging.ClearProviders();
-        builder.Services.Configure<HostOptions>(options => options.ShutdownTimeout = ShutdownLimit);
-        builder.WebHost.ConfigureKestrel(kestrel => kestrel.Listen(IPAddress.Loopback, 0));
+        var builder = LoopbackHost.CreateBuilder(ShutdownLimit);
 
         var app = builder.Build();
         var requests = new ConcurrentQueue<string>();
@@ -2778,8 +2829,7 @@ internal sealed class LoopbackStub : IAsyncDisposable
         try
         {
             await app.StartAsync(ct);
-            var address = app.Services.GetRequiredService<IServer>().Features.GetRequiredFeature<IServerAddressesFeature>().Addresses.Single();
-            return new LoopbackStub(app, requests, new Uri(address));
+            return new LoopbackStub(app, requests, LoopbackHost.BoundAddress(app));
         }
         catch
         {
