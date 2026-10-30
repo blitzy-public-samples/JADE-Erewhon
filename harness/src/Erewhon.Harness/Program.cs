@@ -27,11 +27,17 @@ namespace Erewhon.Harness;
 /// position, and at most its key, then the usage line and exit code 1, before any file, setting or network
 /// is read; no mode runs. A value is never echoed, because a URL may carry a password.</para>
 /// <para><c>replay</c> never fails before its exit path. An unreadable <c>harness.json</c>, a setting whose
-/// value cannot be converted, an execution mode other than <c>docker</c> or <c>local-processes</c>, and an
+/// value cannot be converted, a readiness, request or shutdown limit that is zero or negative (which keeps its
+/// default), an execution mode other than <c>docker</c> or <c>local-processes</c>, and an
 /// operation catalogue or known-limitations register that cannot be loaded each become a startup
 /// <c>CHK-EXCEPTION</c> item. Every other setting keeps its configured value, so <see cref="ReplayMode"/>
 /// still writes the report to <c>Harness:ReportPath</c>, shuts down the facade and the stand-in at their
 /// configured admin URLs (never an external backend), prints the final line and decides the exit code.</para>
+/// <para>A <c>Harness:RepoRoot</c> that is not an existing directory holding <c>harness/config</c> and
+/// <c>baseline</c> does not name the repository. It is a startup <c>CHK-EXCEPTION</c> item too, and nothing is
+/// replayed: no register is loaded, no check runs and nothing is created or written, the root included.
+/// <see cref="ReplayMode"/> then records <c>CHK-REPORT</c> and prints the report's full text to standard output
+/// instead of writing it, shuts the components down as above and exits 1.</para>
 /// <para>SIGTERM and SIGINT cancel the running mode instead of ending the process, so a container stop
 /// still reaches replay's report and shutdown steps. The first signal starts the cancellation and later
 /// ones are ignored. Once the mode has returned, Main waits up to
@@ -67,6 +73,13 @@ internal static class Program
     private const string ArgumentIgnored = "an argument is not a --Harness:Key=value setting, so it is ignored";
     private const string HarnessJsonUnread = "harness.json could not be read, so its settings are not applied";
     private const string SettingNotConverted = "a setting could not be converted, so it keeps its default";
+    private const string LimitNotPositive = "a limit is not a positive number of seconds, so it keeps its default";
+
+    // What a replay does when Harness:RepoRoot is not the repository, and the directories that make a root one.
+    private const string RootNotRepository =
+        "Harness:RepoRoot does not name the repository root, so nothing is replayed and nothing below it is written";
+
+    private static readonly string[] RepositoryMarkers = ["harness/config", "baseline"];
 
     // HarnessOptions owns the default root, so it is read from a fresh instance rather than restated.
     private static readonly string DefaultRepoRoot = new HarnessOptions().RepoRoot;
@@ -178,7 +191,10 @@ internal static class Program
     /// The operating system is not Linux, or the processor architecture's Linux open flags are unknown, so
     /// <c>harness.json</c> cannot be read confined to the repository root.
     /// </exception>
-    /// <exception cref="InvalidOperationException">A value cannot be converted to its setting's type; the message names the key.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// A value cannot be converted to its setting's type, or a readiness, request or shutdown limit is zero or
+    /// negative; the message names the key.
+    /// </exception>
     internal static HarnessOptions LoadOptions(string[] settingArgs) => Load(settingArgs, problems: null);
 
     /// <summary>
@@ -189,8 +205,9 @@ internal static class Program
     /// <para>An argument that is not a <c>--Harness:Key=value</c> setting is left out. When
     /// <c>harness.json</c> cannot be read (malformed, reached through a link, a FIFO or another special file,
     /// over <see cref="HarnessOptions.EvidenceByteLimit"/>, unreadable, or under a root that cannot form a
-    /// path), the environment and the arguments still apply. A setting whose value cannot be converted keeps its
-    /// <see cref="HarnessOptions"/> default, and every other setting keeps its value: the repository root,
+    /// path), the environment and the arguments still apply. A setting whose value cannot be converted, and a
+    /// readiness, request or shutdown limit that is zero or negative, keeps its <see cref="HarnessOptions"/>
+    /// default, and every other setting keeps its value: the repository root,
     /// the report path and the admin URLs that decide where the report goes and what cleanup shuts down,
     /// an empty backend admin URL included.</para>
     /// <para>Each problem carries the exception the failing step raised, the same one
@@ -266,6 +283,22 @@ internal static class Program
                 {
                     problems.Add(new OptionsProblem(SettingNotConverted, ex));
                 }
+            }
+
+            // A limit must be a positive number of seconds. One that is zero or negative is put back to its
+            // default and reported as a value that cannot be converted is: the strict loader throws it, and the
+            // lenient one records it and carries on with the default.
+            foreach (var reset in options.ResetNonPositiveLimits())
+            {
+                var ex = new InvalidOperationException(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{ConfigurationPath.Combine(HarnessOptions.SectionName, reset.Setting)} is {reset.Configured}, not a positive number of seconds; its default is {reset.DefaultSeconds} s"));
+                if (problems is null)
+                {
+                    throw ex;
+                }
+
+                problems.Add(new OptionsProblem(LimitNotPositive, ex));
             }
 
             options.RepoRoot = repoRoot;
@@ -417,6 +450,23 @@ internal static class Program
             AddStartupFailure(startupFailures, "operation catalogue could not be loaded", ex);
         }
 
+        // Decided before the register, the first file below the root after harness.json, is read. A root that
+        // is not the repository, such as a mistyped Harness:RepoRoot or the default /repo outside a container,
+        // gets no register, a body that replays nothing and a writer that only renders, so only the exit path
+        // runs and the report's full text is printed instead of written.
+        if (RepositoryRootProblem(options) is { } notRepository)
+        {
+            AddStartupFailure(startupFailures, RootNotRepository, notRepository);
+            return await RunReplayModeAsync(
+                options,
+                new NothingReplayedBody(notRepository, stdout),
+                new ResultsReportWriter(),
+                KnownLimitationsRegister.Empty,
+                stdout,
+                startupFailures,
+                ct).ConfigureAwait(false);
+        }
+
         KnownLimitationsRegister register;
         try
         {
@@ -450,9 +500,49 @@ internal static class Program
             AddStartupFailure(startupFailures, "the repository root is unusable, so the report cannot be written", ex);
         }
 
+        return await RunReplayModeAsync(options, body, writer, register, stdout, startupFailures, ct).ConfigureAwait(false);
+    }
+
+    // Runs replay's lifecycle owner over what start-up assembled: the body, then the report, the shutdown of the
+    // facade and the stand-in at their configured admin URLs, the final line and the exit code.
+    private static async Task<int> RunReplayModeAsync(
+        HarnessOptions options,
+        IReplayBody body,
+        ResultsReportWriter writer,
+        KnownLimitationsRegister register,
+        TextWriter stdout,
+        List<FailureItem> startupFailures,
+        CancellationToken ct)
+    {
         using var shutdown = new HttpComponentShutdown(options);
         var replay = new ReplayMode(options, body, writer, shutdown, register, stdout, startupFailures);
         return await replay.RunAsync(ct).ConfigureAwait(false);
+    }
+
+    // Null when Harness:RepoRoot names the repository: an existing directory that holds harness/config and
+    // baseline, the directories every replay reads. Otherwise the exception that names what is missing, or the
+    // one resolving the root raised, which replay reports instead of reading or writing below the root.
+    private static Exception? RepositoryRootProblem(HarnessOptions options)
+    {
+        try
+        {
+            var root = options.ResolvePath(".");
+            if (!Directory.Exists(root))
+            {
+                return new DirectoryNotFoundException($"no directory at {root}");
+            }
+
+            var missing = RepositoryMarkers
+                .Select(marker => (Marker: marker, Path: options.ResolvePath(marker)))
+                .Where(marker => !Directory.Exists(marker.Path))
+                .Select(marker => $"no {marker.Marker} directory at {marker.Path}")
+                .ToList();
+            return missing.Count == 0 ? null : new DirectoryNotFoundException(string.Join("; ", missing));
+        }
+        catch (Exception ex)
+        {
+            return ex;
+        }
     }
 
     private static async Task<int> RunModeAsync(string mode, string[] settingArgs, TextWriter stdout, CancellationToken ct)
@@ -522,6 +612,26 @@ internal static class Program
     private sealed class FailedReplayBody(Exception failure) : IReplayBody
     {
         public Task ExecuteAsync(ReplayRunState state, CancellationToken ct) => Task.FromException(failure);
+    }
+
+    /// <summary>
+    /// Stands in for a <see cref="ReplayBody"/> when <c>Harness:RepoRoot</c> does not name the repository: it
+    /// reads, writes, checks and contacts nothing and prints one line saying why nothing was replayed, so
+    /// <see cref="ReplayMode"/> runs only its exit path.
+    /// </summary>
+    /// <param name="reason">What the root lacks, as the startup <c>CHK-EXCEPTION</c> item states it.</param>
+    /// <param name="stdout">Where the line goes.</param>
+    private sealed class NothingReplayedBody(Exception reason, TextWriter stdout) : IReplayBody
+    {
+        public Task ExecuteAsync(ReplayRunState state, CancellationToken ct)
+        {
+            // A cancelled run is recorded as the production body records it.
+            ct.ThrowIfCancellationRequested();
+            LifecycleConsole.WriteLine(
+                stdout,
+                $"{ReplayModeName}: {ReplayMode.SafeMessage(reason)}; Harness:RepoRoot does not name the repository root. Nothing replayed.");
+            return Task.CompletedTask;
+        }
     }
 
     /// <summary>

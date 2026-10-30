@@ -5028,8 +5028,11 @@ public sealed partial class ReplayLifecycleTests
 // not a --Harness:Key=value setting is refused before anything is read. The lenient loader keeps every
 // setting that can be read and converted, so a replay with an unreadable harness.json or an unknown
 // execution mode still writes its report to the configured path and treats an empty backend admin URL
-// as an external backend. Each setting binds as binding the whole section would, an explicit null in
-// harness.json included. A FIFO or a link at harness.json is refused at once by both loaders.
+// as an external backend. A replay whose root is not an existing directory holding harness/config and
+// baseline replays nothing, creates nothing and prints its report. Each setting binds as binding the
+// whole section would, an explicit null in harness.json included. A readiness, request or shutdown limit
+// that binds to zero or less is reported as an unconvertible value is and keeps its default, in the report
+// of a replay too. A FIFO or a link at harness.json is refused at once by both loaders.
 // Every setting is passed as a --Harness:... argument, which overrides the environment, or written to
 // the tree's own harness.json, so no test sets a process environment variable. Every tree is a
 // TempDirectory, never the committed one, and no assertion reads standard error. URLs name loopback
@@ -5052,6 +5055,22 @@ public sealed partial class ReplayLifecycleTests
     // Hard limits for one call: the token is cancelled and the wait ends, so a hang fails the test.
     private static readonly TimeSpan CallLimit = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan ReplayLimit = TimeSpan.FromSeconds(60);
+
+    /// <summary>A <c>Harness:RepoRoot</c> that does not name the repository.</summary>
+    public enum NonRepositoryRoot
+    {
+        /// <summary>A directory two levels below a temporary directory, neither of which exists.</summary>
+        Missing,
+
+        /// <summary>An existing, empty directory.</summary>
+        Empty,
+
+        /// <summary>A directory that holds <c>harness/config</c> and no <c>baseline</c>.</summary>
+        OnlyHarnessConfig,
+
+        /// <summary>A directory that holds <c>baseline</c> and no <c>harness/config</c>.</summary>
+        OnlyBaseline,
+    }
 
     // Each list holds one argument that is not a setting; a bare key or "--help" would otherwise take the
     // argument after it as its value, and a bare word would be ignored.
@@ -5178,6 +5197,63 @@ public sealed partial class ReplayLifecycleTests
         Assert.Equal(conversion.Message, thrown.Message);
     }
 
+    // A limit of zero or less is reported as a value that cannot be converted is: the lenient loader puts it
+    // back to its default and records one problem naming the key, the value it bound to and that default, and
+    // the strict loader throws the same exception. Every other setting keeps its configured value. The value
+    // comes from an argument or from harness.json, where an explicit null binds as the binder binds it, to 0.
+    [Theory]
+    [InlineData(nameof(HarnessOptions.ReadinessTimeoutSeconds), "argument", "0", 0)]
+    [InlineData(nameof(HarnessOptions.ReadinessTimeoutSeconds), "argument", "-5", -5)]
+    [InlineData(nameof(HarnessOptions.ReadinessPollIntervalSeconds), "argument", "0", 0)]
+    [InlineData(nameof(HarnessOptions.ReadinessPollIntervalSeconds), "argument", "-5", -5)]
+    [InlineData(nameof(HarnessOptions.RequestTimeoutSeconds), "argument", "0", 0)]
+    [InlineData(nameof(HarnessOptions.RequestTimeoutSeconds), "argument", "-5", -5)]
+    [InlineData(nameof(HarnessOptions.ShutdownTimeoutSeconds), "argument", "0", 0)]
+    [InlineData(nameof(HarnessOptions.ShutdownTimeoutSeconds), "argument", "-5", -5)]
+    [InlineData(nameof(HarnessOptions.ShutdownRequestTimeoutSeconds), "argument", "0", 0)]
+    [InlineData(nameof(HarnessOptions.ShutdownRequestTimeoutSeconds), "argument", "-5", -5)]
+    [InlineData(nameof(HarnessOptions.ReadinessTimeoutSeconds), "harness.json", "null", 0)]
+    [InlineData(nameof(HarnessOptions.ShutdownTimeoutSeconds), "harness.json", "-5", -5)]
+    public void NonPositiveLimit_LenientKeepsItsDefaultAndEveryOtherValue_StrictThrows(
+        string limit, string source, string value, int bound)
+    {
+        var key = $"{HarnessOptions.SectionName}:{limit}";
+        var other = limit == nameof(HarnessOptions.ReadinessTimeoutSeconds)
+            ? nameof(HarnessOptions.ShutdownTimeoutSeconds)
+            : nameof(HarnessOptions.ReadinessTimeoutSeconds);
+        string[] args;
+        if (source == "harness.json")
+        {
+            RepoRootDirectory.Write(HarnessJson, $$"""{ "Harness": { "{{limit}}": {{value}} } }""");
+            args = DestinationArgs($"--{HarnessOptions.SectionName}:{other}=7");
+        }
+        else
+        {
+            args = DestinationArgs($"--{key}={value}", $"--{HarnessOptions.SectionName}:{other}=7");
+        }
+
+        var problems = new List<Program.OptionsProblem>();
+        var defaults = new HarnessOptions();
+
+        var options = Program.LoadOptions(args, problems);
+
+        AssertConfiguredDestinations(options);
+        Assert.Equal(LimitSettingSeconds(defaults, limit), LimitSettingSeconds(options, limit));
+        Assert.Equal(LimitSettingDuration(defaults, limit), LimitSettingDuration(options, limit));
+        Assert.Equal(7, LimitSettingSeconds(options, other));
+
+        var problem = AssertSingleProblem(problems);
+        Assert.Equal("a limit is not a positive number of seconds, so it keeps its default", problem.Context);
+        var refusal = Assert.IsType<InvalidOperationException>(problem.Exception);
+        Assert.Equal(
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{key} is {bound}, not a positive number of seconds; its default is {LimitSettingSeconds(defaults, limit)} s"),
+            refusal.Message);
+        var thrown = Assert.Throws<InvalidOperationException>(() => Program.LoadOptions(args));
+        Assert.Equal(refusal.Message, thrown.Message);
+    }
+
     // Each setting is bound on its own, yet ends as binding the whole section of one configuration over the
     // same sources leaves it, whatever harness.json holds: a missing key, an explicit null, "", a value, a key
     // holding only nested entries, or a null endpoints object. An argument outranks harness.json both ways: a
@@ -5189,7 +5265,6 @@ public sealed partial class ReplayLifecycleTests
     [InlineData("""{ "Harness": { "Backend": { "AdminUrl": "http://127.0.0.1:2" } } }""", null, "http://127.0.0.1:2", false)]
     [InlineData("""{ "Harness": { "Backend": { "AdminUrl": { "Nested": "x" } } } }""", null, "http://standin:9090", false)]
     [InlineData("""{ "Harness": { "Backend": null } }""", null, "http://standin:9090", false)]
-    [InlineData("""{ "Harness": { "ReadinessTimeoutSeconds": null } }""", null, "http://standin:9090", false)]
     [InlineData("""{ "Harness": { "ReportPath": null, "SeedDirectory": null } }""", null, "http://standin:9090", false)]
     [InlineData("""{ "Harness": { "Backend": { "AdminUrl": null } } }""", "--Harness:Backend:AdminUrl=http://127.0.0.1:1", "http://127.0.0.1:1", false)]
     [InlineData("""{ "Harness": { "Backend": { "AdminUrl": "http://127.0.0.1:2" } } }""", "--Harness:Backend:AdminUrl=", "", true)]
@@ -5224,6 +5299,7 @@ public sealed partial class ReplayLifecycleTests
     public async Task Replay_WithUnreadableHarnessJsonAndUnknownMode_ReportsBoth_AtTheConfiguredReportPath()
     {
         RepoRootDirectory.Write(HarnessJson, MalformedHarnessJson);
+        Directory.CreateDirectory(RepoRootDirectory.PathOf("baseline"));
         var reportPath = RepoRootDirectory.PathOf("custom.md");
         var ports = ClosedPorts.Take(5);
         string[] args =
@@ -5272,6 +5348,106 @@ public sealed partial class ReplayLifecycleTests
             "the console states that the external backend is never shut down");
     }
 
+    // A negative shutdown request limit costs no wait against closed ports, so the run takes as long as with a
+    // positive one; it still runs, with the default limit, and reports the limit as a startup CHK-EXCEPTION item
+    // at the configured report path, so it exits 1.
+    [Fact]
+    public async Task Replay_WithANonPositiveLimit_ReportsIt_AtTheConfiguredReportPath()
+    {
+        Directory.CreateDirectory(RepoRootDirectory.PathOf("harness/config"));
+        Directory.CreateDirectory(RepoRootDirectory.PathOf("baseline"));
+        string[] args =
+        [
+            .. ReplayArgs(RepoRootDirectory.Root),
+            $"--Harness:ReportPath={ReportPath}",
+            "--Harness:ShutdownRequestTimeoutSeconds=-5",
+        ];
+
+        var exitCode = await RunProgramAsync(args, ReplayLimit);
+
+        Assert.Equal(1, exitCode);
+        Assert.True(File.Exists(ReportPath), "the report is written to Harness:ReportPath");
+
+        // The report holds the temporary root, loopback ports and the run date, so its text is not shown.
+        var report = await File.ReadAllTextAsync(ReportPath, TestContext.Current.CancellationToken);
+        const string detail =
+            "a limit is not a positive number of seconds, so it keeps its default: "
+            + "Harness:ShutdownRequestTimeoutSeconds is -5, not a positive number of seconds; its default is 5 s";
+        var rows = report.Split('\n').Where(line => line.Contains(detail, StringComparison.Ordinal)).ToList();
+        Assert.True(rows.Count == 1, "exactly one report row names the limit, its configured value and the default that applies");
+        Assert.True(
+            rows[0].StartsWith($"| `{FailureItemIds.Exception}` |", StringComparison.Ordinal)
+                && rows[0].Contains($"| `{typeof(InvalidOperationException).FullName}` | no |", StringComparison.Ordinal),
+            "that row is an undocumented CHK-EXCEPTION item of the limit's exception type");
+    }
+
+    // A root that is not an existing directory holding harness/config and baseline is not the repository, so the
+    // replay reads no register, replays and checks nothing and creates nothing, neither the root nor RESULTS.md
+    // nor artifacts/: the directory around the root is left exactly as it was. The report's full text goes to
+    // standard output with the CHK-REPORT item and the CHK-EXCEPTION item naming what the root lacks, cleanup
+    // still runs, the final line is the last line printed and the exit code is 1. Every path printed holds the
+    // temporary directory, so the text is checked with fixed messages.
+    [Theory]
+    [InlineData(NonRepositoryRoot.Missing, "no directory at {root}")]
+    [InlineData(NonRepositoryRoot.Empty, "no harness/config directory at {root}/harness/config; no baseline directory at {root}/baseline")]
+    [InlineData(NonRepositoryRoot.OnlyHarnessConfig, "no baseline directory at {root}/baseline")]
+    [InlineData(NonRepositoryRoot.OnlyBaseline, "no harness/config directory at {root}/harness/config")]
+    public async Task Replay_WithARootThatIsNotTheRepository_CreatesNothing_PrintsTheReport_Exits1(
+        NonRepositoryRoot kind, string expectedProblem)
+    {
+        using var parent = new TempDirectory();
+        var root = parent.PathOf(kind == NonRepositoryRoot.Missing ? "nx/sub" : "root");
+        switch (kind)
+        {
+            case NonRepositoryRoot.Empty:
+                Directory.CreateDirectory(root);
+                break;
+            case NonRepositoryRoot.OnlyHarnessConfig:
+                Directory.CreateDirectory(Path.Combine(root, "harness", "config"));
+                break;
+            case NonRepositoryRoot.OnlyBaseline:
+                Directory.CreateDirectory(Path.Combine(root, "baseline"));
+                break;
+        }
+
+        var before = EntriesBelow(parent.Root);
+
+        var exitCode = await RunProgramAsync(ReplayArgs(root), ReplayLimit);
+
+        Assert.Equal(1, exitCode);
+        Assert.Equal(before, EntriesBelow(parent.Root));
+
+        var stdout = _stdout.ToString();
+        var problem = expectedProblem.Replace(RootToken, root, StringComparison.Ordinal);
+        Assert.True(
+            stdout.Contains($"replay: {problem}; Harness:RepoRoot does not name the repository root. Nothing replayed.", StringComparison.Ordinal),
+            "one line names what the root lacks and states that nothing was replayed");
+        Assert.False(
+            stdout.Contains("replay through the facade", StringComparison.Ordinal),
+            "the replay body never starts, so no readiness, reset, case or check runs");
+        Assert.True(
+            stdout.Contains("replay: report could not be written (", StringComparison.Ordinal)
+                && stdout.Contains(ReportTitle, StringComparison.Ordinal)
+                && stdout.Contains("> Backend used: ", StringComparison.Ordinal),
+            "the report's full text, title and banner included, is printed because it is not written");
+        Assert.True(
+            stdout.Contains($"| `{FailureItemIds.Report}` | — | `{FailureItemIds.WriteFailed}` | no |", StringComparison.Ordinal),
+            "the printed report lists the undocumented CHK-REPORT write-failed item");
+        Assert.True(
+            stdout.Contains(
+                $"| `{FailureItemIds.Exception}` | — | `{typeof(DirectoryNotFoundException).FullName}` | no |",
+                StringComparison.Ordinal)
+                && stdout.Contains(
+                    "Harness:RepoRoot does not name the repository root, so nothing is replayed and nothing below it is written: ",
+                    StringComparison.Ordinal),
+            "the printed report lists the undocumented CHK-EXCEPTION item stating that the root is not the repository");
+        Assert.True(
+            stdout.Contains($"{FailureItemIds.Shutdown(ShutdownTarget.FacadeComponent)} {FailureItemIds.StillRunning}", StringComparison.Ordinal)
+                && stdout.Contains("replay: cleanup: the backend is external and is never shut down", StringComparison.Ordinal),
+            "cleanup still asks the facade at its configured admin URL to stop and leaves the external backend alone");
+        Assert.Equal("0 of 22 operations equivalent, 0 documented differences", LastNonEmptyLine(stdout));
+    }
+
     // Runs the entry point with a hard limit that cancels the run's token and also ends the wait.
     private async Task<int> RunProgramAsync(string[] args, TimeSpan limit)
     {
@@ -5282,6 +5458,57 @@ public sealed partial class ReplayLifecycleTests
 
     private string[] Args(string commandLine) =>
         [.. commandLine.Split(' ').Select(argument => argument.Replace(RootToken, RepoRootDirectory.Root, StringComparison.Ordinal))];
+
+    // A replay of root with every listener URL on a closed loopback port, an external backend and 1 s
+    // readiness, request and shutdown limits, so every network step fails at once and the run ends within
+    // seconds. The shutdown request limit is left to the case: a refused call never waits for it.
+    private static string[] ReplayArgs(string root)
+    {
+        var ports = ClosedPorts.Take(5);
+        return
+        [
+            "replay",
+            $"--Harness:RepoRoot={root}",
+            $"--Harness:Target:RestBaseUrl=http://127.0.0.1:{ports[0]}",
+            $"--Harness:Target:SoapBaseUrl=http://127.0.0.1:{ports[1]}",
+            $"--Harness:Target:AdminUrl=http://127.0.0.1:{ports[2]}",
+            $"--Harness:Backend:RestBaseUrl=http://127.0.0.1:{ports[3]}",
+            $"--Harness:Backend:SoapBaseUrl=http://127.0.0.1:{ports[4]}",
+            "--Harness:Backend:AdminUrl=",
+            "--Harness:ReadinessTimeoutSeconds=1",
+            "--Harness:RequestTimeoutSeconds=1",
+            "--Harness:ShutdownTimeoutSeconds=1",
+        ];
+    }
+
+    // Every entry below directory, relative to it with '/' separators, in ordinal order; no temporary path.
+    private static List<string> EntriesBelow(string directory) =>
+    [
+        .. Directory.EnumerateFileSystemEntries(directory, "*", SearchOption.AllDirectories)
+            .Select(entry => Path.GetRelativePath(directory, entry).Replace(Path.DirectorySeparatorChar, '/'))
+            .Order(StringComparer.Ordinal),
+    ];
+
+    // The limit setting named by its property name, as configured and as the duration the harness waits.
+    private static int LimitSettingSeconds(HarnessOptions options, string limit) => limit switch
+    {
+        nameof(HarnessOptions.ReadinessTimeoutSeconds) => options.ReadinessTimeoutSeconds,
+        nameof(HarnessOptions.ReadinessPollIntervalSeconds) => options.ReadinessPollIntervalSeconds,
+        nameof(HarnessOptions.RequestTimeoutSeconds) => options.RequestTimeoutSeconds,
+        nameof(HarnessOptions.ShutdownTimeoutSeconds) => options.ShutdownTimeoutSeconds,
+        nameof(HarnessOptions.ShutdownRequestTimeoutSeconds) => options.ShutdownRequestTimeoutSeconds,
+        _ => throw new ArgumentOutOfRangeException(nameof(limit), limit, "Not a limit setting."),
+    };
+
+    private static TimeSpan LimitSettingDuration(HarnessOptions options, string limit) => limit switch
+    {
+        nameof(HarnessOptions.ReadinessTimeoutSeconds) => options.ReadinessTimeout,
+        nameof(HarnessOptions.ReadinessPollIntervalSeconds) => options.ReadinessPollInterval,
+        nameof(HarnessOptions.RequestTimeoutSeconds) => options.RequestTimeout,
+        nameof(HarnessOptions.ShutdownTimeoutSeconds) => options.ShutdownTimeout,
+        nameof(HarnessOptions.ShutdownRequestTimeoutSeconds) => options.ShutdownRequestTimeout,
+        _ => throw new ArgumentOutOfRangeException(nameof(limit), limit, "Not a limit setting."),
+    };
 
     // The settings as binding the whole section gives them: one configuration over harness.json, the
     // environment and the arguments, bound at once; no section at all means every default.

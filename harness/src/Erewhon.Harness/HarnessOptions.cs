@@ -241,6 +241,30 @@ public sealed class HarnessOptions
     public TimeSpan ShutdownRequestTimeout =>
         Seconds(ShutdownRequestTimeoutSeconds, DefaultShutdownRequestTimeoutSeconds);
 
+    /// <summary>
+    /// Puts every limit setting that is zero or negative back to its default and states each one, so the
+    /// settings loader can report it as it reports a value that cannot be converted. The limits are
+    /// <see cref="ReadinessTimeoutSeconds"/>, <see cref="ReadinessPollIntervalSeconds"/>,
+    /// <see cref="RequestTimeoutSeconds"/>, <see cref="ShutdownTimeoutSeconds"/> and
+    /// <see cref="ShutdownRequestTimeoutSeconds"/>; a positive limit is left as it is.
+    /// </summary>
+    /// <returns>One entry per limit put back, in declaration order; empty when every limit is positive.</returns>
+    internal IReadOnlyList<LimitReset> ResetNonPositiveLimits()
+    {
+        var resets = new List<LimitReset>();
+        ReadinessTimeoutSeconds = PositiveOrDefault(
+            nameof(ReadinessTimeoutSeconds), ReadinessTimeoutSeconds, DefaultReadinessTimeoutSeconds, resets);
+        ReadinessPollIntervalSeconds = PositiveOrDefault(
+            nameof(ReadinessPollIntervalSeconds), ReadinessPollIntervalSeconds, DefaultReadinessPollIntervalSeconds, resets);
+        RequestTimeoutSeconds = PositiveOrDefault(
+            nameof(RequestTimeoutSeconds), RequestTimeoutSeconds, DefaultRequestTimeoutSeconds, resets);
+        ShutdownTimeoutSeconds = PositiveOrDefault(
+            nameof(ShutdownTimeoutSeconds), ShutdownTimeoutSeconds, DefaultShutdownTimeoutSeconds, resets);
+        ShutdownRequestTimeoutSeconds = PositiveOrDefault(
+            nameof(ShutdownRequestTimeoutSeconds), ShutdownRequestTimeoutSeconds, DefaultShutdownRequestTimeoutSeconds, resets);
+        return resets;
+    }
+
     // Blank RepoRoot (for example an empty Harness__RepoRoot) falls back to the default, so a path can
     // never silently resolve against the current directory.
     private string Root => string.IsNullOrWhiteSpace(RepoRoot) ? DefaultRepoRoot : RepoRoot;
@@ -267,9 +291,27 @@ public sealed class HarnessOptions
     };
 
     // A zero or negative limit falls back to its default, so every readiness, request and shutdown wait
-    // stays bounded and positive.
+    // stays bounded and positive. The settings loader already reports such a value and puts it back
+    // (ResetNonPositiveLimits); this fallback covers settings built in code.
     private static TimeSpan Seconds(int configured, int fallback) =>
         TimeSpan.FromSeconds(configured > 0 ? configured : fallback);
+
+    private static int PositiveOrDefault(string setting, int configured, int fallback, List<LimitReset> resets)
+    {
+        if (configured > 0)
+        {
+            return configured;
+        }
+
+        resets.Add(new LimitReset(setting, configured, fallback));
+        return fallback;
+    }
+
+    /// <summary>A limit setting that <see cref="ResetNonPositiveLimits"/> put back to its default.</summary>
+    /// <param name="Setting">The setting's property name, for example <c>ShutdownTimeoutSeconds</c>.</param>
+    /// <param name="Configured">The zero or negative value it was given.</param>
+    /// <param name="DefaultSeconds">The default it now holds.</param>
+    internal sealed record LimitReset(string Setting, int Configured, int DefaultSeconds);
 }
 
 // ConfinedTree sits beside the options because the harness roots every instance at Harness:RepoRoot, as
