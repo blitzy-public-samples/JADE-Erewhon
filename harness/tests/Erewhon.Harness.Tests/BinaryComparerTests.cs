@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
@@ -1456,7 +1455,7 @@ public sealed partial class BinaryComparerTests
         Assert.Empty(await Store.ReadEntriesAsync(TestCancellation));
         Assert.Empty(await Store.ReadRecordIndexAsync(TestCancellation));
         await Assert.ThrowsAsync<InvalidDataException>(() => Store.ReadEntryAsync(KeyOf(AgentRecord), TestCancellation));
-        Assert.Empty(Directory.EnumerateFileSystemEntries(StoreRoot));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(StoreRoot).Select(Relative));
     }
 
     // ---- Write refusals -----------------------------------------------------------------------------
@@ -1472,7 +1471,7 @@ public sealed partial class BinaryComparerTests
 
         Assert.Contains("every record must be labelled 'jade-standin'", ex.Message, StringComparison.Ordinal);
         Assert.Equal(ex.Message, asyncEx.Message);
-        Assert.Empty(Directory.EnumerateFileSystemEntries(StoreRoot));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(StoreRoot).Select(Relative));
     }
 
     [Theory]
@@ -1493,7 +1492,7 @@ public sealed partial class BinaryComparerTests
 
         Assert.Contains(reason, ex.Message, StringComparison.Ordinal);
         Assert.Equal(ex.Message, asyncEx.Message);
-        Assert.Empty(Directory.EnumerateFileSystemEntries(StoreRoot));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(StoreRoot).Select(Relative));
     }
 
     // A method name that climbs out of baseline/ is refused before any path is formed from it.
@@ -1513,7 +1512,7 @@ public sealed partial class BinaryComparerTests
 
         Assert.Equal(parameter, ex.ParamName);
         Assert.Equal(parameter, asyncEx.ParamName);
-        Assert.Empty(Directory.EnumerateFileSystemEntries(StoreRoot));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(StoreRoot).Select(Relative));
     }
 
     // ---- Read refusals ------------------------------------------------------------------------------
@@ -1761,8 +1760,8 @@ public sealed partial class BinaryComparerTests
 
         Store.ClearRecords(TestCancellation);
 
-        Assert.Empty(Directory.GetFiles(Full("baseline/records/rest")));
-        Assert.Empty(Directory.GetFiles(Full("baseline/records/soap")));
+        Assert.Empty(Directory.GetFiles(Full("baseline/records/rest")).Select(Relative));
+        Assert.Empty(Directory.GetFiles(Full("baseline/records/soap")).Select(Relative));
         Assert.Equal(6, kept.Count);
         Assert.Equal(kept, Snapshot(Full("baseline")));
     }
@@ -1772,15 +1771,15 @@ public sealed partial class BinaryComparerTests
     {
         Store.ClearRecords(TestCancellation);
 
-        Assert.Empty(Directory.EnumerateFileSystemEntries(Full("baseline/records/rest")));
-        Assert.Empty(Directory.EnumerateFileSystemEntries(Full("baseline/records/soap")));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(Full("baseline/records/rest")).Select(Relative));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(Full("baseline/records/soap")).Select(Relative));
     }
 
     [Fact]
     public void DeleteWsdl_RemovesTheFileAndIsANoOpWhenAbsent()
     {
         Store.DeleteWsdl();
-        Assert.Empty(Directory.EnumerateFileSystemEntries(StoreRoot));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(StoreRoot).Select(Relative));
 
         Store.WriteManifest(Manifest);
         Store.WriteWsdl(WsdlBytes);
@@ -1795,11 +1794,11 @@ public sealed partial class BinaryComparerTests
     public async Task DeleteManifest_RemovesTheManifestAndAStaleTemporaryAndIsANoOpWhenAbsent()
     {
         Store.DeleteManifest();
-        Assert.Empty(Directory.EnumerateFileSystemEntries(StoreRoot));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(StoreRoot).Select(Relative));
 
         Directory.CreateDirectory(Full("baseline"));
         Store.DeleteManifest();
-        Assert.Empty(Directory.EnumerateFileSystemEntries(Full("baseline")));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(Full("baseline")).Select(Relative));
 
         await WriteFixture(Store, useAsync: false);
         await WriteRaw(ManifestTemporaryFile, "{\"source\":\"jade-"u8.ToArray());
@@ -2243,7 +2242,12 @@ public sealed partial class BinaryComparerTests
             var refusal = await Assert.ThrowsAsync<InvalidOperationException>(() => ReadThrough(reader));
 
             AssertReadLinkRefusal(refusal, link);
-            Assert.Equal(target, new FileInfo(Full(link)).LinkTarget);
+
+            // The outside directory is named per run, so both sides show it as a fixed token.
+            const string outsideToken = "<outside-directory>";
+            Assert.Equal(
+                target.Replace(outside, outsideToken, StringComparison.Ordinal),
+                new FileInfo(Full(link)).LinkTarget?.Replace(outside, outsideToken, StringComparison.Ordinal));
         }
         finally
         {
@@ -2478,17 +2482,9 @@ public sealed partial class BinaryComparerTests
             && path.IndexOf('/', directory.Length + 1) < 0;
     }
 
-    // .NET has no hard-link API, so ln(1) creates it.
-    private static void CreateHardLink(string link, string existingFile)
-    {
-        var startInfo = new ProcessStartInfo("ln") { UseShellExecute = false };
-        startInfo.ArgumentList.Add(existingFile);
-        startInfo.ArgumentList.Add(link);
-        using var process = Process.Start(startInfo);
-        Assert.NotNull(process);
-        Assert.True(process.WaitForExit(TimeSpan.FromSeconds(30)), "ln did not finish within 30 s");
-        Assert.Equal(0, process.ExitCode);
-    }
+    // .NET has no hard-link API, so ln(1) creates it, through the bounded tool runner the replay tests use.
+    private static void CreateHardLink(string link, string existingFile) =>
+        Assert.True(SpecialFileSupport.Run("ln", existingFile, link) == 0, "ln must create the hard link.");
 
     private string Full(string relative) => Path.Combine(StoreRoot, relative.Replace('/', Path.DirectorySeparatorChar));
 
@@ -2550,7 +2546,10 @@ public sealed partial class BinaryComparerTests
         }
         else if (outcome is not null)
         {
-            Assert.True(outcome is IOException, outcome.ToString());
+            // The exception's text can name the temporary root, so only its type is shown.
+            Assert.True(
+                outcome is IOException,
+                $"The race ended with {outcome.GetType().FullName}, which is neither a link refusal nor an I/O error.");
         }
     }
 

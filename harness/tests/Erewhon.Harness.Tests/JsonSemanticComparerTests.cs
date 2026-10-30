@@ -1,9 +1,11 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Net;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Erewhon.Contracts.Admin;
 using Erewhon.Contracts.Catalogue;
 using Erewhon.Harness.Checks;
@@ -1629,6 +1631,14 @@ public sealed partial class JsonSemanticComparerTests
     private const string AuthorityToken = "{authority}";
     private const string UserInfoPassword = "user-info-password";
 
+    // Stand for the test's temporary root and a loopback port, which differ in every run, in what a failure
+    // message shows; the check prints neither token.
+    private const string RootToken = "<root>";
+    private const string PortToken = "<port>";
+
+    // A detail names the stub's port and paths below the root, so the failing item's copy is compared unshown.
+    private const string FailureDetailMessage = "The failing item must carry the check's detail.";
+
     // Request limit and connect limit: generous for a loaded host, never reached by a passing test.
     private const int RequestLimitSeconds = 10;
 
@@ -1666,6 +1676,9 @@ public sealed partial class JsonSemanticComparerTests
     private static readonly string NoResponseConnect = DiscrepancyKinds.NoResponse(NoResponseReasons.Connect);
 
     private static readonly byte[] StaleLiveDocument = Encoding.UTF8.GetBytes("stale live document of an earlier run");
+
+    // The port of a loopback URL, as a detail names the stub it fetched from.
+    private static readonly Regex LoopbackPort = new(@"(?<=127\.0\.0\.1:)[0-9]+", RegexOptions.CultureInvariant);
 
     // Created on first use, so only the drift check tests create this root or hold a runner; removed in
     // Dispose. The check compares with the class's _comparer, built on the same catalogue and rules.
@@ -1721,8 +1734,8 @@ public sealed partial class JsonSemanticComparerTests
         var result = await RunAsync(adminUrl.Replace(AuthorityToken, facade.Authority, StringComparison.Ordinal));
 
         AssertNotRun(result);
-        Assert.Contains(AdminUrlSetting, result.Result.Detail, StringComparison.Ordinal);
-        Assert.DoesNotContain(UserInfoPassword, result.Result.Detail, StringComparison.Ordinal);
+        Assert.Contains(AdminUrlSetting, Redacted(result.Result.Detail), StringComparison.Ordinal);
+        Assert.DoesNotContain(UserInfoPassword, Redacted(result.Result.Detail), StringComparison.Ordinal);
         Assert.Empty(facade.Requests);
         Assert.False(File.Exists(LiveDocumentPath), "A stale live document must be removed.");
         AssertOnlyFilesWritten(contract, liveDocument: null);
@@ -1737,7 +1750,7 @@ public sealed partial class JsonSemanticComparerTests
         var result = await RunAsync($"http://{IPAddress.Loopback}:{ClosedPorts.Take(1).Single()}");
 
         AssertNotRun(result);
-        Assert.Contains(NoResponseConnect, result.Result.Detail, StringComparison.Ordinal);
+        Assert.Contains(NoResponseConnect, Redacted(result.Result.Detail), StringComparison.Ordinal);
         Assert.False(File.Exists(LiveDocumentPath), "A stale live document must be removed.");
         AssertOnlyFilesWritten(contract, liveDocument: null);
     }
@@ -1785,7 +1798,7 @@ public sealed partial class JsonSemanticComparerTests
         Assert.Equal(FailureItemIds.OpenApiDrift, failure.ItemId);
         Assert.Equal(FailureItemIds.Missing, failure.Nature);
         Assert.Null(failure.Operation);
-        Assert.Equal(result.Result.Detail, failure.Detail);
+        Assert.True(string.Equals(result.Result.Detail, failure.Detail, StringComparison.Ordinal), FailureDetailMessage);
         Assert.Empty(result.Discrepancies);
         Assert.Equal(AdminRoutes.OpenApiDocument, Assert.Single(facade.Requests));
         Assert.False(File.Exists(Options.ContractsOpenApiPath), "The check must never create the checked-in contract.");
@@ -1816,7 +1829,9 @@ public sealed partial class JsonSemanticComparerTests
 
         var result = await RunAsync(facade.BaseUrl);
 
-        Assert.Equal(new CheckResult(CheckNames.OpenApiDrift, CheckOutcomes.Pass, Cases: 1, Passed: 1, Detail: null), result.Result);
+        Assert.Equal(
+            new CheckResult(CheckNames.OpenApiDrift, CheckOutcomes.Pass, Cases: 1, Passed: 1, Detail: null),
+            result.Result with { Detail = Redacted(result.Result.Detail) });
         Assert.Null(result.Failure);
         Assert.Empty(result.Discrepancies);
         Assert.Equal(AdminRoutes.OpenApiDocument, Assert.Single(facade.Requests));
@@ -1838,7 +1853,7 @@ public sealed partial class JsonSemanticComparerTests
         Assert.Equal(CheckOutcomes.Pass, result.Result.Outcome);
         Assert.Equal(1, result.Result.Cases);
         Assert.Equal(1, result.Result.Passed);
-        Assert.Contains(LiveDocumentPath, result.Result.Detail, StringComparison.Ordinal);
+        Assert.Contains(Redacted(LiveDocumentPath), Redacted(result.Result.Detail), StringComparison.Ordinal);
         Assert.Null(result.Failure);
         Assert.Empty(result.Discrepancies);
         Assert.True(Directory.Exists(LiveDocumentPath), "The check must leave a directory in the artifact's place untouched.");
@@ -2069,6 +2084,16 @@ public sealed partial class JsonSemanticComparerTests
 
     private string LiveDocumentPath => Path.Combine(Options.ArtifactsDirectory, "openapi", "live.json");
 
+    /// <summary>
+    /// <paramref name="text"/> with the test's root replaced by <see cref="RootToken"/> and every loopback port by
+    /// <see cref="PortToken"/>, so a failure message reads the same in every run. A comparison with a literal that
+    /// holds neither holds exactly when the raw one does, and so does one of two paths below the root, which hold
+    /// no loopback URL.
+    /// </summary>
+    [return: NotNullIfNotNull(nameof(text))]
+    private string? Redacted(string? text) =>
+        text is null ? null : LoopbackPort.Replace(text.Replace(Root, RootToken, StringComparison.Ordinal), PortToken);
+
     private Task<ContractCheckResult> RunAsync(string adminUrl)
     {
         Options.Target.AdminUrl = adminUrl;
@@ -2113,8 +2138,8 @@ public sealed partial class JsonSemanticComparerTests
         }
 
         Assert.Equal(
-            expected.Order(StringComparer.Ordinal),
-            Directory.EnumerateFiles(Root, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal));
+            expected.Select(Redacted).Order(StringComparer.Ordinal),
+            Directory.EnumerateFiles(Root, "*", SearchOption.AllDirectories).Select(Redacted).Order(StringComparer.Ordinal));
         if (contract is not null)
         {
             Assert.Equal(contract, File.ReadAllBytes(Options.ContractsOpenApiPath));
@@ -2137,7 +2162,7 @@ public sealed partial class JsonSemanticComparerTests
         Assert.Equal(FailureItemIds.OpenApiDrift, failure.ItemId);
         Assert.Equal(FailureItemIds.NotRun, failure.Nature);
         Assert.Null(failure.Operation);
-        Assert.Equal(result.Result.Detail, failure.Detail);
+        Assert.True(string.Equals(result.Result.Detail, failure.Detail, StringComparison.Ordinal), FailureDetailMessage);
         Assert.Empty(result.Discrepancies);
     }
 
@@ -2156,7 +2181,7 @@ public sealed partial class JsonSemanticComparerTests
         Assert.Equal(FailureItemIds.OpenApiDrift, failure.ItemId);
         Assert.Equal(FailureItemIds.Diff(DiscrepancySignature.Compute(expected)), failure.Nature);
         Assert.Null(failure.Operation);
-        Assert.Equal(result.Result.Detail, failure.Detail);
+        Assert.True(string.Equals(result.Result.Detail, failure.Detail, StringComparison.Ordinal), FailureDetailMessage);
     }
 
     private static byte[] WithByteOrderMark(byte[] bytes) => [.. Encoding.UTF8.Preamble, .. bytes];
@@ -2243,6 +2268,10 @@ public sealed partial class JsonSemanticComparerTests
     // Printed once the root is accepted, before the readiness wait of ReadinessLimitSeconds; a refusal never prints it.
     private const string WaitLine = "export-openapi: waiting up to 30 s for the facade admin listener";
 
+    // Stands for ExportScratch, which differs in every run, in the console text and entries a failure message
+    // shows; the mode prints no such token.
+    private const string ExportScratchToken = "<export-scratch>";
+
     // Well inside the readiness limit, and generous for a loaded host.
     private static readonly TimeSpan RefusalLimit = TimeSpan.FromSeconds(10);
 
@@ -2295,8 +2324,8 @@ public sealed partial class JsonSemanticComparerTests
 
         Assert.Equal(1, exitCode);
         Assert.Equal(
-            $"{LinePrefix}no contracts directory at {Path.Combine(repoRoot, "contracts")}; {Refusal}{Environment.NewLine}",
-            ExportConsole.ToString());
+            ExportRedacted($"{LinePrefix}no contracts directory at {Path.Combine(repoRoot, "contracts")}; {Refusal}{Environment.NewLine}"),
+            ExportRedacted(ExportConsole.ToString()));
         Assert.True(stopwatch.Elapsed < RefusalLimit, "The refusal must come before the readiness wait.");
         Assert.Equal(before, Entries());
         if (root == NotRepository.ContractsIsAFile)
@@ -2318,12 +2347,12 @@ public sealed partial class JsonSemanticComparerTests
 
         Assert.Equal(0, exitCode);
         Assert.Equal(
-            string.Create(
+            ExportRedacted(string.Create(
                 CultureInfo.InvariantCulture,
-                $"{WaitLine}{Environment.NewLine}{LinePrefix}wrote {Document.Length} bytes to {target}{Environment.NewLine}"),
-            ExportConsole.ToString());
+                $"{WaitLine}{Environment.NewLine}{LinePrefix}wrote {Document.Length} bytes to {target}{Environment.NewLine}")),
+            ExportRedacted(ExportConsole.ToString()));
         string[] created = [repoRoot, Path.Combine(repoRoot, "contracts"), Path.GetDirectoryName(target)!, target];
-        Assert.Equal(created, Entries());
+        Assert.Equal(created.Select(ExportRedacted), Entries());
         Assert.Equal(Document, File.ReadAllBytes(target));
         Assert.Equal(AdminRoutes.OpenApiDocument, facade.Requests[^1]);
         Assert.All(facade.Requests.SkipLast(1), request => Assert.Equal(AdminRoutes.Health, request));
@@ -2345,10 +2374,11 @@ public sealed partial class JsonSemanticComparerTests
 
         Assert.Equal(1, exitCode);
         Assert.Equal(
-            $"{WaitLine}{Environment.NewLine}{LinePrefix}failed: {typeof(IOException).FullName}: The contract directory '{openApiDirectory}' cannot be created: "
-                + $"its parent '{contracts}' is not a directory.{Environment.NewLine}",
-            ExportConsole.ToString());
-        Assert.Equal(new[] { repoRoot }, Entries());
+            ExportRedacted(
+                $"{WaitLine}{Environment.NewLine}{LinePrefix}failed: {typeof(IOException).FullName}: The contract directory '{openApiDirectory}' cannot be created: "
+                + $"its parent '{contracts}' is not a directory.{Environment.NewLine}"),
+            ExportRedacted(ExportConsole.ToString()));
+        Assert.Equal(new[] { ExportRedacted(repoRoot) }, Entries());
     }
 
     private static HarnessOptions ExportOptions(string repoRoot, string adminUrl) => new()
@@ -2360,9 +2390,21 @@ public sealed partial class JsonSemanticComparerTests
         RequestTimeoutSeconds = RequestLimitSeconds,
     };
 
-    /// <summary>Every file and directory under the export-openapi test's directory, in ordinal order.</summary>
+    /// <summary>
+    /// Every file and directory under the export-openapi test's directory, redacted by <see cref="ExportRedacted"/>,
+    /// in ordinal order.
+    /// </summary>
     private string[] Entries() =>
-        [.. Directory.EnumerateFileSystemEntries(ExportScratch, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal)];
+        [.. Directory.EnumerateFileSystemEntries(ExportScratch, "*", SearchOption.AllDirectories).Select(ExportRedacted).Order(StringComparer.Ordinal)];
+
+    /// <summary>
+    /// <paramref name="text"/> with <see cref="ExportScratch"/> replaced by <see cref="ExportScratchToken"/> and every
+    /// loopback port by <see cref="PortToken"/>, so a failure message reads the same in every run. Both sides of a
+    /// comparison go through it, and neither the expected lines nor the paths below the directory hold a loopback
+    /// URL, so it holds exactly when the raw comparison does.
+    /// </summary>
+    private string ExportRedacted(string text) =>
+        LoopbackPort.Replace(text.Replace(ExportScratch, ExportScratchToken, StringComparison.Ordinal), PortToken);
 
     /// <summary>
     /// An in-process facade admin listener on 127.0.0.1 and an ephemeral port: <c>GET /health</c> answers 200, and

@@ -530,7 +530,11 @@ public sealed partial class NormaliserTests : IDisposable
         File.WriteAllText(path, document.ToJsonString());
 
         var exception = Assert.Throws<InvalidDataException>(() => NormalisationRules.Load(path));
-        Assert.Equal(InvalidPrefix + "$.rules[1].id must be 'N2', but is 'N3'.", exception.Message);
+
+        // A message that named the file would show this test's temporary directory, so that is replaced by a fixed token.
+        Assert.Equal(
+            InvalidPrefix + "$.rules[1].id must be 'N2', but is 'N3'.",
+            exception.Message.Replace(TemporaryDirectory, "<temporary-directory>", StringComparison.Ordinal));
     }
 
     // A directory at the path is the portable unreadable case: tests may run as root, which file modes do
@@ -1196,9 +1200,9 @@ public sealed partial class NormaliserTests
     }
 
     [Theory]
-    [InlineData("""[{"name":"Brian Olsen","email":"bo@wol.com","website":""},{"name":"Pauline Wild","email":"pw@wild.com","website":"<lone-surrogate>"}]""", false)]
-    [InlineData("""[{"name":"Brian Olsen","email":"bo@wol.com","website":""},{"name":"<lone-surrogate>","email":"x","website":""},{"name":"Pauline Wild","email":"pw@wild.com","website":""}]""", false)]
-    [InlineData("""[{"name":"Brian Olsen","email":"bo@wol.com","website":""},{"name":"Pauline Wild","email":"pw@wild.com","website":"<lone-surrogate>"}]""", true)]
+    [InlineData("""[{"name":"Brian Olsen","email":"bo@wol.com","website":""},{"name":"Pauline Wild","email":"pw@wild.com","website":"<lone-surrogate>"}]""", false, Label = "escaped surrogate in seed website")]
+    [InlineData("""[{"name":"Brian Olsen","email":"bo@wol.com","website":""},{"name":"<lone-surrogate>","email":"x","website":""},{"name":"Pauline Wild","email":"pw@wild.com","website":""}]""", false, Label = "escaped surrogate in another client's name")]
+    [InlineData("""[{"name":"Brian Olsen","email":"bo@wol.com","website":""},{"name":"Pauline Wild","email":"pw@wild.com","website":"<lone-surrogate>"}]""", true, Label = "raw surrogate in seed website")]
     public void UndecodableSeedRecord_ObservesEverySeedValueAsAbsent(string template, bool raw)
     {
         var result = Run(RestRecord(ConformanceCheck.SeedAssertionCaseId, "Rest.getAllClients", 200, WithLoneSurrogate(template, raw)));
@@ -1374,15 +1378,25 @@ public sealed partial class NormaliserTests
         var fresh = Run(ConformanceSeedRecord());
         var readBack = ConformanceResult.Parse(JsonNode.Parse(fresh.ToJsonNode().ToJsonString()));
 
-        // Xunit.Record is named in full: this class's own Record builds a baseline record.
-        Assert.Null(Xunit.Record.Exception(() => _check.Verify(committed)));
-        Assert.Null(Xunit.Record.Exception(() => _check.Verify(fresh)));
-        Assert.Null(Xunit.Record.Exception(() => _check.Verify(readBack)));
+        AssertVerifies(committed);
+        AssertVerifies(fresh);
+        AssertVerifies(readBack);
     }
 
     [Fact]
     public void Verify_RejectsANullResult() =>
         Assert.Throws<ArgumentNullException>("result", () => _check.Verify(null!));
+
+    // A rejection is shown by its type and message only: the exception's text would carry its stack trace,
+    // whose source paths differ between checkouts. Verify reads no file, so its messages are fixed.
+    private void AssertVerifies(ConformanceResult result)
+    {
+        // Xunit.Record is named in full: this class's own Record builds a baseline record.
+        var rejection = Xunit.Record.Exception(() => _check.Verify(result));
+        Assert.True(
+            rejection is null,
+            $"Verify rejected the result with {rejection?.GetType().FullName}: {rejection?.Message}");
+    }
 
     /// <summary>
     /// Applies <paramref name="tamper"/> to a document written by <see cref="ConformanceResult.ToJsonNode"/>
@@ -1520,13 +1534,13 @@ public sealed partial class NormaliserTests
     /// namespace or in any other give no observation.
     /// </summary>
     [Theory]
-    [InlineData("<e:Envelope xmlns:e=\"http://schemas.xmlsoap.org/soap/envelope/\"><e:Body><message></e:Body></e:Envelope>", Pass)]
-    [InlineData("<Envelope xmlns=\"http://schemas.xmlsoap.org/soap/envelope/\"><Body><message></Body></Envelope>", Pass)]
-    [InlineData("<Envelope><Body><message></Body></Envelope>", Unobserved)]
-    [InlineData("<e:Envelope xmlns:e=\"http://www.w3.org/2003/05/soap-envelope\"><e:Body><message></e:Body></e:Envelope>", Unobserved)]
-    [InlineData("<e:Envelope xmlns:e=\"urn:example:foreign\"><b:Body xmlns:b=\"http://schemas.xmlsoap.org/soap/envelope/\"><message></b:Body></e:Envelope>", Unobserved)]
-    [InlineData("<e:Envelope xmlns:e=\"http://schemas.xmlsoap.org/soap/envelope/\"><Body><message></Body></e:Envelope>", Unobserved)]
-    [InlineData("<e:Envelope xmlns:e=\"http://schemas.xmlsoap.org/soap/envelope/\"><b:Body xmlns:b=\"urn:example:foreign\"><message></b:Body></e:Envelope>", Unobserved)]
+    [InlineData("<e:Envelope xmlns:e=\"http://schemas.xmlsoap.org/soap/envelope/\"><e:Body><message></e:Body></e:Envelope>", Pass, Label = "prefixed SOAP 1.1 envelope")]
+    [InlineData("<Envelope xmlns=\"http://schemas.xmlsoap.org/soap/envelope/\"><Body><message></Body></Envelope>", Pass, Label = "default-namespace SOAP 1.1 envelope")]
+    [InlineData("<Envelope><Body><message></Body></Envelope>", Unobserved, Label = "no namespace")]
+    [InlineData("<e:Envelope xmlns:e=\"http://www.w3.org/2003/05/soap-envelope\"><e:Body><message></e:Body></e:Envelope>", Unobserved, Label = "SOAP 1.2 namespace")]
+    [InlineData("<e:Envelope xmlns:e=\"urn:example:foreign\"><b:Body xmlns:b=\"http://schemas.xmlsoap.org/soap/envelope/\"><message></b:Body></e:Envelope>", Unobserved, Label = "foreign Envelope, SOAP 1.1 Body")]
+    [InlineData("<e:Envelope xmlns:e=\"http://schemas.xmlsoap.org/soap/envelope/\"><Body><message></Body></e:Envelope>", Unobserved, Label = "SOAP 1.1 Envelope, Body in no namespace")]
+    [InlineData("<e:Envelope xmlns:e=\"http://schemas.xmlsoap.org/soap/envelope/\"><b:Body xmlns:b=\"urn:example:foreign\"><message></b:Body></e:Envelope>", Unobserved, Label = "SOAP 1.1 Envelope, foreign Body")]
     public void SoapEnvelope_IsEvidenceOnlyInTheSoap11EnvelopeNamespace(string envelopeTemplate, string expected)
     {
         var message = $"""<getAgentResponse xmlns="{TargetNamespace}"><getAgentResult><name>Hank Williams</name></getAgentResult></getAgentResponse>""";
@@ -1542,17 +1556,17 @@ public sealed partial class NormaliserTests
     /// observation, so a property found only there stays unobserved and is never judged by its value.
     /// </summary>
     [Theory]
-    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><name>Hank Williams</name></getAgentResult></getAgentResponse>", Pass)]
-    [InlineData("<m:getAgentResponse xmlns:m=\"urn:JadeWebServices/WebServiceHTTP/\"><m:getAgentResult><m:name>Hank Williams</m:name></m:getAgentResult></m:getAgentResponse>", Pass)]
-    [InlineData("<getAgentResponse><getAgentResult><name>Hank Williams</name></getAgentResult></getAgentResponse>", Unobserved)]
-    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP\"><getAgentResult><name>Hank Williams</name></getAgentResult></getAgentResponse>", Unobserved)]
-    [InlineData("<getAgentResponse xmlns=\"urn:example:foreign\"><getAgentResult><name>Hank Williams</name></getAgentResult></getAgentResponse>", Unobserved)]
-    [InlineData("<m:getAgentResponse xmlns:m=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><m:name>Hank Williams</m:name></getAgentResult></m:getAgentResponse>", Unobserved)]
-    [InlineData("<m:getAgentResponse xmlns:m=\"urn:JadeWebServices/WebServiceHTTP/\"><f:getAgentResult xmlns:f=\"urn:example:foreign\"><m:name>Hank Williams</m:name></f:getAgentResult></m:getAgentResponse>", Unobserved)]
-    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><f:name xmlns:f=\"urn:example:foreign\">Hank Williams</f:name></getAgentResult></getAgentResponse>", Unobserved)]
-    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><name xmlns=\"\">Hank Williams</name></getAgentResult></getAgentResponse>", Unobserved)]
-    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><f:name xmlns:f=\"urn:example:foreign\"><x/></f:name></getAgentResult></getAgentResponse>", Unobserved)]
-    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><f:name xmlns:f=\"urn:example:foreign\">x</f:name><name>Hank Williams</name></getAgentResult></getAgentResponse>", Pass)]
+    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><name>Hank Williams</name></getAgentResult></getAgentResponse>", Pass, Label = "default target namespace")]
+    [InlineData("<m:getAgentResponse xmlns:m=\"urn:JadeWebServices/WebServiceHTTP/\"><m:getAgentResult><m:name>Hank Williams</m:name></m:getAgentResult></m:getAgentResponse>", Pass, Label = "prefixed target namespace")]
+    [InlineData("<getAgentResponse><getAgentResult><name>Hank Williams</name></getAgentResult></getAgentResponse>", Unobserved, Label = "no namespace")]
+    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP\"><getAgentResult><name>Hank Williams</name></getAgentResult></getAgentResponse>", Unobserved, Label = "near-miss namespace")]
+    [InlineData("<getAgentResponse xmlns=\"urn:example:foreign\"><getAgentResult><name>Hank Williams</name></getAgentResult></getAgentResponse>", Unobserved, Label = "foreign namespace")]
+    [InlineData("<m:getAgentResponse xmlns:m=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><m:name>Hank Williams</m:name></getAgentResult></m:getAgentResponse>", Unobserved, Label = "Result in no namespace")]
+    [InlineData("<m:getAgentResponse xmlns:m=\"urn:JadeWebServices/WebServiceHTTP/\"><f:getAgentResult xmlns:f=\"urn:example:foreign\"><m:name>Hank Williams</m:name></f:getAgentResult></m:getAgentResponse>", Unobserved, Label = "foreign Result")]
+    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><f:name xmlns:f=\"urn:example:foreign\">Hank Williams</f:name></getAgentResult></getAgentResponse>", Unobserved, Label = "foreign name")]
+    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><name xmlns=\"\">Hank Williams</name></getAgentResult></getAgentResponse>", Unobserved, Label = "name in no namespace")]
+    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><f:name xmlns:f=\"urn:example:foreign\"><x/></f:name></getAgentResult></getAgentResponse>", Unobserved, Label = "foreign name with element content")]
+    [InlineData("<getAgentResponse xmlns=\"urn:JadeWebServices/WebServiceHTTP/\"><getAgentResult><f:name xmlns:f=\"urn:example:foreign\">x</f:name><name>Hank Williams</name></getAgentResult></getAgentResponse>", Pass, Label = "foreign name before target name")]
     public void SoapMessageElements_AreEvidenceOnlyInTheTargetNamespace(string message, string expected)
     {
         var result = Run(SoapBodyRecord("Soap.getAgent", SoapEnvelope(message)));

@@ -1,9 +1,11 @@
 using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Security;
 using System.Text;
+using System.Text.RegularExpressions;
 using Erewhon.Contracts.Admin;
 using Erewhon.Contracts.Catalogue;
 using Erewhon.Harness.Checks;
@@ -1071,7 +1073,8 @@ public sealed partial class XmlSemanticComparerTests : IDisposable
     /// on an unmatched getAgentNames item, and on a paired element or item whose other side lacks it. Each row is
     /// the baseline, the body whose attribute is <c>p:T</c> with <c>p</c> bound to <c>urn:t</c>, the body whose
     /// attribute is the raw text <c>{urn:t}T</c>, which reads like that resolved name, whether the bodies are
-    /// getAgentNames responses, and the attribute's path.
+    /// getAgentNames responses, and the attribute's path. Each row is labelled by where the attribute sits, because
+    /// its arguments, cut short in the display name, would give two rows the same name.
     /// </summary>
     public static TheoryData<string, string, string, bool, string> OneSidedResolvedQNameAndLookalike()
     {
@@ -1083,13 +1086,16 @@ public sealed partial class XmlSemanticComparerTests : IDisposable
         static string Untyped(string children) => $"<r xmlns:xsi=\"{XsiNamespace}\">{children}</r>";
         static string AgentNames(string items) => Envelope(GetAgentNames, items, indent: false);
         static string Item(string attributes) => $"<{NameItem}{attributes}><{NameProperty}>Airi Hamada</{NameProperty}></{NameItem}>";
+        static TheoryDataRow<string, string, string, bool, string> Row(
+            string label, string baseline, string resolved, string lookalike, bool agentNames, string attributePath) =>
+            new(baseline, resolved, lookalike, agentNames, attributePath) { Label = label };
 
         return new()
         {
-            { Untyped("<e/>"), Untyped($"<e/><e{Resolved}/>"), Untyped($"<e/><e{Lookalike}/>"), false, "/r/e[2]" + typeStep },
-            { AgentNames(Item("")), AgentNames(Item("") + $"<{NameItem}{Resolved}/>"), AgentNames(Item("") + $"<{NameItem}{Lookalike}/>"), true, $"{itemPath}[2]{typeStep}" },
-            { Untyped("<e/>"), Untyped($"<e{Resolved}/>"), Untyped($"<e{Lookalike}/>"), false, "/r/e" + typeStep },
-            { AgentNames(Item("")), AgentNames(Item(Resolved)), AgentNames(Item(Lookalike)), true, itemPath + typeStep },
+            Row("unmatched untyped child", Untyped("<e/>"), Untyped($"<e/><e{Resolved}/>"), Untyped($"<e/><e{Lookalike}/>"), false, "/r/e[2]" + typeStep),
+            Row("unmatched getAgentNames item", AgentNames(Item("")), AgentNames(Item("") + $"<{NameItem}{Resolved}/>"), AgentNames(Item("") + $"<{NameItem}{Lookalike}/>"), true, $"{itemPath}[2]{typeStep}"),
+            Row("paired untyped element", Untyped("<e/>"), Untyped($"<e{Resolved}/>"), Untyped($"<e{Lookalike}/>"), false, "/r/e" + typeStep),
+            Row("paired getAgentNames item", AgentNames(Item("")), AgentNames(Item(Resolved)), AgentNames(Item(Lookalike)), true, itemPath + typeStep),
         };
     }
 
@@ -1888,6 +1894,14 @@ public sealed partial class XmlSemanticComparerTests
     private const string AuthorityToken = "{authority}";
     private const string UserInfoPassword = "user-info-password";
 
+    // Stand for the test's temporary root and a loopback port, which differ in every run, in what a failure
+    // message shows; the check prints neither token.
+    private const string RootToken = "<root>";
+    private const string PortToken = "<port>";
+
+    // A detail names the stubs' ports and paths below the root, so the failing item's copy is compared unshown.
+    private const string FailureDetailMessage = "The failing item must carry the check's detail.";
+
     // Request limit and connect limit: generous for a loaded host, never reached by a passing test.
     private const int RequestLimitSeconds = 10;
 
@@ -1926,6 +1940,9 @@ public sealed partial class XmlSemanticComparerTests
     private static readonly string NoResponseConnect = DiscrepancyKinds.NoResponse(NoResponseReasons.Connect);
 
     private static readonly byte[] StaleArtifact = Encoding.UTF8.GetBytes("stale artifact of an earlier run");
+
+    // The port of a loopback URL, as a detail names the stubs it fetched from.
+    private static readonly Regex LoopbackPort = new(@"(?<=127\.0\.0\.1:)[0-9]+", RegexOptions.CultureInvariant);
 
     // The facade's info while it serves the contracts WSDL.
     private static readonly byte[] PublishedInfo = FacadeInfo($"\"wsdl\":\"{PublishedStatus}\",");
@@ -2020,8 +2037,8 @@ public sealed partial class XmlSemanticComparerTests
             side == FacadeInfoSide ? unusable : info.BaseUrl);
 
         AssertNotRun(result);
-        Assert.Contains(SettingName(side), result.Result.Detail, StringComparison.Ordinal);
-        Assert.DoesNotContain(UserInfoPassword, result.Result.Detail, StringComparison.Ordinal);
+        Assert.Contains(SettingName(side), Redacted(result.Result.Detail), StringComparison.Ordinal);
+        Assert.DoesNotContain(UserInfoPassword, Redacted(result.Result.Detail), StringComparison.Ordinal);
         Assert.Empty(backend.Requests);
         Assert.Empty(facade.Requests);
         Assert.Empty(info.Requests);
@@ -2057,7 +2074,9 @@ public sealed partial class XmlSemanticComparerTests
 
         var result = await RunAsync(backend.BaseUrl, facade.BaseUrl, info.BaseUrl);
 
-        Assert.Equal(new CheckResult(CheckNames.WsdlContract, CheckOutcomes.Pass, Cases: 1, Passed: 1, Detail: null), result.Result);
+        Assert.Equal(
+            new CheckResult(CheckNames.WsdlContract, CheckOutcomes.Pass, Cases: 1, Passed: 1, Detail: null),
+            result.Result with { Detail = Redacted(result.Result.Detail) });
         Assert.Null(result.Failure);
         Assert.Empty(result.Discrepancies);
         Assert.Equal(WsdlPathAndQuery, Assert.Single(backend.Requests));
@@ -2065,8 +2084,8 @@ public sealed partial class XmlSemanticComparerTests
 
         // The pass rests on the facade's own report that it publishes the contracts WSDL, read once and never saved.
         Assert.Equal(AdminRoutes.Info, Assert.Single(info.Requests));
-        Assert.Equal(backendBody, File.ReadAllBytes(ArtifactPath(BackendSide)));
-        Assert.Equal(facadeBody, File.ReadAllBytes(ArtifactPath(FacadeSide)));
+        Assert.Equal(backendBody, SavedArtifact(BackendSide));
+        Assert.Equal(facadeBody, SavedArtifact(FacadeSide));
         AssertOnlyArtifactsWritten(contract, BackendSide, FacadeSide);
     }
 
@@ -2087,11 +2106,11 @@ public sealed partial class XmlSemanticComparerTests
         Assert.Equal(CheckOutcomes.Pass, result.Result.Outcome);
         Assert.Equal(1, result.Result.Cases);
         Assert.Equal(1, result.Result.Passed);
-        Assert.Contains(ArtifactPath(FacadeSide), result.Result.Detail, StringComparison.Ordinal);
+        Assert.Contains(Redacted(ArtifactPath(FacadeSide)), Redacted(result.Result.Detail), StringComparison.Ordinal);
         Assert.Null(result.Failure);
         Assert.Empty(result.Discrepancies);
         Assert.True(Directory.Exists(ArtifactPath(FacadeSide)), "The check must leave a directory in an artifact's place untouched.");
-        Assert.Equal(backendBody, File.ReadAllBytes(ArtifactPath(BackendSide)));
+        Assert.Equal(backendBody, SavedArtifact(BackendSide));
         AssertOnlyArtifactsWritten(contract, BackendSide);
     }
 
@@ -2188,8 +2207,8 @@ public sealed partial class XmlSemanticComparerTests
             AssertDifference(result, expected);
             natures.Add(result.Failure!.Nature);
             Assert.Equal(AdminRoutes.Info, Assert.Single(info.Requests));
-            Assert.Equal(backendBody, File.ReadAllBytes(ArtifactPath(BackendSide)));
-            Assert.Equal(facadeBody, File.ReadAllBytes(ArtifactPath(FacadeSide)));
+            Assert.Equal(backendBody, SavedArtifact(BackendSide));
+            Assert.Equal(facadeBody, SavedArtifact(FacadeSide));
         }
 
         Assert.Equal(natures[0], natures[1]);
@@ -2299,7 +2318,7 @@ public sealed partial class XmlSemanticComparerTests
             AssertDifference(result, expected);
             natures.Add(result.Failure!.Nature);
             Assert.False(File.Exists(ArtifactPath(side)), "The stale artifact of the unanswered side must be removed.");
-            Assert.Equal(otherBody, File.ReadAllBytes(ArtifactPath(otherSide)));
+            Assert.Equal(otherBody, SavedArtifact(otherSide));
         }
 
         Assert.Equal(natures[0], natures[1]);
@@ -2330,8 +2349,8 @@ public sealed partial class XmlSemanticComparerTests
         var result = await RunAsync(backend.BaseUrl, facade.BaseUrl);
 
         AssertDifference(result, [new($"$status.{side}", DiscrepancyKinds.Value, DiscrepancyValue.Literal("200"), DiscrepancyValue.Literal("404"))]);
-        Assert.Equal(side == BackendSide ? notFoundBody : otherBody, File.ReadAllBytes(ArtifactPath(BackendSide)));
-        Assert.Equal(side == FacadeSide ? notFoundBody : otherBody, File.ReadAllBytes(ArtifactPath(FacadeSide)));
+        Assert.Equal(side == BackendSide ? notFoundBody : otherBody, SavedArtifact(BackendSide));
+        Assert.Equal(side == FacadeSide ? notFoundBody : otherBody, SavedArtifact(FacadeSide));
         AssertOnlyArtifactsWritten(contract, BackendSide, FacadeSide);
     }
 
@@ -2397,8 +2416,8 @@ public sealed partial class XmlSemanticComparerTests
         var result = await RunAsync(backend.BaseUrl, facade.BaseUrl);
 
         AssertDifference(result, expected);
-        Assert.Equal(backendBody, File.ReadAllBytes(ArtifactPath(BackendSide)));
-        Assert.Equal(facadeBody, File.ReadAllBytes(ArtifactPath(FacadeSide)));
+        Assert.Equal(backendBody, SavedArtifact(BackendSide));
+        Assert.Equal(facadeBody, SavedArtifact(FacadeSide));
         AssertOnlyArtifactsWritten(contract, BackendSide, FacadeSide);
     }
 
@@ -2491,8 +2510,8 @@ public sealed partial class XmlSemanticComparerTests
             var result = await RunAsync(backend.BaseUrl, facade.BaseUrl);
 
             AssertDifference(result, expected);
-            Assert.Equal(backendBody, File.ReadAllBytes(ArtifactPath(BackendSide)));
-            Assert.Equal(facadeBody, File.ReadAllBytes(ArtifactPath(FacadeSide)));
+            Assert.Equal(backendBody, SavedArtifact(BackendSide));
+            Assert.Equal(facadeBody, SavedArtifact(FacadeSide));
             AssertOnlyArtifactsWritten(contract, BackendSide, FacadeSide);
             natures.Add(result.Failure!.Nature);
         }
@@ -2558,6 +2577,27 @@ public sealed partial class XmlSemanticComparerTests
     private string ArtifactPath(string side) => Path.Combine(Options.ArtifactsDirectory, "wsdl", $"{side}.wsdl");
 
     /// <summary>
+    /// The bytes the check saved as <paramref name="side"/>'s artifact. A missing one fails with a fixed message,
+    /// because the exception of reading it would name the test's root, which differs in every run.
+    /// </summary>
+    private byte[] SavedArtifact(string side)
+    {
+        var path = ArtifactPath(side);
+        Assert.True(File.Exists(path), $"The check must save the {side} artifact.");
+        return File.ReadAllBytes(path);
+    }
+
+    /// <summary>
+    /// <paramref name="text"/> with the test's root replaced by <see cref="RootToken"/> and every loopback port by
+    /// <see cref="PortToken"/>, so a failure message reads the same in every run. A comparison with a literal that
+    /// holds neither holds exactly when the raw one does, and so does one of two paths below the root, which hold
+    /// no loopback URL.
+    /// </summary>
+    [return: NotNullIfNotNull(nameof(text))]
+    private string? Redacted(string? text) =>
+        text is null ? null : LoopbackPort.Replace(text.Replace(Root, RootToken, StringComparison.Ordinal), PortToken);
+
+    /// <summary>
     /// The configuration key of a side's base URL, for example <c>Harness:Backend:SoapBaseUrl</c>, or
     /// <c>Harness:Target:AdminUrl</c> for the facade's admin listener.
     /// </summary>
@@ -2575,8 +2615,11 @@ public sealed partial class XmlSemanticComparerTests
         var expected = artifactSides
             .Select(ArtifactPath)
             .Append(Options.ContractsWsdlPath)
+            .Select(Redacted)
             .Order(StringComparer.Ordinal);
-        Assert.Equal(expected, Directory.EnumerateFiles(Root, "*", SearchOption.AllDirectories).Order(StringComparer.Ordinal));
+        Assert.Equal(
+            expected,
+            Directory.EnumerateFiles(Root, "*", SearchOption.AllDirectories).Select(Redacted).Order(StringComparer.Ordinal));
         Assert.Equal(contract, File.ReadAllBytes(Options.ContractsWsdlPath));
     }
 
@@ -2591,7 +2634,7 @@ public sealed partial class XmlSemanticComparerTests
         Assert.Equal(FailureItemIds.WsdlContract, failure.ItemId);
         Assert.Equal(FailureItemIds.NotRun, failure.Nature);
         Assert.Null(failure.Operation);
-        Assert.Equal(result.Result.Detail, failure.Detail);
+        Assert.True(string.Equals(result.Result.Detail, failure.Detail, StringComparison.Ordinal), FailureDetailMessage);
         Assert.Empty(result.Discrepancies);
     }
 
@@ -2610,7 +2653,7 @@ public sealed partial class XmlSemanticComparerTests
         Assert.Equal(FailureItemIds.WsdlContract, failure.ItemId);
         Assert.Equal(FailureItemIds.Diff(DiscrepancySignature.Compute(expected)), failure.Nature);
         Assert.Null(failure.Operation);
-        Assert.Equal(result.Result.Detail, failure.Detail);
+        Assert.True(string.Equals(result.Result.Detail, failure.Detail, StringComparison.Ordinal), FailureDetailMessage);
     }
 
     /// <summary>The XML declaration and the stand-in's label comment above <paramref name="document"/>, as the contracts WSDL carries them.</summary>

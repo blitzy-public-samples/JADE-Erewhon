@@ -36,8 +36,9 @@ namespace Erewhon.Harness.Tests;
 /// <summary>
 /// The replay exit path (AAP 0.8.4) and exit code (AAP 0.7.7), driven in-process through the seams of
 /// <see cref="ReplayMode"/>: a fake body, report writers that render with the real
-/// <see cref="ResultsReportWriter"/> and record, fail or block their writes without touching the disk, the
-/// real writer anchored at a temporary repository root, and a shutdown client that records its calls.
+/// <see cref="ResultsReportWriter"/> and record, fail or block their writes without touching the disk, one
+/// that fails every render instead, the real writer anchored at a temporary repository root, and a shutdown
+/// client that records its calls.
 /// Whatever the body, the report write or a shutdown does, every component is shut down, the final line is
 /// the last line printed and the exit code is 0 or 1. The admin URLs name reserved <c>.invalid</c> hosts
 /// that nothing contacts, because every request goes through the fakes. The conformance-evidence
@@ -63,8 +64,9 @@ namespace Erewhon.Harness.Tests;
 /// send SIGTERM, which wait longer than the cancelled exit budget and that bound before they kill it.
 /// </summary>
 /// <remarks>
-/// Assertions on the console and the report text use fixed messages, because both hold the per-test
-/// temporary path and the run date.
+/// No failure message shows a value that varies between runs: a temporary path, the run date, a measured
+/// time, a port or a marker. Text that holds one is checked with fixed-message predicates, or compared after
+/// both sides are redacted.
 /// </remarks>
 public sealed partial class ReplayLifecycleTests : IDisposable
 {
@@ -237,7 +239,7 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         Assert.True(StdoutText.Contains(printed, StringComparison.Ordinal), "stdout holds the full report text");
         Assert.True(printed.Contains("Backend used: JADE stand-in", StringComparison.Ordinal), "the printed report carries its banner");
         Assert.True(printed.Contains(FailureItemIds.Report, StringComparison.Ordinal), "the printed report lists the CHK-REPORT item");
-        Assert.Equal(ResultsReport.FormatFinalLine(0, 0), LastNonEmptyLine(printed));
+        Assert.Equal(ResultsReport.FormatFinalLine(0, 0), Redacted(LastNonEmptyLine(printed)));
 
         Assert.Equal(BothComponents, shutdown.Components);
         Assert.Equal([new Uri(FacadeAdminUrl), new Uri(StandInAdminUrl)], shutdown.Calls.Select(call => call.AdminBaseUrl));
@@ -245,6 +247,74 @@ public sealed partial class ReplayLifecycleTests : IDisposable
 
         // The harness's last line is the final line of the report it printed.
         Assert.Equal(ResultsReport.FormatFinalLine(0, 0), Redacted(LastNonEmptyLine(StdoutText)));
+    }
+
+    // A report that cannot be built or rendered has no text to write or print: the mode records CHK-REPORT,
+    // prints the plain failure list instead, still shuts every component down, and exits 1 with the final line
+    // of a run without a report last. When cleanup adds an item, the rewrite renders again, fails the same way
+    // and prints the list again, now with that item.
+    [Theory]
+    [InlineData(null)]
+    [InlineData(ShutdownFailure.ReturnsNotStopped)]
+    public async Task ReportRenderFailure_RecordsItem_PrintsFailureList_ShutsDownAll_Exits1(ShutdownFailure? firstShutdown)
+    {
+        const string renderFailurePrefix = "report could not be built or rendered: ";
+        var options = Options();
+        var writer = new ThrowingRenderReportWriter();
+        var shutdown = new RecordingShutdown(firstShutdown);
+        var mode = NewMode(FakeBody.NoOp(), writer, shutdown, KnownLimitationsRegister.Empty, options);
+
+        var exitCode = await RunAsync(mode);
+
+        AssertExitCode(1, exitCode);
+        var cleanupFailed = firstShutdown is not null;
+        var reportItem = new FailureItem(FailureItemIds.Report, FailureItemIds.WriteFailed);
+        var shutdownItem = new FailureItem(FailureItemIds.Shutdown(ShutdownTarget.FacadeComponent), FailureItemIds.StillRunning);
+        FailureItem[] expectedItems = cleanupFailed ? [reportItem, shutdownItem] : [reportItem];
+        Assert.Equal(
+            expectedItems.Select(item => (item.ItemId, item.Nature)),
+            mode.State.Failures.Select(item => (item.ItemId, item.Nature)));
+
+        // A repeated render failure adds no second CHK-REPORT item, so the one recorded names the first.
+        Assert.Equal(renderFailurePrefix + ReplayMode.Describe(ThrowingRenderReportWriter.RenderFailure()), mode.State.Failures[0].Detail);
+
+        // The first render precedes every item; the rewrite renders the report holding both items once cleanup
+        // added one. No render produced text, so nothing was written and no file was created.
+        Assert.Equal(cleanupFailed ? 2 : 1, writer.Rendered.Count);
+        Assert.Empty(writer.Rendered[0].Failures);
+        if (cleanupFailed)
+        {
+            Assert.Equal(
+                expectedItems.Select(item => (item.ItemId, item.Nature)),
+                writer.Rendered[^1].UndocumentedFailures.Select(item => (item.ItemId, item.Nature)));
+        }
+
+        Assert.Equal(0, writer.WriteAttempts);
+        Assert.False(File.Exists(options.EffectiveReportPath), "a report that could not be rendered creates no report file");
+        Assert.Empty(SpecialFileSupport.Names(RepoRootDirectory.Root));
+
+        Assert.Equal(BothComponents, shutdown.Components);
+        Assert.Equal([new Uri(FacadeAdminUrl), new Uri(StandInAdminUrl)], shutdown.Calls.Select(call => call.AdminBaseUrl));
+
+        // Each failed render prints the items recorded so far in place of the report text; the conclusion and the
+        // final line follow, and nothing else is printed.
+        var text = Redacted(StdoutText);
+        Assert.False(text.Contains(ReportTitle, StringComparison.Ordinal), "no report text is printed when the report could not be rendered");
+        static string Listed(FailureItem item) => "replay:   " + FailureItemDisplay.Describe(item);
+        string[] failureLists = cleanupFailed
+            ? [Listed(reportItem), "replay: cleanup added failing items; rewriting the report", Listed(reportItem), Listed(shutdownItem)]
+            : [Listed(reportItem)];
+        string[] expectedLines =
+        [
+            .. failureLists,
+            string.Create(CultureInfo.InvariantCulture, $"replay: {expectedItems.Length} undocumented failing item(s); report not written; exit 1"),
+            .. expectedItems.Select(Listed),
+            "replay: 0 documented failing item(s)",
+            ResultsReport.FormatFinalLine(0, 0),
+        ];
+        Assert.Equal(
+            expectedLines,
+            text.Split('\n').Select(line => line.TrimEnd('\r')).Where(line => line.Trim().Length > 0));
     }
 
     // A write that never ends, as one to a stalled destination does, is abandoned at the report-write limit and
@@ -588,7 +658,8 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         Assert.Equal(1, writer.WriteCount);
         Assert.True(writer.Written[^1].Contains("### Captured cases not compared", StringComparison.Ordinal), "the written report lists the captured cases not compared");
 
-        var lines = StdoutText.Split('\n').Select(line => line.TrimEnd('\r')).Where(line => line.Trim().Length > 0).ToArray();
+        // The lines are shown with the temporary path removed.
+        var lines = Redacted(StdoutText).Split('\n').Select(line => line.TrimEnd('\r')).Where(line => line.Trim().Length > 0).ToArray();
         Assert.Equal(
             "replay: 2 captured case(s) not compared, so their operations are undocumented differences: REST-getAgent-01, SOAP-getPhoto-01",
             lines[^2]);
@@ -686,10 +757,13 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         Assert.True(reportText.Contains(wrongType.Nature, StringComparison.Ordinal), "the report keeps the exact wrong-type nature");
         Assert.Equal(reportWriteFails, StdoutText.Contains(reportText, StringComparison.Ordinal));
 
+        // Standard output holds the temporary report path, so the text around a match is not shown.
         var outside = StdoutText.Replace(reportText, string.Empty, StringComparison.Ordinal);
         foreach (var raw in new[] { email, "Hank", privateName, "\u001B", "\u202E", "\\u001B", "\\u202E" })
         {
-            Assert.DoesNotContain(raw, outside, StringComparison.Ordinal);
+            Assert.False(
+                outside.Contains(raw, StringComparison.Ordinal),
+                $"standard output outside the report holds '{LifecycleConsole.Display(raw)}'");
         }
 
         var lines = outside.Split('\n').Select(line => line.TrimEnd('\r')).ToList();
@@ -850,8 +924,13 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         };
         var text = new ResultsReportWriter().Render(ResultsReport.Build(state, KnownLimitationsRegister.Empty, OperationCatalogue.Default));
 
-        Assert.Contains($"| .NET (facade runtime) | {expectedValue} |", text.Split('\n'));
-        Assert.DoesNotContain(credential, text, StringComparison.Ordinal);
+        // The report holds the run date and the temporary root, so only its .NET row is shown, and the search for
+        // the credential has a fixed message.
+        const string frameworkRow = "| .NET (facade runtime) | ";
+        Assert.Equal(
+            [$"{frameworkRow}{expectedValue} |"],
+            text.Split('\n').Where(line => line.StartsWith(frameworkRow, StringComparison.Ordinal)));
+        Assert.False(text.Contains(credential, StringComparison.Ordinal), "the report never quotes the admin URL's credential");
     }
 
     // The facade's /admin/info answer for each scripted outcome; an exception stands for the failure the
@@ -910,23 +989,32 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         var check = state.Checks[CheckNames.Conformance];
         Assert.Equal(CheckOutcomes.NotRun, check.Outcome);
         var exceptions = state.Failures.Where(item => item.ItemId == FailureItemIds.Exception).ToList();
+        // The item's detail and standard output come from a run against a temporary root and a loopback port,
+        // so their text is not shown.
         if (expectFailure)
         {
             var item = Assert.Single(exceptions);
             Assert.Equal(typeof(FileNotFoundException).FullName, item.Nature);
-            Assert.StartsWith("stand-in conformance check: baseline/conformance.json is absent although the baseline was captured", item.Detail, StringComparison.Ordinal);
+            Assert.True(
+                item.Detail?.StartsWith(
+                    "stand-in conformance check: baseline/conformance.json is absent although the baseline was captured",
+                    StringComparison.Ordinal) == true,
+                "the CHK-EXCEPTION item names the absent conformance result of a captured baseline");
             Assert.True(item.IsNeverDocumentable, "a missing conformance result can never be documented");
             Assert.Equal("baseline/conformance.json absent although the baseline was captured", check.Detail);
-            Assert.Contains(
-                "[jade-standin] conformance: baseline/conformance.json absent although the baseline was captured; the stand-in conformance evidence is missing",
-                StdoutText,
-                StringComparison.Ordinal);
+            Assert.True(
+                StdoutText.Contains(
+                    "[jade-standin] conformance: baseline/conformance.json absent although the baseline was captured; the stand-in conformance evidence is missing",
+                    StringComparison.Ordinal),
+                "the console states that the conformance evidence of a captured baseline is missing");
         }
         else
         {
             Assert.Empty(exceptions);
             Assert.Equal("baseline/conformance.json absent", check.Detail);
-            Assert.Contains("[jade-standin] conformance: baseline/conformance.json absent; not run", StdoutText, StringComparison.Ordinal);
+            Assert.True(
+                StdoutText.Contains("[jade-standin] conformance: baseline/conformance.json absent; not run", StringComparison.Ordinal),
+                "the console states that the conformance check did not run");
         }
     }
 
@@ -1053,6 +1141,8 @@ public sealed partial class ReplayLifecycleTests : IDisposable
             await body.ExecuteAsync(state, limit.Token).WaitAsync(limit.Token);
         }
 
+        // The run works in a temporary root against a loopback port: an item's detail is shown with the root
+        // removed, and standard output is checked with fixed messages.
         const string evidenceStep = "confirm the baseline evidence: ";
         var evidence = state.Failures
             .Where(item => item.ItemId == FailureItemIds.Exception && item.Detail?.StartsWith(evidenceStep, StringComparison.Ordinal) == true)
@@ -1060,7 +1150,9 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         if (problem is null)
         {
             Assert.Empty(evidence);
-            Assert.DoesNotContain("[jade-standin] baseline evidence: ", StdoutText, StringComparison.Ordinal);
+            Assert.False(
+                StdoutText.Contains("[jade-standin] baseline evidence: ", StringComparison.Ordinal),
+                "the console states no baseline evidence problem");
         }
         else
         {
@@ -1069,8 +1161,10 @@ public sealed partial class ReplayLifecycleTests : IDisposable
             Assert.True(item.IsNeverDocumentable, "an evidence problem can never be documented");
             Assert.Equal(
                 $"{evidenceStep}The baseline evidence is incomplete or inconsistent (1 problem(s)): {problem}.",
-                item.Detail);
-            Assert.Contains($"[jade-standin] baseline evidence: {problem}", StdoutText, StringComparison.Ordinal);
+                item.Detail is null ? null : Redacted(item.Detail));
+            Assert.True(
+                StdoutText.Contains($"[jade-standin] baseline evidence: {problem}", StringComparison.Ordinal),
+                "the console states the scenario's baseline evidence problem");
         }
 
         var captured = state.CapturedCasesByOperation.Values.SelectMany(ids => ids).ToList();
@@ -1101,7 +1195,7 @@ public sealed partial class ReplayLifecycleTests : IDisposable
             else
             {
                 var item = Assert.Single(notCaptured);
-                Assert.StartsWith(notCapturedReason, item.Detail, StringComparison.Ordinal);
+                Assert.StartsWith(notCapturedReason, item.Detail is null ? null : Redacted(item.Detail), StringComparison.Ordinal);
             }
         }
     }
@@ -1151,7 +1245,9 @@ public sealed partial class ReplayLifecycleTests : IDisposable
                 item => item.ItemId == FailureItemIds.Exception && item.Detail?.StartsWith($"{step}: ", StringComparison.Ordinal) == true);
             Assert.Equal(typeof(InvalidOperationException).FullName, refused.Nature);
             Assert.True(refused.IsNeverDocumentable, "a refused WSDL record can never be documented");
-            Assert.Contains($"{step} failed: ", StdoutText, StringComparison.Ordinal);
+
+            // Standard output holds the temporary root and the loopback port, so it is checked with a fixed message.
+            Assert.True(StdoutText.Contains($"{step} failed: ", StringComparison.Ordinal), "the console states that reading the WSDL record failed");
             Assert.DoesNotContain(
                 state.Failures,
                 item => item.ItemId == FailureItemIds.Exception && item.Detail?.StartsWith("count the baseline: ", StringComparison.Ordinal) == true);
@@ -1166,7 +1262,11 @@ public sealed partial class ReplayLifecycleTests : IDisposable
             Assert.False(baseline.WsdlCaptured, "a refused WSDL record counts as not captured");
             Assert.True(baseline.ManifestPresent, "the manifest facts are still counted");
             Assert.Equal(CaptureExecutionValues.LocalProcesses, baseline.CaptureExecution);
-            Assert.Equal(target, new FileInfo(link).LinkTarget);
+
+            // Both paths lie in temporary directories, so the comparison has a fixed message.
+            Assert.True(
+                string.Equals(target, new FileInfo(link).LinkTarget, StringComparison.Ordinal),
+                "the refused WSDL record is left as the link to its target outside the root");
         }
         finally
         {
@@ -1208,6 +1308,8 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         limit.CancelAfter(RunLimit);
         await body.ExecuteAsync(state, limit.Token).WaitAsync(limit.Token);
 
+        // The run works in a temporary root against a loopback port: the item's detail is shown with the root
+        // removed, and standard output is checked with fixed messages.
         var check = state.Checks[CheckNames.Conformance];
         var exceptions = state.Failures.Where(item => item.ItemId == FailureItemIds.Exception).ToList();
         if (unreachablePassClaimed)
@@ -1219,12 +1321,12 @@ public sealed partial class ReplayLifecycleTests : IDisposable
                 string.Create(
                     CultureInfo.InvariantCulture,
                     $"stand-in conformance check: baseline/conformance.json: $.members[{index}].result is 'pass', but the catalogue records '{unreachableMember}' as unreachable in source, so its result must be 'unreachable-in-source'."),
-                item.Detail);
+                item.Detail is null ? null : Redacted(item.Detail));
             Assert.Equal(CheckOutcomes.NotRun, check.Outcome);
             Assert.Equal("the check did not complete", check.Detail);
             Assert.Null(state.Conformance);
             Assert.DoesNotContain(state.Failures, failure => failure.ItemId.StartsWith("CONF:", StringComparison.Ordinal));
-            Assert.DoesNotContain("check conformance:", StdoutText, StringComparison.Ordinal);
+            Assert.False(StdoutText.Contains("check conformance:", StringComparison.Ordinal), "the console states no conformance count");
         }
         else
         {
@@ -1235,10 +1337,11 @@ public sealed partial class ReplayLifecycleTests : IDisposable
             Assert.Equal("99 of 99 failing items documented by the register; 2 of 2 seed-token assertions hold", check.Detail);
             Assert.NotNull(state.Conformance);
             Assert.Equal((216, 117), (state.Conformance.MembersChecked, state.Conformance.Passed));
-            Assert.Contains(
-                "[jade-standin] check conformance: pass (117 of 216 members passed); 99 of 99 failing items documented by the register; 2 of 2 seed-token assertions hold",
-                StdoutText,
-                StringComparison.Ordinal);
+            Assert.True(
+                StdoutText.Contains(
+                    "[jade-standin] check conformance: pass (117 of 216 members passed); 99 of 99 failing items documented by the register; 2 of 2 seed-token assertions hold",
+                    StringComparison.Ordinal),
+                "the console states the conformance counts of the committed result");
         }
 
         // Replay reads the baseline and never writes it.
@@ -1420,6 +1523,34 @@ public sealed partial class ReplayLifecycleTests : IDisposable
     }
 
     /// <summary>
+    /// Fails every render with the same fixed exception and records the report each render was given; counts
+    /// every write, which a report that could not be rendered must never reach.
+    /// </summary>
+    private sealed class ThrowingRenderReportWriter : IResultsReportWriter
+    {
+        private const string RenderFailureMessage = "the report cannot be rendered";
+
+        private readonly List<ResultsReport> _rendered = [];
+        private int _writeAttempts;
+
+        /// <summary>The report of every render call, in call order.</summary>
+        public IReadOnlyList<ResultsReport> Rendered => _rendered;
+
+        public int WriteAttempts => Volatile.Read(ref _writeAttempts);
+
+        /// <summary>The exception every render throws, created anew for each call.</summary>
+        public static InvalidOperationException RenderFailure() => new(RenderFailureMessage);
+
+        public string Render(ResultsReport report)
+        {
+            _rendered.Add(report);
+            throw RenderFailure();
+        }
+
+        public void Write(string path, string content) => Interlocked.Increment(ref _writeAttempts);
+    }
+
+    /// <summary>
     /// Renders with the real writer and blocks every write until disposed, as a write to a destination that
     /// stalls does; a released write then fails, as one abandoned to a stalled destination eventually may.
     /// </summary>
@@ -1580,8 +1711,14 @@ public sealed partial class ReplayLifecycleTests
     private const string FailedCallNote = "(shutdown call failed)";
     private const string RejectedCallNote = "(shutdown rejected)";
 
+    // Stands for a measured time in a detail or console line, so a failure message reads the same in every run.
+    private const string ElapsedToken = "<elapsed>";
+
     // Headroom over the shutdown limit for scheduling; a wait that ignored the limit overruns it by far more.
     private static readonly TimeSpan Slack = TimeSpan.FromSeconds(3);
+
+    // A measured time as the shutdown and readiness clients print it: "refused after 123 ms", "(45 ms)".
+    private static readonly Regex MeasuredMilliseconds = new("[0-9]+ ms\\b", RegexOptions.CultureInvariant);
 
     // The brief-refusal server answers health for AnsweringFor after the 202, stops listening StopAfterAnswer
     // after its last answer and refuses connections for RefusalWindow. The window closes 120 ms after that
@@ -1657,11 +1794,15 @@ public sealed partial class ReplayLifecycleTests
 
         var (outcome, _) = await ShutdownAsync(component, ShutdownOptions(shutdownSeconds: 2));
 
-        Assert.True(outcome.Stopped, outcome.Detail);
+        Assert.True(outcome.Stopped, WithoutMilliseconds(outcome.Detail));
         Assert.Null(outcome.ToFailureItem());
         Assert.Equal(ShutdownTarget.StandInComponent, outcome.Component);
-        Assert.Matches($"^{Regex.Escape(postText)}; refused after \\d+ ms$", outcome.Detail);
-        Assert.Equal(new[] { ShutdownRequest, HealthRequest, HealthRequest }, component.Requests);
+        Assert.Equal($"{postText}; refused after {ElapsedToken} ms", WithoutMilliseconds(outcome.Detail));
+
+        // How many probes a client that missed the refusal would send depends on timing, so the message is fixed.
+        Assert.True(
+            component.Requests.SequenceEqual([ShutdownRequest, HealthRequest, HealthRequest]),
+            "the requests are the shutdown call, the answered health probe and the refused one, in that order");
     }
 
     // ---- Stop not confirmed ---------------------------------------------------------------------
@@ -1679,8 +1820,8 @@ public sealed partial class ReplayLifecycleTests
         var (outcome, elapsed) = await ShutdownAsync(component, ShutdownOptions(shutdownSeconds: 1));
 
         AssertStillRunning(outcome, elapsed, limitSeconds: 1);
-        Assert.Equal("POST 202; still answering at 1 s (last 200)", outcome.Detail);
-        Assert.True(component.HealthProbes >= 3, $"only {component.HealthProbes} health probe(s)");
+        Assert.Equal("POST 202; still answering at 1 s (last 200)", WithoutMilliseconds(outcome.Detail));
+        Assert.True(component.HealthProbes >= 3, "fewer than 3 health probes");
     }
 
     [Fact]
@@ -1691,8 +1832,8 @@ public sealed partial class ReplayLifecycleTests
         var (outcome, elapsed) = await ShutdownAsync(component, ShutdownOptions(shutdownSeconds: 1));
 
         AssertStillRunning(outcome, elapsed, limitSeconds: 1);
-        Assert.Equal("POST 202; still answering at 1 s (last 200)", outcome.Detail);
-        Assert.True(component.HealthProbes >= 2, $"only {component.HealthProbes} health probe(s)");
+        Assert.Equal("POST 202; still answering at 1 s (last 200)", WithoutMilliseconds(outcome.Detail));
+        Assert.True(component.HealthProbes >= 2, "fewer than 2 health probes");
     }
 
     // "Host not found" alternates with another inconclusive outcome; neither, nor the two together, is a refusal.
@@ -1708,8 +1849,8 @@ public sealed partial class ReplayLifecycleTests
         var (outcome, elapsed) = await ShutdownAsync(component, ShutdownOptions(shutdownSeconds: 2));
 
         AssertStillRunning(outcome, elapsed, limitSeconds: 2);
-        Assert.StartsWith("POST 202; not refused by 2 s (last ", outcome.Detail, StringComparison.Ordinal);
-        Assert.True(component.HealthProbes >= 3, $"only {component.HealthProbes} health probe(s)");
+        Assert.StartsWith("POST 202; not refused by 2 s (last ", WithoutMilliseconds(outcome.Detail), StringComparison.Ordinal);
+        Assert.True(component.HealthProbes >= 3, "fewer than 3 health probes");
     }
 
     [Theory]
@@ -1729,7 +1870,7 @@ public sealed partial class ReplayLifecycleTests
         var (outcome, elapsed) = await ShutdownAsync(component, ShutdownOptions(shutdownSeconds: 1));
 
         AssertStillRunning(outcome, elapsed, limitSeconds: 1);
-        Assert.Equal($"POST 202; not refused by 1 s (last {last})", outcome.Detail);
+        Assert.Equal($"POST 202; not refused by 1 s (last {last})", WithoutMilliseconds(outcome.Detail));
         Assert.True(component.HealthProbes >= 1, "no health probe");
     }
 
@@ -1747,9 +1888,9 @@ public sealed partial class ReplayLifecycleTests
         var (outcome, elapsed) = await ShutdownAsync(component, ShutdownOptions(shutdownSeconds: 1));
 
         AssertStillRunning(outcome, elapsed, limitSeconds: 1);
-        Assert.Equal("POST 202; not refused by 1 s (last name lookup failed)", outcome.Detail);
-        Assert.DoesNotContain("timeout", outcome.Detail, StringComparison.Ordinal);
-        Assert.True(component.HealthProbes >= 2, $"only {component.HealthProbes} health probe(s)");
+        Assert.Equal("POST 202; not refused by 1 s (last name lookup failed)", WithoutMilliseconds(outcome.Detail));
+        Assert.DoesNotContain("timeout", WithoutMilliseconds(outcome.Detail), StringComparison.Ordinal);
+        Assert.True(component.HealthProbes >= 2, "fewer than 2 health probes");
     }
 
     // ---- Failed shutdown call -------------------------------------------------------------------
@@ -1779,13 +1920,15 @@ public sealed partial class ReplayLifecycleTests
         AssertStillRunning(outcome, elapsed, limitSeconds: 3);
         if (health == AdminReply.ConnectionRefused)
         {
-            Assert.Matches($"^{Regex.Escape(postText)}; refused after \\d+ ms {Regex.Escape(note)}$", outcome.Detail);
-            Assert.Equal(new[] { ShutdownRequest, HealthRequest }, component.Requests);
+            Assert.Equal($"{postText}; refused after {ElapsedToken} ms {note}", WithoutMilliseconds(outcome.Detail));
+            Assert.True(
+                component.Requests.SequenceEqual([ShutdownRequest, HealthRequest]),
+                "the requests are the shutdown call and the one refused health probe, in that order");
         }
         else
         {
-            Assert.Equal($"{postText}; not refused by 3 s (last host not found) {note}", outcome.Detail);
-            Assert.True(component.HealthProbes >= 2, $"only {component.HealthProbes} health probe(s)");
+            Assert.Equal($"{postText}; not refused by 3 s (last host not found) {note}", WithoutMilliseconds(outcome.Detail));
+            Assert.True(component.HealthProbes >= 2, "fewer than 2 health probes");
         }
     }
 
@@ -1816,10 +1959,13 @@ public sealed partial class ReplayLifecycleTests
 
             var requestHead = await server;
 
-            Assert.StartsWith(ShutdownRequest + " HTTP/1.1\r\n", requestHead, StringComparison.Ordinal);
-            Assert.True(outcome.Stopped, outcome.Detail);
+            // A request head names the listener's port in its Host header, so it is never shown.
+            Assert.True(
+                requestHead.StartsWith(ShutdownRequest + " HTTP/1.1\r\n", StringComparison.Ordinal),
+                "the request the listener answered is the shutdown call");
+            Assert.True(outcome.Stopped, WithoutMilliseconds(outcome.Detail));
             Assert.Null(outcome.ToFailureItem());
-            Assert.Matches("^POST 202; refused after \\d+ ms$", outcome.Detail);
+            Assert.Equal($"POST 202; refused after {ElapsedToken} ms", WithoutMilliseconds(outcome.Detail));
         }
         finally
         {
@@ -1847,14 +1993,18 @@ public sealed partial class ReplayLifecycleTests
             await serverBound.CancelAsync();
             var heads = await server;
 
-            Assert.True(outcome.Stopped, outcome.Detail);
+            Assert.True(outcome.Stopped, WithoutMilliseconds(outcome.Detail));
             Assert.Null(outcome.ToFailureItem());
-            Assert.Matches("^POST 202; refused after \\d+ ms$", outcome.Detail);
-            Assert.True(heads.Count >= 2, $"{heads.Count} request(s) answered; no health probe before the stop");
-            Assert.StartsWith(ShutdownRequest + " HTTP/1.1\r\n", heads[0], StringComparison.Ordinal);
-            Assert.All(
-                heads.Skip(1),
-                head => Assert.StartsWith(HealthRequest + " HTTP/1.1\r\n", head, StringComparison.Ordinal));
+            Assert.Equal($"POST 202; refused after {ElapsedToken} ms", WithoutMilliseconds(outcome.Detail));
+            Assert.True(heads.Count >= 2, "fewer than 2 requests answered; no health probe before the stop");
+
+            // A request head names the listener's port in its Host header, so it is never shown.
+            Assert.True(
+                heads[0].StartsWith(ShutdownRequest + " HTTP/1.1\r\n", StringComparison.Ordinal),
+                "the first request answered is the shutdown call");
+            Assert.True(
+                heads.Skip(1).All(head => head.StartsWith(HealthRequest + " HTTP/1.1\r\n", StringComparison.Ordinal)),
+                "every request answered after the shutdown call is a health probe");
         }
         finally
         {
@@ -1882,12 +2032,17 @@ public sealed partial class ReplayLifecycleTests
             var heads = await server;
 
             AssertStillRunning(outcome, elapsed, limitSeconds: 2);
-            Assert.Equal("POST 202; still answering at 2 s (last 200)", outcome.Detail);
-            Assert.Single(heads, head => head.StartsWith(ShutdownRequest + " HTTP/1.1\r\n", StringComparison.Ordinal));
+            Assert.Equal("POST 202; still answering at 2 s (last 200)", WithoutMilliseconds(outcome.Detail));
+
+            // A request head names the listener's port in its Host header, and the number of probes depends
+            // on timing, so neither is shown.
+            Assert.True(
+                heads.Count(head => head.StartsWith(ShutdownRequest + " HTTP/1.1\r\n", StringComparison.Ordinal)) == 1,
+                "exactly one shutdown call reached the listener");
             var probes = heads.Count(head => head.StartsWith(HealthRequest + " HTTP/1.1\r\n", StringComparison.Ordinal));
-            Assert.True(probes >= 20, $"only {probes} health probe(s): no fast burst after the watch ended");
+            Assert.True(probes >= 20, "fewer than 20 health probes: no fast burst after the watch ended");
             var watches = heads.Count(head => head.Length == 0);
-            Assert.True(watches >= 2, $"{watches} watch connection(s): none opened again after the burst");
+            Assert.True(watches >= 2, "fewer than 2 watch connections: none opened again after the burst");
         }
         finally
         {
@@ -1903,17 +2058,23 @@ public sealed partial class ReplayLifecycleTests
         ShutdownRequestTimeoutSeconds = requestSeconds,
     };
 
+    // The text with every measured time replaced by ElapsedToken, which no client prints, so a detail compared
+    // with a literal that holds no measured time is equal exactly when the raw detail is.
+    private static string WithoutMilliseconds(string text) => MeasuredMilliseconds.Replace(text, ElapsedToken + " ms");
+
     private static void AssertStillRunning(ShutdownOutcome outcome, TimeSpan elapsed, int limitSeconds)
     {
-        Assert.False(outcome.Stopped, outcome.Detail);
+        Assert.False(outcome.Stopped, WithoutMilliseconds(outcome.Detail));
         var item = outcome.ToFailureItem();
         Assert.NotNull(item);
         Assert.Equal(StillRunningItemId, item.ItemId);
         Assert.Equal(StillRunningNature, item.Nature);
-        Assert.Equal(outcome.Detail, item.Detail);
+        Assert.True(
+            string.Equals(outcome.Detail, item.Detail, StringComparison.Ordinal),
+            "the CHK-SHUTDOWN item carries the outcome's detail");
         Assert.True(
             elapsed < TimeSpan.FromSeconds(limitSeconds) + Slack,
-            $"Shutdown took {elapsed.TotalMilliseconds:0} ms against a {limitSeconds} s limit.");
+            $"the shutdown outlasted its {limitSeconds} s limit plus slack");
     }
 
     // Accepts the watch connection, which sends nothing, and then the shutdown call, stops listening before
@@ -3054,7 +3215,7 @@ public sealed partial class ReplayLifecycleTests
 
         Assert.Empty(standIn.Requests);
         Assert.Equal(before, Snapshot());
-        Assert.EndsWith($"seed facts cannot be confirmed (expected {unconfirmable}); {NotTouched}", LastLine());
+        AssertLastLineEndsWith($"seed facts cannot be confirmed (expected {unconfirmable}); {NotTouched}");
     }
 
     [Theory]
@@ -3083,7 +3244,7 @@ public sealed partial class ReplayLifecycleTests
         Assert.Equal(recapture, File.Exists(Full(ManifestFile)));
         Assert.Single(standIn.Requests, request => request == SeedResetRequest);
         Assert.All(standIn.Requests, request => Assert.Contains(request, AdminRequests));
-        Assert.EndsWith($"{ResetPoints.CaptureStart} reset not confirmed; {NotTouched}", LastLine());
+        AssertLastLineEndsWith($"{ResetPoints.CaptureStart} reset not confirmed; {NotTouched}");
     }
 
     [Fact]
@@ -3105,9 +3266,7 @@ public sealed partial class ReplayLifecycleTests
         Assert.False(File.Exists(Full(ManifestTemporaryFile)));
         Assert.False(File.Exists(Full(ConformanceFile)));
         Assert.False(File.Exists(Full(ContractsWsdlFile)));
-        Assert.EndsWith(
-            $"reset bracket of {emptyStateCase} not confirmed; capture stopped, baseline/manifest.json not written",
-            LastLine());
+        AssertLastLineEndsWith($"reset bracket of {emptyStateCase} not confirmed; capture stopped, baseline/manifest.json not written");
     }
 
     [Theory]
@@ -3133,14 +3292,18 @@ public sealed partial class ReplayLifecycleTests
         Assert.Equal(new ManifestCounts(22, 56, 22, 56), manifest.Counts);
         Assert.False(File.Exists(Full(ManifestTemporaryFile)));
         Assert.False(File.Exists(Full(SentinelRecord)));
-        Assert.Contains("[jade-standin] baseline/manifest.json withdrawn until this capture completes", Lines());
+        Assert.True(
+            Lines().Contains("[jade-standin] baseline/manifest.json withdrawn until this capture completes", StringComparer.Ordinal),
+            "the capture states that baseline/manifest.json is withdrawn until it completes");
 
+        // Each file is named relative to the temporary root, so a failure reads the same in every run.
         var published = File.GetLastWriteTimeUtc(Full(ManifestFile));
         Assert.All(
             Directory.EnumerateFiles(Full("baseline"), "*", SearchOption.AllDirectories)
                 .Concat(Directory.EnumerateFiles(Full("contracts"), "*", SearchOption.AllDirectories))
-                .Where(file => file != Full(ManifestFile)),
-            file => Assert.True(File.GetLastWriteTimeUtc(file) <= published, Relative(file)));
+                .Where(file => file != Full(ManifestFile))
+                .Select(Relative),
+            relative => Assert.True(File.GetLastWriteTimeUtc(Full(relative)) <= published, relative));
     }
 
     // The baseline WSDL is the served bytes; the contracts WSDL is those bytes labelled, written only when absent,
@@ -3166,10 +3329,14 @@ public sealed partial class ReplayLifecycleTests
         Assert.True(manifest.WsdlCaptured, "A publishable WSDL must be recorded as captured.");
         Assert.Equal(served, File.ReadAllBytes(Full(BaselineWsdlFile)));
         Assert.Equal(contractPresent ? SentinelBytes : CaptureMode.WithHeaderComment(served), File.ReadAllBytes(Full(ContractsWsdlFile)));
-        Assert.Equal(["ErewhonWebService.wsdl"], SpecialFileSupport.Names(Full("contracts/wsdl")));
-        Assert.Contains(
-            contractPresent ? "[jade-standin] contracts WSDL present; not overwritten" : "[jade-standin] wrote contracts WSDL",
-            Lines());
+        Assert.Equal(["ErewhonWebService.wsdl"], ShownNames(Full("contracts/wsdl")));
+
+        // The console names the temporary root and the stub's loopback port, so its lines are not shown.
+        Assert.True(
+            Lines().Contains(
+                contractPresent ? "[jade-standin] contracts WSDL present; not overwritten" : "[jade-standin] wrote contracts WSDL",
+                StringComparer.Ordinal),
+            "the capture states that it wrote the contracts WSDL or kept the one present");
     }
 
     // Each body the facade would refuse to publish, with the reason the capture gives. A baseline WSDL from an
@@ -3196,7 +3363,11 @@ public sealed partial class ReplayLifecycleTests
         Assert.False(manifest.WsdlCaptured, "A WSDL the facade would not publish must not be recorded as captured.");
         Assert.False(File.Exists(Full(BaselineWsdlFile)), "A WSDL the facade would not publish must leave no baseline WSDL.");
         Assert.False(Directory.Exists(Full("contracts")), "A WSDL the facade would not publish must write no contracts WSDL.");
-        Assert.Contains($"[jade-standin] WARN WSDL not captured: the facade would not publish it ({problem}){WsdlDropSuffix}", Lines());
+
+        // The console names the temporary root and the stub's loopback port, so its lines are not shown.
+        Assert.True(
+            Lines().Contains($"[jade-standin] WARN WSDL not captured: the facade would not publish it ({problem}){WsdlDropSuffix}", StringComparer.Ordinal),
+            "the capture warns that the WSDL is not captured, with the form's reason");
     }
 
     // A contracts directory linked out of the repository is refused like a linked baseline directory: the
@@ -3220,11 +3391,16 @@ public sealed partial class ReplayLifecycleTests
         Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
         Assert.False(File.Exists(Full(ManifestFile)), "A refused contracts WSDL must leave no manifest.");
         Assert.NotNull(new FileInfo(Full(linkedDirectory)).LinkTarget);
-        Assert.StartsWith("[jade-standin] capture failed: System.IO.IOException: ", LastLine(), StringComparison.Ordinal);
-        Assert.Contains(
-            $"{LinkRefusal}: refused '{ContractsWsdlFile}', because '{linkedDirectory}' is a symbolic link.",
-            LastLine(),
-            StringComparison.Ordinal);
+
+        // The console names the temporary root and the stub's loopback port, so the last line is not shown.
+        Assert.True(
+            LastLine().StartsWith("[jade-standin] capture failed: System.IO.IOException: ", StringComparison.Ordinal),
+            "the capture's last console line states that it failed with an IOException");
+        Assert.True(
+            LastLine().Contains(
+                $"{LinkRefusal}: refused '{ContractsWsdlFile}', because '{linkedDirectory}' is a symbolic link.",
+                StringComparison.Ordinal),
+            "the capture's last console line names the refused contracts WSDL and its linked directory");
     }
 
     // The publishable WSDL broken in one way the facade's publication rule refuses.
@@ -3294,6 +3470,12 @@ public sealed partial class ReplayLifecycleTests
         _captureConsole.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 
     private string LastLine() => Lines()[^1];
+
+    // The console names the temporary root and the stub's loopback port, so the last line is not shown.
+    private void AssertLastLineEndsWith(string expectedEnd) =>
+        Assert.True(
+            LastLine().EndsWith(expectedEnd, StringComparison.Ordinal),
+            $"the capture's last console line does not end with '{expectedEnd}'");
 
     private string Full(string relative) => Path.Combine(CaptureRoot, relative.Replace('/', Path.DirectorySeparatorChar));
 
@@ -3531,6 +3713,8 @@ public sealed partial class ReplayLifecycleTests
         Assert.True(seed > empty, "the stub received no seed reset after the empty reset");
         Assert.True(requests.Count <= seed + 1, "a request followed the abandoned seed restoration");
 
+        // The console and a failed step's detail can name the temporary root and the stub's loopback port, so
+        // they are checked with fixed messages.
         var lines = console.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
         if (mode == BracketMode.Replay)
         {
@@ -3538,8 +3722,12 @@ public sealed partial class ReplayLifecycleTests
             var abandoned = $"{SeedRestorationLabel} was abandoned {ShortRestorationLimitSeconds} s after the run was cancelled";
             var item = Assert.Single(state.Failures, item => item.Detail?.StartsWith(SeedRestorationLabel, StringComparison.Ordinal) == true);
             Assert.Equal(FailureItemIds.Exception, item.ItemId);
-            Assert.Equal(abandoned, item.Detail);
-            Assert.Contains($"replay: {abandoned}", lines);
+            Assert.True(
+                string.Equals(abandoned, item.Detail, StringComparison.Ordinal),
+                "the CHK-EXCEPTION item does not state that the seed restoration was abandoned at the cancelled-run limit");
+            Assert.True(
+                lines.Contains($"replay: {abandoned}", StringComparer.Ordinal),
+                "the console does not state that the seed restoration was abandoned at the cancelled-run limit");
             var restoreItem = FailureItemIds.Reset(ResetPoints.After(EmptyStateCaseId));
             Assert.False(
                 state.Failures.Any(failure => string.Equals(failure.ItemId, restoreItem, StringComparison.Ordinal)),
@@ -3547,11 +3735,14 @@ public sealed partial class ReplayLifecycleTests
         }
         else
         {
-            Assert.Null(outcome);
+            // An exception's text can name the root or the port, so only its type is shown.
+            Assert.True(outcome is null, $"the capture threw {outcome?.GetType().FullName} instead of exiting 1");
             Assert.Equal(1, await (Task<int>)execution);
-            Assert.Contains(
-                $"{SourceLabels.ConsolePrefix} WARN {SeedRestorationLabel} was abandoned {ShortRestorationLimitSeconds} s after the capture was cancelled",
-                lines);
+            Assert.True(
+                lines.Contains(
+                    $"{SourceLabels.ConsolePrefix} WARN {SeedRestorationLabel} was abandoned {ShortRestorationLimitSeconds} s after the capture was cancelled",
+                    StringComparer.Ordinal),
+                "the console does not warn that the seed restoration was abandoned at the cancelled-run limit");
             Assert.True(
                 lines.Any(line => line.StartsWith($"{SourceLabels.ConsolePrefix} reset bracket of {EmptyStateCaseId} not confirmed", StringComparison.Ordinal)),
                 "the capture did not stop at the unconfirmed bracket");
@@ -4031,13 +4222,19 @@ public sealed partial class ReplayLifecycleTests
             expected);
         var lines = PrintedLines();
         Assert.Equal(2, lines.Count);
+
+        // The lines are shown with the per-test temporary directory above "missing" replaced by a fixed token;
+        // the escaped part of the path below it stays visible.
+        var temporary = Path.GetDirectoryName(Path.GetDirectoryName(directory))!;
+        const string temporaryToken = "<temporary-directory>";
+        var escapedDirectory = directory.Replace("\r\n", "\\u000D\\u000A", StringComparison.Ordinal);
         Assert.Equal(
-            $"{SourceLabels.ConsolePrefix} seed fingerprint of '{directory.Replace("\r\n", "\\u000D\\u000A", StringComparison.Ordinal)}' "
+            $"{SourceLabels.ConsolePrefix} seed fingerprint of '{escapedDirectory.Replace(temporary, temporaryToken, StringComparison.Ordinal)}' "
             + $"unavailable: {nameof(DirectoryNotFoundException)}",
-            lines[0]);
+            lines[0].Replace(temporary, temporaryToken, StringComparison.Ordinal));
         Assert.StartsWith(
             $"{SourceLabels.ConsolePrefix} {ResetExpectations.ExpectedReferenceDateKey} '{ReferenceDate}\\u000A{forged}' is not a yyyy-MM-dd date",
-            lines[1],
+            lines[1].Replace(temporary, temporaryToken, StringComparison.Ordinal),
             StringComparison.Ordinal);
     }
 
@@ -4146,7 +4343,11 @@ public sealed partial class ReplayLifecycleTests
 
         Assert.Null(item);
         Assert.Equal(1, writer.Attempts);
-        Assert.StartsWith($"GET {AdminRoutes.Health} HTTP/1.1", await answering, StringComparison.Ordinal);
+
+        // A request head names the listener's port in its Host header, so it is never shown.
+        Assert.True(
+            (await answering).StartsWith($"GET {AdminRoutes.Health} HTTP/1.1", StringComparison.Ordinal),
+            "the request the listener answered is the health probe");
     }
 
     [Theory]
@@ -4199,9 +4400,10 @@ public sealed partial class ReplayLifecycleTests
             await answering;
         }
 
+        // The ready line holds the measured wait, which is shown as a fixed token.
         var expectedStart = (linePrefix ?? "")
             + (listening ? $"ready: {ShutdownTarget.StandInComponent} (" : $"not ready: {ShutdownTarget.StandInComponent} (invalid admin URL: ");
-        Assert.StartsWith(expectedStart, Assert.Single(PrintedLines()), StringComparison.Ordinal);
+        Assert.StartsWith(expectedStart, Assert.Single(PrintedLines().Select(WithoutMilliseconds)), StringComparison.Ordinal);
     }
 
     [Theory]
@@ -4226,9 +4428,13 @@ public sealed partial class ReplayLifecycleTests
             TestContext.Current.CancellationToken);
 
         Assert.Equal(ShutdownTarget.StandInComponent, outcome.Component);
-        Assert.True(outcome.Stopped, outcome.Detail);
+        Assert.True(outcome.Stopped, WithoutMilliseconds(outcome.Detail));
         Assert.Null(outcome.ToFailureItem());
-        Assert.Equal(new[] { "POST " + AdminRoutes.Shutdown, "GET " + AdminRoutes.Health }, admin.Requests);
+
+        // How many probes a client that missed the refusal would send depends on timing, so the message is fixed.
+        Assert.True(
+            admin.Requests.SequenceEqual(["POST " + AdminRoutes.Shutdown, "GET " + AdminRoutes.Health]),
+            "the requests are the shutdown call and the one refused health probe, in that order");
         Assert.Equal(1, writer.Attempts);
     }
 
@@ -4310,8 +4516,9 @@ public sealed partial class ReplayLifecycleTests
     // The console text as lines, without the terminator of the last one.
     private List<string> PrintedLines()
     {
+        // The text can hold a temporary path or a measured time, so the check of its end is not shown.
         var text = _console.ToString();
-        Assert.EndsWith(Environment.NewLine, text, StringComparison.Ordinal);
+        Assert.True(text.EndsWith(Environment.NewLine, StringComparison.Ordinal), "the console text ends with a line terminator");
         return [.. text[..^Environment.NewLine.Length].Split(Environment.NewLine)];
     }
 
@@ -4426,7 +4633,9 @@ public sealed partial class ReplayLifecycleTests
 
         Assert.Equal(1, exitCode);
         Assert.True(elapsed.Elapsed < RejectBound, "the argument is refused before any setting, file or network is read");
-        Assert.Empty(_stdout.ToString());
+
+        // A mode that ran would print the temporary root and measured waits, so the text is not shown.
+        Assert.True(_stdout.ToString().Length == 0, "the refused argument prints nothing to standard output");
         Assert.False(Directory.Exists(RepoRootDirectory.PathOf("baseline")), "no mode ran, so nothing wrote baseline/");
         Assert.False(Directory.Exists(RepoRootDirectory.PathOf("contracts")), "no mode ran, so nothing wrote contracts/");
     }
@@ -4442,7 +4651,7 @@ public sealed partial class ReplayLifecycleTests
         var exitCode = await RunProgramAsync(Args(commandLine), CallLimit);
 
         Assert.Equal(0, exitCode);
-        Assert.Equal([FinalLine], _stdout.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries));
+        Assert.Equal([FinalLine], Redacted(_stdout.ToString()).Split('\n', StringSplitOptions.RemoveEmptyEntries));
     }
 
     [Fact]
@@ -4456,7 +4665,7 @@ public sealed partial class ReplayLifecycleTests
 
         AssertConfiguredDestinations(options);
         Assert.Equal(7, options.ShutdownTimeoutSeconds);
-        var problem = Assert.Single(problems);
+        var problem = AssertSingleProblem(problems);
         Assert.IsType<InvalidDataException>(problem.Exception);
         Assert.Contains("harness.json", problem.Context, StringComparison.Ordinal);
         Assert.Throws<InvalidDataException>(() => Program.LoadOptions(args));
@@ -4479,7 +4688,7 @@ public sealed partial class ReplayLifecycleTests
         // Setting one endpoint key keeps the defaults of the others.
         Assert.Equal(defaults.Target.RestBaseUrl, options.Target.RestBaseUrl);
 
-        var problem = Assert.Single(problems);
+        var problem = AssertSingleProblem(problems);
         var conversion = Assert.IsType<InvalidOperationException>(problem.Exception);
         Assert.Contains("Harness:RequestTimeoutSeconds", conversion.Message, StringComparison.Ordinal);
         var thrown = Assert.Throws<InvalidOperationException>(() => Program.LoadOptions(args));
@@ -4514,7 +4723,7 @@ public sealed partial class ReplayLifecycleTests
         var lenient = Program.LoadOptions(args, problems);
         var whole = BindWholeSection(path, args);
 
-        Assert.Empty(problems);
+        Assert.True(problems.Count == 0, $"the lenient loader recorded {ProblemContexts(problems)}");
         Assert.Equal(expectedAdminUrl, whole.Backend.AdminUrl);
         Assert.Equal(expectedExternal, whole.IsExternalBackend);
         foreach (var options in new[] { strict, lenient })
@@ -4522,9 +4731,9 @@ public sealed partial class ReplayLifecycleTests
             Assert.Equal(whole.Backend.AdminUrl, options.Backend.AdminUrl);
             Assert.Equal(whole.IsExternalBackend, options.IsExternalBackend);
             Assert.Equal(whole.ReadinessTimeoutSeconds, options.ReadinessTimeoutSeconds);
-            Assert.Equal(whole.ReportPath, options.ReportPath);
-            Assert.Equal(whole.SeedDirectory, options.SeedDirectory);
-            Assert.Equal(RepoRootDirectory.Root, options.RepoRoot);
+            Assert.Equal(RedactedSetting(whole.ReportPath), RedactedSetting(options.ReportPath));
+            Assert.Equal(RedactedSetting(whole.SeedDirectory), RedactedSetting(options.SeedDirectory));
+            Assert.Equal(RepoRootToken, Redacted(options.RepoRoot));
         }
     }
 
@@ -4558,14 +4767,26 @@ public sealed partial class ReplayLifecycleTests
         Assert.True(File.Exists(reportPath), "the report is written to Harness:ReportPath");
         Assert.False(File.Exists(RepoRootDirectory.PathOf("RESULTS.md")), "the default report path is never written");
 
+        // The report and standard output hold the temporary root, loopback ports and the run date, so their text
+        // is not shown.
         var report = await File.ReadAllTextAsync(reportPath, TestContext.Current.CancellationToken);
-        Assert.Contains(typeof(InvalidDataException).FullName!, report, StringComparison.Ordinal);
-        Assert.Contains("harness.json could not be read, so its settings are not applied", report, StringComparison.Ordinal);
-        Assert.Contains("Harness:ExecutionMode 'kubernetes' is neither 'local-processes' nor 'docker'", report, StringComparison.Ordinal);
-        Assert.Contains("| Execution mode | `unknown` |", report, StringComparison.Ordinal);
+        Assert.True(
+            report.Contains(typeof(InvalidDataException).FullName!, StringComparison.Ordinal),
+            "the report names the exception that left harness.json unread");
+        Assert.True(
+            report.Contains("harness.json could not be read, so its settings are not applied", StringComparison.Ordinal),
+            "the report states that harness.json could not be read");
+        Assert.True(
+            report.Contains("Harness:ExecutionMode 'kubernetes' is neither 'local-processes' nor 'docker'", StringComparison.Ordinal),
+            "the report states that the execution mode is unknown");
+        Assert.True(
+            report.Contains("| Execution mode | `unknown` |", StringComparison.Ordinal),
+            "the report's run facts show the execution mode as unknown");
 
         // The empty backend admin URL survived, so the backend counts as external and is left running.
-        Assert.Contains("cleanup: the backend is external and is never shut down", _stdout.ToString(), StringComparison.Ordinal);
+        Assert.True(
+            _stdout.ToString().Contains("cleanup: the backend is external and is never shut down", StringComparison.Ordinal),
+            "the console states that the external backend is never shut down");
     }
 
     // Runs the entry point with a hard limit that cancels the run's token and also ends the wait.
@@ -4610,14 +4831,29 @@ public sealed partial class ReplayLifecycleTests
         .. more,
     ];
 
+    // Paths below the temporary tree are compared with its root replaced by RepoRootToken, so a failure reads the
+    // same in every run.
     private void AssertConfiguredDestinations(HarnessOptions options)
     {
-        Assert.Equal(RepoRootDirectory.Root, options.RepoRoot);
-        Assert.Equal(ReportPath, options.EffectiveReportPath);
+        Assert.Equal(RepoRootToken, Redacted(options.RepoRoot));
+        Assert.Equal(Redacted(ReportPath), Redacted(options.EffectiveReportPath));
         Assert.Equal(TargetAdminUrl, options.Target.AdminUrl);
         Assert.Equal("", options.Backend.AdminUrl);
         Assert.True(options.IsExternalBackend, "an empty backend admin URL marks an external backend");
     }
+
+    private string? RedactedSetting(string? value) => value is null ? null : Redacted(value);
+
+    // A settings problem holds an exception whose message can name the temporary tree, so only the fixed
+    // contexts are shown.
+    private static Program.OptionsProblem AssertSingleProblem(List<Program.OptionsProblem> problems)
+    {
+        Assert.True(problems.Count == 1, $"the lenient loader recorded {ProblemContexts(problems)}, not exactly one problem");
+        return problems[0];
+    }
+
+    private static string ProblemContexts(List<Program.OptionsProblem> problems) =>
+        problems.Count == 0 ? "no problem" : string.Join("; ", problems.Select(problem => problem.Context));
 }
 
 // ---- Signal cancellation ------------------------------------------------------------------------
@@ -4692,6 +4928,9 @@ public sealed partial class ReplayLifecycleTests
     [InlineData(1, 2)]
     public async Task ThrowingCallbacks_AreObservedAndReported_Exit1(int exitCode, int throwing)
     {
+        // The unique marker tells this test's faults apart from any other unobserved task exception; every
+        // standard-error line is shown with it replaced by a fixed token, so a failure reads the same in every run.
+        const string markerToken = "<marker>";
         var marker = Guid.NewGuid().ToString("N");
         var messages = Enumerable.Range(1, throwing).Select(index => $"callback {index} failed {marker}").ToArray();
         var unobserved = new ConcurrentQueue<Exception>();
@@ -4709,17 +4948,20 @@ public sealed partial class ReplayLifecycleTests
             var (result, callbacks) = await RunThrowingAsync(exitCode, messages);
 
             AssertExitCode(1, result);
-            var line = Assert.Single(CancellationErrors);
+            var line = Assert.Single(CancellationErrors.Select(error => error.Replace(marker, markerToken, StringComparison.Ordinal)));
             Assert.StartsWith(FailedPrefix, line, StringComparison.Ordinal);
             Assert.DoesNotContain("\n", line, StringComparison.Ordinal);
             foreach (var message in messages)
             {
-                Assert.Contains($"{typeof(InvalidOperationException).FullName}: {message}", line, StringComparison.Ordinal);
+                Assert.Contains(
+                    $"{typeof(InvalidOperationException).FullName}: {message.Replace(marker, markerToken, StringComparison.Ordinal)}",
+                    line,
+                    StringComparison.Ordinal);
             }
 
             // Once the task is collected, the finaliser has run that would publish a fault nobody observed.
             Assert.True(await CollectedAsync(callbacks), "the callbacks' task was collected, so its finaliser has run");
-            Assert.Empty(unobserved);
+            Assert.True(unobserved.IsEmpty, "a fault of the callbacks reached TaskScheduler.UnobservedTaskException");
         }
         finally
         {
@@ -4752,7 +4994,11 @@ public sealed partial class ReplayLifecycleTests
         }
 
         AssertExitCode(1, result);
-        Assert.InRange(elapsed, TestBound - TimerTolerance, TestBound + Slack);
+
+        // A timing assertion with a fixed message: the measured time is never shown.
+        Assert.True(
+            elapsed >= TestBound - TimerTolerance && elapsed <= TestBound + Slack,
+            "completion did not return at its bound, within the timer tolerance before it or the slack after it");
         Assert.Equal("cancellation callbacks were still running after 0.2 s", Assert.Single(CancellationErrors));
         Assert.True(callbacks.IsCompletedSuccessfully, "the released callback finishes");
     }
@@ -4996,8 +5242,11 @@ public sealed partial class ReplayLifecycleTests
 // bidirectional characters a path or message holds. The fake facade listens on loopback only.
 // These members live in this class because the harness test project keeps its fixed set of test
 // classes, and these lines are escaped by the console sink covered above. The standard-error test
-// replaces Console.Error, which is process-wide, so it keeps only the terminated lines that start with
-// its mode's prefix: what a test of another class writes there meanwhile can neither fail it nor pass it.
+// replaces Console.Error, which is process-wide, so the whole class belongs to a collection that xunit
+// runs on its own, after every other test class and never beside one; within the class, tests run one at
+// a time. The test still keeps only the terminated lines that start with its mode's prefix and name its
+// own root, so a stray line could neither fail it nor pass it.
+[Collection(ProcessWideConsoleCollection.Name)]
 public sealed partial class ReplayLifecycleTests
 {
     // ESC starting a colour sequence, BEL ending an OSC title sequence, a right-to-left override and an
@@ -5008,6 +5257,9 @@ public sealed partial class ReplayLifecycleTests
     // Bounds the fake facade's wait for the mode's requests, so a mode that stops before readiness fails
     // the test instead of leaving it waiting.
     private static readonly TimeSpan AnswerLimit = TimeSpan.FromSeconds(30);
+
+    // Stands for ModeDiagnosticsRoot, which differs in every run, in the lines a failure message shows.
+    private const string ModeDiagnosticsRootToken = "<mode-diagnostics-root>";
 
     // Created on first use, so only the mode diagnostics tests touch the file system; removed in Dispose.
     private string? _modeDiagnosticsRoot;
@@ -5106,14 +5358,14 @@ public sealed partial class ReplayLifecycleTests
         Assert.Equal(
             new[] { $"GET {AdminRoutes.Health}", $"GET {AdminRoutes.OpenApiDocument}" },
             await answering.WaitAsync(AnswerLimit, ct));
-        var lines = ModeDiagnosticLines(stdout.ToString());
+        var lines = ModeDiagnosticLines(ModeRedacted(stdout.ToString()));
         Assert.Equal(2, lines.Count);
         Assert.Equal("export-openapi: waiting up to 10 s for the facade admin listener", lines[0]);
         var line = lines[1];
-        AssertEscaped(line, expectedStart, LifecycleConsole.Display(root));
+        AssertEscaped(line, expectedStart, ModeRedacted(LifecycleConsole.Display(root)));
         if (outcome == ExportOutcome.Written)
         {
-            Assert.Equal($"{expectedStart}{LifecycleConsole.Display(options.ContractsOpenApiPath)}", line);
+            Assert.Equal(ModeRedacted($"{expectedStart}{LifecycleConsole.Display(options.ContractsOpenApiPath)}"), line);
             Assert.Equal("{}", await File.ReadAllTextAsync(options.ContractsOpenApiPath, ct));
         }
     }
@@ -5149,30 +5401,39 @@ public sealed partial class ReplayLifecycleTests
         }
 
         Assert.Equal(1, exitCode);
-        Assert.Equal("", stdout.ToString());
 
-        // Other test classes run the modes concurrently and may write to the swapped standard error, but
-        // only this run's line names this test's own repository root; the mode prints exactly one.
+        // A mode that printed here would print the temporary root and measured waits, so the text is not shown.
+        Assert.True(stdout.ToString().Length == 0, "the mode prints nothing to standard output");
+
+        // The class's collection keeps every other test off the swapped standard error while this one runs (see
+        // ProcessWideConsoleCollection). Only this run's line names this test's own repository root, so a stray
+        // line could still neither fail nor pass it; the mode prints exactly one.
         var modePrefix = mode + ": ";
-        var escapedRoot = LifecycleConsole.Display(root);
+        var escapedRoot = ModeRedacted(LifecycleConsole.Display(root));
         var line = Assert.Single(
-            TerminatedLines(stderr.ToString()),
+            TerminatedLines(ModeRedacted(stderr.ToString())),
             printed => printed.StartsWith(modePrefix, StringComparison.Ordinal)
                 && printed.Contains(escapedRoot, StringComparison.Ordinal));
-        AssertEscaped(line, expectedStart, LifecycleConsole.Display(root));
+        AssertEscaped(line, expectedStart, escapedRoot);
         if (errorLine == ErrorLine.SummaryMissingReport)
         {
             Assert.Equal(
-                $"{expectedStart}{LifecycleConsole.Display(new HarnessOptions { RepoRoot = root }.EffectiveReportPath)}' does not exist",
+                ModeRedacted(
+                    $"{expectedStart}{LifecycleConsole.Display(new HarnessOptions { RepoRoot = root }.EffectiveReportPath)}' does not exist"),
                 line);
         }
     }
 
     // ---- Helpers --------------------------------------------------------------------------------
 
+    // The text with ModeDiagnosticsRoot, a plain path that Display keeps as it is, replaced by
+    // ModeDiagnosticsRootToken, which no mode prints. Both sides of a comparison go through it, so it holds
+    // exactly when the raw comparison does, and the hostile part of the path below the root stays visible.
+    private string ModeRedacted(string text) => text.Replace(ModeDiagnosticsRoot, ModeDiagnosticsRootToken, StringComparison.Ordinal);
+
     // The line starts as expected, quotes the escaped hostile text, holds none of HostileName's controls
     // as they are, and holds no character that Display escapes, so it can neither split nor drive the
-    // console.
+    // console. The line and the text are given redacted by ModeRedacted.
     private static void AssertEscaped(string line, string expectedStart, string escapedText)
     {
         Assert.StartsWith(expectedStart, line, StringComparison.Ordinal);
@@ -5184,7 +5445,7 @@ public sealed partial class ReplayLifecycleTests
     // The printed text as lines, each with its terminator removed.
     private static List<string> ModeDiagnosticLines(string text)
     {
-        Assert.EndsWith(Environment.NewLine, text, StringComparison.Ordinal);
+        Assert.True(text.EndsWith(Environment.NewLine, StringComparison.Ordinal), "the printed text ends with a line terminator");
         return [.. text[..^Environment.NewLine.Length].Split(Environment.NewLine)];
     }
 
@@ -5227,6 +5488,19 @@ public sealed partial class ReplayLifecycleTests
 
         return requests;
     }
+}
+
+/// <summary>
+/// The test collection of <see cref="ReplayLifecycleTests"/>. Its standard-error test replaces the process-wide
+/// <see cref="Console.Error"/>, so xunit runs this collection on its own, after every parallel collection and
+/// never beside a test of another class. This is a collection definition only, with no tests of its own, so
+/// the harness test project keeps its six test classes.
+/// </summary>
+[CollectionDefinition(Name, DisableParallelization = true)]
+public sealed class ProcessWideConsoleCollection
+{
+    /// <summary>The collection's name, which <see cref="ReplayLifecycleTests"/> names in its collection attribute.</summary>
+    public const string Name = "Process-wide console";
 }
 
 // ---- Support types of the capture mode tests ----------------------------------------------------
@@ -5436,6 +5710,9 @@ public sealed partial class ReplayLifecycleTests
     // file's parent, the other a recreated directory itself.
     private static readonly string[] SwappedDirectories = ["artifacts/replay/rest", "artifacts/discrepancies"];
 
+    // What WithoutPublishingGuid shows in place of a publication's temporary file name.
+    private const string PublishingTemporaryToken = ".<random>.publishing";
+
     private static readonly byte[] SentinelBytes = "protected content outside the repository\n"u8.ToArray();
     private static readonly byte[] FirstBytes = "{\"first\":\"a longer document than the second\"}"u8.ToArray();
     private static readonly byte[] SecondBytes = "{\"second\":2}"u8.ToArray();
@@ -5570,7 +5847,7 @@ public sealed partial class ReplayLifecycleTests
 
         Assert.False(IsLink("artifacts/discrepancies"), "The recreated entry must be a real directory, not a link.");
         Assert.True(Directory.Exists(target), "The recreated entry must be a directory.");
-        Assert.Empty(Directory.EnumerateFileSystemEntries(target));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(target).Select(ConfinedRelative));
         Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
     }
 
@@ -5592,7 +5869,7 @@ public sealed partial class ReplayLifecycleTests
         ConfinedTreeUnderTest.RecreateDirectory(ConfinedFull("artifacts/replay"));
 
         Assert.True(Directory.Exists(ConfinedFull("artifacts/replay")), "The cleared directory must exist again.");
-        Assert.Empty(Directory.EnumerateFileSystemEntries(ConfinedFull("artifacts/replay")));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(ConfinedFull("artifacts/replay")).Select(ConfinedRelative));
         Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
     }
 
@@ -5672,7 +5949,7 @@ public sealed partial class ReplayLifecycleTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => ConfinedTreeUnderTest.WriteFileAsync(ConfinedFull("artifacts/wsdl/facade.wsdl"), FirstBytes, cancelled.Token));
 
-        Assert.Empty(Directory.EnumerateFileSystemEntries(ConfinedRoot));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(ConfinedRoot).Select(ConfinedRelative));
     }
 
     // ---- Publishing a file --------------------------------------------------------------------------
@@ -5687,7 +5964,7 @@ public sealed partial class ReplayLifecycleTests
         ConfinedTreeUnderTest.PublishFile(ConfinedFull(file), SecondBytes);
 
         Assert.Equal(SecondBytes, File.ReadAllBytes(ConfinedFull(file)));
-        Assert.Equal([PublishedName], SpecialFileSupport.Names(ConfinedFull("artifacts/report")));
+        Assert.Equal([PublishedName], ShownNames(ConfinedFull("artifacts/report")));
     }
 
     // A hard link is a regular file, so it is replaced; the outside file it shares an inode with keeps its content.
@@ -5702,7 +5979,7 @@ public sealed partial class ReplayLifecycleTests
 
         Assert.Equal(SecondBytes, File.ReadAllBytes(ConfinedFull(PublishedName)));
         Assert.Equal(SentinelBytes, File.ReadAllBytes(outsideFile));
-        Assert.Equal([PublishedName], SpecialFileSupport.Names(ConfinedRoot));
+        Assert.Equal([PublishedName], ShownNames(ConfinedRoot));
     }
 
     // The entry is examined, never opened: an unread FIFO would otherwise block the call for good, so the call
@@ -5721,7 +5998,7 @@ public sealed partial class ReplayLifecycleTests
         var failure = await Assert.ThrowsAsync<IOException>(() => publish.WaitAsync(PromptLimit, TestCancellation));
 
         Assert.Contains($"ConfinedTree could not publish '{name}': {refusal}", failure.Message, StringComparison.Ordinal);
-        Assert.Equal([name], SpecialFileSupport.Names(ConfinedRoot));
+        Assert.Equal([name], ShownNames(ConfinedRoot));
         Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
         Assert.True(RefusedPublishTargetKept(entry, name), "A refused publication must leave the entry at the name as it was.");
     }
@@ -5778,10 +6055,11 @@ public sealed partial class ReplayLifecycleTests
             swapper.Join();
         }
 
-        Assert.Null(swapFailure);
+        // An exception's text names the temporary root, so only its type is shown.
+        Assert.True(swapFailure is null, $"The swapper must not fail, but it threw {swapFailure?.GetType().FullName}.");
         Assert.True(Volatile.Read(ref _confinedRaceSwaps) >= MinimumRaceSwaps, "The swapper must have raced the publications.");
         Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
-        Assert.DoesNotContain(SpecialFileSupport.Names(ConfinedRoot), name => name.EndsWith(".publishing", StringComparison.Ordinal));
+        Assert.DoesNotContain(ShownNames(ConfinedRoot), name => name.EndsWith(".publishing", StringComparison.Ordinal));
     }
 
     // ---- Publishing a new file ----------------------------------------------------------------------
@@ -5792,7 +6070,7 @@ public sealed partial class ReplayLifecycleTests
         Assert.True(await ConfinedTreeUnderTest.PublishNewFileAsync(ConfinedFull(NewFileName), FirstBytes, TestCancellation));
 
         Assert.Equal(FirstBytes, await File.ReadAllBytesAsync(ConfinedFull(NewFileName), TestCancellation));
-        Assert.Equal([Path.GetFileName(NewFileName)], SpecialFileSupport.Names(ConfinedFull("contracts/wsdl")));
+        Assert.Equal([Path.GetFileName(NewFileName)], ShownNames(ConfinedFull("contracts/wsdl")));
     }
 
     // A regular file at the name is kept byte for byte, a hard link to a file outside included, which is neither
@@ -5818,7 +6096,7 @@ public sealed partial class ReplayLifecycleTests
         Assert.False(await ConfinedTreeUnderTest.PublishNewFileAsync(ConfinedFull(NewFileName), FirstBytes, TestCancellation));
 
         Assert.Equal(SentinelBytes, await File.ReadAllBytesAsync(ConfinedFull(NewFileName), TestCancellation));
-        Assert.Equal([Path.GetFileName(NewFileName)], SpecialFileSupport.Names(ConfinedFull("contracts/wsdl")));
+        Assert.Equal([Path.GetFileName(NewFileName)], ShownNames(ConfinedFull("contracts/wsdl")));
         Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
     }
 
@@ -5856,7 +6134,7 @@ public sealed partial class ReplayLifecycleTests
         var failure = await Assert.ThrowsAsync<IOException>(() => publish.WaitAsync(PromptLimit, TestCancellation));
 
         Assert.Contains($"ConfinedTree could not publish '{name}': {refusal}", failure.Message, StringComparison.Ordinal);
-        Assert.Equal([name], SpecialFileSupport.Names(ConfinedRoot));
+        Assert.Equal([name], ShownNames(ConfinedRoot));
         Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
         Assert.True(RefusedPublishTargetKept(entry, name), "A refused publication must leave the entry at the name as it was.");
     }
@@ -5870,7 +6148,7 @@ public sealed partial class ReplayLifecycleTests
         await Assert.ThrowsAnyAsync<OperationCanceledException>(
             () => ConfinedTreeUnderTest.PublishNewFileAsync(ConfinedFull(NewFileName), FirstBytes, cancelled.Token));
 
-        Assert.Empty(Directory.EnumerateFileSystemEntries(ConfinedRoot));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(ConfinedRoot).Select(ConfinedRelative));
     }
 
     // ---- Deleting a file ----------------------------------------------------------------------------
@@ -5910,7 +6188,7 @@ public sealed partial class ReplayLifecycleTests
     public void DeleteFile_MissingDirectoryOrDirectoryAtTheTarget_CreatesAndRemovesNothing()
     {
         ConfinedTreeUnderTest.DeleteFile(ConfinedFull("artifacts/openapi/live.json"));
-        Assert.Empty(Directory.EnumerateFileSystemEntries(ConfinedRoot));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(ConfinedRoot).Select(ConfinedRelative));
 
         Directory.CreateDirectory(ConfinedFull("artifacts/openapi/live.json"));
         ConfinedTreeUnderTest.DeleteFile(ConfinedFull("artifacts/openapi/live.json"));
@@ -5966,7 +6244,8 @@ public sealed partial class ReplayLifecycleTests
             RemoveSwappedInLinks();
         }
 
-        Assert.Null(swapFailure);
+        // An exception's text names the temporary root, so only its type is shown.
+        Assert.True(swapFailure is null, $"The swapper must not fail, but it threw {swapFailure?.GetType().FullName}.");
         Assert.Equal(before, ConfinedSnapshot(ConfinedOutside));
         ConfinedTreeUnderTest.RecreateDirectory(ConfinedFull("artifacts/replay"));
         ConfinedTreeUnderTest.WriteFile(ConfinedFull("artifacts/replay/rest/001-getAgent-01.body"), SecondBytes);
@@ -6021,7 +6300,7 @@ public sealed partial class ReplayLifecycleTests
         ConfinedTreeUnderTest.WriteFile(ConfinedFull($"artifacts/discrepancies/{fileName}"), FirstBytes);
         Assert.Equal(
             Encoding.UTF8.GetBytes(expected),
-            Encoding.UTF8.GetBytes(Path.GetFileName(Assert.Single(Directory.EnumerateFiles(ConfinedFull("artifacts/discrepancies"))))));
+            Encoding.UTF8.GetBytes(Assert.Single(Directory.EnumerateFiles(ConfinedFull("artifacts/discrepancies")).Select(Path.GetFileName))!));
     }
 
     [Theory]
@@ -6248,13 +6527,14 @@ public sealed partial class ReplayLifecycleTests
 
     // Every entry below a directory, in ordinal order: files as "relative/path=hex", directories as
     // "relative/path/" and links as "relative/path->relative/target", so a created, changed or removed entry
-    // changes the snapshot. Paths are relative, so a failure reads the same in every run.
+    // changes the snapshot. Paths are relative and a publication's temporary file is shown by
+    // WithoutPublishingGuid, so a failure reads the same in every run.
     private static List<string> ConfinedSnapshot(string directory) =>
     [
         .. Directory.EnumerateFileSystemEntries(directory, "*", SearchOption.AllDirectories)
             .Select(entry =>
             {
-                var relative = Path.GetRelativePath(directory, entry).Replace(Path.DirectorySeparatorChar, '/');
+                var relative = WithoutPublishingGuid(Path.GetRelativePath(directory, entry).Replace(Path.DirectorySeparatorChar, '/'));
                 var linkTarget = new FileInfo(entry).LinkTarget;
                 return linkTarget is not null
                     ? relative + "->" + Path.GetRelativePath(directory, linkTarget).Replace(Path.DirectorySeparatorChar, '/')
@@ -6265,17 +6545,25 @@ public sealed partial class ReplayLifecycleTests
             .Order(StringComparer.Ordinal),
     ];
 
-    // .NET has no hard-link API, so ln(1) creates it.
-    private static void CreateHardLink(string link, string existingFile)
-    {
-        var startInfo = new ProcessStartInfo("ln") { UseShellExecute = false };
-        startInfo.ArgumentList.Add(existingFile);
-        startInfo.ArgumentList.Add(link);
-        using var process = Process.Start(startInfo);
-        Assert.NotNull(process);
-        process.WaitForExit();
-        Assert.True(process.ExitCode == 0, "ln must create the hard link.");
-    }
+    // A publication writes a temporary file named "." + a new Guid's 32 hex digits + ".publishing" beside its
+    // target, so one left behind is shown with those digits replaced by a token no publication writes. No listing
+    // holds such a file before the operation under test, so a listing compared after this replacement differs
+    // from the expected one exactly when the raw listing does.
+    private static string WithoutPublishingGuid(string relative) =>
+        PublishingTemporaryName().Replace(relative, PublishingTemporaryToken);
+
+    // The last component of a relative path when it is a publication's temporary file name; \z, unlike $, also
+    // rejects a trailing newline.
+    [GeneratedRegex(@"(?<=\A|/)\.[0-9a-f]{32}\.publishing\z", RegexOptions.CultureInvariant)]
+    private static partial Regex PublishingTemporaryName();
+
+    // SpecialFileSupport.Names, with each publication's temporary file shown by WithoutPublishingGuid.
+    private static List<string> ShownNames(string directory) =>
+        [.. SpecialFileSupport.Names(directory).Select(WithoutPublishingGuid)];
+
+    // .NET has no hard-link API, so ln(1) creates it, bounded like every other tool the tests run.
+    private static void CreateHardLink(string link, string existingFile) =>
+        Assert.True(SpecialFileSupport.Run("ln", existingFile, link) == 0, "ln must create the hard link.");
 
     private bool IsLink(string relative) => new FileInfo(ConfinedFull(relative)).LinkTarget is not null;
 
@@ -6305,10 +6593,16 @@ public sealed partial class ReplayLifecycleTests
 /// Named pipes (FIFOs) for the tests that point a write at one, and a directory listing that is safe beside
 /// one. .NET has no API that creates or recognises a FIFO, so mkfifo(1) creates it and the shell's
 /// <c>test -p</c> recognises it. Nothing here opens an entry, so nothing can block on a FIFO that nobody reads.
+/// Each tool here, and ln(1) for the tests' hard links, runs through <see cref="Run"/>, which bounds it.
 /// </summary>
 internal static class SpecialFileSupport
 {
     private static readonly TimeSpan ToolLimit = TimeSpan.FromSeconds(30);
+
+    // How long a killed tool gets to exit, and how often a wait for a tool looks at the test's cancellation.
+    private static readonly TimeSpan WindDownLimit = TimeSpan.FromSeconds(5);
+
+    private static readonly TimeSpan CancellationPollInterval = TimeSpan.FromMilliseconds(100);
 
     /// <summary>Creates a FIFO at <paramref name="path"/>, which must not exist.</summary>
     public static void CreateFifo(string path) =>
@@ -6326,9 +6620,12 @@ internal static class SpecialFileSupport
             .Order(StringComparer.Ordinal),
     ];
 
-    // Runs a tool with its arguments passed as they are and returns its exit code; a tool that does not end
-    // within the limit fails the test instead of hanging it.
-    private static int Run(string tool, params string[] arguments)
+    /// <summary>
+    /// Runs a tool with its arguments passed as they are and returns its exit code. A tool that does not end
+    /// within the tool limit fails the test, and a cancelled test stops waiting for it, instead of hanging; either
+    /// way the tool and everything it spawned are killed and their exit awaited, so none outlives the test.
+    /// </summary>
+    public static int Run(string tool, params string[] arguments)
     {
         var startInfo = new ProcessStartInfo(tool) { UseShellExecute = false };
         foreach (var argument in arguments)
@@ -6336,14 +6633,67 @@ internal static class SpecialFileSupport
             startInfo.ArgumentList.Add(argument);
         }
 
+        var ct = TestContext.Current.CancellationToken;
+        ct.ThrowIfCancellationRequested();
         using var process = Process.Start(startInfo);
         Assert.NotNull(process);
-        if (!process.WaitForExit(ToolLimit))
+        var exited = false;
+        try
         {
-            process.Kill();
-            Assert.Fail($"{tool} did not finish within the tool limit.");
+            exited = WaitForExit(process, ct);
+            if (!exited)
+            {
+                ct.ThrowIfCancellationRequested();
+                Assert.Fail($"{tool} did not finish within the tool limit.");
+            }
+
+            return process.ExitCode;
+        }
+        finally
+        {
+            if (!exited)
+            {
+                Stop(process);
+            }
+        }
+    }
+
+    // Waits until the tool exits, the tool limit passes or the test is cancelled, whichever comes first, looking
+    // at the cancellation between short slices of the wait. Reports whether the tool exited.
+    private static bool WaitForExit(Process process, CancellationToken ct)
+    {
+        var waited = Stopwatch.StartNew();
+        while (!ct.IsCancellationRequested)
+        {
+            var remaining = ToolLimit - waited.Elapsed;
+            if (remaining <= TimeSpan.Zero)
+            {
+                return false;
+            }
+
+            if (process.WaitForExit(remaining < CancellationPollInterval ? remaining : CancellationPollInterval))
+            {
+                return true;
+            }
         }
 
-        return process.ExitCode;
+        return false;
+    }
+
+    // Kills the tool and everything it spawned, then waits a bounded time for its exit, so it is gone before its
+    // Process is released. A tool that already exited needs neither.
+    private static void Stop(Process process)
+    {
+        try
+        {
+            process.Kill(entireProcessTree: true);
+        }
+        catch (InvalidOperationException)
+        {
+            // The tool exited before the kill: nothing is left to stop.
+            return;
+        }
+
+        process.WaitForExit(WindDownLimit);
     }
 }

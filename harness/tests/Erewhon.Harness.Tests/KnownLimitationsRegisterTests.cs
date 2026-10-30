@@ -1,4 +1,6 @@
+using System.ComponentModel;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.IO.Pipes;
 using System.Net.Sockets;
@@ -61,6 +63,12 @@ public sealed partial class KnownLimitationsRegisterTests : IDisposable
     // Every loader message starts with this, after the path when the register was read from a file.
     private const string RegisterErrorPrefix = "Invalid known-limitations register: ";
 
+    // Stands for a register file's per-test temporary path in the messages a failure shows; no message holds it.
+    private const string RegisterFileToken = "<register-file>";
+
+    // Stands for the root of Temp, which differs in every run, in the details and settings a failure shows.
+    private const string TempRootToken = "<temp-root>";
+
     private static readonly Discrepancy Website = new(
         "$.website",
         DiscrepancyKinds.Value,
@@ -108,6 +116,16 @@ public sealed partial class KnownLimitationsRegisterTests : IDisposable
 
     /// <summary>This test's own temporary directory, created on first use.</summary>
     private TempDirectory Temp => _temp ??= new TempDirectory();
+
+    /// <summary>
+    /// <paramref name="text"/> with <see cref="Temp"/>'s root replaced by <see cref="TempRootToken"/>, which no
+    /// check prints, so a failure message reads the same in every run. A comparison with a literal that holds
+    /// neither, or of two texts redacted alike, holds exactly when the raw one does. A test that never created
+    /// <see cref="Temp"/> has nothing to redact, and the call does not create it.
+    /// </summary>
+    [return: NotNullIfNotNull(nameof(text))]
+    private string? Redacted(string? text) =>
+        _temp is null ? text : text?.Replace(_temp.Root, TempRootToken, StringComparison.Ordinal);
 
     /// <summary>
     /// Deletes the temporary directory and any repository in it, if this test created one, and disposes the
@@ -340,14 +358,14 @@ public sealed partial class KnownLimitationsRegisterTests : IDisposable
     }
 
     [Theory]
-    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"bogus","matches":[]}]}""")]
-    [InlineData("""{"version":1,"entries":{"id":"KL-X","category":"check"}}""")]
-    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check"},{"id":"KL-X","category":"check"}]}""")]
-    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","matches":[{"itemId":"CHK-ORDERING","nature":" "}]}]}""")]
-    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","matches":[],"matches":[]}]}""")]
-    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","attempts":-1}]}""")]
-    [InlineData("""{"version":2,"entries":[]}""")]
-    [InlineData("""{"version":1,"entries":[""")]
+    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"bogus","matches":[]}]}""", Label = "unknown category")]
+    [InlineData("""{"version":1,"entries":{"id":"KL-X","category":"check"}}""", Label = "entries not an array")]
+    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check"},{"id":"KL-X","category":"check"}]}""", Label = "duplicate id")]
+    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","matches":[{"itemId":"CHK-ORDERING","nature":" "}]}]}""", Label = "blank nature")]
+    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","matches":[],"matches":[]}]}""", Label = "duplicate member name")]
+    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","attempts":-1}]}""", Label = "negative attempts")]
+    [InlineData("""{"version":2,"entries":[]}""", Label = "unsupported version")]
+    [InlineData("""{"version":1,"entries":[""", Label = "truncated document")]
     public void Parse_InvalidContent_Throws(string json)
     {
         Assert.Throws<InvalidDataException>(() => KnownLimitationsRegister.Parse(json));
@@ -355,16 +373,16 @@ public sealed partial class KnownLimitationsRegisterTests : IDisposable
 
     // The JSON is valid, but each \u escape of a lone surrogate has no UTF-16 string value.
     [Theory]
-    [InlineData("""{"version":1,"entries":[{"id":"KL-\uD800","category":"check"}]}""", "entries[0]: 'id' is not valid UTF-16 text: ")]
-    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check\uD800"}]}""", "entries[0] (KL-X): 'category' is not valid UTF-16 text: ")]
-    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","operation":"\uDC00"}]}""", "entries[0] (KL-X): 'operation' is not valid UTF-16 text: ")]
-    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","reason":"a\uDC00b"}]}""", "entries[0] (KL-X): 'reason' is not valid UTF-16 text: ")]
-    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","reason":"\uDC00\uD800"}]}""", "entries[0] (KL-X): 'reason' is not valid UTF-16 text: ")]
-    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","actionTaken":"\uDC00"}]}""", "entries[0] (KL-X): 'actionTaken' is not valid UTF-16 text: ")]
-    [InlineData("""{"version":1,"entries":[{"id":"KL-A","category":"check"},{"id":"KL-X","category":"check","matches":[{"itemId":"CHK-ORDERING","nature":"not-run"},{"itemId":"CHK-\uD800","nature":"not-run"}]}]}""", "entries[1] (KL-X): 'matches[1].itemId' is not valid UTF-16 text: ")]
-    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","matches":[{"itemId":"CHK-ORDERING","nature":"d:\uDC00"}]}]}""", "entries[0] (KL-X): 'matches[0].nature' is not valid UTF-16 text: ")]
-    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","matches":[{"itemId":"CHK-ORDERING","nature":"d:\uD800\u0041"}]}]}""", "entries[0] (KL-X): 'matches[0].nature' is not valid UTF-16 text: ")]
-    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","note\uD800":"x"}]}""", "a member name is not valid UTF-16 text: ")]
+    [InlineData("""{"version":1,"entries":[{"id":"KL-\uD800","category":"check"}]}""", "entries[0]: 'id' is not valid UTF-16 text: ", Label = "id high surrogate")]
+    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check\uD800"}]}""", "entries[0] (KL-X): 'category' is not valid UTF-16 text: ", Label = "category high surrogate")]
+    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","operation":"\uDC00"}]}""", "entries[0] (KL-X): 'operation' is not valid UTF-16 text: ", Label = "operation low surrogate")]
+    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","reason":"a\uDC00b"}]}""", "entries[0] (KL-X): 'reason' is not valid UTF-16 text: ", Label = "reason low surrogate inside text")]
+    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","reason":"\uDC00\uD800"}]}""", "entries[0] (KL-X): 'reason' is not valid UTF-16 text: ", Label = "reason low then high surrogate")]
+    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","actionTaken":"\uDC00"}]}""", "entries[0] (KL-X): 'actionTaken' is not valid UTF-16 text: ", Label = "actionTaken low surrogate")]
+    [InlineData("""{"version":1,"entries":[{"id":"KL-A","category":"check"},{"id":"KL-X","category":"check","matches":[{"itemId":"CHK-ORDERING","nature":"not-run"},{"itemId":"CHK-\uD800","nature":"not-run"}]}]}""", "entries[1] (KL-X): 'matches[1].itemId' is not valid UTF-16 text: ", Label = "second entry's second itemId high surrogate")]
+    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","matches":[{"itemId":"CHK-ORDERING","nature":"d:\uDC00"}]}]}""", "entries[0] (KL-X): 'matches[0].nature' is not valid UTF-16 text: ", Label = "nature low surrogate")]
+    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","matches":[{"itemId":"CHK-ORDERING","nature":"d:\uD800\u0041"}]}]}""", "entries[0] (KL-X): 'matches[0].nature' is not valid UTF-16 text: ", Label = "nature high surrogate then letter")]
+    [InlineData("""{"version":1,"entries":[{"id":"KL-X","category":"check","note\uD800":"x"}]}""", "a member name is not valid UTF-16 text: ", Label = "member name high surrogate")]
     public void Parse_LoneSurrogateEscape_ThrowsNamingTheMember(string json, string expected)
     {
         var exception = Assert.Throws<InvalidDataException>(() => KnownLimitationsRegister.Parse(json));
@@ -405,8 +423,10 @@ public sealed partial class KnownLimitationsRegisterTests : IDisposable
         {
             var exception = Assert.Throws<InvalidDataException>(() => KnownLimitationsRegister.Load(path));
 
-            Assert.StartsWith(path + ": " + RegisterErrorPrefix + "not valid UTF-8: ", exception.Message, StringComparison.Ordinal);
-            Assert.DoesNotContain("\uFFFD", exception.Message, StringComparison.Ordinal);
+            // The message is shown with the temporary path replaced by a fixed token.
+            var message = exception.Message.Replace(path, RegisterFileToken, StringComparison.Ordinal);
+            Assert.StartsWith(RegisterFileToken + ": " + RegisterErrorPrefix + "not valid UTF-8: ", message, StringComparison.Ordinal);
+            Assert.DoesNotContain("\uFFFD", message, StringComparison.Ordinal);
 
             // The reported index is the offset of the first invalid byte in the file, mark included.
             var decoding = Assert.IsType<DecoderFallbackException>(exception.InnerException);
@@ -423,9 +443,10 @@ public sealed partial class KnownLimitationsRegisterTests : IDisposable
         {
             var exception = Assert.Throws<InvalidDataException>(() => KnownLimitationsRegister.Load(path));
 
+            // The message is shown with the temporary path replaced by a fixed token.
             Assert.StartsWith(
-                path + ": " + RegisterErrorPrefix + "entries[0] (KL-X): 'matches[0].nature' is not valid UTF-16 text: ",
-                exception.Message,
+                RegisterFileToken + ": " + RegisterErrorPrefix + "entries[0] (KL-X): 'matches[0].nature' is not valid UTF-16 text: ",
+                exception.Message.Replace(path, RegisterFileToken, StringComparison.Ordinal),
                 StringComparison.Ordinal);
             var parsing = Assert.IsType<InvalidDataException>(exception.InnerException);
             Assert.IsType<InvalidOperationException>(parsing.InnerException);
@@ -2207,8 +2228,12 @@ public sealed partial class KnownLimitationsRegisterTests : IDisposable
             var target = Directory.CreateDirectory(Path.Combine(directory, "harness")).FullName;
 
             Assert.Throws<IOException>(() => writer.Write(target, text));
-            Assert.Empty(Directory.EnumerateFileSystemEntries(target));
-            Assert.Equal([target], Directory.EnumerateFileSystemEntries(directory));
+
+            // Entries are named relative to the temporary directory, so a failure reads the same in every run.
+            Assert.Empty(Directory.EnumerateFileSystemEntries(target).Select(entry => Path.GetRelativePath(directory, entry)));
+            Assert.Equal(
+                [Path.GetRelativePath(directory, target)],
+                Directory.EnumerateFileSystemEntries(directory).Select(entry => Path.GetRelativePath(directory, entry)));
         });
 
         Assert.DoesNotContain(CredentialMark, text, StringComparison.OrdinalIgnoreCase);
@@ -3780,7 +3805,9 @@ public sealed partial class KnownLimitationsRegisterTests
             File.WriteAllText(path, "{}", new UTF8Encoding(false));
 
             var ex = Assert.Throws<InvalidDataException>(() => CaseMatrix.Load(path, Catalogue));
-            Assert.Equal(MatrixMessagePrefix + "missing 'version'", ex.Message);
+
+            // A message that named the file would show its temporary directory, so that is replaced by a fixed token.
+            Assert.Equal(MatrixMessagePrefix + "missing 'version'", ex.Message.Replace(directory, "<temporary-directory>", StringComparison.Ordinal));
         });
     }
 
@@ -4512,9 +4539,11 @@ public sealed partial class KnownLimitationsRegisterTests
 
         AssertAllPassedCounts(summary);
         var item = AssertSingleTrxItem(summary);
-        Assert.Contains(expectedReason, item.Detail, StringComparison.Ordinal);
-        Assert.Contains(FacadeTestResults.ExitCodeFileName, item.Detail, StringComparison.Ordinal);
-        Assert.DoesNotContain("\n", item.Detail, StringComparison.Ordinal);
+
+        // The detail names the exit-code file by its full path, which is shown with Temp's root redacted.
+        Assert.Contains(expectedReason, Redacted(item.Detail), StringComparison.Ordinal);
+        Assert.Contains(FacadeTestResults.ExitCodeFileName, Redacted(item.Detail), StringComparison.Ordinal);
+        Assert.DoesNotContain("\n", Redacted(item.Detail), StringComparison.Ordinal);
         Assert.Null(summary.ExitCode);
     }
 
@@ -4528,8 +4557,10 @@ public sealed partial class KnownLimitationsRegisterTests
 
         AssertAllPassedCounts(summary);
         var item = AssertSingleTrxItem(summary);
-        Assert.Contains("exit-code file unreadable: ", item.Detail, StringComparison.Ordinal);
-        Assert.EndsWith("is a directory", item.Detail, StringComparison.Ordinal);
+
+        // The detail names the exit-code file by its full path, which is shown with Temp's root redacted.
+        Assert.Contains("exit-code file unreadable: ", Redacted(item.Detail), StringComparison.Ordinal);
+        Assert.EndsWith("is a directory", Redacted(item.Detail), StringComparison.Ordinal);
         Assert.Null(summary.ExitCode);
     }
 
@@ -4572,15 +4603,16 @@ public sealed partial class KnownLimitationsRegisterTests
 
         AssertThreeNotRunChecks(summary);
         var item = AssertSingleTrxItem(summary);
-        var trxReason = $"TRX file absent: {Temp.PathOf($"artifacts/facade-tests/{FacadeTestResults.TrxFileName}")}";
+        // The detail names the TRX file by its full path, which both sides show with Temp's root redacted.
+        var trxReason = Redacted($"TRX file absent: {Temp.PathOf($"artifacts/facade-tests/{FacadeTestResults.TrxFileName}")}");
         if (expectedCompletionReason is null)
         {
-            Assert.Equal(trxReason, item.Detail);
+            Assert.Equal(trxReason, Redacted(item.Detail));
         }
         else
         {
-            Assert.StartsWith(trxReason + "; ", item.Detail, StringComparison.Ordinal);
-            Assert.Contains(expectedCompletionReason, item.Detail, StringComparison.Ordinal);
+            Assert.StartsWith(trxReason + "; ", Redacted(item.Detail), StringComparison.Ordinal);
+            Assert.Contains(expectedCompletionReason, Redacted(item.Detail), StringComparison.Ordinal);
         }
     }
 
@@ -4767,7 +4799,7 @@ public sealed partial class KnownLimitationsRegisterTests
         var trx = Assert.Single(summary.Failures, item => item.ItemId == FailureItemIds.FacadeTrx);
         if (state != "unparseable")
         {
-            Assert.Contains(xmlPath, trx.Detail, StringComparison.Ordinal);
+            Assert.Contains(Redacted(xmlPath), Redacted(trx.Detail), StringComparison.Ordinal);
         }
     }
 
@@ -4950,7 +4982,8 @@ public sealed partial class KnownLimitationsRegisterTests
 
         var summary = await Task.Run(() => Read(), ct).WaitAsync(PromptReadLimit, ct);
 
-        var refusal = path + kind switch
+        // The refusal names the planted file by its full path, which both sides show with Temp's root redacted.
+        var refusal = Redacted(path) + kind switch
         {
             "fifo" => " is not a regular file (a FIFO)",
             "oversized" => string.Create(CultureInfo.InvariantCulture, $" exceeds the {byteLimit}-byte limit"),
@@ -4960,12 +4993,12 @@ public sealed partial class KnownLimitationsRegisterTests
         {
             case "trx":
                 AssertThreeNotRunChecks(summary);
-                Assert.Equal($"TRX file unreadable: {refusal}", AssertSingleTrxItem(summary).Detail);
+                Assert.Equal($"TRX file unreadable: {refusal}", Redacted(AssertSingleTrxItem(summary).Detail));
                 Assert.Equal(0, summary.ExitCode);
                 break;
             case "exit-code":
                 AssertAllPassedCounts(summary);
-                Assert.Equal($"exit-code file unreadable: {refusal}", AssertSingleTrxItem(summary).Detail);
+                Assert.Equal($"exit-code file unreadable: {refusal}", Redacted(AssertSingleTrxItem(summary).Detail));
                 Assert.Null(summary.ExitCode);
                 break;
             case "xunit-xml":
@@ -4992,7 +5025,9 @@ public sealed partial class KnownLimitationsRegisterTests
         var summary = Read();
 
         AssertThreeNotRunChecks(summary);
-        Assert.Equal($"TRX file unreadable: {trxPath} is a directory", AssertSingleTrxItem(summary).Detail);
+
+        // The detail names the TRX file by its full path, which both sides show with Temp's root redacted.
+        Assert.Equal(Redacted($"TRX file unreadable: {trxPath} is a directory"), Redacted(AssertSingleTrxItem(summary).Detail));
     }
 
     // The results directory, or the artifacts directory above it, replaced by a link to a directory of valid
@@ -5023,11 +5058,15 @@ public sealed partial class KnownLimitationsRegisterTests
         var summary = await Task.Run(() => Read(), ct).WaitAsync(PromptReadLimit, ct);
 
         AssertThreeNotRunChecks(summary);
+
+        // The detail names each file and the refused component by full path, which both sides show with Temp's
+        // root redacted.
         var reason = $"{componentPath} {expectedReason}";
         Assert.Equal(
-            $"TRX file unreadable: {Temp.PathOf($"artifacts/facade-tests/{FacadeTestResults.TrxFileName}")}: {reason}; "
-                + $"exit-code file unreadable: {Temp.PathOf($"artifacts/facade-tests/{FacadeTestResults.ExitCodeFileName}")}: {reason}",
-            AssertSingleTrxItem(summary).Detail);
+            Redacted(
+                $"TRX file unreadable: {Temp.PathOf($"artifacts/facade-tests/{FacadeTestResults.TrxFileName}")}: {reason}; "
+                    + $"exit-code file unreadable: {Temp.PathOf($"artifacts/facade-tests/{FacadeTestResults.ExitCodeFileName}")}: {reason}"),
+            Redacted(AssertSingleTrxItem(summary).Detail));
         Assert.Null(summary.ExitCode);
     }
 
@@ -5065,12 +5104,13 @@ public sealed partial class KnownLimitationsRegisterTests
         }
     }
 
-    private static void MakeFifo(string path)
+    // A path below Temp is shown in the failure with Temp's root redacted.
+    private void MakeFifo(string path)
     {
         if (MkFifo(path, FifoMode) != 0)
         {
             var errno = Marshal.GetLastPInvokeError();
-            Assert.Fail($"mkfifo could not make {path}: {Marshal.GetPInvokeErrorMessage(errno)}");
+            Assert.Fail($"mkfifo could not make {Redacted(path)}: {Marshal.GetPInvokeErrorMessage(errno)}");
         }
     }
 
@@ -5114,15 +5154,16 @@ public sealed partial class KnownLimitationsRegisterTests
     }
 
     // The failed REST routing invocation keeps its TEST item, with an empty exception-type slot, and the
-    // CHK-FACADE-TRX item, the only other item, says why the type is not recorded.
-    private static void AssertUntypedFailure(FacadeTestSummary summary, string expectedDetailStart)
+    // CHK-FACADE-TRX item, the only other item, says why the type is not recorded. A detail read below Temp
+    // names its files by their full path, so it is shown with Temp's root redacted.
+    private void AssertUntypedFailure(FacadeTestSummary summary, string expectedDetailStart)
     {
         Assert.Equal(2, summary.Failures.Count);
         var test = Assert.Single(summary.Failures, item => item.ItemId == FailureItemIds.Test(RoutingClass, RoutingTestName(RestArguments)));
         Assert.Equal(ExpectedNature(string.Empty, "RoutingTests.cs", FacadeTrxAssertionLine, FacadeTrxAssertionMessage), test.Nature);
         var trx = Assert.Single(summary.Failures, item => item.ItemId == FailureItemIds.FacadeTrx);
         Assert.Equal(FailureItemIds.Missing, trx.Nature);
-        Assert.StartsWith(expectedDetailStart, trx.Detail, StringComparison.Ordinal);
+        Assert.StartsWith(expectedDetailStart, Redacted(trx.Detail), StringComparison.Ordinal);
     }
 
     // The signature as the identity table defines it, computed independently of the parser.
@@ -5422,7 +5463,7 @@ public sealed partial class KnownLimitationsRegisterTests
 
         Assert.Equal(
             new CheckResult(CheckNames.JadeUnchanged, CheckOutcomes.Pass, 2, 2, $"no change under Erewhon/ since starting commit {StartingCommit}"),
-            result.Result);
+            result.Result with { Detail = Redacted(result.Result.Detail) });
         Assert.Empty(result.Failures);
         Assert.Equal(new JadeUnchangedSummary(2, 0), result.Summary);
     }
@@ -5451,7 +5492,7 @@ public sealed partial class KnownLimitationsRegisterTests
         Assert.Equal(expected, result.Failures);
         Assert.Equal(
             new CheckResult(CheckNames.JadeUnchanged, CheckOutcomes.Fail, 3, 1, $"3 path(s) under Erewhon/ changed since starting commit {StartingCommit}"),
-            result.Result);
+            result.Result with { Detail = Redacted(result.Result.Detail) });
         Assert.Equal(new JadeUnchangedSummary(3, 3), result.Summary);
 
         // A deleted path has no content to hash; the other two are hashed once each.
@@ -5544,7 +5585,7 @@ public sealed partial class KnownLimitationsRegisterTests
         Assert.Equal(4, git.Calls.Count);
         string[] formatArgs = ["rev-parse", "--show-object-format"];
         Assert.Equal(formatArgs, git.Calls[^1].Args);
-        Assert.Equal(Temp.Root, git.Calls[^1].RepoRoot);
+        Assert.Equal(TempRootToken, Redacted(git.Calls[^1].RepoRoot));
         Assert.Equal(Git.DefaultTimeout, git.Calls[^1].Timeout);
     }
 
@@ -5609,7 +5650,7 @@ public sealed partial class KnownLimitationsRegisterTests
         await ScriptedJadeUnchangedCheck(git, $"  {StartingCommit} ").RunAsync(TestContext.Current.CancellationToken);
 
         Assert.Equal(3, git.Calls.Count);
-        Assert.All(git.Calls, call => Assert.Equal(Temp.Root, call.RepoRoot));
+        Assert.All(git.Calls, call => Assert.Equal(TempRootToken, Redacted(call.RepoRoot)));
         Assert.All(git.Calls, call => Assert.Equal(Git.DefaultTimeout, call.Timeout));
         string[] diffArgs = ["diff", "--name-status", "--no-renames", "-z", StartingCommit, "--", "Erewhon/"];
         string[] statusArgs = ["status", "--porcelain", "--no-renames", "--untracked-files=all", "-z", "--", "Erewhon/"];
@@ -5788,7 +5829,9 @@ public sealed partial class KnownLimitationsRegisterTests
         return await TestGit.CommitAllAsync(Temp.Root, "starting commit", ct);
     }
 
-    private static string AssertJadeUnchangedNotRun(JadeUnchangedResult result, string expectedDetail)
+    // A detail can name the repository root, so it is compared unshown with the check's, and checked and
+    // returned with Temp's root redacted.
+    private string AssertJadeUnchangedNotRun(JadeUnchangedResult result, string expectedDetail)
     {
         Assert.Equal(CheckNames.JadeUnchanged, result.Result.Name);
         Assert.Equal(CheckOutcomes.NotRun, result.Result.Outcome);
@@ -5797,9 +5840,12 @@ public sealed partial class KnownLimitationsRegisterTests
         var item = Assert.Single(result.Failures);
         Assert.Equal(FailureItemIds.JadeUnchanged, item.ItemId);
         Assert.Equal(FailureItemIds.NotRun, item.Nature);
-        Assert.Equal(result.Result.Detail, item.Detail);
-        Assert.Contains(expectedDetail, item.Detail, StringComparison.Ordinal);
-        return item.Detail!;
+        Assert.True(
+            string.Equals(result.Result.Detail, item.Detail, StringComparison.Ordinal),
+            "The failing item must carry the check's detail.");
+        var detail = Redacted(item.Detail);
+        Assert.Contains(expectedDetail, detail, StringComparison.Ordinal);
+        return detail!;
     }
 }
 
@@ -5966,11 +6012,15 @@ public sealed partial class KnownLimitationsRegisterTests
         if (expectedNature is not null)
         {
             Assert.Equal(FailureItemIds.Ordering, result.Failure!.ItemId);
-            Assert.Equal(result.Result.Detail, result.Failure.Detail);
+            Assert.True(
+                string.Equals(result.Result.Detail, result.Failure.Detail, StringComparison.Ordinal),
+                "The failing item must carry the check's detail.");
         }
         else
         {
-            Assert.Equal(new CheckResult(CheckNames.Ordering, CheckOutcomes.Pass, 1, 1, "baseline commit aaaaaaaaaaaa is an ancestor of the first facade commit bbbbbbbbbbbb"), result.Result);
+            Assert.Equal(
+                new CheckResult(CheckNames.Ordering, CheckOutcomes.Pass, 1, 1, "baseline commit aaaaaaaaaaaa is an ancestor of the first facade commit bbbbbbbbbbbb"),
+                result.Result with { Detail = Redacted(result.Result.Detail) });
         }
 
         Assert.Equal(BaselineCommit, result.BaselineCommit);
@@ -6003,7 +6053,7 @@ public sealed partial class KnownLimitationsRegisterTests
         await ScriptedOrderingEvidence(git).RunAsync(TestContext.Current.CancellationToken);
 
         Assert.Equal(4, git.Calls.Count);
-        Assert.All(git.Calls, call => Assert.Equal(Temp.Root, call.RepoRoot));
+        Assert.All(git.Calls, call => Assert.Equal(TempRootToken, Redacted(call.RepoRoot)));
         Assert.All(git.Calls, call => Assert.Equal(Git.DefaultTimeout, call.Timeout));
         Assert.Equal(LogArgs(BaselinePathspec), git.Calls[1].Args);
         Assert.Equal(LogArgs(FacadePathspec), git.Calls[2].Args);
@@ -6035,8 +6085,7 @@ public sealed partial class KnownLimitationsRegisterTests
 
         Assert.Equal(CheckOutcomes.Pass, result.Result.Outcome);
         Assert.Null(result.Failure);
-        Assert.Equal(baseline, result.BaselineCommit);
-        Assert.Equal(facade, result.FacadeCommit);
+        AssertRealCommits(result, baseline, facade);
     }
 
     [Fact]
@@ -6055,9 +6104,12 @@ public sealed partial class KnownLimitationsRegisterTests
 
         Assert.Equal(CheckOutcomes.Fail, result.Result.Outcome);
         Assert.Equal(FailureItemIds.NotAncestor, result.Failure?.Nature);
-        Assert.Contains("is not an ancestor of the first facade commit", result.Failure?.Detail, StringComparison.Ordinal);
-        Assert.Equal(baseline, result.BaselineCommit);
-        Assert.Equal(facade, result.FacadeCommit);
+
+        // The detail names both commits, whose ids change with the time they were made, so it is not shown.
+        Assert.True(
+            result.Failure?.Detail?.Contains("is not an ancestor of the first facade commit", StringComparison.Ordinal) == true,
+            "The detail must state that the baseline commit is not an ancestor of the first facade commit.");
+        AssertRealCommits(result, baseline, facade);
     }
 
     [Fact]
@@ -6083,6 +6135,17 @@ public sealed partial class KnownLimitationsRegisterTests
 
     private OrderingEvidence ScriptedOrderingEvidence(ScriptedGit git) => new(new HarnessOptions { RepoRoot = Temp.Root }, git.Runner);
 
+    // A real commit's id hashes the time it was made, so the ids are compared with fixed messages.
+    private static void AssertRealCommits(OrderingResult result, string baseline, string facade)
+    {
+        Assert.True(
+            string.Equals(baseline, result.BaselineCommit, StringComparison.Ordinal),
+            "The baseline commit must be the commit that first added baseline/manifest.json.");
+        Assert.True(
+            string.Equals(facade, result.FacadeCommit, StringComparison.Ordinal),
+            "The facade commit must be the first commit that added a facade/ path.");
+    }
+
     // A history that passes unless a step's answer is replaced: not shallow, one baseline commit, one
     // later facade commit, and an ancestor relation between them.
     private static ScriptedGit Script(
@@ -6105,13 +6168,18 @@ public sealed partial class KnownLimitationsRegisterTests
         "--diff-filter=A", "--no-renames", "--reverse", "--format=%H", "--", pathspec,
     ];
 
-    private static void AssertFail(OrderingResult result, string expectedNature, string expectedDetail)
+    // The check's row is shown with Temp's root redacted; a failing item is shown without its detail.
+    private void AssertFail(OrderingResult result, string expectedNature, string expectedDetail)
     {
-        Assert.Equal(new CheckResult(CheckNames.Ordering, CheckOutcomes.Fail, 1, 0, expectedDetail), result.Result);
+        Assert.Equal(
+            new CheckResult(CheckNames.Ordering, CheckOutcomes.Fail, 1, 0, expectedDetail),
+            result.Result with { Detail = Redacted(result.Result.Detail) });
         Assert.Equal(new FailureItem(FailureItemIds.Ordering, expectedNature, Operation: null, Detail: expectedDetail), result.Failure);
     }
 
-    private static string AssertOrderingNotRun(OrderingResult result, string expectedDetail)
+    // A detail can name the repository root, so it is compared unshown with the check's, and checked and
+    // returned with Temp's root redacted.
+    private string AssertOrderingNotRun(OrderingResult result, string expectedDetail)
     {
         Assert.Equal(CheckNames.Ordering, result.Result.Name);
         Assert.Equal(CheckOutcomes.NotRun, result.Result.Outcome);
@@ -6120,9 +6188,12 @@ public sealed partial class KnownLimitationsRegisterTests
         Assert.NotNull(item);
         Assert.Equal(FailureItemIds.Ordering, item.ItemId);
         Assert.Equal(FailureItemIds.NotRun, item.Nature);
-        Assert.Equal(result.Result.Detail, item.Detail);
-        Assert.Contains(expectedDetail, item.Detail, StringComparison.Ordinal);
-        return item.Detail!;
+        Assert.True(
+            string.Equals(result.Result.Detail, item.Detail, StringComparison.Ordinal),
+            "The failing item must carry the check's detail.");
+        var detail = Redacted(item.Detail);
+        Assert.Contains(expectedDetail, detail, StringComparison.Ordinal);
+        return detail!;
     }
 }
 
@@ -6433,7 +6504,15 @@ public sealed partial class KnownLimitationsRegisterTests
 /// <param name="RepoRoot">The repository root the check passed.</param>
 /// <param name="Args">The git arguments, copied when the call was made.</param>
 /// <param name="Timeout">The limit the check passed.</param>
-internal sealed record GitCall(string RepoRoot, IReadOnlyList<string> Args, TimeSpan Timeout);
+internal sealed record GitCall(string RepoRoot, IReadOnlyList<string> Args, TimeSpan Timeout)
+{
+    /// <summary>
+    /// The command line and limit, as a failed assertion over a list of calls shows each call. The repository root
+    /// is left out: it is a temporary directory that differs in every run, and tests compare it on its own.
+    /// </summary>
+    public override string ToString() =>
+        string.Create(CultureInfo.InvariantCulture, $"git {string.Join(' ', Args)} (limit {Timeout.TotalSeconds:0.###} s)");
+}
 
 /// <summary>
 /// A git runner that answers from a script instead of running git and records every invocation, so the
@@ -6532,6 +6611,9 @@ internal static class TestGit
 {
     private static readonly TimeSpan Limit = TimeSpan.FromSeconds(60);
 
+    // How long a killed git gets to exit.
+    private static readonly TimeSpan WindDownLimit = TimeSpan.FromSeconds(5);
+
     private static readonly string[] InheritedRepositoryVariables =
     [
         "GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
@@ -6555,8 +6637,18 @@ internal static class TestGit
     public static async Task<string> HashObjectAsync(string root, string path, CancellationToken ct) =>
         (await RunAsync(root, ct, "hash-object", "--", path)).Trim();
 
-    /// <summary>Runs git in <paramref name="workingDirectory"/> and returns its standard output.</summary>
-    /// <exception cref="InvalidOperationException">git exited non-zero or did not finish within the limit.</exception>
+    /// <summary>
+    /// Runs git in <paramref name="workingDirectory"/> and returns its standard output. A git that does not
+    /// finish within the limit, or before <paramref name="ct"/> is cancelled, is killed with everything it
+    /// spawned and its exit awaited, so none outlives the call.
+    /// </summary>
+    /// <remarks>
+    /// A failure names git's subcommand alone, never its other arguments or its standard error, because those
+    /// carry the run's temporary paths and a failure must read the same in every run. git's standard error goes
+    /// to the test's output instead.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">git could not be started, exited non-zero or did not finish within the limit.</exception>
+    /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
     public static async Task<string> RunAsync(string workingDirectory, CancellationToken ct, params string[] args)
     {
         var startInfo = new ProcessStartInfo("git")
@@ -6591,33 +6683,75 @@ internal static class TestGit
         startInfo.Environment["GIT_TERMINAL_PROMPT"] = "0";
         startInfo.Environment["LC_ALL"] = "C";
 
-        using var process = Process.Start(startInfo)
-            ?? throw new InvalidOperationException($"git {string.Join(' ', args)} could not be started");
-        process.StandardInput.Close();
-        var stdout = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
-        var stderr = process.StandardError.ReadToEndAsync(CancellationToken.None);
-
-        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        deadline.CancelAfter(Limit);
+        var command = args.Length == 0 ? "git" : "git " + args[0];
+        ct.ThrowIfCancellationRequested();
+        Process? started;
         try
         {
-            await process.WaitForExitAsync(deadline.Token);
+            started = Process.Start(startInfo);
         }
-        catch (OperationCanceledException)
+        catch (Win32Exception)
         {
-            if (!process.HasExited)
+            // Its message names the temporary working directory, so it is not passed on.
+            throw new InvalidOperationException($"{command} could not be started");
+        }
+
+        using var process = started ?? throw new InvalidOperationException($"{command} could not be started");
+        var finished = false;
+        try
+        {
+            process.StandardInput.Close();
+            var stdout = process.StandardOutput.ReadToEndAsync(CancellationToken.None);
+            var stderr = process.StandardError.ReadToEndAsync(CancellationToken.None);
+
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            deadline.CancelAfter(Limit);
+            string output;
+            string error;
+            try
             {
-                process.Kill(entireProcessTree: true);
+                await process.WaitForExitAsync(deadline.Token);
+                output = await stdout.WaitAsync(deadline.Token);
+                error = await stderr.WaitAsync(deadline.Token);
+            }
+            catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+            {
+                ct.ThrowIfCancellationRequested();
+                throw new InvalidOperationException($"{command} did not finish within {Limit.TotalSeconds} s");
             }
 
-            ct.ThrowIfCancellationRequested();
-            throw new InvalidOperationException($"git {string.Join(' ', args)} did not finish within {Limit.TotalSeconds} s");
+            finished = true;
+            if (process.ExitCode == 0)
+            {
+                return output;
+            }
+
+            TestContext.Current.TestOutputHelper?.WriteLine($"{command} exited {process.ExitCode}: {error.Trim()}");
+            throw new InvalidOperationException($"{command} exited {process.ExitCode}");
+        }
+        finally
+        {
+            if (!finished)
+            {
+                Stop(process);
+            }
+        }
+    }
+
+    // Kills git and everything it spawned, then waits a bounded time for its exit, so it is gone before its
+    // Process is released. A git that already exited needs neither.
+    private static void Stop(Process process)
+    {
+        try
+        {
+            process.Kill(entireProcessTree: true);
+        }
+        catch (InvalidOperationException)
+        {
+            // git exited before the kill: nothing is left to stop.
+            return;
         }
 
-        var output = await stdout;
-        var error = await stderr;
-        return process.ExitCode == 0
-            ? output
-            : throw new InvalidOperationException($"git {string.Join(' ', args)} exited {process.ExitCode}: {error.Trim()}");
+        process.WaitForExit(WindDownLimit);
     }
 }
