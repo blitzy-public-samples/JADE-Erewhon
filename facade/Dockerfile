@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 
 # Strangler facade images, built from the repository root:
 #   docker build -f facade/Dockerfile --target runtime .   Compose service "facade": owns the
@@ -7,6 +7,8 @@
 #   docker build -f facade/Dockerfile --target test .      Compose service "facade-tests": runs the
 #       routing, failure-behaviour and listener-isolation tests and writes their TRX
 # The root .dockerignore admits only the paths copied below.
+# The BuildKit frontend in line 1 is pinned to an exact version, as the base images are, and also by
+# digest, so the symbolic COPY --chmod modes below are always parsed by the same frontend.
 
 FROM mcr.microsoft.com/dotnet/sdk:10.0.403-noble AS build
 ENV DOTNET_NOLOGO=1 \

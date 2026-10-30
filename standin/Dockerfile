@@ -1,9 +1,11 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.27.1@sha256:4edf897a3ffa55b89f906fc8cc78afdb3f1834cc9c7083565e611a8a7d5fe99e
 
 # JADE stand-in image: the backend of this run, standing in for the ErewhonREST (65000) and
 # WebServiceHTTP (21001) JADE applications, plus the internal admin listener (9090).
 # Build from the repository root:  docker build -f standin/Dockerfile .
 # The root .dockerignore admits only the paths copied below.
+# The BuildKit frontend in line 1 is pinned to an exact version, as the base images are, and also by
+# digest, so the symbolic COPY --chmod modes below are always parsed by the same frontend.
 
 FROM mcr.microsoft.com/dotnet/sdk:10.0.403-noble AS build
 ENV DOTNET_NOLOGO=1 \
