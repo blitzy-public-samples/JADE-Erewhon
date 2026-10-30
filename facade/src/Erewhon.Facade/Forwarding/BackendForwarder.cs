@@ -1111,7 +1111,7 @@ public sealed partial class BackendForwarder : IDisposable
 /// </summary>
 /// <remarks>
 /// <para>
-/// <see cref="SocketsHttpHandler"/> resends a request on a new connection, up to three more times, when
+/// <see cref="SocketsHttpHandler"/> resends a request on another connection, up to three more times, when
 /// the backend closes the connection before answering and no body byte has gone out yet. A body-less
 /// request and a request holding its body back for <c>Expect: 100-continue</c> can both be in that
 /// state after the backend has received the whole request head, so each resend can be another backend

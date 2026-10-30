@@ -1045,9 +1045,9 @@ public sealed class SoapResolutionTests
 // head back.
 /// <summary>
 /// Shows that fields nominated by a <c>Connection</c> header are dropped on the request and the response
-/// hop while the other end-to-end fields pass, mixed lists and keep-alive connections included, that the
-/// response head is not held until the body, and that a deadline passing after the head aborts the
-/// response.
+/// hop while the other end-to-end fields pass, mixed lists, keep-alive connections and every request
+/// framing Kestrel accepts included, that the response head is not held until the body, and that a
+/// deadline passing after the head aborts the response.
 /// </summary>
 public sealed class PassThroughTransformerTests
 {
@@ -1066,6 +1066,11 @@ public sealed class PassThroughTransformerTests
 
     // A request field line that nominates the custom field next to keep-alive, as one Connection line.
     private const string KeepAliveNominatingLine = "Connection: X-Hop-One, keep-alive";
+
+    // Lengths of the padding chunk extension of a chunked request: over 8 KiB, and 1 MiB, which reaches
+    // the facade over many reads.
+    private const int LongExtensionPadding = 9000;
+    private const int ManyReadsExtensionPadding = 1024 * 1024;
 
     // The largest message head the raw reader accepts, as Kestrel's default request header limit.
     private const int MaxMessageHeadBytes = 32 * 1024;
@@ -1286,19 +1291,32 @@ public sealed class PassThroughTransformerTests
     }
 
     /// <summary>
-    /// Sends, on one keep-alive connection, a request whose body is chunked with a chunk extension and a
+    /// Sends, on one keep-alive connection, a request whose body is chunked with chunk extensions and a
     /// trailer field, then a request whose <c>Connection</c> line nominates a custom field next to
     /// <c>keep-alive</c>. Asserts that the chunked body arrives whole and that the field is dropped from
-    /// the second request, which is only found by following the first request's chunked framing.
+    /// the second request, which is only found by following the first request's chunked framing,
+    /// however long its chunk extensions are.
     /// </summary>
     /// <param name="operationId">A catalogue operation whose request carries a body.</param>
     /// <param name="pipelined">Whether both requests are written before either response is read.</param>
+    /// <param name="extensionPadding">
+    /// The length of a padding extension on the first chunk-size line and on the last chunk's, or 0 for
+    /// none.
+    /// </param>
     [Theory]
-    [InlineData("Rest.postCreateAgent", false)]
-    [InlineData("Rest.postCreateAgent", true)]
-    [InlineData("Soap.updateAgentWithDTO", false)]
-    [InlineData("Soap.updateAgentWithDTO", true)]
-    public async Task NominatedFieldIsDroppedFromRequestAfterChunkedRequest(string operationId, bool pipelined)
+    [InlineData("Rest.postCreateAgent", false, 0)]
+    [InlineData("Rest.postCreateAgent", true, 0)]
+    [InlineData("Rest.postCreateAgent", false, LongExtensionPadding)]
+    [InlineData("Rest.postCreateAgent", true, LongExtensionPadding)]
+    [InlineData("Rest.postCreateAgent", false, ManyReadsExtensionPadding)]
+    [InlineData("Rest.postCreateAgent", true, ManyReadsExtensionPadding)]
+    [InlineData("Soap.updateAgentWithDTO", false, 0)]
+    [InlineData("Soap.updateAgentWithDTO", true, 0)]
+    [InlineData("Soap.updateAgentWithDTO", false, LongExtensionPadding)]
+    [InlineData("Soap.updateAgentWithDTO", true, LongExtensionPadding)]
+    [InlineData("Soap.updateAgentWithDTO", false, ManyReadsExtensionPadding)]
+    [InlineData("Soap.updateAgentWithDTO", true, ManyReadsExtensionPadding)]
+    public async Task NominatedFieldIsDroppedFromRequestAfterChunkedRequest(string operationId, bool pipelined, int extensionPadding)
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
         await using StubBackend backend = await StubBackend.StartAsync(BackendStubId, null, ct);
@@ -1314,7 +1332,7 @@ public sealed class PassThroughTransformerTests
         IReadOnlyList<int> statuses = await SendRawOnOneConnectionAsync(
             socket,
             [
-                ChunkedRequest(prepared, body, socket, [hopLine]),
+                ChunkedRequest(prepared, body, socket, [hopLine], extensionPadding),
                 ContentLengthRequest(prepared, body, socket, [KeepAliveNominatingLine, hopLine]),
             ],
             pipelined,
@@ -1328,6 +1346,145 @@ public sealed class PassThroughTransformerTests
         Assert.Equal(EndToEndValue, received[0].Header(EndToEndHeader));
         AssertForwardedWithContentLength(received[1], prepared, body);
         Assert.True(received[1].Header(HopField) is null, "custom field nominated after a chunked request reached the backend");
+    }
+
+    /// <summary>
+    /// Sends, on one keep-alive connection, a request whose <c>Content-Length</c> value Kestrel reads as
+    /// the length of its body although it is not a plain digit string, then a request whose
+    /// <c>Connection</c> line nominates a custom field next to <c>keep-alive</c>. Asserts that the first
+    /// body arrives whole and that the field is dropped from the second request, which is only found by
+    /// framing the first body at that length.
+    /// </summary>
+    /// <param name="operationId">A catalogue operation whose request carries a body.</param>
+    /// <param name="form">
+    /// The form of the first request's <c>Content-Length</c> value: the length after a plus sign, between
+    /// a vertical tab and a form feed, or before a NUL.
+    /// </param>
+    [Theory]
+    [InlineData("Rest.postCreateAgent", "plus-sign")]
+    [InlineData("Rest.postCreateAgent", "surrounding-white-space")]
+    [InlineData("Rest.postCreateAgent", "trailing-nul")]
+    [InlineData("Soap.updateAgentWithDTO", "plus-sign")]
+    [InlineData("Soap.updateAgentWithDTO", "surrounding-white-space")]
+    [InlineData("Soap.updateAgentWithDTO", "trailing-nul")]
+    public async Task NominatedFieldIsDroppedFromRequestAfterContentLengthInAnotherForm(string operationId, string form)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await using StubBackend backend = await StubBackend.StartAsync(BackendStubId, null, ct);
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(
+            new FacadeTestSettings { BackendRestBaseUrl = backend.RestBaseUrl, BackendSoapBaseUrl = backend.SoapBaseUrl }, ct);
+
+        OperationDescriptor operation = OperationCatalogue.Default.GetById(operationId);
+        PreparedRequest prepared = OperationRequests.For(operation);
+        byte[] body = prepared.Body ?? throw new InvalidOperationException("operation request carries no body");
+        Uri socket = SocketFor(facade, operation);
+        string hopLine = HopField + ": " + HopValue;
+        string length = body.Length.ToString(CultureInfo.InvariantCulture);
+        string contentLength = form switch
+        {
+            "plus-sign" => "+" + length,
+            "surrounding-white-space" => "\v" + length + "\f",
+            "trailing-nul" => length + "\0",
+            _ => throw new ArgumentOutOfRangeException(nameof(form), form, "unknown Content-Length form"),
+        };
+        StringBuilder firstHead = RequestHeadStart(prepared, socket, [hopLine])
+            .Append(ContentLengthHeader).Append(": ").Append(contentLength).Append(CrLf)
+            .Append(CrLf);
+
+        IReadOnlyList<int> statuses = await SendRawOnOneConnectionAsync(
+            socket,
+            [
+                [.. Encoding.ASCII.GetBytes(firstHead.ToString()), .. body],
+                ContentLengthRequest(prepared, body, socket, [KeepAliveNominatingLine, hopLine]),
+            ],
+            pipelined: false,
+            ct);
+
+        Assert.Equal([200, 200], statuses);
+        IReadOnlyList<StubRequest> received = backend.Received;
+        Assert.True(received.Count == 2, "backend did not receive exactly two requests");
+        Assert.Equal(body, received[0].Body);
+        Assert.True(received[0].Header(HopField) == HopValue, "un-nominated custom field of the first request did not reach the backend");
+        AssertForwardedWithContentLength(received[1], prepared, body);
+        Assert.True(received[1].Header(HopField) is null, "custom field nominated after a request with another Content-Length form reached the backend");
+    }
+
+    /// <summary>
+    /// Sends a request whose request line runs the first byte of its target into its version, with no
+    /// space between them, which Kestrel dispatches with that byte alone as the target, and whose
+    /// <c>Connection</c> line nominates a custom field next to <c>keep-alive</c>. Asserts that the
+    /// request reaches the backend at that target, with its body whole and without the field.
+    /// </summary>
+    /// <param name="operationId">A catalogue operation whose request carries a body.</param>
+    [Theory]
+    [InlineData("Rest.postCreateAgent")]
+    [InlineData("Soap.updateAgentWithDTO")]
+    public async Task NominatedFieldIsDroppedFromRequestWhoseTargetRunsIntoItsVersion(string operationId)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await using StubBackend backend = await StubBackend.StartAsync(BackendStubId, null, ct);
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(
+            new FacadeTestSettings { BackendRestBaseUrl = backend.RestBaseUrl, BackendSoapBaseUrl = backend.SoapBaseUrl }, ct);
+
+        OperationDescriptor operation = OperationCatalogue.Default.GetById(operationId);
+        PreparedRequest prepared = OperationRequests.For(operation);
+        byte[] body = prepared.Body ?? throw new InvalidOperationException("operation request carries no body");
+        Uri socket = SocketFor(facade, operation);
+        byte[] request = ContentLengthRequest(prepared, body, socket, [KeepAliveNominatingLine, HopField + ": " + HopValue]);
+
+        // The request line "<method> /xHTTP/1.1" replaces the request's own, which ends at its first LF.
+        int requestLineLength = Array.IndexOf(request, (byte)'\n') + 1;
+        byte[] runOn = [.. Encoding.ASCII.GetBytes(prepared.Method.Method + " /xHTTP/1.1" + CrLf), .. request.AsSpan(requestLineLength)];
+
+        int status = await SendRawAsync(socket, runOn, ct);
+
+        Assert.Equal(200, status);
+        IReadOnlyList<StubRequest> received = backend.Received;
+        Assert.True(received.Count == 1, "backend did not receive exactly one request");
+        Assert.Equal("/", received[0].RawTarget);
+        Assert.Equal(body, received[0].Body);
+        Assert.Equal(EndToEndValue, received[0].Header(EndToEndHeader));
+        Assert.True(received[0].Header(HopField) is null, "custom field nominated by a request whose target runs into its version reached the backend");
+    }
+
+    /// <summary>
+    /// Writes at once, on one connection, a request whose <c>Connection</c> line nominates a custom field
+    /// next to <c>keep-alive</c> and then a request head with an obsolete line folding, which Kestrel
+    /// rejects. Asserts that the first request reaches the backend without the field and that the second
+    /// is answered with 400 without reaching it.
+    /// </summary>
+    /// <param name="operationId">A catalogue operation whose request carries a body.</param>
+    [Theory]
+    [InlineData("Rest.postCreateAgent")]
+    [InlineData("Soap.updateAgentWithDTO")]
+    public async Task NominatedFieldIsDroppedFromRequestPipelinedBeforeRejectedHead(string operationId)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        await using StubBackend backend = await StubBackend.StartAsync(BackendStubId, null, ct);
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(
+            new FacadeTestSettings { BackendRestBaseUrl = backend.RestBaseUrl, BackendSoapBaseUrl = backend.SoapBaseUrl }, ct);
+
+        OperationDescriptor operation = OperationCatalogue.Default.GetById(operationId);
+        PreparedRequest prepared = OperationRequests.For(operation);
+        byte[] body = prepared.Body ?? throw new InvalidOperationException("operation request carries no body");
+        Uri socket = SocketFor(facade, operation);
+        byte[] rejected = Encoding.ASCII.GetBytes(
+            prepared.Method.Method + " " + prepared.PathAndQuery + " HTTP/1.1" + CrLf
+            + "Host: " + socket.Authority + CrLf
+            + " folded: line" + CrLf
+            + CrLf);
+
+        IReadOnlyList<int> statuses = await SendRawOnOneConnectionAsync(
+            socket,
+            [ContentLengthRequest(prepared, body, socket, [KeepAliveNominatingLine, HopField + ": " + HopValue]), rejected],
+            pipelined: true,
+            ct);
+
+        Assert.Equal([200, 400], statuses);
+        IReadOnlyList<StubRequest> received = backend.Received;
+        Assert.True(received.Count == 1, "backend did not receive exactly one request");
+        AssertForwardedWithContentLength(received[0], prepared, body);
+        Assert.True(received[0].Header(HopField) is null, "custom field nominated by a request pipelined before a rejected head reached the backend");
     }
 
     /// <summary>
@@ -1573,8 +1730,15 @@ public sealed class PassThroughTransformerTests
     }
 
     // A raw request for the prepared operation whose body is sent chunked: its first half as a chunk with
-    // a chunk extension, the rest as a second chunk, then the last chunk and one trailer field.
-    private static byte[] ChunkedRequest(PreparedRequest prepared, byte[] body, Uri socket, IEnumerable<string> fieldLines)
+    // a chunk extension, the rest as a second chunk, then the last chunk and one trailer field. A non-zero
+    // extension padding adds a further extension of that many padding bytes to the first chunk-size line
+    // and to the last chunk's.
+    private static byte[] ChunkedRequest(
+        PreparedRequest prepared,
+        byte[] body,
+        Uri socket,
+        IEnumerable<string> fieldLines,
+        int extensionPadding)
     {
         if (body.Length < 2)
         {
@@ -1585,9 +1749,10 @@ public sealed class PassThroughTransformerTests
         StringBuilder head = RequestHeadStart(prepared, socket, fieldLines)
             .Append(TransferEncodingHeader).Append(": chunked").Append(CrLf)
             .Append(CrLf);
-        string firstChunkLine = split.ToString("x", CultureInfo.InvariantCulture) + ";ext=one" + CrLf;
+        string padding = extensionPadding > 0 ? ";pad=" + new string('a', extensionPadding) : string.Empty;
+        string firstChunkLine = split.ToString("x", CultureInfo.InvariantCulture) + ";ext=one" + padding + CrLf;
         string secondChunkLine = (body.Length - split).ToString("x", CultureInfo.InvariantCulture) + CrLf;
-        string lastChunkAndTrailer = "0" + CrLf + "X-Trailer: t" + CrLf + CrLf;
+        string lastChunkAndTrailer = "0" + padding + CrLf + "X-Trailer: t" + CrLf + CrLf;
         return
         [
             .. Encoding.ASCII.GetBytes(head.ToString() + firstChunkLine),

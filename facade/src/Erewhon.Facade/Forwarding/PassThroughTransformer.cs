@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Globalization;
 using System.IO.Pipelines;
 using System.Net;
 using System.Net.Http.Headers;
@@ -80,10 +81,14 @@ public sealed class PassThroughTransformer : HttpTransformer
     // The authority of an absolute-form target ends at the first of these (RFC 3986 3.2).
     private static readonly char[] AuthorityTerminators = ['/', '?', '#'];
 
-    // The raw request target is re-parsed without canonicalisation, so escapes such as %2F, %20
-    // and '+', dot segments, and bare query keys such as "?WebServiceHTTP&...&wsdl" reach the
-    // backend exactly as the caller sent them. Request.Path and Request.QueryString are decoded
-    // forms and cannot be used to rebuild the target without changing it.
+    // The complete raw request target is re-parsed without the canonicalisation System.Uri applies
+    // by default, which decodes escapes of unreserved characters such as %41 and %7E and removes
+    // dot segments. Escapes such as %2F and %20, '+', dot segments, and bare query keys such as
+    // "?WebServiceHTTP&...&wsdl" therefore reach the backend exactly as the caller sent them.
+    // Request.Path cannot rebuild the target without changing it: Kestrel decodes the escapes in
+    // it, %20 and %41 for example though not %2F, and removes its dot segments.
+    // Request.QueryString keeps the query as sent, escapes included, and the raw target supplies
+    // it along with the path.
     private static readonly UriCreationOptions RawTargetOptions = new()
     {
         DangerousDisablePathAndQueryCanonicalization = true,
@@ -215,8 +220,11 @@ public sealed class PassThroughTransformer : HttpTransformer
         // Connection header to close, keep-alive or upgrade alone, every line of it, when that is the
         // only connection option the header holds; the lines as the caller sent them come from the
         // REST and SOAP listeners' RawConnectionHeaderCapture, for the head of this very request
-        // (same method and raw target), and the fields either copy nominates are removed. Without a
-        // capture, or once it has stopped for the connection, Kestrel's copy is all there is.
+        // (same method and raw target), and the fields either copy nominates are removed. The capture
+        // follows every request framing Kestrel accepts, chunk extensions of any length included, and
+        // stops only at framing Kestrel itself rejects or at a reader call it cannot account for.
+        // Without a capture, or once it no longer knows the request in progress, Kestrel's copy is all
+        // there is.
         var rawTarget = GetRawTarget(httpContext);
         RemoveNominatedRequestFields(proxyRequest, httpContext.Request.Headers.Connection);
         if (rawTarget is not null
@@ -247,7 +255,7 @@ public sealed class PassThroughTransformer : HttpTransformer
         }
 
         // A request that arrived without a body (no Content-Length, not chunked) and without content
-        // headers reaches this point with no content. SocketsHttpHandler resends such a request on a new
+        // headers reaches this point with no content. SocketsHttpHandler resends such a request on another
         // connection, up to three more times, when the backend closes the connection before answering,
         // because no body has started to go out, while the forwarder still sees and logs one call. For a
         // path-only write such as POST /createTender/... each resend is another backend transaction. A
@@ -414,10 +422,13 @@ public sealed class PassThroughTransformer : HttpTransformer
     // header when they carry no content. Any content would make the handler write Content-Length, or
     // Transfer-Encoding: chunked when the content has no length, a header the caller never sent, so these
     // requests keep no content and their headers pass unchanged. The cost is that, without content, the
-    // handler may still resend such a request when the backend closes the connection unanswered; these
-    // methods are idempotent, so a resend repeats no write. The methods are compared with HttpMethod
-    // equality (ordinal, case-insensitive), as the handler compares them. A request the forwarder tunnels
-    // as an upgrade is left to its own upgrade handling.
+    // handler may resend such a request on another connection, up to three more times, when the backend
+    // closes the connection before answering, so the backend can receive it more than once. RFC 9110
+    // defines GET, HEAD, OPTIONS and DELETE as idempotent, which means only that the intended effect of
+    // repeating one is the same as sending it once (RFC 9110 9.2.2); each delivery still reaches the
+    // backend and can change state or have side effects of its own. CONNECT is not defined as idempotent.
+    // The methods are compared with HttpMethod equality (ordinal, case-insensitive), as the handler
+    // compares them. A request the forwarder tunnels as an upgrade is left to its own upgrade handling.
     private static bool SendsContentLengthWhenBodyless(HttpContext httpContext, HttpMethod method) =>
         method != HttpMethod.Get
         && method != HttpMethod.Head
@@ -506,19 +517,28 @@ public static class RawConnectionHeaderCaptureExtensions
 /// The capture follows the connection's HTTP/1.1 request framing forward over the bytes Kestrel reads:
 /// each request head (bounded by the listener's Kestrel request-line and header limits, so every head
 /// Kestrel admits is framed) is parsed once for its method, raw target and <c>Connection</c> line
-/// values, and each body, framed by <c>Content-Length</c> or chunked, is skipped
-/// by count, never copied. A head's values become current when Kestrel consumes the head, which it does
-/// before it dispatches the request; Kestrel dispatches the requests of one HTTP/1.1 connection one at
-/// a time, so the head consumed last is that of the request in progress. At most 32 framed heads wait
-/// for Kestrel: a pipelining caller's further heads are framed on later reads, as Kestrel catches up.
+/// values, as Kestrel reads them, and each body, framed by <c>Content-Length</c> or chunked, is skipped
+/// by count, never copied. Chunk extensions of any length are skipped as they arrive, never collected:
+/// a chunk-size line ends at the first CRLF after its hex size, where Kestrel ends every chunk-size
+/// line it accepts, and a CR or LF before that CRLF is skipped with the extensions, as Kestrel reads it
+/// with its <c>EnableInsecureChunkedRequestParsing</c> switch set and rejects it otherwise. A
+/// head's values become current when Kestrel consumes the head, which it does before it dispatches the
+/// request; Kestrel dispatches the requests of one HTTP/1.1 connection one at a time, so the head
+/// consumed last is that of the request in progress. At most 32 framed heads wait for Kestrel: a
+/// pipelining caller's further heads are framed on later reads, as Kestrel catches up.
 /// </para>
 /// <para>
-/// Framing the capture cannot follow (a head or trailer section over its bound, an invalid or
-/// conflicting <c>Content-Length</c>, a final transfer coding other than chunked, a malformed chunk)
-/// or a reader call it cannot account for stops the capture for the rest of the connection:
-/// <see cref="TryGetConnectionValues"/> then answers false, and the request headers Kestrel parsed
-/// are all there is. Observation never throws into Kestrel and never changes what Kestrel reads. The
-/// state belongs to one connection, so it only ever describes requests of the caller that sent them.
+/// Framing stops only at framing Kestrel itself rejects: a head or trailer section larger than the
+/// listener's Kestrel limits admit, a request line without a method or a target, a header line without
+/// a field name, a <c>Content-Length</c> that is not a number or that a second one contradicts, a final
+/// transfer coding other than chunked, a chunk size without hex digits or followed by anything but
+/// <c>;</c> or CR, and chunk data not followed by CRLF. Kestrel dispatches no request after such
+/// framing, and the heads framed before it still become current as Kestrel consumes them. A reader call
+/// the capture cannot account for, or Kestrel consuming past the bytes the capture has framed, stops the
+/// capture for the rest of the connection: <see cref="TryGetConnectionValues"/> then answers false, and
+/// the request headers Kestrel parsed are all there is. Observation never throws into Kestrel and never
+/// changes what Kestrel reads. The state belongs to one connection, so it only ever describes requests
+/// of the caller that sent them.
 /// </para>
 /// <para>
 /// Kestrel's reader calls are serialised by the pipe; the lookup comes from the request's own flow, so
@@ -527,9 +547,6 @@ public static class RawConnectionHeaderCaptureExtensions
 /// </remarks>
 public sealed class RawConnectionHeaderCapture
 {
-    // A chunk-size line with its chunk extensions.
-    private const int MaxChunkLineBytes = 8 * 1024;
-
     // Framed request heads waiting for Kestrel's dispatch, as a pipelining caller sends them.
     private const int MaxPendingHeads = 32;
 
@@ -548,6 +565,9 @@ public sealed class RawConnectionHeaderCapture
     private readonly List<string> _connectionValues = [];
     private CapturedHead? _current;
     private bool _stopped;
+
+    // Set at framing Kestrel rejects, and by a stop: no further byte is framed.
+    private bool _framingStopped;
 
     // Offsets count bytes from the start of the connection. Kestrel has consumed _consumed bytes and the
     // capture has framed _observed bytes; the buffer of the read Kestrel has not yet advanced past
@@ -569,6 +589,11 @@ public sealed class RawConnectionHeaderCapture
     private bool _hasTransferEncoding;
     private bool _chunked;
 
+    // The size of the chunk-size line being read and whether it has a hex digit yet; both are reset
+    // when the line ends.
+    private long _chunkSize;
+    private bool _chunkSizeHasDigits;
+
     // maxHeadBytes bounds a request line, its header fields and the blank line that ends them;
     // maxTrailerBytes bounds the trailer fields and blank line after a chunked body's last chunk.
     internal RawConnectionHeaderCapture(int maxHeadBytes, int maxTrailerBytes)
@@ -586,7 +611,15 @@ public sealed class RawConnectionHeaderCapture
         RequestLine,
         HeaderLine,
         ContentLengthBody,
-        ChunkSizeLine,
+
+        // The hex digits of a chunk size, up to the ';' that starts its chunk extensions or a CR.
+        ChunkSize,
+
+        // Chunk extensions, skipped up to the next CR.
+        ChunkExtension,
+
+        // The byte after a CR in a chunk-size line: an LF ends the line.
+        ChunkSizeLineFeed,
         ChunkData,
         ChunkDataCarriageReturn,
         ChunkDataLineFeed,
@@ -632,7 +665,8 @@ public sealed class RawConnectionHeaderCapture
     internal IDuplexPipe Observe(IDuplexPipe transport) =>
         new ObservedTransport(new ObservingPipeReader(transport.Input, this), transport.Output);
 
-    // A read returned buffer: the bytes past those already framed are framed now.
+    // A read returned buffer: it is kept for Kestrel's advance, and the bytes past those already framed
+    // are framed now, unless framing has stopped.
     private void OnRead(in ReadOnlySequence<byte> buffer)
     {
         lock (_gate)
@@ -717,7 +751,7 @@ public sealed class RawConnectionHeaderCapture
     {
         while (!bytes.IsEmpty)
         {
-            if (_stopped)
+            if (_framingStopped)
             {
                 return false;
             }
@@ -727,9 +761,11 @@ public sealed class RawConnectionHeaderCapture
                 Framing.BeforeRequestLine => SkipLineBreaks(bytes),
                 Framing.RequestLine or Framing.HeaderLine => TakeLine(bytes, _maxHeadBytes),
                 Framing.ContentLengthBody or Framing.ChunkData => SkipCounted(bytes),
-                Framing.ChunkSizeLine => TakeLine(bytes, MaxChunkLineBytes),
+                Framing.ChunkSize => TakeChunkSize(bytes),
+                Framing.ChunkExtension => SkipChunkExtension(bytes),
+                Framing.ChunkSizeLineFeed => EndChunkSizeLine(bytes[0]),
                 Framing.ChunkDataCarriageReturn => Expect(bytes[0], CarriageReturn, Framing.ChunkDataLineFeed),
-                Framing.ChunkDataLineFeed => Expect(bytes[0], LineFeed, Framing.ChunkSizeLine),
+                Framing.ChunkDataLineFeed => Expect(bytes[0], LineFeed, Framing.ChunkSize),
                 Framing.TrailerLine => TakeLine(bytes, _maxTrailerBytes),
                 _ => throw new UnreachableException(),
             };
@@ -744,7 +780,7 @@ public sealed class RawConnectionHeaderCapture
             bytes = bytes[used..];
         }
 
-        return !_stopped;
+        return !_framingStopped;
     }
 
     // Skips the CR and LF bytes before a request line. A head starts only while fewer than the bound
@@ -782,7 +818,7 @@ public sealed class RawConnectionHeaderCapture
         return used;
     }
 
-    // The CR and the LF that end a chunk's data.
+    // The CR and the LF that end a chunk's data, which Kestrel requires.
     private int Expect(byte actual, byte expected, Framing next)
     {
         _observed++;
@@ -792,7 +828,97 @@ public sealed class RawConnectionHeaderCapture
         }
         else
         {
-            Stop();
+            StopFraming();
+        }
+
+        return 1;
+    }
+
+    // "<hex size>" at the start of a chunk-size line, up to the ';' that starts its chunk extensions or
+    // the CR of its line end. Kestrel requires at least one hex digit followed directly by one of the
+    // two, and a size that fits an int; a long holds every size it accepts.
+    private int TakeChunkSize(ReadOnlySpan<byte> bytes)
+    {
+        var used = 0;
+        while (used < bytes.Length)
+        {
+            var digit = HexValue(bytes[used]);
+            if (digit < 0)
+            {
+                break;
+            }
+
+            if (_chunkSize > (long.MaxValue >> 4))
+            {
+                StopFraming();
+                return bytes.Length;
+            }
+
+            _chunkSize = (_chunkSize << 4) | (long)digit;
+            _chunkSizeHasDigits = true;
+            used++;
+        }
+
+        _observed += used;
+        if (used == bytes.Length)
+        {
+            return used;
+        }
+
+        var end = bytes[used];
+        if (!_chunkSizeHasDigits || end is not ((byte)';' or CarriageReturn))
+        {
+            StopFraming();
+            return bytes.Length;
+        }
+
+        _observed++;
+        _framing = end == CarriageReturn ? Framing.ChunkSizeLineFeed : Framing.ChunkExtension;
+        return used + 1;
+    }
+
+    // Chunk extensions are skipped up to the next CR, never collected, so an extension of any length,
+    // spread over any number of reads, is followed without holding any of it.
+    private int SkipChunkExtension(ReadOnlySpan<byte> bytes)
+    {
+        var carriageReturn = bytes.IndexOf(CarriageReturn);
+        var used = carriageReturn < 0 ? bytes.Length : carriageReturn + 1;
+        if (carriageReturn >= 0)
+        {
+            _framing = Framing.ChunkSizeLineFeed;
+        }
+
+        _observed += used;
+        return used;
+    }
+
+    // The byte after a CR in a chunk-size line. An LF ends the line, the first CRLF after the size, as it
+    // ends every chunk-size line Kestrel accepts: the last chunk (size 0) is followed by the trailer
+    // section, any other chunk by its data. Another CR may be the one before the LF; any other byte is
+    // skipped as chunk extension text, as Kestrel's insecure chunked parsing reads a lone CR.
+    private int EndChunkSizeLine(byte next)
+    {
+        _observed++;
+        if (next == LineFeed)
+        {
+            if (_chunkSize == 0)
+            {
+                _sectionLength = 0;
+                _lineLength = 0;
+                _framing = Framing.TrailerLine;
+            }
+            else
+            {
+                _bytesToSkip = _chunkSize;
+                _framing = Framing.ChunkData;
+            }
+
+            _chunkSize = 0;
+            _chunkSizeHasDigits = false;
+        }
+        else if (next != CarriageReturn)
+        {
+            _framing = Framing.ChunkExtension;
         }
 
         return 1;
@@ -807,7 +933,7 @@ public sealed class RawConnectionHeaderCapture
         var used = lineFeed < 0 ? bytes.Length : lineFeed + 1;
         if (used > sectionLimit - _sectionLength)
         {
-            Stop();
+            StopFraming();
             return bytes.Length;
         }
 
@@ -827,8 +953,7 @@ public sealed class RawConnectionHeaderCapture
         }
 
         var line = _line.AsSpan(0, _lineLength);
-        var endsWithCarriageReturn = !line.IsEmpty && line[^1] == CarriageReturn;
-        if (endsWithCarriageReturn)
+        if (!line.IsEmpty && line[^1] == CarriageReturn)
         {
             line = line[..^1];
         }
@@ -845,9 +970,6 @@ public sealed class RawConnectionHeaderCapture
             case Framing.HeaderLine:
                 OnHeaderField(line);
                 break;
-            case Framing.ChunkSizeLine:
-                OnChunkSizeLine(line, endsWithCarriageReturn);
-                break;
             case Framing.TrailerLine when line.IsEmpty:
                 _framing = Framing.BeforeRequestLine;
                 break;
@@ -859,16 +981,23 @@ public sealed class RawConnectionHeaderCapture
         return used;
     }
 
-    // "<method> SP <request-target> SP <version>": the method and the raw target are kept with the line.
+    // "<method> SP <request-target> SP <version>": the method and the raw target are kept with the line,
+    // bounded as Kestrel bounds them. The method ends at the first SP. The target starts right after it,
+    // with a byte other than SP, and ends at the next SP; when no SP follows its first byte, Kestrel
+    // takes that byte alone as the target and the byte after it as the SP, so "GET /xHTTP/1.1" is a
+    // GET of "/". A line without a method or a target is one Kestrel rejects.
     private void OnRequestLine(ReadOnlySpan<byte> line)
     {
         var methodLength = line.IndexOf((byte)' ');
-        var targetLength = methodLength <= 0 ? -1 : line[(methodLength + 1)..].IndexOf((byte)' ');
-        if (targetLength <= 0)
+        var targetStart = methodLength + 1;
+        if (methodLength <= 0 || targetStart >= line.Length || line[targetStart] == (byte)' ')
         {
-            Stop();
+            StopFraming();
             return;
         }
+
+        var spaceAfterFirstByte = line[(targetStart + 1)..].IndexOf((byte)' ');
+        var targetLength = spaceAfterFirstByte < 0 ? 1 : spaceAfterFirstByte + 1;
 
         // The line is the start of _line, which becomes the request line buffer; the old request line
         // buffer collects the header lines.
@@ -889,7 +1018,7 @@ public sealed class RawConnectionHeaderCapture
         var colon = line.IndexOf((byte)':');
         if (colon <= 0 || line[0] is (byte)' ' or (byte)'\t')
         {
-            Stop();
+            StopFraming();
             return;
         }
 
@@ -904,7 +1033,7 @@ public sealed class RawConnectionHeaderCapture
             if (!TryParseContentLength(value, out var length)
                 || (_contentLength >= 0 && _contentLength != length))
             {
-                Stop();
+                StopFraming();
                 return;
             }
 
@@ -935,11 +1064,11 @@ public sealed class RawConnectionHeaderCapture
         {
             if (!_chunked)
             {
-                Stop();
+                StopFraming();
                 return;
             }
 
-            next = Framing.ChunkSizeLine;
+            next = Framing.ChunkSize;
         }
         else if (_contentLength > 0)
         {
@@ -964,74 +1093,33 @@ public sealed class RawConnectionHeaderCapture
         _framing = next;
     }
 
-    // "<hex size> [';' extensions] CRLF". A chunk line must end with CRLF, as Kestrel requires.
-    private void OnChunkSizeLine(ReadOnlySpan<byte> line, bool endsWithCarriageReturn)
+    // Framing Kestrel rejects: no byte from here on is framed, and Kestrel dispatches no request after
+    // it. The heads framed before it stay and still become current as Kestrel consumes them.
+    private void StopFraming()
     {
-        var digits = 0;
-        long size = 0;
-        while (digits < line.Length && HexValue(line[digits]) >= 0)
-        {
-            if (size > (long.MaxValue >> 4))
-            {
-                Stop();
-                return;
-            }
-
-            size = (size << 4) | (long)HexValue(line[digits]);
-            digits++;
-        }
-
-        if (!endsWithCarriageReturn || digits == 0 || (digits < line.Length && line[digits] != (byte)';'))
-        {
-            Stop();
-            return;
-        }
-
-        _sectionLength = 0;
-        if (size == 0)
-        {
-            // The last chunk: trailer fields follow, up to an empty line.
-            _framing = Framing.TrailerLine;
-        }
-        else
-        {
-            _bytesToSkip = size;
-            _framing = Framing.ChunkData;
-        }
-    }
-
-    // Any inconsistency ends the capture for the connection: nothing is reported for it afterwards.
-    private void Stop()
-    {
-        _stopped = true;
-        _pending.Clear();
-        _current = null;
+        _framingStopped = true;
         _connectionValues.Clear();
-        _readBuffer = default;
         _line = [];
         _requestLine = [];
     }
 
-    private static bool TryParseContentLength(ReadOnlySpan<byte> value, out long length)
+    // A reader call the capture cannot account for, or Kestrel consuming past the framed bytes: which
+    // head is in progress is no longer known, so nothing is reported for the connection afterwards.
+    private void Stop()
     {
-        length = 0;
-        if (value.IsEmpty)
-        {
-            return false;
-        }
-
-        foreach (var b in value)
-        {
-            if (b is < (byte)'0' or > (byte)'9' || length > (long.MaxValue - 9) / 10)
-            {
-                return false;
-            }
-
-            length = (length * 10) + (b - '0');
-        }
-
-        return true;
+        StopFraming();
+        _stopped = true;
+        _pending.Clear();
+        _current = null;
+        _readBuffer = default;
     }
+
+    // Kestrel reads a Content-Length value as a long that must not be negative: through long.TryParse
+    // with NumberStyles.Integer (an optional sign, surrounding white space and trailing NULs) when its
+    // request header encoding selector gives Content-Length an encoding, and as an optionally signed
+    // digit string otherwise. This parse accepts every value either reading accepts, as the same length.
+    private static bool TryParseContentLength(ReadOnlySpan<byte> value, out long length) =>
+        long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out length) && length >= 0;
 
     private static int HexValue(byte b) => b switch
     {
