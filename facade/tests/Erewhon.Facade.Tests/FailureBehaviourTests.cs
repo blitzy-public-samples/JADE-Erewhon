@@ -34,6 +34,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Xml.Linq;
+using Erewhon.Contracts.Admin;
 using Erewhon.Contracts.Catalogue;
 using Erewhon.Contracts.Hosting;
 using Erewhon.Facade;
@@ -857,9 +858,11 @@ public sealed class BackendErrorPassThroughTests
 /// <summary>
 /// Raw-byte checks of what the facade sends to a backend and returns to a caller: single delivery of
 /// body-less writes and of writes sent with <c>Expect: 100-continue</c>, the unchanged wire form of
-/// body-less requests, Latin-1 header bytes in both directions, response heads beyond 64 KiB, the
-/// unavailable answer to a backend that breaks its reply, uploads that carry only the caller's own
-/// <c>Expect</c>, and a backend's answer to, or drop of, an upload the caller has paused.
+/// body-less requests, Latin-1 header bytes in both directions, response heads beyond 64 KiB, request
+/// heads at and over the limit of 100 header lines, chunked writes whose head and trailer lines reach or
+/// pass that limit together, the unavailable answer to a backend that breaks its reply, uploads that carry
+/// only the caller's own <c>Expect</c>, and a backend's answer to, or drop of, an upload the caller has
+/// paused.
 /// </summary>
 public sealed class ForwardingTransportTests
 {
@@ -889,6 +892,14 @@ public sealed class ForwardingTransportTests
     private const int DefaultResponseHeadLimit = 64 * 1024;
     private const int FillerLineCount = 80;
     private const int FillerValueLength = 1000;
+
+    // Kestrel's default limit on the header lines of a request head, Host included, which the facade keeps
+    // on every listener; CallerHead writes two of those lines itself, Host and Connection.
+    private const int HeaderLineLimit = 100;
+    private const int CallerHeadFieldLines = 2;
+
+    // The header lines of the chunked write whose trailer lines Kestrel counts against the same limit.
+    private const int TrailerWriteHeadLines = 60;
 
     // An upload of 1 MiB, the size from which an HTTP client such as curl asks for 100-continue itself.
     private const int LargeUploadLength = 1024 * 1024;
@@ -1021,6 +1032,29 @@ public sealed class ForwardingTransportTests
         { GetCompanyId, 404 },
         { PostCreateAgentId, 200 },
         { PostCreateAgentId, 404 },
+    };
+
+    /// <summary>
+    /// Request heads of exactly the 100 header lines Kestrel admits, on the REST and SOAP listeners, which
+    /// forward them, and of one line more, on the REST, SOAP and admin listeners.
+    /// </summary>
+    public static TheoryData<ListenerKind, int> HeaderLineHeads() => new()
+    {
+        { ListenerKind.Rest, HeaderLineLimit },
+        { ListenerKind.Soap, HeaderLineLimit },
+        { ListenerKind.Rest, HeaderLineLimit + 1 },
+        { ListenerKind.Soap, HeaderLineLimit + 1 },
+        { ListenerKind.Admin, HeaderLineLimit + 1 },
+    };
+
+    /// <summary>
+    /// Trailer sections of a chunked write whose head has <see cref="TrailerWriteHeadLines"/> header lines:
+    /// one that brings head and trailer to exactly the 100 lines Kestrel admits, and one of a line more.
+    /// </summary>
+    public static TheoryData<int> TrailerLineCounts() => new()
+    {
+        HeaderLineLimit - TrailerWriteHeadLines,
+        HeaderLineLimit - TrailerWriteHeadLines + 1,
     };
 
     /// <summary>Whether an upload is chunked rather than framed by <c>Content-Length</c>.</summary>
@@ -1252,6 +1286,182 @@ public sealed class ForwardingTransportTests
         Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
         Assert.Equal(status, calls[0].Value("Status"));
         Assert.Equal(LogLevel.Information, calls[0].Level);
+    }
+
+    /// <summary>
+    /// The facade keeps Kestrel's limit of 100 header lines, <c>Host</c> included, on every listener. A
+    /// head of 101 header lines sent to the REST, SOAP or admin listener is answered 431 by the facade
+    /// itself: it never reaches the backend and writes no backend call line. A head of exactly 100 header
+    /// lines, for the catalogue REST read <c>getCompany</c> or a SOAP call naming its operation in
+    /// <c>SOAPAction</c>, is forwarded once: the backend receives the request line, the body and every
+    /// field line the caller sent unchanged, apart from <c>Host</c>, which names the backend, and the
+    /// hop-by-hop <c>Connection</c>, which is dropped, and its 200 reaches the caller, logged
+    /// <c>forwarded</c>.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(HeaderLineHeads))]
+    public async Task HeadAtHeaderLineLimitIsForwardedAndOneLineOverIsRefused(ListenerKind listener, int headerLines)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var logs = new LogCapture();
+        await using ScriptedBackend backend = ScriptedBackend.Start(OkReply());
+        await using FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, timeoutSeconds: null, ct);
+
+        // The REST and SOAP calls are catalogue operations; the admin request is the health check.
+        PreparedRequest? call = listener switch
+        {
+            ListenerKind.Rest => OperationRequests.ForRest(OperationCatalogue.Default.GetById(GetCompanyId)),
+            ListenerKind.Soap => OperationRequests.ForSoap(OperationCatalogue.Default.GetById(GetAgentNamesId)),
+            ListenerKind.Admin => null,
+            _ => throw new ArgumentOutOfRangeException(nameof(listener)),
+        };
+        int port = listener switch
+        {
+            ListenerKind.Rest => facade.RestPort,
+            ListenerKind.Soap => facade.SoapPort,
+            _ => facade.AdminPort,
+        };
+        string method = call?.Method.Method ?? "GET";
+        string target = call?.PathAndQuery ?? AdminRoutes.Health;
+        string body = call?.Body is { } bytes ? Encoding.Latin1.GetString(bytes) : string.Empty;
+
+        // The call's own field lines, then distinct tiny lines up to the intended count with the Host and
+        // Connection lines CallerHead adds.
+        var callerFields = new List<string>();
+        if (call?.ContentType is { } contentType)
+        {
+            callerFields.Add("Content-Type: " + contentType);
+        }
+
+        if (body.Length > 0)
+        {
+            callerFields.Add("Content-Length: " + body.Length.ToString(CultureInfo.InvariantCulture));
+        }
+
+        if (call?.SoapAction is { } soapAction)
+        {
+            callerFields.Add("SOAPAction: " + soapAction);
+        }
+
+        for (int line = callerFields.Count + CallerHeadFieldLines; line < headerLines; line++)
+        {
+            callerFields.Add("X-Line-" + line.ToString("D3", CultureInfo.InvariantCulture) + ": v");
+        }
+
+        byte[] request = CallerHead(method, target, string.Concat(callerFields.Select(field => field + "\r\n")), body);
+        Assert.True(
+            FieldLines(Encoding.Latin1.GetString(request)).Length == headerLines,
+            "composed request head does not carry the intended number of header lines");
+
+        RawExchange response = await SendRawAsync(port, request, ct);
+
+        IReadOnlyList<ScriptedRequest> received = backend.Requests;
+        if (headerLines > HeaderLineLimit)
+        {
+            Assert.Equal(431, response.Status);
+            Assert.True(received.Count == 0, "head over the header line limit reached the backend");
+            Assert.True(logs.BackendCalls.Count == 0, "head over the header line limit wrote a backend call line");
+        }
+        else
+        {
+            Assert.Equal(200, response.Status);
+            Assert.Equal(BackendBody, Encoding.Latin1.GetString(response.Body));
+            Assert.True(received.Count == 1, "head at the header line limit did not reach the backend exactly once");
+            Assert.True(
+                received[0].Head.StartsWith(method + " " + target + " HTTP/1.1\r\n", StringComparison.Ordinal),
+                "head at the header line limit did not reach the backend with its request line unchanged");
+
+            string[] forwarded = FieldLines(received[0].Head);
+            string backendHost = "Host: " + new Uri(backend.BaseUrl).Authority;
+            Assert.True(
+                forwarded.Count(field => field.StartsWith("Host:", StringComparison.OrdinalIgnoreCase)) == 1
+                    && forwarded.Contains(backendHost, StringComparer.Ordinal),
+                "head at the header line limit did not reach the backend with one Host line naming the backend");
+            Assert.Equal(
+                callerFields.Order(StringComparer.Ordinal),
+                forwarded.Where(field => !string.Equals(field, backendHost, StringComparison.Ordinal)).Order(StringComparer.Ordinal));
+            Assert.True(
+                received[0].Body.AsSpan().SequenceEqual(Encoding.Latin1.GetBytes(body)),
+                "backend did not receive the body of a head at the header line limit byte for byte");
+
+            IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
+            Assert.True(calls.Count == 1, "head at the header line limit did not write exactly one backend call line");
+            Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
+            Assert.Equal(200, calls[0].Value("Status"));
+        }
+    }
+
+    /// <summary>
+    /// Kestrel counts the trailer lines of a chunked request body against the same limit of 100 header
+    /// lines as its head. A chunked catalogue write <c>postCreateAgent</c> whose head of 60 header lines
+    /// and trailer section hold exactly 100 lines together is forwarded: the backend receives the whole
+    /// body once, byte for byte, and its 200 reaches the caller, logged <c>forwarded</c>. With one trailer
+    /// line more, the facade's Kestrel answers 431 once it reads the trailer section, and the backend never
+    /// receives the complete request.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(TrailerLineCounts))]
+    public async Task TrailerLinesWithinHeaderLineLimitAreForwardedAndOneLineOverIsRefused(int trailerLines)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var logs = new LogCapture();
+        await using ScriptedBackend backend = ScriptedBackend.Start(OkReply());
+        await using FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, timeoutSeconds: null, ct);
+
+        PreparedRequest write = OperationRequests.ForRest(OperationCatalogue.Default.GetById(PostCreateAgentId));
+        string body = Encoding.Latin1.GetString(write.Body!);
+
+        // The write's own field lines, then distinct tiny lines up to the intended count with the Host and
+        // Connection lines CallerHead adds; the body is one chunk, followed by the last chunk and the
+        // trailer section.
+        var headFields = new List<string> { "Content-Type: " + write.ContentType, "Transfer-Encoding: chunked" };
+        for (int line = headFields.Count + CallerHeadFieldLines; line < TrailerWriteHeadLines; line++)
+        {
+            headFields.Add("X-Line-" + line.ToString("D3", CultureInfo.InvariantCulture) + ": v");
+        }
+
+        var framedBody = new StringBuilder()
+            .Append(body.Length.ToString("x", CultureInfo.InvariantCulture)).Append("\r\n")
+            .Append(body).Append("\r\n")
+            .Append("0\r\n");
+        for (int line = 0; line < trailerLines; line++)
+        {
+            framedBody.Append("X-Trailer-").Append(line.ToString("D3", CultureInfo.InvariantCulture)).Append(": t\r\n");
+        }
+
+        framedBody.Append("\r\n");
+
+        byte[] request = CallerHead(
+            write.Method.Method,
+            write.PathAndQuery,
+            string.Concat(headFields.Select(field => field + "\r\n")),
+            framedBody.ToString());
+        Assert.True(
+            FieldLines(Encoding.Latin1.GetString(request)).Length == TrailerWriteHeadLines,
+            "composed request head does not carry the intended number of header lines");
+
+        RawExchange response = await SendRawAsync(facade.RestPort, request, ct);
+
+        IReadOnlyList<ScriptedRequest> received = backend.Requests;
+        if (TrailerWriteHeadLines + trailerLines > HeaderLineLimit)
+        {
+            Assert.Equal(431, response.Status);
+            Assert.True(received.Count == 0, "write whose trailer lines pass the header line limit completed at the backend");
+        }
+        else
+        {
+            Assert.Equal(200, response.Status);
+            Assert.Equal(BackendBody, Encoding.Latin1.GetString(response.Body));
+            Assert.True(received.Count == 1, "write whose trailer lines reach the header line limit did not reach the backend exactly once");
+            Assert.True(
+                received[0].Body.AsSpan().SequenceEqual(write.Body!),
+                "backend did not receive the chunked body of a write at the header line limit byte for byte");
+
+            IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
+            Assert.True(calls.Count == 1, "write at the header line limit did not write exactly one backend call line");
+            Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
+            Assert.Equal(200, calls[0].Value("Status"));
+        }
     }
 
     /// <summary>
@@ -1688,6 +1898,15 @@ public sealed class ForwardingTransportTests
         }
 
         return lines.ToString();
+    }
+
+    // The field lines of a request head, without their CRLF: every line after the request line up to the
+    // blank line that ends the header section.
+    private static string[] FieldLines(string head)
+    {
+        int end = head.IndexOf("\r\n\r\n", StringComparison.Ordinal);
+        Assert.True(end >= 0, "request head has no complete header section");
+        return head[..end].Split("\r\n")[1..];
     }
 
     // An HTTP/1.1 request head that frames no body unless extraHeaders carries a Content-Length or

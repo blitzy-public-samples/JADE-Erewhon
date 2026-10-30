@@ -102,26 +102,31 @@ try
         // The facade never answers 413: any body-size limit stays the backend's own.
         kestrel.Limits.MaxRequestBodySize = null;
 
-        // Nor 414 or 431 for a request line or header block the request buffer can hold: it is
-        // forwarded, and the backend's own limits decide. The buffer is the bound because Kestrel
-        // refuses to start with either head limit above MaxRequestBufferSize, which stays bounded
-        // (Kestrel's 1 MiB default) since it is also the back-pressure threshold for a body streamed
-        // to a slow backend. Kestrel refuses a header block only once it holds more than the limit
-        // plus the block's closing CRLF, and stops reading when the buffer is full, so the header
-        // limit stays three bytes below the buffer: at the full size, a block just over it would wait
-        // for the request-headers timeout (408) instead of being refused with 431. The header total
-        // already bounds how many headers fit. Only a larger head is answered by the facade itself, with
-        // 414 or 431 rather than forwarded, and that bound is the accepted limit recorded as
-        // KL-FACADE-REQUEST-HEAD in harness/config/known-limitations.json.
+        // Nor 414 or 431 for a request line, or a header block of at most 100 header lines, that the
+        // request buffer can hold: it is forwarded, and the backend's own limits decide. The buffer is
+        // the bound because Kestrel refuses to start with either head limit above MaxRequestBufferSize,
+        // which stays bounded (Kestrel's 1 MiB default) since it is also the back-pressure threshold
+        // for a body streamed to a slow backend. Kestrel refuses a header block only once it holds more
+        // than the limit plus the block's closing CRLF, and stops reading when the buffer is full, so
+        // the header limit stays three bytes below the buffer: at the full size, a block just over it
+        // would wait for the request-headers timeout (408) instead of being refused with 431. The
+        // number of header lines keeps Kestrel's default limit of 100, which is the stand-in's limit
+        // too, because the byte limit alone would let a caller fill the block with many thousands of
+        // tiny header lines, each parsed and allocated before forwarding. Kestrel has no limits per
+        // listener, so these apply to every listener, admin included. Only a larger head, or one with
+        // more header lines, is answered by the facade itself, with 414 or 431 rather than forwarded,
+        // and those bounds are the accepted limits recorded as KL-FACADE-REQUEST-HEAD in
+        // harness/config/known-limitations.json. A chunked body's trailer lines count against the same
+        // 100 lines, and its trailer section against what the header block left of the byte limit: one
+        // over either is refused with 431 only once Kestrel reads it, after the head and possibly part of
+        // the body have reached the backend, which then sees its connection closed mid-body.
         const int RequestBufferSize = 1024 * 1024;
         kestrel.Limits.MaxRequestBufferSize = RequestBufferSize;
         kestrel.Limits.MaxRequestLineSize = RequestBufferSize;
         kestrel.Limits.MaxRequestHeadersTotalSize = RequestBufferSize - 3;
-        kestrel.Limits.MaxRequestHeaderCount = int.MaxValue;
 
         // Header values are read and written as Latin-1, one char per byte, as BackendForwarder's handler
-        // writes and reads them, so non-ASCII header bytes pass through in both directions unchanged;
-        // ASCII values decode and encode exactly as before.
+        // writes and reads them, so non-ASCII header bytes pass through in both directions unchanged.
         kestrel.RequestHeaderEncodingSelector = static _ => System.Text.Encoding.Latin1;
         kestrel.ResponseHeaderEncodingSelector = static _ => System.Text.Encoding.Latin1;
 
