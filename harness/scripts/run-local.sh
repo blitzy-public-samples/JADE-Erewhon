@@ -18,20 +18,7 @@
 # port is reachable from another host:
 #   stand-in  REST 15000  SOAP 15001  admin 15090
 #   facade    REST 65000  SOAP 21001  admin  9090
-#
-# Port collisions. The ports are fixed, so every run in one network namespace competes for them. Before
-# starting a component the script warns about each of its ports a listener already holds and names that
-# listener's process (ss). After starting it, the script polls every 0.5 s, for up to 60 s, until the
-# pid it started owns every listener on those ports. Another process on one of them (a competing run, a
-# process left by a SIGKILLed run, any other server), or the started pid exiting, ends the run with exit
-# 1 before the harness starts, naming the port and its owner, so the harness never tests, resets or shuts
-# down a process this run did not start. A component still running but not yet bound at 60 s is left to
-# the harness's readiness check (CHK-READY). Immediately before the harness starts, every component the
-# run started is checked again: it must still be running, and every listener on its ports must still be
-# its own. One that has exited since its own check (the stand-in while the facade starts, for example),
-# or a port another process has taken since, ends the run the same way; a port with no listener while
-# its pid runs is again left to CHK-READY. A second run in the same checkout stops at once, before any
-# build, on the lock artifacts/local/run-local.lock.
+# A started component has up to 60 s to bind its ports; one not bound by then is left to CHK-READY.
 #
 # Environment overrides honoured:
 #   BACKEND_REST_URL, BACKEND_SOAP_URL  Where the facade forwards; default the local stand-in. In replay
@@ -56,22 +43,21 @@
 # Exit status: the harness's own, 0 or 1, and only ever from a harness that ran against the processes
 # this run started. Usage errors, a missing tool, a second run in the same checkout, build failures, a
 # port collision, a component that exits before the harness starts and interrupts exit 1. So does a log or a
-# facade-test result this run cannot write or clear, so the harness never reads an earlier run's
-# artifacts/facade-tests/ as this run's. Each such failure before the harness starts ends with a line
-# naming what the run did not regenerate: the report (RESULTS.md, or HARNESS_REPORT_PATH) for replay,
-# baseline/** and contracts/wsdl/ErewhonWebService.wsdl for capture, the OpenAPI document for
-# export-openapi. RESULTS.md is never deleted. Failed or timed-out facade tests are not such a failure:
-# their status goes to artifacts/facade-tests/exit-code and the harness reports them. A log its logger
-# (tee) could not write in full is reported as an error and never changes the status.
+# facade-test status this run cannot write, and an artifacts/facade-tests/ or a private staging directory
+# for the facade tests it cannot clear or create, so the harness never reads an earlier run's
+# artifacts/facade-tests/ as this run's. So does artifacts/ or artifacts/local/ when it is a symbolic
+# link or not a directory, and artifacts/local/run-local.lock when it is a symbolic link or not a
+# regular file; nothing is written through any of them. Each such failure before the harness starts
+# ends with a line naming what the run did not regenerate: the report (RESULTS.md, or
+# HARNESS_REPORT_PATH) for replay, baseline/** and contracts/wsdl/ErewhonWebService.wsdl for capture,
+# the OpenAPI document for export-openapi. RESULTS.md is never deleted. Failed facade tests, and tests
+# stopped at their 600 s limit (status 124), are not such a failure: their status goes to
+# artifacts/facade-tests/exit-code and the harness reports them. Nor is a TRX or xunit XML the tests did
+# not write as a regular file, which is not published: the harness reports a missing TRX as
+# CHK-FACADE-TRX. A log its logger (tee) could not write in full is reported as an error and never
+# changes the status.
 #
-# Supervision. Every build and the facade-test run is a background job in its own process group and
-# session (setsid) that the script waits on, so a signal to the script is handled at once and stops the
-# whole group: SIGTERM, then SIGKILL after 10 s. The facade-test run is limited to 600 s; at the limit it
-# is stopped the same way, exit-code records 124 and the run continues to the harness. The loggers (tee)
-# of the facade tests and the harness ignore INT, TERM and HUP; one still running 10 s after the script
-# closes its input is killed by its pid (SIGKILL) and reaped, and its log is reported as incomplete.
-# Every process the script starts is stopped by its pid or its process group on every exit path, never
-# by name.
+# Every started process is stopped by its pid or process group on every exit path, never by name.
 
 set -uo pipefail
 # No job control, even under `bash -m`: background jobs stay in the script's process group, so the
@@ -185,6 +171,23 @@ HARNESS_LOG=""
 OUTPUTS=""
 HARNESS_STARTED=0
 CLEANED=0
+# Descriptors of the directories every output is written through (hold_dir): the repository root
+# while prepare opens artifacts/, then artifacts/ and artifacts/local/ for the rest of the run, and
+# artifacts/facade-tests/ and the facade tests' staging directory while the facade tests run and their
+# results and status are published. STAGE_NAME is the staging directory's name in artifacts/, and
+# STAGE_PRIVATE is 1 once it has passed its check (make_staging).
+ROOT_FD=""
+ART_FD=""
+LOG_FD=""
+RESULTS_FD=""
+STAGE_FD=""
+STAGE_NAME=""
+STAGE_PRIVATE=0
+# What hold_dir, create_temp and open_log hand their caller.
+HELD_FD=""
+TEMP_NAME=""
+TEMP_FD=""
+LOG_OUT=""
 
 usage() {
     echo "usage: harness/scripts/run-local.sh capture|export-openapi|replay" >&2
@@ -195,21 +198,134 @@ rel() {
     printf '%s' "${1#"$REPO_ROOT"/}"
 }
 
-# Prints the last <count> lines of <file> to stderr, each quoted with "> ".
+# --- Output confinement ---------------------------------------------------------------------------
+# Everything the script itself writes goes under artifacts/, which another process may have replaced,
+# in whole or in part, by symbolic links. So nothing there is reached by its path again: artifacts/,
+# artifacts/local/ and artifacts/facade-tests/ are held open (hold_dir), and each name is resolved inside
+# a held directory through /proc/$$/fd/<n>/<name>, so no path above the held directory is resolved
+# again. $$ is the main shell even in a subshell, and it holds those descriptors, so the same path also
+# serves a command the script runs. No existing name is opened for writing: each file is created
+# exclusively under a fresh name and renamed into place (create_temp, publish_temp), the lock is opened
+# read-only (open_lock), and a directory is cleared by its name alone. The facade tests create their TRX
+# and xunit XML by name, so they are given only a private directory of their own, made under a fresh
+# name with mode 700 (make_staging), and the two files are renamed from it into artifacts/facade-tests/
+# (publish_result).
+
+# refuse_output <path> <what it is>: ends the run with 1 when an output path is not what this run writes
+# through, a symbolic link or not a directory (not a regular file, for the lock). Nothing was written
+# through it, and on_exit then names what the run did not regenerate.
+refuse_output() {
+    echo "run-local.sh: $(rel "$1") is $2; this run writes nothing through it" >&2
+    exit 1
+}
+
+# hold_dir <parent fd> <path>: opens the directory <path>, whose parent is held open as <parent fd>,
+# creating it when absent, and sets HELD_FD to its descriptor; <path> is the physical path it must
+# have. A symbolic link or any other entry that is not a directory is refused (refuse_output). An
+# absent one is created with mkdir, which never follows a symbolic link and fails on any entry already
+# there, so one that a concurrent creation put there is checked below like any other. It is opened as
+# `<name>/.`, which fails on anything but a directory rather than opening it (or blocking on a FIFO),
+# and kept only when /proc shows a directory at <path>: one reached through a link put there since the
+# checks has another physical path and is refused.
+hold_dir() {
+    local parent="$1" path="$2" entry fd
+    entry="/proc/$$/fd/$parent/${path##*/}"
+    if [ -L "$entry" ]; then
+        refuse_output "$path" "a symbolic link"
+    elif [ -e "$entry" ] && [ ! -d "$entry" ]; then
+        refuse_output "$path" "not a directory"
+    elif [ ! -e "$entry" ]; then
+        mkdir -- "$entry" 2>/dev/null
+    fi
+    if ! { exec {fd}<"$entry/."; } 2>/dev/null; then
+        echo "run-local.sh: cannot create or open $(rel "$path")/; this run writes nothing through it" >&2
+        exit 1
+    fi
+    if [ ! -d "/proc/$$/fd/$fd" ] || [ "$(readlink -- "/proc/$$/fd/$fd")" != "$path" ]; then
+        exec {fd}<&-
+        refuse_output "$path" "no longer the directory it was checked to be"
+    fi
+    HELD_FD="$fd"
+}
+
+# has_srandom: true when bash provides SRANDOM (getrandom(2)), which bash 5.1 added.
+has_srandom() {
+    ((BASH_VERSINFO[0] > 5 || (BASH_VERSINFO[0] == 5 && BASH_VERSINFO[1] >= 1)))
+}
+
+# random_name_part: prints 16 hex digits (64 bits) from the kernel's random number generator, through
+# SRANDOM or else /dev/urandom (od, tr). False when neither yields them.
+random_name_part() {
+    local part=""
+    if has_srandom; then
+        printf -v part '%08x%08x' "$SRANDOM" "$SRANDOM"
+    else
+        part="$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+    fi
+    [[ "$part" =~ ^[0-9a-f]{16}$ ]] || return 1
+    printf '%s\n' "$part"
+}
+
+# create_temp <dir fd> <name>: creates a new, empty regular file in the held directory <dir fd> under the
+# fresh name .<name>.<random_name_part>, and sets TEMP_NAME to that name and TEMP_FD to the write
+# descriptor of its creating open. The name is refused when any entry, a dangling symbolic link
+# included, is already there. It is then created under noclobber: for a name with no entry, bash's
+# noclobber open is O_CREAT|O_EXCL, which never follows a symbolic link and fails on any entry that
+# appears in between. The random part keeps anyone from placing in advance the one kind of entry that
+# noclobber opens without O_EXCL, a non-regular one. noclobber is local to the call. False when nothing
+# was created.
+create_temp() {
+    local -
+    local entry fd part
+    part="$(random_name_part)" || return 1
+    TEMP_NAME=".$2.$part"
+    entry="/proc/$$/fd/$1/$TEMP_NAME"
+    if [ -e "$entry" ] || [ -L "$entry" ]; then
+        return 1
+    fi
+    set -C
+    { exec {fd}>"$entry"; } 2>/dev/null || return 1
+    TEMP_FD="$fd"
+}
+
+# publish_temp <dir fd> <name>: renames TEMP_NAME over <name> in the held directory <dir fd>. mv -fT
+# renames with rename(2), which replaces a file or symbolic link at <name> without following it and fails
+# on a directory, so <name> names the old entry until it names the new file, whole as it was when
+# renamed. On failure TEMP_NAME is unlinked; the caller still closes TEMP_FD. False when <name> was not
+# published.
+publish_temp() {
+    local dir="/proc/$$/fd/$1"
+    if ! mv -fT -- "$dir/$TEMP_NAME" "$dir/$2" 2>/dev/null; then
+        rm -f -- "$dir/$TEMP_NAME"
+        return 1
+    fi
+}
+
+# quote_tail <count> <log name>: prints the last <count> lines of artifacts/local/<log name> to stderr,
+# each quoted with "> ". The log is reached through the held artifacts/local/ and read only while it is
+# a regular file, so a symbolic link put in its place is never followed.
 quote_tail() {
-    local count="$1" file="$2"
-    if [ -f "$file" ]; then
+    local count="$1" file="/proc/$$/fd/$LOG_FD/$2"
+    if [ -f "$file" ] && [ ! -L "$file" ]; then
         tail -n "$count" "$file" | sed 's/^/> /' >&2
     fi
 }
 
-# open_log <log>: creates or empties <log> before the step that writes it starts, and ends the run with 1
+# open_log <log name>: creates artifacts/local/<log name> afresh, a new empty regular file, before the
+# step that writes it starts, and sets LOG_OUT to the descriptor that created it: the step writes the
+# log through that descriptor alone, never through its path. An earlier log, or a symbolic link put in
+# its place, is replaced and never opened or truncated (create_temp, publish_temp). Ends the run with 1
 # when that fails, so no step runs without its log.
 open_log() {
-    if ! : >"$1"; then
-        echo "run-local.sh: cannot write the log $(rel "$1"); the step that writes it is not started" >&2
-        exit 1
+    if create_temp "$LOG_FD" "$1"; then
+        if publish_temp "$LOG_FD" "$1"; then
+            LOG_OUT="$TEMP_FD"
+            return 0
+        fi
+        exec {TEMP_FD}>&-
     fi
+    echo "run-local.sh: cannot write the log $(rel "$LOGDIR/$1"); the step that writes it is not started" >&2
+    exit 1
 }
 
 # --- Process environments -------------------------------------------------------------------------
@@ -270,20 +386,23 @@ harness_env() {
     )
 }
 
-# --- Helpers --------------------------------------------------------------------------------------
-
 # build <component> <project path relative to the component> [extra dotnet build arguments]
 # Restore is implicit and deliberately not locked: the first local build writes the committed
 # packages.lock.json files, and the Dockerfiles enforce locked mode.
 build() {
-    local component="$1" project="$2" log status
+    local component="$1" project="$2" log logfd pid status
     shift 2
-    log="$LOGDIR/build-$component-$(basename "$project" .csproj).log"
+    log="build-$component-$(basename "$project" .csproj).log"
     open_log "$log"
-    echo "run-local.sh: building $component/$project ($CONFIGURATION, log $(rel "$log"))"
+    logfd="$LOG_OUT"
+    echo "run-local.sh: building $component/$project ($CONFIGURATION, log $(rel "$LOGDIR/$log"))"
+    # The job writes the log through the descriptor open_log created; neither it nor the script keeps
+    # another copy of that descriptor.
     (cd "$REPO_ROOT/$component" && exec setsid -w dotnet build "$project" -c "$CONFIGURATION" "$@") \
-        >"$log" 2>&1 &
-    supervise "$!" "the $component build of $project"
+        >&"$logfd" 2>&1 {logfd}>&- &
+    pid=$!
+    exec {logfd}>&-
+    supervise "$pid" "the $component build of $project"
     status=$?
     if [ "$status" -ne 0 ]; then
         echo "run-local.sh: build failed: $component $project" >&2
@@ -334,21 +453,24 @@ warn_busy() {
 # exec (and env's own exec) make the background subshell's pid the dotnet process itself, so $! is the
 # pid to stop and the pid ss shows on the process's listeners; the caller then runs await_listeners.
 # The process gets no copy of the checkout lock (fd 9), so one that outlives a SIGKILLed run never
-# blocks the next run, whose await_listeners names it instead. Readiness is the harness's: it polls
-# each /health within its readiness limit.
+# blocks the next run, whose await_listeners names it instead. Its log, artifacts/local/<name>.log, is
+# made by open_log, and the process writes it through the descriptor open_log created alone. Readiness
+# is the harness's: it polls each /health within its readiness limit.
 start_bg() {
-    local name="$1" component="$2" dll="$3" log pid
+    local name="$1" component="$2" dll="$3" logfd pid
     shift 3
-    log="$LOGDIR/$name.log"
+    open_log "$name.log"
+    logfd="$LOG_OUT"
     (
         cd "$REPO_ROOT/$component" || exit 1
         exec env "${PROC_ENV[@]}" dotnet "$dll" "$@"
-    ) >"$log" 2>&1 9>&- &
+    ) >&"$logfd" 2>&1 9>&- {logfd}>&- &
     pid=$!
+    exec {logfd}>&-
     PIDS+=("$pid")
     NAMES[$pid]="$name"
     STARTED_PID="$pid"
-    echo "started $name pid $pid (log $(rel "$log"))"
+    echo "started $name pid $pid (log $(rel "$LOGDIR/$name.log"))"
 }
 
 # await_listeners <name> <pid> <port>...: polls every 0.5 s, for up to LISTEN_SECONDS, until <pid> owns
@@ -382,12 +504,12 @@ await_listeners() {
         done
         if [ -n "$held" ]; then
             echo "run-local.sh: port collision for $name pid $pid: $held; the harness is not run, so it touches no process this run did not start; last lines of $(rel "$log"):" >&2
-            quote_tail 20 "$log"
+            quote_tail 20 "$name.log"
             exit 1
         fi
         if ! kill -0 "$pid" 2>/dev/null; then
             echo "run-local.sh: $name pid $pid exited during start-up; the harness is not run; last lines of $(rel "$log"):" >&2
-            quote_tail 20 "$log"
+            quote_tail 20 "$name.log"
             exit 1
         fi
         if [ -z "$pending" ]; then
@@ -440,7 +562,7 @@ recheck_started() {
         else
             continue
         fi
-        quote_tail 20 "$log"
+        quote_tail 20 "$name.log"
         failed=1
     done
     if [ "$failed" -ne 0 ]; then
@@ -594,9 +716,10 @@ close_tee() {
     return 0
 }
 
-# cleanup: stops, once, the supervised build or facade-test job in flight and reaps its logger, then the
-# harness if it is still running and its logger, then every started process in reverse start order (the
-# facade before the stand-in). A logger pid is dropped only once close_tee has seen that logger gone.
+# cleanup: stops, once, the supervised build or facade-test job in flight and reaps its logger, removes
+# the facade tests' staging directory when one is left (remove_staging), then stops the harness if it is
+# still running and reaps its logger, then every started process in reverse start order (the facade
+# before the stand-in). A logger pid is dropped only once close_tee has seen that logger gone.
 cleanup() {
     local i
     if [ "$CLEANED" -eq 1 ]; then
@@ -611,6 +734,9 @@ cleanup() {
     if [ -n "$TEST_TEE_PID" ]; then
         close_tee 4 "$TEST_TEE_PID" "$LOGDIR/facade-tests.log" "the facade tests'"
         [ "$?" -eq 2 ] || TEST_TEE_PID=""
+    fi
+    if [ -n "$STAGE_NAME" ]; then
+        remove_staging
     fi
     if [ -n "$HARNESS_PID" ]; then
         stop_pid "$HARNESS_PID" "$HARNESS_STOP_SECONDS"
@@ -662,13 +788,17 @@ trap on_signal INT TERM HUP
 # The harness runs as a background job that the script waits on, so a signal to the script interrupts
 # the wait at once and cleanup passes SIGTERM on to the harness, which still writes its report and
 # shuts its components down. tee ignores the signals so the console copy and the log stay complete.
+# tee writes the log through its inherited copy of the descriptor open_log created (/dev/fd/<n>), never
+# through the log's path, and the script closes its own copy before the harness starts.
 run_harness() {
-    local mode="$1" log
+    local mode="$1" log logfd
     log="$LOGDIR/harness-$mode.log"
-    open_log "$log"
+    open_log "harness-$mode.log"
+    logfd="$LOG_OUT"
     HARNESS_LOG="$log"
-    exec 3> >(trap '' INT TERM HUP; exec tee "$log")
+    exec 3> >(trap '' INT TERM HUP; exec tee "/dev/fd/$logfd")
     TEE_PID=$!
+    exec {logfd}>&-
     harness_env "$mode"
     # From here the harness owns the report and on_exit no longer names it as not regenerated.
     HARNESS_STARTED=1
@@ -697,53 +827,176 @@ refuse_evidence() {
     exit 1
 }
 
-# clear_facade_results: removes artifacts/facade-tests/ and checks that nothing of it is left.
+# clear_facade_results: removes artifacts/facade-tests/ and checks that nothing of it is left. rm runs
+# inside the held artifacts/, entered through its descriptor and confirmed at its physical path, and is
+# given the relative name alone: it removes a symbolic link there itself and follows none inside the
+# tree, so nothing outside artifacts/ is removed.
 clear_facade_results() {
-    local results="$ART/facade-tests"
-    if ! rm -rf -- "$results" || [ -e "$results" ] || [ -L "$results" ]; then
+    local results="$ART/facade-tests" entry="/proc/$$/fd/$ART_FD/facade-tests"
+    if ! (cd -P -- "/proc/$$/fd/$ART_FD" && [ "$(pwd -P)" = "$ART" ] && rm -rf -- facade-tests) ||
+        [ -e "$entry" ] || [ -L "$entry" ]; then
         refuse_evidence "cannot remove $(rel "$results")/"
     fi
 }
 
+# publish_status <status>: publishes <status> as exit-code in the held artifacts/facade-tests/. It is
+# written in full under a fresh temporary name and then renamed over exit-code (create_temp,
+# publish_temp), so a reader never sees a partial or an earlier status and a symbolic link put at
+# exit-code is replaced, never followed. False when the status was not published.
+publish_status() {
+    create_temp "$RESULTS_FD" exit-code || return 1
+    if ! printf '%s\n' "$1" >&"$TEMP_FD"; then
+        exec {TEMP_FD}>&-
+        rm -f -- "/proc/$$/fd/$RESULTS_FD/$TEMP_NAME"
+        return 1
+    fi
+    exec {TEMP_FD}>&-
+    publish_temp "$RESULTS_FD" exit-code
+}
+
+# make_staging: creates the facade tests' private staging directory in the held artifacts/ under the
+# fresh name .facade-tests.<random_name_part>, holds it open as STAGE_FD (hold_dir) and sets STAGE_NAME.
+# mkdir -m 0700 follows no symbolic link and fails on any entry already at that name. The directory is
+# kept only when stat, through the held descriptor, shows mode 700 and the effective user as its owner;
+# otherwise the run ends with 1 before the harness starts (refuse_evidence), and cleanup removes it with
+# rmdir alone (remove_staging).
+make_staging() {
+    local part mode_owner
+    if ! part="$(random_name_part)" ||
+        ! mkdir -m 0700 -- "/proc/$$/fd/$ART_FD/.facade-tests.$part" 2>/dev/null; then
+        refuse_evidence "cannot create a private staging directory for the facade tests in $(rel "$ART")/"
+    fi
+    STAGE_NAME=".facade-tests.$part"
+    hold_dir "$ART_FD" "$ART/$STAGE_NAME"
+    STAGE_FD="$HELD_FD"
+    mode_owner="$(stat -L -c '%a %u' -- "/proc/$$/fd/$STAGE_FD" 2>/dev/null)"
+    if [ "$mode_owner" != "700 $EUID" ]; then
+        refuse_evidence "the staging directory $(rel "$ART/$STAGE_NAME")/ is not private to this run (mode and owner ${mode_owner:-unreadable}, not 700 $EUID)"
+    fi
+    STAGE_PRIVATE=1
+}
+
+# remove_staging: closes STAGE_FD and removes the staging directory from the held artifacts/. Once it
+# has passed its check, rm -rf is given its relative name inside artifacts/, entered through ART_FD as
+# in clear_facade_results, so it follows no symbolic link in the tree; before that only rmdir, which
+# removes no symbolic link and no non-empty directory, so nothing that may not be this run's is removed.
+# Warns when an entry is left at that name.
+remove_staging() {
+    local entry
+    if [ -z "$STAGE_NAME" ]; then
+        return 0
+    fi
+    if [ -n "$STAGE_FD" ]; then
+        exec {STAGE_FD}<&-
+        STAGE_FD=""
+    fi
+    entry="/proc/$$/fd/$ART_FD/$STAGE_NAME"
+    if [ "$STAGE_PRIVATE" -eq 1 ]; then
+        (cd -P -- "/proc/$$/fd/$ART_FD" && [ "$(pwd -P)" = "$ART" ] && rm -rf -- "$STAGE_NAME")
+    else
+        rmdir -- "$entry" 2>/dev/null
+    fi
+    if [ -e "$entry" ] || [ -L "$entry" ]; then
+        echo "run-local.sh: warning: the staging directory $(rel "$ART/$STAGE_NAME")/ was not removed" >&2
+    fi
+    STAGE_NAME=""
+    STAGE_PRIVATE=0
+}
+
+# publish_result <name>: publishes the file <name> the facade tests wrote into the staging directory by
+# renaming it into the held artifacts/facade-tests/. mv -fT renames with rename(2) between the two held
+# directories, both made by this run in artifacts/ and so on one filesystem: nothing is opened or
+# copied, and a file or symbolic link put at <name> in artifacts/facade-tests/ is replaced without
+# being followed. A staged entry that is a symbolic link or not a regular file is refused and left to
+# remove_staging, never read, followed or moved. The published entry is checked again, so one replaced
+# in the staging directory between the check and the rename is unlinked (rm -f, which removes no
+# directory) and reported rather than published. False when <name> was not published, with an error
+# unless the tests wrote no <name> at all.
+publish_result() {
+    local results="$ART/facade-tests" staged="/proc/$$/fd/$STAGE_FD/$1" published="/proc/$$/fd/$RESULTS_FD/$1"
+    if [ ! -e "$staged" ] && [ ! -L "$staged" ]; then
+        return 1
+    fi
+    if [ -L "$staged" ] || [ ! -f "$staged" ]; then
+        echo "run-local.sh: error: the facade tests wrote $1 as a symbolic link or a non-regular file;" \
+            "not published to $(rel "$results")/" >&2
+        return 1
+    fi
+    if ! mv -fT -- "$staged" "$published" 2>/dev/null; then
+        echo "run-local.sh: error: cannot rename the facade tests' $1 into $(rel "$results")/; not published" >&2
+        return 1
+    fi
+    if [ -L "$published" ] || [ ! -f "$published" ]; then
+        rm -f -- "$published" 2>/dev/null
+        echo "run-local.sh: error: the facade tests' $1 was replaced by a symbolic link or a non-regular" \
+            "file before it reached $(rel "$results")/; not published" >&2
+        return 1
+    fi
+}
+
 # run_facade_tests: the facade tests as facade/tests/run-tests.sh runs them, into a cleared
-# artifacts/facade-tests/, so an old TRX is never read as this run's evidence. The run is a supervised
-# job bounded by FACADE_TESTS_SECONDS; at the limit it is stopped and its status is 124. The status is
-# recorded in exit-code and the run continues whatever it is; the harness reports the outcome.
+# artifacts/facade-tests/, so an old TRX is never read as this run's evidence. The directory is made
+# afresh by a mkdir inside the held artifacts/, which fails on any entry that has reappeared, and is
+# then held open itself (hold_dir). The tests write into a private staging directory (make_staging),
+# never into artifacts/facade-tests/. The run is a supervised job bounded by FACADE_TESTS_SECONDS; at
+# the limit it is stopped and its status is 124. Its TRX and xunit XML are then published from the
+# staging directory (publish_result), and only after them its status as exit-code (publish_status), so
+# a reader that sees this run's status also sees this run's TRX; the staging directory is then removed
+# (remove_staging). The run continues whatever the status and whether or not a TRX was published; the
+# harness reports the outcome.
 run_facade_tests() {
-    local results="$ART/facade-tests" log="$LOGDIR/facade-tests.log" status
+    local results="$ART/facade-tests" log="$LOGDIR/facade-tests.log" logfd status trx_published=0 xml_published=0
     clear_facade_results
-    if ! mkdir -p -- "$results"; then
+    if ! mkdir -- "/proc/$$/fd/$ART_FD/facade-tests" 2>/dev/null; then
         refuse_evidence "cannot create $(rel "$results")/"
     fi
-    open_log "$log"
+    hold_dir "$ART_FD" "$results"
+    RESULTS_FD="$HELD_FD"
+    make_staging
+    open_log facade-tests.log
+    logfd="$LOG_OUT"
     echo "run-local.sh: running the facade tests (results $(rel "$results")/, log $(rel "$log")," \
         "limit $FACADE_TESTS_SECONDS s)"
     # The console copy goes through a logger the script tracks, as for the harness; tee ignores the
-    # signals so both copies stay complete while cleanup stops the tests.
-    exec 4> >(trap '' INT TERM HUP; exec tee "$log")
+    # signals so both copies stay complete while cleanup stops the tests. tee writes the log through its
+    # inherited copy of the descriptor open_log created, and the script closes its own copy.
+    exec 4> >(trap '' INT TERM HUP; exec tee "/dev/fd/$logfd")
     TEST_TEE_PID=$!
+    exec {logfd}>&-
     # No `--` before the test-application options: on SDK 10.0.403 `dotnet test` rejects
-    # `-- ... --results-directory <dir>` when <dir> exists, and writes no TRX.
+    # `-- ... --results-directory <dir>` when <dir> exists, and writes no TRX. The results directory is
+    # given as the /proc path of the held staging directory, so the TRX and xunit XML land in the
+    # directory make_staging checked whatever happens to its path meanwhile.
     (cd "$REPO_ROOT/facade" && exec setsid -w dotnet test \
         --project tests/Erewhon.Facade.Tests/Erewhon.Facade.Tests.csproj -c "$CONFIGURATION" --no-restore \
         --report-xunit-trx --report-xunit-trx-filename facade-tests.trx \
-        --report-xunit-xml --report-xunit-xml-filename facade-tests.xunit.xml --results-directory "$results") \
+        --report-xunit-xml --report-xunit-xml-filename facade-tests.xunit.xml \
+        --results-directory "/proc/$$/fd/$STAGE_FD") \
         >&4 2>&1 4>&- &
     supervise "$!" "the facade tests" "$FACADE_TESTS_SECONDS"
     status=$?
     # A logger still running after SIGKILL keeps its pid in TEST_TEE_PID, so cleanup tries again.
     close_tee 4 "$TEST_TEE_PID" "$log" "the facade tests'"
     [ "$?" -eq 2 ] || TEST_TEE_PID=""
-    if ! printf '%s\n' "$status" >"$results/exit-code"; then
+    if publish_result facade-tests.trx; then
+        trx_published=1
+    fi
+    if publish_result facade-tests.xunit.xml; then
+        xml_published=1
+    fi
+    if ! publish_status "$status"; then
         refuse_evidence "cannot write $(rel "$results")/exit-code (the facade tests exited $status)"
     fi
     echo "run-local.sh: facade tests exited $status"
-    if [ ! -f "$results/facade-tests.trx" ]; then
+    if [ "$trx_published" -eq 0 ]; then
         echo "run-local.sh: warning: $(rel "$results")/facade-tests.trx was not written" >&2
     fi
-    if [ ! -f "$results/facade-tests.xunit.xml" ]; then
+    if [ "$xml_published" -eq 0 ]; then
         echo "run-local.sh: warning: $(rel "$results")/facade-tests.xunit.xml was not written" >&2
     fi
+    remove_staging
+    exec {RESULTS_FD}<&-
+    RESULTS_FD=""
 }
 
 # The stand-in sets its own content root to its build output, so it needs no argument.
@@ -769,15 +1022,56 @@ start_facade() {
 
 # --- Subcommands ----------------------------------------------------------------------------------
 
-# prepare: the checks and directories every subcommand needs, once its name is known to be valid. Every
-# external program the script runs is looked up on PATH first, so a missing one stops the run with its
-# name before anything is built, started or written. Unchecked, a missing setsid would leave builds and
-# tests unsupervised, a missing ss or grep would make every port-ownership check fail, a missing flock
-# would let a second run into this checkout, and a missing tee would lose the logs and the harness's
-# console copy.
+# open_lock: opens artifacts/local/run-local.lock, inside the held artifacts/local/, as fd 9. The file is
+# never unlinked or replaced, since a run that holds the lock holds that file. A symbolic link there, or
+# any other entry that is not a regular file, is refused (refuse_output). An absent one is created under
+# noclobber, O_CREAT|O_EXCL, which never follows a symbolic link; when another run creates it first, that
+# one is opened instead. An existing one is opened read-only, which is all flock needs: unlike `>>` or
+# `<>` that open has no O_CREAT, so a dangling link put there after the check creates nothing elsewhere,
+# and the check before it keeps the open off a FIFO, on which it would block. fd 9 is kept only when
+# /proc shows a regular file at artifacts/local/run-local.lock.
+open_lock() {
+    local -
+    local lock="$LOGDIR/run-local.lock" entry="/proc/$$/fd/$LOG_FD/run-local.lock" opened=0
+    if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then
+        set -C
+        { exec 9>"$entry"; } 2>/dev/null && opened=1
+    fi
+    if [ "$opened" -eq 0 ]; then
+        if [ -L "$entry" ]; then
+            refuse_output "$lock" "a symbolic link"
+        elif [ -e "$entry" ] && [ ! -f "$entry" ]; then
+            refuse_output "$lock" "not a regular file"
+        elif ! { exec 9<"$entry"; } 2>/dev/null; then
+            echo "run-local.sh: cannot open $(rel "$lock")" >&2
+            exit 1
+        fi
+    fi
+    if [ ! -f "/proc/$$/fd/9" ] || [ "$(readlink -- "/proc/$$/fd/9")" != "$lock" ]; then
+        exec 9<&-
+        refuse_output "$lock" "no longer the regular file it was checked to be"
+    fi
+}
+
+# prepare: the checks and directories every subcommand needs, once its name is known to be valid. The
+# programs the build, start, supervision, logging and output steps run are looked up on PATH first, so
+# a missing one stops the run with its name before anything is built, started or written under
+# artifacts/. Root resolution has run before this check and needs dirname, and readlink when the script
+# is invoked through a symbolic link; without them it ends the run with "cannot locate the repository".
+# Unchecked, a missing setsid would leave builds and tests unsupervised, a missing ss or grep would make
+# every port-ownership check fail, a missing flock would let a second run into this checkout, a missing
+# tee would lose the logs and the harness's console copy, a missing mv or readlink (or od or tr, where
+# bash has no SRANDOM) would make every output under artifacts/ fail, a missing stat would refuse every
+# staging directory of the facade tests, and a missing rmdir would leave one that failed its check
+# behind. artifacts/ and artifacts/local/ are then held open (hold_dir) and the checkout lock is taken
+# (open_lock).
 prepare() {
     local tool missing=()
-    for tool in dotnet setsid ss flock grep tee env sed tail sleep mkdir rm basename dirname; do
+    local -a tools=(dotnet setsid ss flock grep tee env sed tail sleep mkdir rm rmdir mv readlink stat basename)
+    if ! has_srandom; then
+        tools+=(od tr)
+    fi
+    for tool in "${tools[@]}"; do
         if ! type -P "$tool" >/dev/null 2>&1; then
             missing+=("$tool")
         fi
@@ -789,16 +1083,28 @@ prepare() {
         echo "run-local.sh: required tools are not on PATH: ${missing[*]}" >&2
         exit 1
     fi
-    mkdir -p "$LOGDIR"
+    if [ ! -d "/proc/$$/fd" ]; then
+        echo "run-local.sh: /proc/$$/fd is not available, so artifacts/ cannot be held open; this run writes nothing under it" >&2
+        exit 1
+    fi
+    # The repository root is held only while artifacts/ is opened in it.
+    if ! { exec {ROOT_FD}<"$REPO_ROOT/."; } 2>/dev/null ||
+        [ "$(readlink -- "/proc/$$/fd/$ROOT_FD")" != "$REPO_ROOT" ]; then
+        echo "run-local.sh: cannot hold the repository $REPO_ROOT open; this run writes nothing under it" >&2
+        exit 1
+    fi
+    hold_dir "$ROOT_FD" "$ART"
+    ART_FD="$HELD_FD"
+    exec {ROOT_FD}<&-
+    ROOT_FD=""
+    hold_dir "$ART_FD" "$LOGDIR"
+    LOG_FD="$HELD_FD"
     # One run per checkout: fd 9 holds an exclusive lock on artifacts/local/run-local.lock until the
     # script exits, so a second run here stops before it builds or writes anything. The lock is not
     # host-wide; await_listeners tells apart runs of other checkouts. The stand-in, the facade and the
     # harness are started without fd 9, so one left running by a SIGKILLed run never holds the lock and
     # the next run's await_listeners names it instead.
-    if ! exec 9>>"$LOGDIR/run-local.lock"; then
-        echo "run-local.sh: cannot open $(rel "$LOGDIR/run-local.lock")" >&2
-        exit 1
-    fi
+    open_lock
     if ! flock -n 9; then
         echo "run-local.sh: another run-local.sh run in this checkout holds $(rel "$LOGDIR/run-local.lock"); this run stops before building or writing anything" >&2
         exit 1
@@ -841,8 +1147,6 @@ cmd_replay() {
     recheck_started
     run_harness replay 9>&-
 }
-
-# --- Main -----------------------------------------------------------------------------------------
 
 if [ "$#" -ne 1 ]; then
     usage
