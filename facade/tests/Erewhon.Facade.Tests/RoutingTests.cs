@@ -49,6 +49,7 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
+using Microsoft.Extensions.Primitives;
 using Xunit;
 using Yarp.ReverseProxy.Forwarder;
 
@@ -1046,8 +1047,9 @@ public sealed class SoapResolutionTests
 /// <summary>
 /// Shows that fields nominated by a <c>Connection</c> header are dropped on the request and the response
 /// hop while the other end-to-end fields pass, mixed lists, keep-alive connections and every request
-/// framing Kestrel accepts included, that the response head is not held until the body, and that a
-/// deadline passing after the head aborts the response.
+/// framing Kestrel accepts included, that the response head is not held until the body, that a
+/// deadline passing after the head aborts the response, and which trailer fields the transform passes
+/// on to the next hop.
 /// </summary>
 public sealed class PassThroughTransformerTests
 {
@@ -1133,6 +1135,66 @@ public sealed class PassThroughTransformerTests
     // failure once the bound has passed.
     private static bool ExchangeBoundEnded(Exception exception, CancellationTokenSource exchange, CancellationToken ct) =>
         !ct.IsCancellationRequested && (exception is OperationCanceledException || exchange.IsCancellationRequested);
+
+    // The name and value of a trailer field in one of the cases of TrailerFieldPassesOnlyAsOneLineOfTheMessage,
+    // each named for what sets it apart, so that no test name carries the bytes themselves.
+    private static (string Name, string Value) TrailerField(string field) => field switch
+    {
+        "token-value" => ("X-Checksum", "abc123"),
+        "latin1-value" => ("X-Latin", "caf\u00e9"),
+        "empty-value" => ("X-Empty", string.Empty),
+        "space-in-name" => ("X Bad", "v"),
+        "colon-in-name" => ("X-Bad:", "v"),
+        "empty-name" => (string.Empty, "v"),
+        "crlf-in-value" => ("X-Split", "a" + CrLf + "X-Injected: 1"),
+        "lf-in-value" => ("X-Split", "a\nX-Injected: 1"),
+        "nul-in-value" => ("X-Nul", "a\0b"),
+        "wide-char-in-value" => ("X-Wide", "a\u0100b"),
+        "hop-by-hop" => ("Keep-Alive", "timeout=5"),
+        "hop-by-hop-other-case" => ("proxy-AUTHORIZATION", "none"),
+        "nominated" => ("X-Nominated", "v"),
+        _ => throw new ArgumentOutOfRangeException(nameof(field)),
+    };
+
+    /// <summary>
+    /// A trailer field between two that pass reaches the next hop as one line, <c>name: value</c> and
+    /// CRLF, byte for byte in Latin-1, only when it can go as that one line and belongs to the message: a
+    /// token value, a Latin-1 value byte and an empty value pass. A name that is no token (a space, a colon,
+    /// none at all), a value holding CR LF, a lone LF, a NUL or a char Latin-1 cannot carry, which could end
+    /// the line and smuggle another, a hop-by-hop field in any letter case and a field the sender's
+    /// <c>Connection</c> header nominates are left out, and the fields around them still pass.
+    /// </summary>
+    /// <param name="field">The case, as <see cref="TrailerField"/> names it.</param>
+    /// <param name="passes">Whether the field reaches the next hop.</param>
+    [Theory]
+    [InlineData("token-value", true)]
+    [InlineData("latin1-value", true)]
+    [InlineData("empty-value", true)]
+    [InlineData("space-in-name", false)]
+    [InlineData("colon-in-name", false)]
+    [InlineData("empty-name", false)]
+    [InlineData("crlf-in-value", false)]
+    [InlineData("lf-in-value", false)]
+    [InlineData("nul-in-value", false)]
+    [InlineData("wide-char-in-value", false)]
+    [InlineData("hop-by-hop", false)]
+    [InlineData("hop-by-hop-other-case", false)]
+    [InlineData("nominated", false)]
+    public void TrailerFieldPassesOnlyAsOneLineOfTheMessage(string field, bool passes)
+    {
+        (string name, string value) = TrailerField(field);
+        var fields = new List<KeyValuePair<string, StringValues>>
+        {
+            new("X-Before", "b"),
+            new(name, value),
+            new("X-After", "a"),
+        };
+
+        byte[] lines = PassThroughTransformer.EncodeTrailerFields(fields, ["x-nominated"]);
+
+        string expected = "X-Before: b" + CrLf + (passes ? name + ": " + value + CrLf : string.Empty) + "X-After: a" + CrLf;
+        Assert.Equal(expected, Encoding.Latin1.GetString(lines));
+    }
 
     /// <summary>
     /// Sends a request with a body whose two <c>Connection</c> lines nominate custom, request and content

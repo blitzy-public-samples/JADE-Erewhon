@@ -864,7 +864,8 @@ public sealed class BackendErrorPassThroughTests
 /// body-less writes and of writes sent with <c>Expect: 100-continue</c>, the unchanged wire form of
 /// body-less requests, Latin-1 header bytes in both directions, response heads beyond 64 KiB, request
 /// heads at and over the limit of 100 header lines, chunked writes whose head and trailer lines reach or
-/// pass that limit together, the unavailable answer to a backend that breaks its reply, uploads that carry
+/// pass that limit together, the trailer fields of chunked writes and chunked responses, which pass in
+/// both directions, the unavailable answer to a backend that breaks its reply, uploads that carry
 /// only the caller's own <c>Expect</c>, a backend's answer to, drop of, switch of protocols during or
 /// interim responses, valid or not, during an upload the caller has paused, and uploads to HTTPS
 /// backends, whose certificates are validated.
@@ -908,6 +909,52 @@ public sealed class ForwardingTransportTests
 
     // The header lines of the chunked write whose trailer lines Kestrel counts against the same limit.
     private const int TrailerWriteHeadLines = 60;
+
+    // The trailer sections a chunked upload or response carries: fields that all pass, a Latin-1 value
+    // byte and a repeated field among them; none at all; and hop-by-hop fields, one of them the field the
+    // sender's Connection header nominates, beside one field that passes. TrailerFieldLines gives the
+    // lines sent and those the next hop must receive.
+    private const string RelayedTrailers = "relayed-trailers";
+    private const string NoTrailers = "no-trailers";
+    private const string HopByHopTrailers = "hop-by-hop-trailers";
+
+    // A REST write whose method token is in lower case, "post", which the HTTP stack would upper-case, so
+    // the facade sends it through a single-use invoker whose connection restores the caller's line; and a
+    // REST write carrying the caller's own Expect: 100-continue, whose head the HTTP stack sends and
+    // flushes on its own before the body.
+    private const string RestOwnMethodCaller = "rest-own-method";
+    private const string RestExpectContinueCaller = "rest-expect-continue";
+
+    // How the handler's writes of a request reach a backend connection: all at once, one byte per
+    // asynchronous write, one byte per synchronous write, one WriteByte per byte, or in two writes split
+    // inside the last chunk's size line.
+    private const string WholeWrite = "whole";
+    private const string ByteAsyncWrites = "byte-async";
+    private const string ByteSyncWrites = "byte-sync";
+    private const string WriteBytes = "write-byte";
+    private const string SplitInLastChunk = "split-in-last-chunk";
+
+    // What a backend connection is handed to write: a relaying call's chunked upload with trailer fields
+    // or without, a relaying call whose head declares a body of declared length that holds what looks
+    // like a last chunk, and a chunked upload of a call that relays no trailer fields.
+    private const string RelayedUpload = "relayed";
+    private const string RelayedUploadWithoutFields = "relayed-without-fields";
+    private const string LengthDelimitedUpload = "length-delimited";
+    private const string NonRelayingUpload = "non-relaying";
+
+    private const string RelayedTrailerLines = "X-Checksum: tvalue-QA\r\nX-Latin: caf\u00e9\r\nX-Dup: 1\r\nX-Dup: 2\r\n";
+    private const string HopByHopTrailerLines =
+        "Keep-Alive: timeout=5\r\nTE: trailers\r\nProxy-Authorization: none\r\nUpgrade: foo\r\nX-Hop: v\r\n";
+    private const string KeptTrailerLine = "X-Kept: k\r\n";
+
+    // The Trailer header announcing the trailer fields, and the Connection line that nominates X-Hop,
+    // which every sender of a trailer section sends with its head.
+    private const string TrailerAnnouncementHeader = "Trailer: X-Checksum, X-Latin, X-Dup\r\n";
+    private const string NominatingConnectionHeader = "Connection: X-Hop\r\n";
+
+    // The two parts of a chunked backend response's body, sent as one chunk each.
+    private const string ResponseFirstPart = "hello";
+    private const string ResponseSecondPart = " trailers";
 
     // An upload of 1 MiB, the size from which an HTTP client such as curl asks for 100-continue itself.
     private const int LargeUploadLength = 1024 * 1024;
@@ -1105,6 +1152,32 @@ public sealed class ForwardingTransportTests
         HeaderLineLimit - TrailerWriteHeadLines,
         HeaderLineLimit - TrailerWriteHeadLines + 1,
     };
+
+    /// <summary>
+    /// A chunked REST write, the same write with the method token in lower case, which goes through an
+    /// invoker of its own that restores the caller's request line, and with the caller's own
+    /// <c>Expect: 100-continue</c>, a chunked SOAP write naming its operation in <c>SOAPAction</c> and one
+    /// whose body the facade inspects, each with every trailer section: fields that pass, none, and
+    /// hop-by-hop fields beside one that passes.
+    /// </summary>
+    public static MatrixTheoryData<string, string> ChunkedUploadTrailers() => new(
+        [RestCaller, RestOwnMethodCaller, RestExpectContinueCaller, SoapActionCaller, SoapInspectedCaller],
+        [RelayedTrailers, NoTrailers, HopByHopTrailers]);
+
+    /// <summary>
+    /// Every way the handler's writes may split a request, for every request a backend connection may be
+    /// handed: a relaying call's chunked upload with trailer fields and without, a relaying call's body of
+    /// declared length, and a chunked upload of a call that relays none.
+    /// </summary>
+    public static MatrixTheoryData<string, string> ConnectionWriteSplits() => new(
+        [WholeWrite, ByteAsyncWrites, ByteSyncWrites, WriteBytes, SplitInLastChunk],
+        [RelayedUpload, RelayedUploadWithoutFields, LengthDelimitedUpload, NonRelayingUpload]);
+
+    /// <summary>
+    /// The trailer sections of a chunked backend response: fields that pass, none, and hop-by-hop fields
+    /// beside one that passes.
+    /// </summary>
+    public static TheoryData<string> ChunkedResponseTrailers() => new() { RelayedTrailers, NoTrailers, HopByHopTrailers };
 
     /// <summary>Whether an upload is chunked rather than framed by <c>Content-Length</c>.</summary>
     public static TheoryData<bool> UploadFramings() => new() { false, true };
@@ -1649,6 +1722,243 @@ public sealed class ForwardingTransportTests
             Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
             Assert.Equal(200, calls[0].Value("Status"));
         }
+    }
+
+    /// <summary>
+    /// A chunked write's trailer section follows its body to the backend, for a REST write, sent with the
+    /// catalogue's method token, in lower case through a single-use invoker, or with the caller's own
+    /// <c>Expect: 100-continue</c>, whose head goes out before the body, a SOAP write naming its
+    /// operation in <c>SOAPAction</c> and one whose body the facade inspects, each sent in two chunks: the
+    /// backend receives the request line and the <c>Trailer</c> header unchanged, the body byte for byte
+    /// and, after the last chunk, every trailer field line of the caller's that passes, in order and byte
+    /// for byte, a Latin-1 value byte and a repeated field included. Hop-by-hop fields and the field the
+    /// caller's <c>Connection</c> header nominates stay behind, and a body without trailer fields still
+    /// ends with <c>0</c> CRLF CRLF. The backend's 200 reaches the caller, logged <c>forwarded</c>.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ChunkedUploadTrailers))]
+    public async Task ChunkedUploadCarriesCallersTrailerFieldsToBackend(string caller, string trailers)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var logs = new LogCapture();
+        await using ScriptedBackend backend = ScriptedBackend.Start(OkReply());
+        await using FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, timeoutSeconds: null, ct);
+
+        PreparedRequest write = caller switch
+        {
+            RestCaller or RestOwnMethodCaller or RestExpectContinueCaller =>
+                OperationRequests.ForRest(OperationCatalogue.Default.GetById(PostCreateAgentId)),
+            SoapActionCaller => OperationRequests.ForSoap(OperationCatalogue.Default.GetById(UpdateAgentId)),
+            SoapInspectedCaller => OperationRequests.ForSoap(OperationCatalogue.Default.GetById(UpdateAgentId), includeSoapAction: false),
+            _ => throw new ArgumentOutOfRangeException(nameof(caller)),
+        };
+        string method = caller == RestOwnMethodCaller ? write.Method.Method.ToLowerInvariant() : write.Method.Method;
+        (string sentLines, string relayedLines) = TrailerFieldLines(trailers);
+        string body = Encoding.Latin1.GetString(write.Body!);
+        int half = body.Length / 2;
+        string headers = "Content-Type: " + write.ContentType + "\r\n"
+            + (write.SoapAction is { } soapAction ? "SOAPAction: " + soapAction + "\r\n" : string.Empty)
+            + "Transfer-Encoding: chunked\r\n"
+            + (caller == RestExpectContinueCaller ? ExpectContinueHeader : string.Empty)
+            + TrailerAnnouncementHeader
+            + NominatingConnectionHeader;
+        string framedBody = Chunk(body[..half]) + Chunk(body[half..]) + "0\r\n" + sentLines + "\r\n";
+        int port = write.Operation.Surface == Surface.Rest ? facade.RestPort : facade.SoapPort;
+
+        RawExchange response = await SendRawAsync(port, CallerHead(method, write.PathAndQuery, headers, framedBody), ct);
+
+        Assert.Equal(200, response.Status);
+        Assert.Equal(BackendBody, Encoding.Latin1.GetString(response.Body));
+
+        IReadOnlyList<ScriptedRequest> received = backend.Requests;
+        Assert.True(received.Count == 1, "chunked write with a trailer section did not reach the backend exactly once");
+        Assert.True(
+            received[0].Head.StartsWith(method + " " + write.PathAndQuery + " HTTP/1.1\r\n", StringComparison.Ordinal),
+            "chunked write with a trailer section did not reach the backend with its request line unchanged");
+        Assert.True(received[0].Body.AsSpan().SequenceEqual(write.Body!), "backend did not receive the chunked body byte for byte");
+        Assert.True(
+            received[0].Head.Contains("\r\n" + TrailerAnnouncementHeader, StringComparison.Ordinal),
+            "caller's Trailer header did not reach the backend unchanged");
+        Assert.Equal("0\r\n" + relayedLines + "\r\n", received[0].LastChunk);
+
+        IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
+        Assert.True(calls.Count == 1, "chunked write with a trailer section did not write exactly one backend call line");
+        Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(200, calls[0].Value("Status"));
+    }
+
+    /// <summary>
+    /// A backend connection inserts the caller's trailer field lines right after the last chunk's size
+    /// line of a relaying call's chunked upload, however the handler's writes split the request: at once,
+    /// one byte per asynchronous or synchronous write or per <c>WriteByte</c>, or in two writes split
+    /// inside that line. It changes no byte of a relaying call's chunked upload whose trailer section holds
+    /// no field, of a relaying call's request whose head declares a body of declared length, even one that
+    /// holds what looks like a last chunk, or of a chunked upload of a call that relays no trailer fields.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ConnectionWriteSplits))]
+    public async Task BackendConnectionInsertsTrailerFieldsOnlyAfterRelayingCallsLastChunk(string split, string upload)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        string chunkedRequest = "POST /createAgent HTTP/1.1\r\nHost: backend\r\nTransfer-Encoding: chunked\r\n\r\n"
+            + Chunk(ResponseFirstPart) + Chunk(ResponseSecondPart) + "0\r\n\r\n";
+        string lengthDelimitedRequest = "POST /createAgent HTTP/1.1\r\nHost: backend\r\nContent-Length: 5\r\n\r\n0\r\n\r\n";
+        (string request, IHeaderDictionary? trailerFields, string expected) = upload switch
+        {
+            RelayedUpload => (chunkedRequest, new HeaderDictionary { ["X-Checksum"] = "abc" }, chunkedRequest[..^2] + "X-Checksum: abc\r\n\r\n"),
+            RelayedUploadWithoutFields => (chunkedRequest, new HeaderDictionary(), chunkedRequest),
+            LengthDelimitedUpload => (lengthDelimitedRequest, new HeaderDictionary { ["X-Checksum"] = "abc" }, lengthDelimitedRequest),
+            NonRelayingUpload => (chunkedRequest, null, chunkedRequest),
+            _ => throw new ArgumentOutOfRangeException(nameof(upload)),
+        };
+        byte[] bytes = Encoding.Latin1.GetBytes(request);
+
+        using var wire = new MemoryStream();
+        BackendCallState call = BackendCallState.Begin(
+            upload == LengthDelimitedUpload,
+            trailerFields is null ? null : new ReadRequestTrailers(trailerFields));
+        try
+        {
+            await using var connection = new BackendConnectionStream(wire);
+            switch (split)
+            {
+                case WholeWrite:
+                    await connection.WriteAsync(bytes, ct);
+                    break;
+                case ByteAsyncWrites:
+                    for (int index = 0; index < bytes.Length; index++)
+                    {
+                        await connection.WriteAsync(bytes.AsMemory(index, 1), ct);
+                    }
+
+                    break;
+                case ByteSyncWrites:
+                    for (int index = 0; index < bytes.Length; index++)
+                    {
+                        connection.Write(bytes, index, 1);
+                    }
+
+                    break;
+                case WriteBytes:
+                    foreach (byte value in bytes)
+                    {
+                        connection.WriteByte(value);
+                    }
+
+                    break;
+                case SplitInLastChunk:
+                    int splitAt = request.LastIndexOf("0\r\n", StringComparison.Ordinal) + 2;
+                    await connection.WriteAsync(bytes.AsMemory(0, splitAt), ct);
+                    await connection.WriteAsync(bytes.AsMemory(splitAt), ct);
+                    break;
+                default:
+                    throw new ArgumentOutOfRangeException(nameof(split));
+            }
+
+            Assert.Equal(expected, Encoding.Latin1.GetString(wire.ToArray()));
+        }
+        finally
+        {
+            call.End();
+        }
+    }
+
+    /// <summary>
+    /// A backend's chunked response reaches an HTTP/1.1 caller with its trailer section: the body byte for
+    /// byte, the <c>Trailer</c> header unchanged and, after the last chunk, every trailer field line of the
+    /// backend's that passes, in order and byte for byte, a Latin-1 value byte and a repeated field
+    /// included. Hop-by-hop fields and the field the backend's <c>Connection</c> header nominates stay
+    /// behind, and a body without trailer fields still ends with <c>0</c> CRLF CRLF. The caller's
+    /// connection stays in step: a <c>HEAD</c> after it gets the head alone, and a second <c>GET</c> on the
+    /// same connection gets the whole response again, each call logged <c>forwarded</c>.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ChunkedResponseTrailers))]
+    public async Task ChunkedResponseCarriesBackendsTrailerFieldsToCaller(string trailers)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        (string sentLines, string relayedLines) = TrailerFieldLines(trailers);
+        byte[] reply = Encoding.Latin1.GetBytes(
+            "HTTP/1.1 200 OK\r\n"
+            + "Content-Type: text/plain\r\n"
+            + "Transfer-Encoding: chunked\r\n"
+            + TrailerAnnouncementHeader
+            + NominatingConnectionHeader
+            + "\r\n"
+            + Chunk(ResponseFirstPart) + Chunk(ResponseSecondPart) + "0\r\n" + sentLines + "\r\n");
+        var logs = new LogCapture();
+        await using ScriptedBackend backend = ScriptedBackend.Start(reply);
+        await using FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, timeoutSeconds: null, ct);
+        string target = CatalogueTarget(GetCompanyId);
+
+        IReadOnlyList<KeptConnectionResponse> responses = await ExchangeOnOneConnectionAsync(
+            facade.RestPort, [("GET", target), ("HEAD", target), ("GET", target)], ct);
+
+        Assert.True(responses.Count == 3, "caller did not get a response to each request on its connection");
+        foreach (KeptConnectionResponse response in responses)
+        {
+            Assert.Equal(200, response.Status);
+            Assert.True(
+                response.Head.Contains("\r\n" + TrailerAnnouncementHeader, StringComparison.Ordinal),
+                "backend's Trailer header did not reach the caller unchanged");
+        }
+
+        foreach (KeptConnectionResponse response in new[] { responses[0], responses[2] })
+        {
+            Assert.True(
+                response.Head.Contains("\r\nTransfer-Encoding: chunked\r\n", StringComparison.Ordinal),
+                "chunked response did not reach the caller chunked");
+            Assert.Equal(ResponseFirstPart + ResponseSecondPart, Encoding.Latin1.GetString(response.Body));
+            Assert.Equal("0\r\n" + relayedLines + "\r\n", response.LastChunk);
+        }
+
+        Assert.True(responses[1].Body.Length == 0 && responses[1].LastChunk.Length == 0, "response to HEAD carried a body");
+
+        IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(3, LogWaitBound, ct);
+        Assert.True(calls.Count == 3, "calls on one caller connection did not write one backend call line each");
+        foreach (CapturedLog call in calls)
+        {
+            Assert.Equal(ForwardedOutcome, call.Value("Outcome"));
+            Assert.Equal(200, call.Value("Status"));
+        }
+    }
+
+    /// <summary>
+    /// An HTTP/1.0 caller, which knows no chunked framing, gets a backend's chunked response as before:
+    /// the body bytes alone, ended by the facade closing the connection, with no chunk framing and no
+    /// trailer section, and the <c>Trailer</c> header unchanged; the call is logged <c>forwarded</c>.
+    /// </summary>
+    [Fact]
+    public async Task ChunkedResponseToHttp10CallerEndsWithTheConnectionAsBefore()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        byte[] reply = Encoding.Latin1.GetBytes(
+            "HTTP/1.1 200 OK\r\n"
+            + "Content-Type: text/plain\r\n"
+            + "Transfer-Encoding: chunked\r\n"
+            + TrailerAnnouncementHeader
+            + "\r\n"
+            + Chunk(ResponseFirstPart) + Chunk(ResponseSecondPart) + "0\r\n" + RelayedTrailerLines + "\r\n");
+        var logs = new LogCapture();
+        await using ScriptedBackend backend = ScriptedBackend.Start(reply);
+        await using FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, timeoutSeconds: null, ct);
+
+        RawExchange response = await SendRawAsync(
+            facade.RestPort, Encoding.Latin1.GetBytes("GET " + CatalogueTarget(GetCompanyId) + " HTTP/1.0\r\nHost: facade\r\n\r\n"), ct);
+
+        Assert.Equal(200, response.Status);
+        Assert.False(
+            response.Head.Contains("\r\nTransfer-Encoding:", StringComparison.OrdinalIgnoreCase),
+            "response to an HTTP/1.0 caller declared a transfer coding");
+        Assert.True(
+            response.Head.Contains("\r\n" + TrailerAnnouncementHeader, StringComparison.Ordinal),
+            "backend's Trailer header did not reach the HTTP/1.0 caller unchanged");
+        Assert.Equal(ResponseFirstPart + ResponseSecondPart, Encoding.Latin1.GetString(response.Body));
+
+        IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
+        Assert.True(calls.Count == 1, "response to an HTTP/1.0 caller did not write exactly one backend call line");
+        Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(200, calls[0].Value("Status"));
     }
 
     /// <summary>
@@ -2368,6 +2678,20 @@ public sealed class ForwardingTransportTests
         return last ? [.. chunk, .. "0\r\n\r\n"u8] : chunk;
     }
 
+    // One chunk holding the text, one char per byte: its size in hex, CRLF, the text and CRLF.
+    private static string Chunk(string text) =>
+        text.Length.ToString("x", CultureInfo.InvariantCulture) + "\r\n" + text + "\r\n";
+
+    // The trailer field lines a sender writes for one of the trailer sections of ChunkedUploadTrailers and
+    // ChunkedResponseTrailers, and the lines the next hop must receive of them, in the same order.
+    private static (string Sent, string Relayed) TrailerFieldLines(string trailers) => trailers switch
+    {
+        RelayedTrailers => (RelayedTrailerLines, RelayedTrailerLines),
+        NoTrailers => (string.Empty, string.Empty),
+        HopByHopTrailers => (HopByHopTrailerLines + KeptTrailerLine, KeptTrailerLine),
+        _ => throw new ArgumentOutOfRangeException(nameof(trailers)),
+    };
+
     // A backend's 404 whose head is the whole response: Content-Length: 0 and no body.
     private static byte[] EmptyNotFoundReply() => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"u8.ToArray();
 
@@ -2509,6 +2833,53 @@ public sealed class ForwardingTransportTests
             Assert.Fail("raw facade request failed at the transport level (" + exception.GetType().Name + ")");
             throw new UnreachableException();
         }
+    }
+
+    // Sends each request, a body-less head without Connection: close, on one connection to a facade
+    // socket, and reads each response in full before the next request goes out: its head and, unless it
+    // answers HEAD, the body its Content-Length or chunked framing declares, the last chunk of a chunked
+    // body kept as received. A response that runs past its framing would garble the next one.
+    private static async Task<IReadOnlyList<KeptConnectionResponse>> ExchangeOnOneConnectionAsync(
+        int port, IReadOnlyList<(string Method, string Target)> requests, CancellationToken ct)
+    {
+        using var limit = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        limit.CancelAfter(RawCallerTimeout);
+        var responses = new List<KeptConnectionResponse>();
+        try
+        {
+            using var client = new TcpClient(AddressFamily.InterNetwork);
+            await client.ConnectAsync(IPAddress.Loopback, port, limit.Token);
+            NetworkStream stream = client.GetStream();
+            var reader = new ConnectionReader(stream);
+            foreach ((string method, string target) in requests)
+            {
+                await stream.WriteAsync(Encoding.Latin1.GetBytes(method + " " + target + " HTTP/1.1\r\nHost: facade\r\n\r\n"), limit.Token);
+
+                byte[]? headBytes = await reader.ReadThroughAsync("\r\n\r\n"u8.ToArray(), DefaultResponseHeadLimit, limit.Token);
+                Assert.NotNull(headBytes);
+                var head = new ScriptedRequest(Encoding.Latin1.GetString(headBytes), []);
+                ScriptedRequest? message = HttpMethods.IsHead(method)
+                    ? head
+                    : await ScriptedBackend.ReadBodyAsync(reader, head, limit.Token);
+                Assert.NotNull(message);
+
+                string[] statusLine = message.Head[..message.Head.IndexOf('\r', StringComparison.Ordinal)].Split(' ');
+                Assert.True(
+                    statusLine.Length >= 2 && int.TryParse(statusLine[1], NumberStyles.None, CultureInfo.InvariantCulture, out _),
+                    "facade response on a kept connection has no status code");
+                int status = int.Parse(statusLine[1], NumberStyles.None, CultureInfo.InvariantCulture);
+                responses.Add(new KeptConnectionResponse(status, message.Head, message.Body, message.LastChunk));
+            }
+        }
+        catch (Exception exception) when (
+            exception is SocketException or IOException
+            || (exception is OperationCanceledException && !ct.IsCancellationRequested))
+        {
+            Assert.Fail("raw facade exchange on a kept connection failed at the transport level (" + exception.GetType().Name + ")");
+            throw new UnreachableException();
+        }
+
+        return responses;
     }
 
     // Sends an upload's head and first part to a facade socket and reads the final response while the
@@ -2789,6 +3160,25 @@ public sealed class ForwardingTransportTests
         }
     }
 
+    /// <summary>The server's trailer fields of a chunked request body that has been read to its end.</summary>
+    /// <param name="trailers">The trailer fields.</param>
+    private sealed class ReadRequestTrailers(IHeaderDictionary trailers) : IHttpRequestTrailersFeature
+    {
+        public bool Available => true;
+
+        public IHeaderDictionary Trailers => trailers;
+    }
+
+    /// <summary>One response as a raw caller read it on a connection it kept open for the next request.</summary>
+    /// <param name="Status">The status code from the status line.</param>
+    /// <param name="Head">The status line and header section, terminator included, one char per byte.</param>
+    /// <param name="Body">The body bytes, with any chunked framing removed; empty for a response to <c>HEAD</c>.</param>
+    /// <param name="LastChunk">
+    /// The end of a chunked body as received, one char per byte: the last chunk's size line, the trailer
+    /// field lines and the blank line; empty for a body that is not chunked.
+    /// </param>
+    private sealed record KeptConnectionResponse(int Status, string Head, byte[] Body, string LastChunk);
+
     /// <summary>
     /// A backend on a raw loopback socket that records the bytes of every request head it receives and
     /// then either closes the connection without answering or writes a fixed reply and closes, or, after
@@ -2956,6 +3346,13 @@ public sealed class ForwardingTransportTests
     /// <param name="Body">The body bytes, with any chunked framing removed; empty when none was read.</param>
     private sealed record ScriptedRequest(string Head, byte[] Body)
     {
+        /// <summary>
+        /// The end of a chunked body as received, one char per byte: the last chunk's size line, the
+        /// trailer field lines and the blank line that ends the request; empty for a body that is not
+        /// chunked.
+        /// </summary>
+        public string LastChunk { get; init; } = string.Empty;
+
         /// <summary>The number of header lines with the given name, matched case-insensitively.</summary>
         public int HeaderCount(string name) =>
             Head.Split("\r\n").Skip(1).Count(line =>
@@ -3109,14 +3506,14 @@ public sealed class ForwardingTransportTests
                         return;
                     }
 
-                    byte[]? body = await ReadBodyAsync(reader, received, limit.Token);
-                    if (body is null)
+                    ScriptedRequest? complete = await ReadBodyAsync(reader, received, limit.Token);
+                    if (complete is null)
                     {
                         // The facade ended the connection before the declared body arrived.
                         return;
                     }
 
-                    _requests.Enqueue(received with { Body = body });
+                    _requests.Enqueue(complete);
                     if (_reply is not null)
                     {
                         await stream.WriteAsync(_reply, limit.Token);
@@ -3144,10 +3541,11 @@ public sealed class ForwardingTransportTests
 
         /// <summary>
         /// Reads the body the head declares: chunked when Transfer-Encoding names chunked, with the chunk
-        /// framing removed, otherwise the <c>Content-Length</c> bytes, or none.
+        /// framing removed and its last chunk kept as received, otherwise the <c>Content-Length</c> bytes,
+        /// or none.
         /// </summary>
-        /// <returns>The body; null when the connection ends first.</returns>
-        public static async Task<byte[]?> ReadBodyAsync(ConnectionReader reader, ScriptedRequest request, CancellationToken ct)
+        /// <returns>The request with its body and, when chunked, its last chunk; null when the connection ends first.</returns>
+        public static async Task<ScriptedRequest?> ReadBodyAsync(ConnectionReader reader, ScriptedRequest request, CancellationToken ct)
         {
             if (request.HeaderValue("Transfer-Encoding") is { } coding && coding.Contains("chunked", StringComparison.OrdinalIgnoreCase))
             {
@@ -3165,11 +3563,13 @@ public sealed class ForwardingTransportTests
                     if (length == 0)
                     {
                         // The trailer section, possibly empty, ends with a blank line.
+                        var lastChunk = new StringBuilder(Encoding.Latin1.GetString(sizeLine));
                         while (await reader.ReadThroughAsync(LineEnd, MaxHeadBytes, ct) is { } trailer)
                         {
+                            lastChunk.Append(Encoding.Latin1.GetString(trailer));
                             if (trailer.Length == LineEnd.Length)
                             {
-                                return body.ToArray();
+                                return request with { Body = body.ToArray(), LastChunk = lastChunk.ToString() };
                             }
                         }
 
@@ -3187,7 +3587,7 @@ public sealed class ForwardingTransportTests
                 ? long.Parse(value, NumberStyles.None, CultureInfo.InvariantCulture)
                 : 0;
             using var exact = new MemoryStream();
-            return await reader.CopyExactlyAsync(exact, declared, ct) ? exact.ToArray() : null;
+            return await reader.CopyExactlyAsync(exact, declared, ct) ? request with { Body = exact.ToArray() } : null;
         }
     }
 
@@ -3569,13 +3969,13 @@ public sealed class ForwardingTransportTests
                         await stream.WriteAsync(interim.AsMemory(0, sentBeforeBody), ct);
                     }
 
-                    byte[]? body = await ScriptedBackend.ReadBodyAsync(reader, request, ct);
-                    if (body is null)
+                    ScriptedRequest? complete = await ScriptedBackend.ReadBodyAsync(reader, request, ct);
+                    if (complete is null)
                     {
                         return;
                     }
 
-                    _requests.Enqueue(request with { Body = body });
+                    _requests.Enqueue(complete);
                     if (sentBeforeBody < interim.Length)
                     {
                         await stream.WriteAsync(interim.AsMemory(sentBeforeBody), ct);
@@ -3846,6 +4246,20 @@ public sealed class BackendForwarderTests
     // How a caller abandons its call on a real socket.
     private const string DisconnectBeforeResponse = "disconnect-before-response";
     private const string TruncatedUpload = "truncated-upload";
+
+    // How a call whose response keeps the backend's chunked framing ends: through YARP's trailers step,
+    // reported forwarded without it, or with an exception after the response started.
+    private const string EndsWithTrailersStep = "trailers-step";
+    private const string EndsWithoutTrailersStep = "no-trailers-step";
+
+    // How a body is written to a response that keeps the backend's chunked framing: through the body
+    // stream asynchronously or synchronously, a byte at a time with WriteByte, through the body's pipe
+    // writer, or as a file sent through the body feature.
+    private const string StreamAsyncWrite = "stream-async";
+    private const string StreamSyncWrite = "stream-sync";
+    private const string StreamWriteBytes = "stream-write-byte";
+    private const string PipeWriterWrite = "pipe-writer";
+    private const string SendFileWrite = "send-file";
 
     // Unit-level targets are never connected to: the fake forwarder answers for them.
     private const string UnitRestBaseUrl = "http://backend.invalid:65000";
@@ -4331,6 +4745,151 @@ public sealed class BackendForwarderTests
         Assert.Equal(expectedConnectionAbort, call.Lifetime.AbortCalled);
         Assert.Equal(status, call.Context.Response.StatusCode);
         Assert.True(call.Body.ToArray().AsSpan().SequenceEqual(body), "facade changed or added to the backend's body bytes");
+    }
+
+    /// <summary>
+    /// The response to an HTTP/1.1 caller of a chunked backend response keeps the backend's chunked
+    /// framing: each body write goes out as one chunk, and YARP's trailers step ends the body with the last
+    /// chunk and the backend's trailer fields, after which the call is forwarded and its connection kept.
+    /// A call that ends with the response started but without that step, whether YARP reports it forwarded
+    /// or an exception escapes, has its connection aborted, so the server never ends the response as
+    /// complete without its last chunk; the line keeps the outcome and status the call reached.
+    /// </summary>
+    [Theory]
+    [InlineData(EndsWithTrailersStep, Forwarded, LogLevel.Information, false)]
+    [InlineData(EndsWithoutTrailersStep, Forwarded, LogLevel.Information, true)]
+    [InlineData(ThrowsAfterResponseStarted, Failed, LogLevel.Warning, true)]
+    public async Task ChunkFramedResponseEndsWithItsLastChunkOrIsAborted(
+        string ending,
+        string expectedOutcome,
+        LogLevel expectedLevel,
+        bool expectedConnectionAbort)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        using var call = new UnitCall();
+        call.Context.Request.Protocol = HttpProtocol.Http11;
+        using var harness = new ForwarderHarness(
+            async (context, token) =>
+            {
+                // YARP copies the backend's status, has the transformer copy the headers and send the head,
+                // copies the body through the caller's response stream and then asks for the trailers.
+                context.Response.StatusCode = StatusCodes.Status200OK;
+                using var backendResponse = new HttpResponseMessage(HttpStatusCode.OK) { Content = new UnknownLengthContent([]) };
+                backendResponse.Headers.TransferEncodingChunked = true;
+                backendResponse.TrailingHeaders.TryAddWithoutValidation("X-Checksum", "abc");
+                await new PassThroughTransformer().TransformResponseAsync(context, backendResponse, token);
+                call.Response.Started = true;
+                await context.Response.Body.WriteAsync("hello"u8.ToArray(), token);
+
+                if (ending == ThrowsAfterResponseStarted)
+                {
+                    throw new InvalidOperationException("unit forwarder failed after the response started");
+                }
+
+                if (ending == EndsWithTrailersStep)
+                {
+                    await new PassThroughTransformer().TransformResponseTrailersAsync(context, backendResponse, token);
+                }
+
+                return ForwarderError.None;
+            });
+
+        Task forwarding = harness.Forwarder.ForwardAsync(call.Context, Surface.Rest, Operation(RestOperationId));
+        if (ending == ThrowsAfterResponseStarted)
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(() => forwarding.WaitAsync(HangGuard, ct));
+        }
+        else
+        {
+            await forwarding.WaitAsync(HangGuard, ct);
+        }
+
+        Assert.Equal("chunked", call.Context.Response.Headers.TransferEncoding.ToString());
+        string expectedBody = ending == EndsWithTrailersStep ? "5\r\nhello\r\n0\r\nX-Checksum: abc\r\n\r\n" : "5\r\nhello\r\n";
+        Assert.Equal(expectedBody, Encoding.Latin1.GetString(call.Body.ToArray()));
+        Assert.Equal(expectedConnectionAbort, call.Lifetime.AbortCalled);
+
+        IReadOnlyList<CapturedLog> calls = harness.Logs.BackendCalls;
+        Assert.True(calls.Count == 1, "chunk-framed response did not write exactly one backend call line");
+        Assert.Equal(expectedOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(expectedLevel, calls[0].Level);
+        Assert.Equal(200, calls[0].Value("Status"));
+    }
+
+    /// <summary>
+    /// Every way of writing a body to a response that keeps the backend's chunked framing frames it: an
+    /// asynchronous or synchronous write of the body stream goes out as one chunk, a <c>WriteByte</c> as a
+    /// chunk of one byte, and a write through the body's pipe writer and a file sent through the body
+    /// feature as one chunk each. The trailers step then ends the body with the last chunk and the
+    /// backend's trailer fields, and the call is forwarded with its connection kept.
+    /// </summary>
+    [Theory]
+    [InlineData(StreamAsyncWrite, "5\r\nhello\r\n")]
+    [InlineData(StreamSyncWrite, "5\r\nhello\r\n")]
+    [InlineData(StreamWriteBytes, "1\r\nh\r\n1\r\ne\r\n1\r\nl\r\n1\r\nl\r\n1\r\no\r\n")]
+    [InlineData(PipeWriterWrite, "5\r\nhello\r\n")]
+    [InlineData(SendFileWrite, "5\r\nhello\r\n")]
+    public async Task ChunkFramedResponseFramesEveryWayOfWriting(string writing, string expectedChunks)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        byte[] body = "hello"u8.ToArray();
+        string file = Path.Combine(Path.GetTempPath(), "erewhon-chunk-framing-" + Guid.NewGuid().ToString("N") + ".bin");
+        await File.WriteAllBytesAsync(file, body, ct);
+        try
+        {
+            using var call = new UnitCall();
+            call.Context.Request.Protocol = HttpProtocol.Http11;
+            using var harness = new ForwarderHarness(
+                async (context, token) =>
+                {
+                    context.Response.StatusCode = StatusCodes.Status200OK;
+                    using var backendResponse = new HttpResponseMessage(HttpStatusCode.OK) { Content = new UnknownLengthContent([]) };
+                    backendResponse.Headers.TransferEncodingChunked = true;
+                    backendResponse.TrailingHeaders.TryAddWithoutValidation("X-Checksum", "abc");
+                    await new PassThroughTransformer().TransformResponseAsync(context, backendResponse, token);
+                    call.Response.Started = true;
+
+                    switch (writing)
+                    {
+                        case StreamAsyncWrite:
+                            await context.Response.Body.WriteAsync(body, token);
+                            break;
+                        case StreamSyncWrite:
+                            context.Response.Body.Write(body, 0, body.Length);
+                            break;
+                        case StreamWriteBytes:
+                            foreach (byte value in body)
+                            {
+                                context.Response.Body.WriteByte(value);
+                            }
+
+                            break;
+                        case PipeWriterWrite:
+                            await context.Response.BodyWriter.WriteAsync(body, token);
+                            break;
+                        case SendFileWrite:
+                            await context.Response.SendFileAsync(file, token);
+                            break;
+                        default:
+                            throw new ArgumentOutOfRangeException(nameof(writing));
+                    }
+
+                    await new PassThroughTransformer().TransformResponseTrailersAsync(context, backendResponse, token);
+                    return ForwarderError.None;
+                });
+
+            await harness.Forwarder.ForwardAsync(call.Context, Surface.Rest, Operation(RestOperationId)).WaitAsync(HangGuard, ct);
+
+            Assert.Equal(expectedChunks + "0\r\nX-Checksum: abc\r\n\r\n", Encoding.Latin1.GetString(call.Body.ToArray()));
+            Assert.False(call.Lifetime.AbortCalled, "chunk-framed response ended with its last chunk was aborted");
+            IReadOnlyList<CapturedLog> calls = harness.Logs.BackendCalls;
+            Assert.True(calls.Count == 1, "chunk-framed response did not write exactly one backend call line");
+            Assert.Equal(Forwarded, calls[0].Value("Outcome"));
+        }
+        finally
+        {
+            File.Delete(file);
+        }
     }
 
     /// <summary>

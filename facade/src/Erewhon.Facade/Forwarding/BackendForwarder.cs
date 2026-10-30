@@ -29,7 +29,9 @@ namespace Erewhon.Facade.Forwarding;
 /// Every request the facade does not answer itself goes through <see cref="ForwardAsync"/>: the 22
 /// catalogue operations, suffixed REST forms, unmatched traffic on the REST and SOAP listeners, and WSDL
 /// requests when no WSDL file is present. The backend's status, end-to-end headers and body bytes reach
-/// the caller unchanged, 4xx and 5xx results included; nothing is parsed or re-serialised.
+/// the caller unchanged, 4xx and 5xx results included, and so do the end-to-end trailer fields after a
+/// chunked body, in both directions (<see cref="PassThroughTransformer"/>); no body is parsed or
+/// re-serialised.
 /// </para>
 /// <para>
 /// A backend that gives no usable response, or an expired deadline, before the backend's status line
@@ -304,8 +306,11 @@ public sealed partial class BackendForwarder : IDisposable
             CancellableRequestBody.Install(context);
 
             // Shared with the body reader, the backend connection and the transformer for the rest of the
-            // call, so that a backend answering before the upload is over has its answer returned.
-            callState = BackendCallState.Begin(PassThroughTransformer.CarriesLengthDelimitedBody(context));
+            // call, so that a backend answering before the upload is over has its answer returned, and so
+            // that the trailer fields of a chunked upload follow its last chunk to the backend.
+            callState = BackendCallState.Begin(
+                PassThroughTransformer.CarriesLengthDelimitedBody(context),
+                PassThroughTransformer.CarriesChunkedBody(context) ? context.Features.Get<IHttpRequestTrailersFeature>() : null);
 
             ForwarderError error;
             try
@@ -326,6 +331,11 @@ public sealed partial class BackendForwarder : IDisposable
         finally
         {
             callState?.End();
+
+            // A response that keeps the backend's chunked framing and started without its last chunk,
+            // however the call ended, is aborted rather than ended as complete on a connection the server
+            // keeps open; the outcome and status logged stay what the call reached.
+            PassThroughTransformer.AbortUnendedChunkedResponse(context);
 
             // No result means an exception is propagating: the server answers it with 500 unless the
             // response has already started, in which case the status already sent stands.
@@ -1423,6 +1433,15 @@ internal sealed class SingleDeliveryHandler : DelegatingHandler
 /// one, fails the call, which the forwarder answers as an unavailable backend at once.
 /// </para>
 /// <para>
+/// <b>Trailer fields.</b> A chunked upload's trailer section, which the server reads after the caller's
+/// last chunk, follows the upload's last chunk to the backend. The HTTP stack ends every chunked body it
+/// writes with an empty trailer section, so the backend connection inserts the caller's trailer field
+/// lines there, as <see cref="RequestTrailerLines"/> gives them: by then the caller's body has been read
+/// to its end, which is when the server has its trailer fields. The fields the caller's
+/// <c>Connection</c> header nominates, which <see cref="PassThroughTransformer"/> hands in, and the
+/// hop-by-hop fields stay behind, as they do from the head. An abandoned upload sends no last chunk.
+/// </para>
+/// <para>
 /// <b>Locking.</b> Every change of state takes one lock, under which the connection is told to start and
 /// stop its watch and to drop writes. The connection reports a reply or a failed write only outside its
 /// own lock, so the two locks are always taken in that order.
@@ -1437,6 +1456,17 @@ internal sealed class BackendCallState
     // Whether the request body is framed by its declared Content-Length, which the HTTP stack sends in
     // full or fails the call; otherwise it is chunked, or there is none.
     private readonly bool _lengthDelimitedBody;
+
+    // Whether the request body is chunked with the server's trailer fields to follow it, whose trailer
+    // section the backend connection then carries on after the upload's last chunk.
+    private readonly bool _relaysRequestTrailers;
+
+    // The server's trailer fields of the caller's chunked body until the call ends, which releases them;
+    // null for any other body.
+    private IHttpRequestTrailersFeature? _requestTrailers;
+
+    // The field names the caller's Connection header nominates, which the trailer section never carries.
+    private string[] _nominatedRequestFields = [];
 
     // The caller's body reader while an upload read is waiting on it; cancelled when the upload ends.
     private PipeReader? _waitingUploadReader;
@@ -1458,10 +1488,21 @@ internal sealed class BackendCallState
     private bool _ended;
     private int _responseRelayed;
 
-    private BackendCallState(bool lengthDelimitedBody) => _lengthDelimitedBody = lengthDelimitedBody;
+    private BackendCallState(bool lengthDelimitedBody, IHttpRequestTrailersFeature? requestTrailers)
+    {
+        _lengthDelimitedBody = lengthDelimitedBody;
+        _relaysRequestTrailers = requestTrailers is not null;
+        _requestTrailers = requestTrailers;
+    }
 
     /// <summary>The forwarded call the current execution context belongs to; null outside one.</summary>
     public static BackendCallState? Current => CurrentCall.Value;
+
+    /// <summary>
+    /// Whether the call's upload is chunked and the server reads its trailer fields, which the backend
+    /// connection then inserts after the upload's last chunk; no other upload is followed for that.
+    /// </summary>
+    public bool RelaysRequestTrailers => _relaysRequestTrailers;
 
     /// <summary>
     /// Whether the upload ended before the caller's body did, so that the rest of it was dropped: the
@@ -1525,17 +1566,21 @@ internal sealed class BackendCallState
     /// Whether the incoming request carries a body framed by its declared <c>Content-Length</c>, as the
     /// HTTP stack then sends it to the backend.
     /// </param>
+    /// <param name="requestTrailers">
+    /// The server's trailer fields of the incoming request when its body is chunked; null for any other
+    /// body, or when the server reads no trailer fields.
+    /// </param>
     /// <returns>The call's state; end it with <see cref="End"/> when the call is over.</returns>
-    public static BackendCallState Begin(bool lengthDelimitedBody)
+    public static BackendCallState Begin(bool lengthDelimitedBody, IHttpRequestTrailersFeature? requestTrailers = null)
     {
-        var state = new BackendCallState(lengthDelimitedBody);
+        var state = new BackendCallState(lengthDelimitedBody, requestTrailers);
         CurrentCall.Value = state;
         return state;
     }
 
     /// <summary>
     /// Ends the call: no later write failure or backend reply can abandon its upload, the backend is no
-    /// longer watched for it, and no reader is cancelled for it.
+    /// longer watched for it, no reader is cancelled for it, and the caller's trailer fields are released.
     /// </summary>
     public void End()
     {
@@ -1543,10 +1588,55 @@ internal sealed class BackendCallState
         {
             _ended = true;
             _waitingUploadReader = null;
+            _requestTrailers = null;
             StopWatchingLocked();
         }
 
         CurrentCall.Value = null;
+    }
+
+    /// <summary>
+    /// Adds field names the caller's <c>Connection</c> header nominates, which the trailer section the
+    /// backend receives leaves out; ignored unless the call relays request trailers.
+    /// </summary>
+    /// <param name="names">The nominated field names, matched case-insensitively.</param>
+    public void NominateRequestFields(IEnumerable<string> names)
+    {
+        ArgumentNullException.ThrowIfNull(names);
+        if (!_relaysRequestTrailers)
+        {
+            return;
+        }
+
+        lock (_gate)
+        {
+            _nominatedRequestFields = [.. _nominatedRequestFields, .. names];
+        }
+    }
+
+    /// <summary>
+    /// The field lines of the caller's trailer section as the backend receives them after the upload's
+    /// last chunk, each ending with CRLF, encoded and filtered as <see cref="PassThroughTransformer"/>
+    /// relays every trailer section.
+    /// </summary>
+    /// <returns>
+    /// The lines; empty when the call relays no request trailers, the server has not read the caller's
+    /// trailer section, which it has once the body has been read to its end, the call is over, or no
+    /// field passes.
+    /// </returns>
+    public byte[] RequestTrailerLines()
+    {
+        IHttpRequestTrailersFeature? trailers;
+        string[] nominated;
+        lock (_gate)
+        {
+            trailers = _requestTrailers;
+            nominated = _nominatedRequestFields;
+        }
+
+        return trailers is { Available: true }
+            ? PassThroughTransformer.EncodeTrailerFields(trailers.Trailers, nominated)
+            : [];
     }
 
     /// <summary>
@@ -1835,6 +1925,17 @@ internal sealed class BackendCallState
 /// has dropped, or after the handler has disposed the connection to cancel the call.
 /// </para>
 /// <para>
+/// <b>Trailer fields.</b> For a call whose upload relays the caller's trailer fields
+/// (<see cref="BackendCallState.RelaysRequestTrailers"/>), and for no other, the writes are followed as
+/// the handler makes them, however they split the bytes: the request head up to its blank line, which
+/// must declare <c>Transfer-Encoding: chunked</c>, then each chunk-size line, the chunk's data and its
+/// CRLF, up to the last chunk's size line. The caller's trailer field lines go out right after that line,
+/// before the blank line that ends the trailer section, within the same write. Every other byte, a
+/// chunked body without trailer fields and every write of any other call included, goes out unchanged; a
+/// head that declares no chunked body, or framing the handler never writes, ends the following with
+/// nothing inserted. The following starts afresh with the first write of each call.
+/// </para>
+/// <para>
 /// <b>No reuse.</b> A connection whose upload was ended is never used for another call: every read for any
 /// other call, the handler's checks of an idle connection included, returns the end of the stream, which
 /// the handler takes as a connection it must not reuse, and a write for another call fails as a closed
@@ -1898,6 +1999,10 @@ internal sealed class BackendConnectionStream : Stream
 
     // The handler's reads of the wrapped stream in progress; a read ahead starts only while there are none.
     private int _handlerReads;
+
+    // The following of the last call that relays request trailers to write here. Only writes touch it,
+    // and the handler makes one write at a time on a connection.
+    private ChunkedUploadScanner? _upload;
 
     private int _disposed;
 
@@ -2080,7 +2185,7 @@ internal sealed class BackendConnectionStream : Stream
     /// <inheritdoc />
     /// <remarks>
     /// Registers the connection on the current call; completes without sending once the call's upload has
-    /// ended.
+    /// ended. The write that ends a relaying call's last chunk carries the caller's trailer field lines.
     /// </remarks>
     public override void Write(ReadOnlySpan<byte> buffer)
     {
@@ -2096,9 +2201,10 @@ internal sealed class BackendConnectionStream : Stream
         }
 
         call?.RegisterConnection(this);
+        var withTrailer = call is null ? null : WithRequestTrailer(call, buffer);
         try
         {
-            _inner.Write(buffer);
+            _inner.Write(withTrailer is null ? buffer : withTrailer);
         }
         catch (IOException failure) when (TryEndUpload(failure))
         {
@@ -2119,7 +2225,7 @@ internal sealed class BackendConnectionStream : Stream
     /// <inheritdoc />
     /// <remarks>
     /// Registers the connection on the current call; completes without sending once the call's upload has
-    /// ended.
+    /// ended. The write that ends a relaying call's last chunk carries the caller's trailer field lines.
     /// </remarks>
     public override ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
     {
@@ -2132,10 +2238,11 @@ internal sealed class BackendConnectionStream : Stream
         }
 
         call?.RegisterConnection(this);
+        var withTrailer = call is null ? null : WithRequestTrailer(call, buffer.Span);
         ValueTask write;
         try
         {
-            write = _inner.WriteAsync(buffer, cancellationToken);
+            write = _inner.WriteAsync(withTrailer is null ? buffer : withTrailer, cancellationToken);
         }
         catch (IOException failure) when (TryEndUpload(failure))
         {
@@ -2692,6 +2799,43 @@ internal sealed class BackendConnectionStream : Stream
     private bool IsEndedForAnotherCall() =>
         Volatile.Read(ref _abandonedBy) is { } abandonedBy && !ReferenceEquals(abandonedBy, BackendCallState.Current);
 
+    // The bytes a write of 'call' sends in place of 'data': 'data' with the caller's trailer field lines
+    // inserted right after the last chunk's size line, when this write holds the end of that line and a
+    // field passes; null when the write goes out as it is. Only a call that relays request trailers is
+    // followed, from its first write on this connection.
+    private byte[]? WithRequestTrailer(BackendCallState call, ReadOnlySpan<byte> data)
+    {
+        if (!call.RelaysRequestTrailers)
+        {
+            return null;
+        }
+
+        var upload = _upload;
+        if (upload is null || !ReferenceEquals(upload.Call, call))
+        {
+            upload = new ChunkedUploadScanner(call);
+            _upload = upload;
+        }
+
+        var insertAt = upload.Advance(data);
+        if (insertAt < 0)
+        {
+            return null;
+        }
+
+        var lines = call.RequestTrailerLines();
+        if (lines.Length == 0)
+        {
+            return null;
+        }
+
+        var sent = new byte[data.Length + lines.Length];
+        data[..insertAt].CopyTo(sent);
+        lines.CopyTo(sent.AsSpan(insertAt));
+        data[insertAt..].CopyTo(sent.AsSpan(insertAt + lines.Length));
+        return sent;
+    }
+
     // Takes a write failure as the end of the upload when the backend reset or closed the connection
     // while the current call's upload was being sent.
     private bool TryEndUpload(IOException failure)
@@ -2919,6 +3063,217 @@ internal sealed class BackendConnectionStream : Stream
             _lineHasColon = false;
             _laterHeaderLine = true;
             return Step.Interim;
+        }
+    }
+
+    /// <summary>
+    /// Follows one call's request as the handler writes it, in the order the bytes go out, however writes
+    /// split them, to find the end of its chunked body's last chunk size line: the request head up to the
+    /// blank line that ends it, which must declare chunked as its final transfer coding, then each chunk
+    /// as the handler frames it, a size line of hex digits ended by CRLF, that many data bytes and CRLF,
+    /// up to the size line <c>0</c>. Anything else, a head without that declaration included, ends the
+    /// following with no place found. Written to and read by the connection's writes alone.
+    /// </summary>
+    /// <param name="call">The call whose request is followed.</param>
+    private sealed class ChunkedUploadScanner(BackendCallState call)
+    {
+        // A header line is looked at only up to this length, which "Transfer-Encoding: chunked" as the
+        // handler writes it is well within; a longer Transfer-Encoding line declares nothing.
+        private const int MaxInspectedLineLength = 64;
+
+        // Fifteen hex digits hold any chunk size the handler writes and never overflow a long.
+        private const int MaxChunkSizeDigits = 15;
+
+        private static readonly byte[] TransferEncodingName = "Transfer-Encoding"u8.ToArray();
+        private static readonly byte[] ChunkedCoding = "chunked"u8.ToArray();
+        private static readonly byte[] OptionalWhiteSpace = " \t"u8.ToArray();
+
+        // The first bytes of the current head line and its full length, which may exceed what is kept, and
+        // whether its last byte so far is a CR, which is no part of the line when its LF follows.
+        private readonly byte[] _line = new byte[MaxInspectedLineLength];
+        private int _lineLength;
+        private bool _lineEndsWithCr;
+        private bool _requestLineSeen;
+        private bool _declaresChunked;
+
+        private Part _part = Part.Head;
+        private long _chunkSize;
+        private int _chunkSizeDigits;
+        private long _dataLeft;
+
+        private enum Part
+        {
+            Head,
+            ChunkSize,
+            ChunkSizeLineFeed,
+            ChunkData,
+            ChunkDataCarriageReturn,
+            ChunkDataLineFeed,
+            Done,
+        }
+
+        /// <summary>The call whose request is followed.</summary>
+        public BackendCallState Call => call;
+
+        /// <summary>Follows the next bytes the handler writes for the call.</summary>
+        /// <param name="data">The bytes of one write, which follow every byte of the writes before.</param>
+        /// <returns>
+        /// The offset in <paramref name="data"/> just after the LF that ends the last chunk's size line,
+        /// where the trailer field lines go; -1 when that line does not end in these bytes. The offset is
+        /// returned once per call, after which nothing more is followed.
+        /// </returns>
+        public int Advance(ReadOnlySpan<byte> data)
+        {
+            var index = 0;
+            while (index < data.Length)
+            {
+                switch (_part)
+                {
+                    case Part.Done:
+                        return -1;
+
+                    case Part.Head:
+                        index = AdvanceHead(data, index);
+                        break;
+
+                    case Part.ChunkData:
+                        var taken = (int)Math.Min(_dataLeft, data.Length - index);
+                        _dataLeft -= taken;
+                        index += taken;
+                        if (_dataLeft == 0)
+                        {
+                            _part = Part.ChunkDataCarriageReturn;
+                        }
+
+                        break;
+
+                    default:
+                        if (AdvanceFraming(data[index++]))
+                        {
+                            return index;
+                        }
+
+                        break;
+                }
+            }
+
+            return -1;
+        }
+
+        // The value of a hex digit, or -1 for any other byte.
+        private static int HexValue(byte value) => value switch
+        {
+            >= (byte)'0' and <= (byte)'9' => value - '0',
+            >= (byte)'a' and <= (byte)'f' => value - 'a' + 10,
+            >= (byte)'A' and <= (byte)'F' => value - 'A' + 10,
+            _ => -1,
+        };
+
+        // Takes the head bytes from 'index' up to and including the next LF, or all of them; returns the
+        // index of the first byte not taken.
+        private int AdvanceHead(ReadOnlySpan<byte> data, int index)
+        {
+            var rest = data[index..];
+            var lineFeed = rest.IndexOf((byte)'\n');
+            var lineBytes = lineFeed < 0 ? rest : rest[..lineFeed];
+            if (!lineBytes.IsEmpty)
+            {
+                var kept = Math.Min(_lineLength, _line.Length);
+                var keep = Math.Min(_line.Length - kept, lineBytes.Length);
+                lineBytes[..keep].CopyTo(_line.AsSpan(kept));
+                _lineLength = (int)Math.Min((long)_lineLength + lineBytes.Length, int.MaxValue);
+                _lineEndsWithCr = lineBytes[^1] == (byte)'\r';
+            }
+
+            if (lineFeed < 0)
+            {
+                return data.Length;
+            }
+
+            EndHeadLine();
+            return index + lineFeed + 1;
+        }
+
+        // A line of the head has ended at its LF: the blank line ends the head, the request line declares
+        // nothing, and a Transfer-Encoding line declares whether the body is chunked.
+        private void EndHeadLine()
+        {
+            var length = _lineEndsWithCr ? _lineLength - 1 : _lineLength;
+            var complete = length <= _line.Length;
+            var line = _line.AsSpan(0, Math.Min(length, _line.Length));
+            _lineLength = 0;
+            _lineEndsWithCr = false;
+
+            if (length == 0)
+            {
+                _part = _requestLineSeen && _declaresChunked ? Part.ChunkSize : Part.Done;
+                return;
+            }
+
+            if (!_requestLineSeen)
+            {
+                _requestLineSeen = true;
+                return;
+            }
+
+            var colon = line.IndexOf((byte)':');
+            if (colon >= 0 && Ascii.EqualsIgnoreCase(line[..colon], TransferEncodingName))
+            {
+                var codings = line[(colon + 1)..];
+                var finalCoding = codings[(codings.LastIndexOf((byte)',') + 1)..].Trim(OptionalWhiteSpace);
+                _declaresChunked = complete && Ascii.EqualsIgnoreCase(finalCoding, ChunkedCoding);
+            }
+        }
+
+        // Takes one byte of chunk framing; true when it is the LF that ends the last chunk's size line.
+        private bool AdvanceFraming(byte value)
+        {
+            switch (_part)
+            {
+                case Part.ChunkSize:
+                    if (HexValue(value) is var digit and >= 0 && _chunkSizeDigits < MaxChunkSizeDigits)
+                    {
+                        _chunkSize = (_chunkSize * 16) + digit;
+                        _chunkSizeDigits++;
+                    }
+                    else
+                    {
+                        _part = value == (byte)'\r' && _chunkSizeDigits > 0 ? Part.ChunkSizeLineFeed : Part.Done;
+                    }
+
+                    return false;
+
+                case Part.ChunkSizeLineFeed:
+                    if (value != (byte)'\n')
+                    {
+                        _part = Part.Done;
+                        return false;
+                    }
+
+                    if (_chunkSize == 0)
+                    {
+                        _part = Part.Done;
+                        return true;
+                    }
+
+                    _dataLeft = _chunkSize;
+                    _chunkSize = 0;
+                    _chunkSizeDigits = 0;
+                    _part = Part.ChunkData;
+                    return false;
+
+                case Part.ChunkDataCarriageReturn:
+                    _part = value == (byte)'\r' ? Part.ChunkDataLineFeed : Part.Done;
+                    return false;
+
+                case Part.ChunkDataLineFeed:
+                    _part = value == (byte)'\n' ? Part.ChunkSize : Part.Done;
+                    return false;
+
+                default:
+                    _part = Part.Done;
+                    return false;
+            }
         }
     }
 }

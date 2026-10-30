@@ -9,6 +9,7 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Microsoft.Extensions.Primitives;
 using Microsoft.Net.Http.Headers;
 using Yarp.ReverseProxy.Forwarder;
 using Yarp.ReverseProxy.Transforms;
@@ -68,16 +69,32 @@ namespace Erewhon.Facade.Forwarding;
 /// on, and the fields either nominates are dropped.
 /// </para>
 /// <para>
+/// The trailer fields after a chunked body pass in both directions under the same rule: a field on
+/// YARP's list or nominated by the sender's <c>Connection</c> header is dropped, and so is a field
+/// whose name is no token or whose value holds a CR, LF or NUL or a character Latin-1 cannot carry,
+/// because such a line would end or split the trailer section. The caller's trailer section of a
+/// chunked upload reaches the backend after the last chunk the HTTP stack writes, which the backend
+/// connection, a <see cref="BackendConnectionStream"/>, carries on. The backend's trailer section of a
+/// chunked response reaches an HTTP/1.1 caller whose server offers no response trailers of its own:
+/// the caller's response then keeps the backend's chunked framing, each body write going out as one
+/// chunk, and ends with the last chunk and those fields. Every other response is framed by the server
+/// as before. The <c>Trailer</c> header is an end-to-end field and passes unchanged either way.
+/// </para>
+/// <para>
 /// The instance holds no state, so one singleton serves every request concurrently; the one fact it
 /// reports about a call, that the backend's whole response has been relayed, goes to that call's own
-/// <see cref="BackendCallState"/>, and the body that counts a declared length on its way to the caller
-/// is installed on that call's own response.
+/// <see cref="BackendCallState"/>, as do the field names the caller's <c>Connection</c> header
+/// nominates, and the body that counts a declared length or frames chunks on its way to the caller is
+/// installed on that call's own response.
 /// </para>
 /// </remarks>
 public sealed class PassThroughTransformer : HttpTransformer
 {
     /// <summary>The asterisk-form request target, which only <c>OPTIONS</c> carries (RFC 9112 3.2.4).</summary>
     internal const string AsteriskFormTarget = "*";
+
+    // The transfer coding of a response that keeps the backend's chunked framing.
+    private const string ChunkedCoding = "chunked";
 
     // The authority of an absolute-form target ends at the first of these (RFC 3986 3.2).
     private static readonly char[] AuthorityTerminators = ['/', '?', '#'];
@@ -97,6 +114,37 @@ public sealed class PassThroughTransformer : HttpTransformer
 
     // Optional white space (OWS) around the elements of a Connection list: SP and HTAB.
     private static readonly char[] OptionalWhiteSpace = [' ', '\t'];
+
+    // The fields YARP drops from every header section it copies, in either direction (its own skip list,
+    // which it keeps internal). They describe one hop, never the message, so a trailer section drops
+    // them too.
+    private static readonly HashSet<string> HopByHopFields = new(StringComparer.OrdinalIgnoreCase)
+    {
+        HeaderNames.Connection,
+        HeaderNames.TransferEncoding,
+        HeaderNames.KeepAlive,
+        HeaderNames.Upgrade,
+        "Proxy-Connection",
+        HeaderNames.ProxyAuthenticate,
+        "Proxy-Authentication-Info",
+        HeaderNames.ProxyAuthorization,
+        "Proxy-Features",
+        "Proxy-Instruction",
+        "Security-Scheme",
+        "ALPN",
+        "Close",
+        "HTTP2-Settings",
+        HeaderNames.UpgradeInsecureRequests,
+        HeaderNames.TE,
+        HeaderNames.AltSvc,
+    };
+
+    // The characters of a field name: an RFC 9110 token (section 5.6.2).
+    private static readonly SearchValues<char> TokenChars =
+        SearchValues.Create("!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz");
+
+    // The characters no relayed trailer value may hold, because each would end or split its line.
+    private static readonly SearchValues<char> LineBreakingChars = SearchValues.Create("\r\n\0");
 
     /// <summary>Returns the request target exactly as it arrived, or null when the server exposes none.</summary>
     /// <param name="context">The incoming request.</param>
@@ -125,6 +173,15 @@ public sealed class PassThroughTransformer : HttpTransformer
         CarriesBody(context)
         && context.Request.ContentLength > 0
         && context.Request.Headers.TransferEncoding.Count == 0;
+
+    /// <summary>
+    /// Tells whether the request carries a chunked body, whose trailer section the server reads after
+    /// its last chunk; the server refuses a <c>Transfer-Encoding</c> whose final coding is not chunked.
+    /// </summary>
+    /// <param name="context">The incoming request.</param>
+    /// <returns>True for a body framed by <c>Transfer-Encoding</c>.</returns>
+    internal static bool CarriesChunkedBody(HttpContext context) =>
+        CarriesBody(context) && context.Request.Headers.TransferEncoding.Count > 0;
 
     /// <summary>Tells whether a raw request target is the asterisk form, <c>*</c>.</summary>
     /// <param name="rawTarget">The raw request target, or null.</param>
@@ -225,14 +282,18 @@ public sealed class PassThroughTransformer : HttpTransformer
         // follows every request framing Kestrel accepts, chunk extensions of any length included, and
         // stops only at framing Kestrel itself rejects or at a reader call it cannot account for.
         // Without a capture, or once it no longer knows the request in progress, Kestrel's copy is all
-        // there is.
+        // there is. The call's state keeps the fields either copy nominates, so that the caller's
+        // trailer section of a chunked upload does not carry them to the backend either.
         var rawTarget = GetRawTarget(httpContext);
+        var callState = BackendCallState.Current;
         RemoveNominatedRequestFields(proxyRequest, httpContext.Request.Headers.Connection);
+        callState?.NominateRequestFields(NominatedFieldNames(httpContext.Request.Headers.Connection));
         if (rawTarget is not null
             && httpContext.Features.Get<RawConnectionHeaderCapture>() is { } capture
             && capture.TryGetConnectionValues(httpContext.Request.Method, rawTarget, out var sentConnectionValues))
         {
             RemoveNominatedRequestFields(proxyRequest, sentConnectionValues);
+            callState?.NominateRequestFields(NominatedFieldNames(sentConnectionValues));
         }
 
         // With no Host header set, the handler writes the destination URI's authority.
@@ -293,6 +354,14 @@ public sealed class PassThroughTransformer : HttpTransformer
     /// on this call's response alone. A chunked or unknown-length response is relayed only once its body
     /// has been copied to the end, which <see cref="TransformResponseTrailersAsync"/> records. A head the
     /// flush did not finish sending, and a 101 response, record nothing here.
+    /// <para>
+    /// A chunked backend response whose trailer fields the caller's server cannot carry itself keeps the
+    /// backend's chunked framing towards an HTTP/1.1 caller, so that its trailer section can follow the
+    /// body: the head goes out with <c>Transfer-Encoding: chunked</c>, as the server would frame it, and a
+    /// body installed on this call's response alone frames each write as one chunk. Only a response that
+    /// can carry a body qualifies: not one to <c>HEAD</c>, not a 1xx, 204, 205 or 304, and not one with
+    /// a declared length.
+    /// </para>
     /// </remarks>
     /// <param name="httpContext">The incoming request, whose response is being written.</param>
     /// <param name="proxyResponse">The backend's response, or null when the backend did not respond.</param>
@@ -334,11 +403,32 @@ public sealed class PassThroughTransformer : HttpTransformer
         // after this transform.
         if (proxyResponse.StatusCode != HttpStatusCode.SwitchingProtocols)
         {
+            // A response that relays the backend's trailer section declares the chunked framing itself,
+            // which makes Kestrel write its body bytes as they are, before the head is committed.
+            var serverBody = RelaysResponseTrailers(httpContext, proxyResponse)
+                ? httpContext.Features.Get<IHttpResponseBodyFeature>()
+                : null;
+            if (serverBody is not null)
+            {
+                httpContext.Response.Headers.TransferEncoding = ChunkedCoding;
+            }
+
             // StartAsync fails on an already cancelled token before anything is sent, so such a call
             // still ends before the response started: with the facade's 504 or Fault, or with
             // nothing for a caller that left. On HTTP/1.1 StartAsync only commits the head to
             // Kestrel's output pipe; the flush puts it on the wire.
             await httpContext.Response.StartAsync(cancellationToken).ConfigureAwait(false);
+
+            // The chunk-framing body is installed only once the chunked head is committed: a call that
+            // failed before then is answered with the facade's own response, whose Clear() drops the
+            // header, through the server's body as it was.
+            if (serverBody is not null)
+            {
+                var chunkedBody = new ChunkedResponseBody(serverBody);
+                httpContext.Features.Set<IHttpResponseBodyFeature>(chunkedBody);
+                httpContext.Features.Set(chunkedBody);
+            }
+
             var headSent = false;
             try
             {
@@ -362,11 +452,13 @@ public sealed class PassThroughTransformer : HttpTransformer
     }
 
     /// <summary>
-    /// Copies the backend's response trailers unchanged, if the caller's response supports them, and
-    /// records on the call's <see cref="BackendCallState"/> that the backend's whole response has been
-    /// relayed. This is where a chunked or unknown-length response is first known to be relayed; a
-    /// response without a body or with a declared length was recorded as soon as it had been sent
-    /// (<see cref="TransformResponseAsync"/>).
+    /// Copies the backend's end-to-end response trailers unchanged, and records on the call's
+    /// <see cref="BackendCallState"/> that the backend's whole response has been relayed. A response
+    /// that keeps the backend's chunked framing (<see cref="TransformResponseAsync"/>) ends here with its
+    /// last chunk and the trailer fields that pass; any other response gets them only where the caller's
+    /// server supports response trailers. This is where a chunked or unknown-length response is first
+    /// known to be relayed; a response without a body or with a declared length was recorded as soon as
+    /// it had been sent (<see cref="TransformResponseAsync"/>).
     /// </summary>
     /// <param name="httpContext">The incoming request, whose response is being written.</param>
     /// <param name="proxyResponse">The backend's response, whose body has been copied in full.</param>
@@ -377,7 +469,22 @@ public sealed class PassThroughTransformer : HttpTransformer
         HttpResponseMessage proxyResponse,
         CancellationToken cancellationToken)
     {
-        await base.TransformResponseTrailersAsync(httpContext, proxyResponse, cancellationToken).ConfigureAwait(false);
+        ArgumentNullException.ThrowIfNull(httpContext);
+        ArgumentNullException.ThrowIfNull(proxyResponse);
+
+        // The backend's Connection header nominates fields of its own hop, in its trailer section too.
+        if (httpContext.Features.Get<ChunkedResponseBody>() is { } chunkedBody)
+        {
+            IEnumerable<string> nominated = proxyResponse.Headers.NonValidated.TryGetValues(HeaderNames.Connection, out var connection)
+                ? NominatedFieldNames(connection)
+                : [];
+            var trailerLines = EncodeTrailerFields(proxyResponse.TrailingHeaders.NonValidated, nominated);
+            await chunkedBody.EndAsync(trailerLines, cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            await base.TransformResponseTrailersAsync(httpContext, proxyResponse, cancellationToken).ConfigureAwait(false);
+        }
 
         // The forwarder asks for the trailers only after it has copied the backend's whole response
         // body, and checks the upload only after this: BackendForwarder then keeps the backend's answer
@@ -385,12 +492,123 @@ public sealed class PassThroughTransformer : HttpTransformer
         BackendCallState.Current?.MarkResponseRelayed();
     }
 
+    /// <summary>
+    /// Encodes a sender's trailer fields as the field lines of the trailer section the next hop receives:
+    /// <c>name: value</c> and CRLF, one line per value, each name and value as received, in Latin-1, one
+    /// byte per char, as header bytes pass in both directions.
+    /// </summary>
+    /// <remarks>
+    /// A field is left out when YARP's hop-by-hop list or <paramref name="nominated"/> names it, matched
+    /// case-insensitively, and a value is left out when its field name is no RFC 9110 token or the value
+    /// holds a CR, LF or NUL or a char above U+00FF: any of them could end the line or the section early
+    /// and smuggle bytes the sender never framed as a field. Such a value is skipped, never the call.
+    /// </remarks>
+    /// <param name="fields">The sender's trailer fields, each name with its values in the order received.</param>
+    /// <param name="nominated">The field names the sender's <c>Connection</c> header nominates.</param>
+    /// <returns>The field lines, without the blank line that ends the section; empty when none passes.</returns>
+    internal static byte[] EncodeTrailerFields(IEnumerable<KeyValuePair<string, StringValues>> fields, IEnumerable<string> nominated)
+    {
+        ArgumentNullException.ThrowIfNull(fields);
+        ArgumentNullException.ThrowIfNull(nominated);
+
+        var excluded = new HashSet<string>(nominated, StringComparer.OrdinalIgnoreCase);
+        var lines = new ArrayBufferWriter<byte>();
+        foreach (var (name, values) in fields)
+        {
+            foreach (var value in values)
+            {
+                AppendTrailerField(lines, name, value, excluded);
+            }
+        }
+
+        return lines.WrittenSpan.ToArray();
+    }
+
+    /// <inheritdoc cref="EncodeTrailerFields(IEnumerable{KeyValuePair{string, StringValues}}, IEnumerable{string})"/>
+    internal static byte[] EncodeTrailerFields(HttpHeadersNonValidated fields, IEnumerable<string> nominated)
+    {
+        ArgumentNullException.ThrowIfNull(nominated);
+
+        var excluded = new HashSet<string>(nominated, StringComparer.OrdinalIgnoreCase);
+        var lines = new ArrayBufferWriter<byte>();
+        foreach (var (name, values) in fields)
+        {
+            foreach (var value in values)
+            {
+                AppendTrailerField(lines, name, value, excluded);
+            }
+        }
+
+        return lines.WrittenSpan.ToArray();
+    }
+
+    /// <summary>
+    /// Aborts the caller's connection when the call's response keeps the backend's chunked framing and
+    /// has started, but its last chunk was never written, so that the server never ends the response on
+    /// a connection it keeps open with the caller still waiting for that chunk, or taking the next
+    /// response for the rest of this one. Does nothing for any other response.
+    /// </summary>
+    /// <param name="context">The call's context, once the call is over.</param>
+    internal static void AbortUnendedChunkedResponse(HttpContext context)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+
+        if (context.Features.Get<ChunkedResponseBody>() is { Ended: false } && context.Response.HasStarted)
+        {
+            context.Abort();
+        }
+    }
+
+    // Whether the caller's response keeps the backend's chunked framing so that the backend's trailer
+    // section can follow its body: an HTTP/1.1 caller, whose server would otherwise frame the body itself
+    // and, offering no response trailers of its own, end it without them; a response that may carry a
+    // body, which Kestrel refuses a Transfer-Encoding for otherwise; and a backend body that is chunked
+    // and declares no length. HTTP/1.0 callers, whose bodies the server ends by closing the connection,
+    // and every other response keep the server's own framing.
+    private static bool RelaysResponseTrailers(HttpContext httpContext, HttpResponseMessage proxyResponse)
+    {
+        var response = httpContext.Response;
+        return HttpProtocol.IsHttp11(httpContext.Request.Protocol)
+            && !HttpMethods.IsHead(httpContext.Request.Method)
+            && response.StatusCode >= StatusCodes.Status200OK
+            && response.StatusCode is not (StatusCodes.Status204NoContent or StatusCodes.Status205ResetContent or StatusCodes.Status304NotModified)
+            && proxyResponse.Headers.TransferEncodingChunked == true
+            && response.ContentLength is null
+            && response.Headers.TransferEncoding.Count == 0
+            && !response.SupportsTrailers()
+            && httpContext.Features.Get<IHttpResponseBodyFeature>() is not null;
+    }
+
+    // Appends one trailer field line unless the field is hop-by-hop or nominated, or its name or value
+    // could break the trailer section's framing.
+    private static void AppendTrailerField(ArrayBufferWriter<byte> lines, string name, string? value, HashSet<string> excluded)
+    {
+        if (value is null
+            || name.Length == 0
+            || name.AsSpan().ContainsAnyExcept(TokenChars)
+            || HopByHopFields.Contains(name)
+            || excluded.Contains(name)
+            || value.AsSpan().ContainsAny(LineBreakingChars)
+            || value.AsSpan().ContainsAnyInRange((char)0x100, char.MaxValue))
+        {
+            return;
+        }
+
+        var nameLength = Encoding.Latin1.GetBytes(name, lines.GetSpan(name.Length));
+        lines.Advance(nameLength);
+        lines.Write(": "u8);
+        var valueLength = Encoding.Latin1.GetBytes(value, lines.GetSpan(value.Length));
+        lines.Advance(valueLength);
+        lines.Write("\r\n"u8);
+    }
+
     // Called once the response head has been sent. Kestrel sends no body after the head of a response
     // to HEAD, of a 204 or 304, or of one that declares Content-Length: 0, so such a head is the whole
     // response. A declared non-zero length is reached by the forwarder's body writes, which a pass-through
     // body counts; the forwarder takes the caller's body stream only after this transform. A chunked or
-    // unknown-length body ends with framing Kestrel writes after the forwarder returns, so its end is
-    // left to the trailers step.
+    // unknown-length body ends with framing written after the forwarder's copy, by the trailers step for
+    // a response that keeps the backend's chunked framing and by Kestrel once the forwarder returns for
+    // any other, so its end is left to the trailers step.
     private static void TrackRelayedResponse(HttpContext httpContext, BackendCallState callState)
     {
         var response = httpContext.Response;
@@ -637,6 +855,224 @@ public sealed class PassThroughTransformer : HttpTransformer
             public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
 
             public override void SetLength(long value) => inner.SetLength(value);
+
+            public override ValueTask DisposeAsync() => inner.DisposeAsync();
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing)
+                {
+                    inner.Dispose();
+                }
+
+                base.Dispose(disposing);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The caller's response body for one call whose response keeps the backend's chunked framing: each
+    /// non-empty write goes to the server's body stream as one chunk, its size in hex, CRLF, the bytes and
+    /// CRLF, and <see cref="EndAsync"/> ends the body with the last chunk, the backend's trailer field
+    /// lines and the blank line. The server writes all of it as it is, because the response declares
+    /// <c>Transfer-Encoding: chunked</c> itself.
+    /// </summary>
+    /// <remarks>
+    /// Body bytes are neither altered, buffered nor reordered, and each write and flush goes to the
+    /// server's stream as one write or flush, which keeps the server's synchronous-IO policy, flushing and
+    /// cancellation handling. A write after the last chunk is refused, so nothing can follow the end of the
+    /// response on a connection the server keeps open. <see cref="Writer"/> and <see cref="SendFileAsync"/>,
+    /// which the forwarder does not use, write through the same framing, and <see cref="CompleteAsync"/>
+    /// ends a body nothing ended before, without trailer fields. <see cref="StartAsync"/> and
+    /// <see cref="DisableBuffering"/> pass to the server's feature.
+    /// </remarks>
+    private sealed class ChunkedResponseBody : IHttpResponseBodyFeature
+    {
+        // A chunk-size line holds at most eight hex digits for an int length; with its CRLF and the CRLF
+        // after the data, the framing adds at most twelve bytes to a write.
+        private const int MaxFramingLength = 12;
+
+        private readonly IHttpResponseBodyFeature _inner;
+        private PipeWriter? _writer;
+        private volatile bool _ended;
+
+        /// <summary>Wraps the server's body feature of a call whose response keeps chunked framing.</summary>
+        /// <param name="inner">The server's body feature of the call's response, whose head is committed.</param>
+        public ChunkedResponseBody(IHttpResponseBodyFeature inner)
+        {
+            ArgumentNullException.ThrowIfNull(inner);
+
+            _inner = inner;
+            Stream = new ChunkFramingStream(inner.Stream, this);
+        }
+
+        public Stream Stream { get; }
+
+        public PipeWriter Writer => _writer ??= PipeWriter.Create(Stream, new StreamPipeWriterOptions(leaveOpen: true));
+
+        /// <summary>Whether the last chunk has been written, after which no body byte follows.</summary>
+        public bool Ended => _ended;
+
+        public void DisableBuffering() => _inner.DisableBuffering();
+
+        public Task StartAsync(CancellationToken cancellationToken = default) => _inner.StartAsync(cancellationToken);
+
+        public Task SendFileAsync(string path, long offset, long? count, CancellationToken cancellationToken = default) =>
+            SendFileFallback.SendFileAsync(Stream, path, offset, count, cancellationToken);
+
+        public async Task CompleteAsync()
+        {
+            await EndAsync(ReadOnlyMemory<byte>.Empty, CancellationToken.None).ConfigureAwait(false);
+            await _inner.CompleteAsync().ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Ends the body: bytes <see cref="Writer"/> still holds go out first, then the last chunk, the
+        /// trailer field lines and the blank line, flushed. The body counts as ended only once that write
+        /// and flush have completed. Does nothing once the body has ended.
+        /// </summary>
+        /// <param name="trailerLines">The trailer field lines, each ending with CRLF; empty for none.</param>
+        /// <param name="cancellationToken">Cancelled when the call is abandoned or its deadline expires.</param>
+        /// <returns>A task that completes when the last chunk has been written and flushed.</returns>
+        public async Task EndAsync(ReadOnlyMemory<byte> trailerLines, CancellationToken cancellationToken)
+        {
+            if (_ended)
+            {
+                return;
+            }
+
+            if (_writer is { } writer)
+            {
+                await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            await _inner.Stream.WriteAsync(LastChunk(trailerLines.Span), cancellationToken).ConfigureAwait(false);
+            await _inner.Stream.FlushAsync(cancellationToken).ConfigureAwait(false);
+            _ended = true;
+        }
+
+        // The last chunk, a zero size line, followed by the trailer field lines and the blank line.
+        private static byte[] LastChunk(ReadOnlySpan<byte> trailerLines) => [.. "0\r\n"u8, .. trailerLines, .. "\r\n"u8];
+
+        // Frames 'data' as one chunk in a buffer rented from the shared pool, which the caller returns once
+        // the framed bytes have been written; 'length' is how many of its bytes the chunk takes.
+        private static byte[] Frame(ReadOnlySpan<byte> data, out int length)
+        {
+            var framed = ArrayPool<byte>.Shared.Rent(data.Length + MaxFramingLength);
+            data.Length.TryFormat(framed, out var sizeLength, "x", CultureInfo.InvariantCulture);
+            var cursor = sizeLength;
+            "\r\n"u8.CopyTo(framed.AsSpan(cursor));
+            cursor += 2;
+            data.CopyTo(framed.AsSpan(cursor));
+            cursor += data.Length;
+            "\r\n"u8.CopyTo(framed.AsSpan(cursor));
+            length = cursor + 2;
+            return framed;
+        }
+
+        private void ThrowIfEnded()
+        {
+            if (_ended)
+            {
+                throw new InvalidOperationException("The response body has already ended with its last chunk.");
+            }
+        }
+
+        /// <summary>Writes each non-empty write to the server's body stream as one chunk.</summary>
+        private sealed class ChunkFramingStream(Stream inner, ChunkedResponseBody owner) : Stream
+        {
+            public override bool CanRead => false;
+
+            public override bool CanSeek => false;
+
+            public override bool CanWrite => inner.CanWrite;
+
+            public override bool CanTimeout => inner.CanTimeout;
+
+            public override long Length => throw new NotSupportedException();
+
+            public override long Position
+            {
+                get => throw new NotSupportedException();
+                set => throw new NotSupportedException();
+            }
+
+            public override int WriteTimeout
+            {
+                get => inner.WriteTimeout;
+                set => inner.WriteTimeout = value;
+            }
+
+            public override void Write(byte[] buffer, int offset, int count)
+            {
+                ValidateBufferArguments(buffer, offset, count);
+                Write(buffer.AsSpan(offset, count));
+            }
+
+            // An empty write goes to the server's stream as it is: it frames nothing, and a zero-size
+            // chunk would end the body.
+            public override void Write(ReadOnlySpan<byte> buffer)
+            {
+                owner.ThrowIfEnded();
+                if (buffer.IsEmpty)
+                {
+                    inner.Write(buffer);
+                    return;
+                }
+
+                var framed = Frame(buffer, out var length);
+                try
+                {
+                    inner.Write(framed.AsSpan(0, length));
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(framed);
+                }
+            }
+
+            public override void WriteByte(byte value) => Write(new ReadOnlySpan<byte>(in value));
+
+            public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            {
+                ValidateBufferArguments(buffer, offset, count);
+                return WriteAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+            }
+
+            public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+            {
+                owner.ThrowIfEnded();
+                if (buffer.IsEmpty)
+                {
+                    await inner.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+
+                var framed = Frame(buffer.Span, out var length);
+                try
+                {
+                    await inner.WriteAsync(framed.AsMemory(0, length), cancellationToken).ConfigureAwait(false);
+                }
+                finally
+                {
+                    ArrayPool<byte>.Shared.Return(framed);
+                }
+            }
+
+            public override IAsyncResult BeginWrite(byte[] buffer, int offset, int count, AsyncCallback? callback, object? state) =>
+                TaskToAsyncResult.Begin(WriteAsync(buffer, offset, count, CancellationToken.None), callback, state);
+
+            public override void EndWrite(IAsyncResult asyncResult) => TaskToAsyncResult.End(asyncResult);
+
+            public override void Flush() => inner.Flush();
+
+            public override Task FlushAsync(CancellationToken cancellationToken) => inner.FlushAsync(cancellationToken);
+
+            public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+            public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+
+            public override void SetLength(long value) => throw new NotSupportedException();
 
             public override ValueTask DisposeAsync() => inner.DisposeAsync();
 
