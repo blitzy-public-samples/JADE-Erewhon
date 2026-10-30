@@ -144,8 +144,8 @@ readonly LISTEN_SECONDS=60
 readonly FACADE_TESTS_SECONDS=600
 
 export DOTNET_NOLOGO=1 DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
-# No persistent MSBuild node, MSBuild server or compiler server outlives a build, so the script leaves
-# no process running that it did not stop. A value the caller set is kept.
+# By default MSBuild node reuse, the MSBuild server and the compiler server are off, so none outlives
+# the run or is shared with other host builds; non-empty caller values are kept and can re-enable them.
 export MSBUILDDISABLENODEREUSE="${MSBUILDDISABLENODEREUSE:-1}"
 export DOTNET_CLI_USE_MSBUILD_SERVER="${DOTNET_CLI_USE_MSBUILD_SERVER:-0}"
 export UseSharedCompilation="${UseSharedCompilation:-false}"

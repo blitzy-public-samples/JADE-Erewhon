@@ -18,8 +18,10 @@
     - A .csproj sets neither TargetFramework nor a Version on any PackageReference. Versions come
       only from the root Directory.Packages.props, which NuGet finds by walking up from the project.
     - Each project commits the packages.lock.json that restore writes. Locked-mode restore is
-      requested on the command line by the Dockerfiles and harness/scripts/run-local.sh, so a
-      local restore can still regenerate a lock file after a deliberate version change.
+      requested on the command line by the three Dockerfiles, and by facade/tests/run-tests.sh
+      on a fresh checkout that has not been restored yet. harness/scripts/run-local.sh restores
+      implicitly and unlocked through dotnet build, so a local build can still regenerate a lock
+      file after a deliberate version change.
     - Every dotnet command runs with its working directory inside facade/, standin/ or harness/,
       because dotnet finds the component global.json (SDK 10.0.403, Microsoft.Testing.Platform
       runner) from the working directory, not from the project path.
