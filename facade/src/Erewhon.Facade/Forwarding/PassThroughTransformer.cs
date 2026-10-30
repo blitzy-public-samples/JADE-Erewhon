@@ -16,8 +16,7 @@ namespace Erewhon.Facade.Forwarding;
 
 /// <summary>
 /// The request and response transform used for every forwarded call: a byte-faithful pass-through
-/// that rebuilds no payload and adds no header but one, <c>Expect: 100-continue</c> on large or
-/// unknown-length uploads (AAP 0.3.2.1, 0.4.1).
+/// that rebuilds no payload and adds no header (AAP 0.3.2.1, 0.4.1).
 /// </summary>
 /// <remarks>
 /// <para>
@@ -32,14 +31,12 @@ namespace Erewhon.Facade.Forwarding;
 /// stack would write for it anyway, as an empty content, so the stack sends it to the backend once.
 /// </para>
 /// <para>
-/// The one header added is <c>Expect: 100-continue</c>, on a request whose body is at least
-/// <see cref="ExpectContinueThreshold"/> bytes or of unknown length and that carries no <c>Expect</c>
-/// of its own. The HTTP stack sends a whole request body before it reads any response unless the
-/// request asks for 100-continue, so a backend that rejects an upload early, for example with 413
-/// for its own body-size limit, and closes the connection would otherwise surface only as a failed
-/// upload, never as its response. With the expectation the backend's early answer reaches the caller
-/// unchanged, and a backend that accepts the upload answers 100 Continue and receives the body as
-/// before. Smaller bodies, which carry every ordinary JADE call, are sent exactly as before.
+/// An upload reaches the backend with an <c>Expect</c> header only when the caller sent one, whatever
+/// the size or framing of its body. A backend that answers an upload before it has read all of it, for
+/// example with 413 for its own body-size limit, whether it then keeps the connection open or closes
+/// it, still has its answer reach the caller unchanged, also while the caller pauses its upload: the
+/// backend connection, a <see cref="BackendConnectionStream"/>, watches the backend while the upload is
+/// in progress and takes its answer, close or reset as the end of the upload, which is never resent.
 /// </para>
 /// <para>
 /// The request target is taken from the raw target the caller sent, never from the decoded
@@ -77,12 +74,6 @@ namespace Erewhon.Facade.Forwarding;
 /// </remarks>
 public sealed class PassThroughTransformer : HttpTransformer
 {
-    /// <summary>
-    /// The request body size, 1 MiB, from which a request without an <c>Expect</c> header of its own is
-    /// forwarded with <c>Expect: 100-continue</c>; curl applies the same threshold to its uploads.
-    /// </summary>
-    public const long ExpectContinueThreshold = 1024 * 1024;
-
     /// <summary>The asterisk-form request target, which only <c>OPTIONS</c> carries (RFC 9112 3.2.4).</summary>
     internal const string AsteriskFormTarget = "*";
 
@@ -117,6 +108,17 @@ public sealed class PassThroughTransformer : HttpTransformer
         context.Features.Get<IHttpRequestBodyDetectionFeature>() is { } detection
             ? detection.CanHaveBody
             : context.Request.ContentLength > 0 || context.Request.Headers.TransferEncoding.Count > 0;
+
+    /// <summary>
+    /// Tells whether the request carries a body framed by its declared <c>Content-Length</c>, which the
+    /// HTTP stack sends to the backend framed the same way; a chunked body, or none, is not.
+    /// </summary>
+    /// <param name="context">The incoming request.</param>
+    /// <returns>True for a body of declared, non-zero length that is not chunked.</returns>
+    internal static bool CarriesLengthDelimitedBody(HttpContext context) =>
+        CarriesBody(context)
+        && context.Request.ContentLength > 0
+        && context.Request.Headers.TransferEncoding.Count == 0;
 
     /// <summary>Tells whether a raw request target is the asterisk form, <c>*</c>.</summary>
     /// <param name="rawTarget">The raw request target, or null.</param>
@@ -183,8 +185,7 @@ public sealed class PassThroughTransformer : HttpTransformer
     /// <summary>
     /// Copies every end-to-end request header unchanged, drops the fields the caller's
     /// <c>Connection</c> header nominates, replaces the caller's <c>Host</c> with the target
-    /// authority, asks for 100-continue on a large or unknown-length body that carries no
-    /// <c>Expect</c> of its own, and points the request at <paramref name="destinationPrefix"/>
+    /// authority, and points the request at <paramref name="destinationPrefix"/>
     /// followed by the origin form of the caller's raw request target. A body-less request whose method the HTTP stack
     /// sends with <c>Content-Length: 0</c> gets an empty content carrying that same header, so the
     /// handler sends it to the backend once.
@@ -227,18 +228,6 @@ public sealed class PassThroughTransformer : HttpTransformer
 
         // With no Host header set, the handler writes the destination URI's authority.
         proxyRequest.Headers.Host = null;
-
-        // A body of unknown length (chunked) or of at least 1 MiB waits for the backend's 100 Continue,
-        // so an early rejection reaches the caller as the backend's response instead of a failed upload.
-        // A caller's own Expect header, already copied above, is left exactly as sent, and a request
-        // without a body, which has content here only to carry content headers, gets none.
-        if (proxyRequest.Content is not null
-            && CarriesBody(httpContext)
-            && httpContext.Request.Headers.Expect.Count == 0
-            && httpContext.Request.ContentLength is not < ExpectContinueThreshold)
-        {
-            proxyRequest.Headers.ExpectContinue = true;
-        }
 
         // The origin form of an origin-form or absolute-form target is appended to the prefix. An
         // asterisk-form request is addressed to the target's base URL, and BackendForwarder writes the

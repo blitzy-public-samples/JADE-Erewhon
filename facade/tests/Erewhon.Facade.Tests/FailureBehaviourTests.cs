@@ -3,7 +3,9 @@
 // facade builds itself (BackendForwarder's problem+json and SoapFaultWriter's Fault), so the equivalence
 // replay excludes them and they are proven here, against the facade on real loopback Kestrel listeners.
 // The expected texts are the plan's literals, held here independently of the facade's own constants,
-// which are asserted to match the same wire values.
+// which are asserted to match the same wire values. Each payload is held to its complete fixed form:
+// the problem body byte for byte against JSON composed here, with its exact Content-Type and member
+// set, and the Fault's whole Envelope/Body/Fault structure, with faultcode resolved as a QName.
 //
 // The facade-tests container runs with network_mode none, so the unreachable targets are a closed
 // loopback port and a name under the reserved .invalid domain, which never resolves.
@@ -73,9 +75,15 @@ public sealed class FailureBehaviourTests
     private const string ProblemType = "about:blank";
     private const string SoapMediaType = "text/xml";
     private const string SoapCharSet = "utf-8";
-    private const string ServerFaultCode = "soap:Server";
+    private const string ServerFaultLocalName = "Server";
     private const string UnavailableText = "Backend unavailable";
     private const string TimedOutText = "Backend timed out";
+
+    // The problem detail is these two parts around the operation's JADE method name from the catalogue.
+    private const string ProblemDetailStart = "The backend for operation ";
+    private const string UnavailableDetailEnd = " could not be reached.";
+    private const string TimedOutDetailEnd = " did not respond in time.";
+    private const string ContentTypeHeader = "Content-Type";
 
     private const int SlowBackendTimeoutSeconds = 2;
 
@@ -86,6 +94,10 @@ public sealed class FailureBehaviourTests
     private const string TimeoutOutcome = "timeout";
 
     private static readonly XNamespace SoapEnvelope = "http://schemas.xmlsoap.org/soap/envelope/";
+
+    private static readonly string[] ProblemMembers = ["type", "title", "status", "detail"];
+
+    private static readonly char[] XmlWhitespace = [' ', '\t', '\r', '\n'];
 
     private static readonly TimeSpan UnreachableBound = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan SlowBackendDelay = TimeSpan.FromSeconds(10);
@@ -105,18 +117,8 @@ public sealed class FailureBehaviourTests
 
         RawResponse response = await SendAsync(facade, RestOperationId, ct);
 
-        Assert.Equal(502, response.Status);
-        Assert.Equal(ProblemMediaType, response.MediaType, ignoreCase: true);
-        Assert.Equal(BackendForwarder.ProblemContentType, response.MediaType, ignoreCase: true);
-
-        using JsonDocument problem = ParseProblem(response);
-        JsonElement root = problem.RootElement;
-        Assert.Equal(ProblemType, StringMember(root, "type"));
-        Assert.Equal(UnavailableText, StringMember(root, "title"));
-        Assert.Equal(BackendForwarder.UnavailableTitle, StringMember(root, "title"));
-        AssertStatusMember(Member(root, "status"), 502);
-        Assert.Contains(
-            OperationCatalogue.Default.GetById(RestOperationId).JadeMethod, StringMember(root, "detail"), StringComparison.Ordinal);
+        AssertProblemResponse(response, 502, UnavailableText, UnavailableDetailEnd, RestOperationId);
+        Assert.Equal(UnavailableText, BackendForwarder.UnavailableTitle);
 
         Assert.True(response.Elapsed <= UnreachableBound, "unreachable REST response exceeded 5 s bound");
     }
@@ -133,9 +135,8 @@ public sealed class FailureBehaviourTests
 
         RawResponse response = await SendAsync(facade, SoapOperationId, ct);
 
-        string? faultString = AssertSoapFault(response);
-        Assert.Equal(UnavailableText, faultString);
-        Assert.Equal(SoapFaultWriter.BackendUnavailable, faultString);
+        AssertSoapFault(response, UnavailableText);
+        Assert.Equal(UnavailableText, SoapFaultWriter.BackendUnavailable);
 
         Assert.True(response.Elapsed <= UnreachableBound, "unreachable SOAP response exceeded 5 s bound");
     }
@@ -149,17 +150,8 @@ public sealed class FailureBehaviourTests
 
         RawResponse response = await SendAsync(facade, RestOperationId, ct);
 
-        Assert.Equal(504, response.Status);
-        Assert.Equal(ProblemMediaType, response.MediaType, ignoreCase: true);
-
-        using JsonDocument problem = ParseProblem(response);
-        JsonElement root = problem.RootElement;
-        Assert.Equal(TimedOutText, StringMember(root, "title"));
-        Assert.Equal(BackendForwarder.TimedOutTitle, StringMember(root, "title"));
-        if (root.TryGetProperty("status", out JsonElement status))
-        {
-            AssertStatusMember(status, 504);
-        }
+        AssertProblemResponse(response, 504, TimedOutText, TimedOutDetailEnd, RestOperationId);
+        Assert.Equal(TimedOutText, BackendForwarder.TimedOutTitle);
 
         Assert.True(
             response.Elapsed >= TimeoutLowerBound && response.Elapsed <= TimeoutUpperBound,
@@ -178,9 +170,8 @@ public sealed class FailureBehaviourTests
 
         RawResponse response = await SendAsync(facade, SoapOperationId, ct);
 
-        string? faultString = AssertSoapFault(response);
-        Assert.Equal(TimedOutText, faultString);
-        Assert.Equal(SoapFaultWriter.BackendTimedOut, faultString);
+        AssertSoapFault(response, TimedOutText);
+        Assert.Equal(TimedOutText, SoapFaultWriter.BackendTimedOut);
 
         Assert.True(
             response.Elapsed >= TimeoutLowerBound && response.Elapsed <= TimeoutUpperBound,
@@ -228,11 +219,10 @@ public sealed class FailureBehaviourTests
             await facade.DisposeAsync();
         }
 
+        // The raw socket response holds no headers, so the Content-Type of this 504, which the facade writes
+        // as for every REST timeout, is asserted by RestCallToSlowBackendReturns504AfterDeadline.
         Assert.Equal(504, response.Status);
-        using (JsonDocument problem = JsonDocument.Parse(response.Body))
-        {
-            Assert.Equal(TimedOutText, StringMember(problem.RootElement, "title"));
-        }
+        AssertProblemBody(response.Body, 504, TimedOutText, TimedOutDetailEnd, TrickledUploadOperationId);
 
         Assert.True(
             response.Elapsed >= TimeoutLowerBound && response.Elapsed <= TimeoutUpperBound,
@@ -296,9 +286,78 @@ public sealed class FailureBehaviourTests
         return await FacadeFactory.SendAsync(client, OperationRequests.For(operation).ToMessage(socket), ct);
     }
 
-    private static JsonDocument ParseProblem(RawResponse response)
+    // Asserts the complete REST failure response: the status, exactly one Content-Type value that is
+    // exactly application/problem+json as received, and the fixed problem body (AssertProblemBody).
+    private static void AssertProblemResponse(
+        RawResponse response, int status, string title, string detailEnd, string operationId)
     {
-        JsonDocument problem = JsonDocument.Parse(response.Body);
+        Assert.Equal(status, response.Status);
+        Assert.True(
+            response.Headers.TryGetValue(ContentTypeHeader, out string[]? contentType) && contentType.Length == 1,
+            "problem response does not carry exactly one Content-Type value");
+        Assert.True(
+            string.Equals(ProblemMediaType, contentType[0], StringComparison.Ordinal),
+            "problem Content-Type is not exactly application/problem+json");
+        Assert.Equal(ProblemMediaType, BackendForwarder.ProblemContentType);
+
+        AssertProblemBody(response.Body, status, title, detailEnd, operationId);
+    }
+
+    // Asserts the fixed problem body against expectations authored here, never taken from the facade's
+    // builder: a JSON object whose members are exactly type, title, status and detail, each once; type
+    // about:blank; the given title; status as a JSON integer; the detail sentence naming the operation's
+    // JADE method from the catalogue; and bytes equal to the UTF-8 of that object written without
+    // whitespace in the order type, title, status, detail. No message holds a received value.
+    private static void AssertProblemBody(byte[] body, int status, string title, string detailEnd, string operationId)
+    {
+        string jadeMethod = OperationCatalogue.Default.GetById(operationId).JadeMethod;
+
+        // The expected JSON is composed without escaping, which is exact only for a name like this.
+        Assert.True(jadeMethod.All(char.IsAsciiLetterOrDigit), "operation name would need escaping in the expected problem JSON");
+        string detail = ProblemDetailStart + jadeMethod + detailEnd;
+
+        using (JsonDocument problem = ParseProblem(body))
+        {
+            JsonElement root = problem.RootElement;
+
+            // Four members whose distinct names are the four expected ones: none missing, extra or repeated.
+            var names = new HashSet<string>(StringComparer.Ordinal);
+            int count = 0;
+            foreach (JsonProperty member in root.EnumerateObject())
+            {
+                names.Add(member.Name);
+                count++;
+            }
+
+            Assert.True(
+                count == ProblemMembers.Length && names.SetEquals(ProblemMembers),
+                "problem body members are not exactly type, title, status and detail, each once");
+
+            Assert.True(
+                string.Equals(ProblemType, StringMember(root, "type"), StringComparison.Ordinal),
+                "problem type member is not about:blank");
+            Assert.True(
+                string.Equals(title, StringMember(root, "title"), StringComparison.Ordinal),
+                "problem title member is not the expected title");
+            AssertStatusMember(Member(root, "status"), status);
+            Assert.True(
+                string.Equals(detail, StringMember(root, "detail"), StringComparison.Ordinal),
+                "problem detail member is not the expected sentence for the operation");
+        }
+
+        string expected =
+            "{\"type\":\"" + ProblemType
+            + "\",\"title\":\"" + title
+            + "\",\"status\":" + status.ToString(CultureInfo.InvariantCulture)
+            + ",\"detail\":\"" + detail + "\"}";
+        Assert.True(
+            body.AsSpan().SequenceEqual(Encoding.UTF8.GetBytes(expected)),
+            "problem body bytes are not the expected JSON in the order type, title, status, detail");
+    }
+
+    private static JsonDocument ParseProblem(byte[] body)
+    {
+        JsonDocument problem = JsonDocument.Parse(body);
         if (problem.RootElement.ValueKind != JsonValueKind.Object)
         {
             problem.Dispose();
@@ -329,9 +388,14 @@ public sealed class FailureBehaviourTests
         Assert.Equal(expected, value);
     }
 
-    // Asserts HTTP 500, text/xml in UTF-8, and a SOAP 1.1 envelope whose Body holds only a Fault with the
-    // unqualified faultcode soap:Server; returns the Fault's faultstring text.
-    private static string? AssertSoapFault(RawResponse response)
+    // Asserts HTTP 500, text/xml in UTF-8, and the complete SOAP 1.1 Server Fault: a root
+    // {http://schemas.xmlsoap.org/soap/envelope/}Envelope whose only element is the Body (the facade writes
+    // no Header), a Body whose only element is the Fault, and a Fault whose elements are exactly the
+    // unqualified faultcode and faultstring, in that order, each holding text only. Envelope, Body and
+    // Fault hold no text but whitespace. faultcode is resolved as a QName through the namespace
+    // declarations in scope at faultcode, so a prefix bound to another namespace fails even when the text
+    // reads soap:Server; faultstring must equal the expected text exactly. No message holds a received value.
+    private static void AssertSoapFault(RawResponse response, string expectedFaultString)
     {
         Assert.Equal(500, response.Status);
         Assert.Equal(SoapMediaType, response.MediaType, ignoreCase: true);
@@ -339,19 +403,62 @@ public sealed class FailureBehaviourTests
 
         XElement? envelope = XDocument.Parse(response.BodyText).Root;
         Assert.NotNull(envelope);
-        Assert.Equal(SoapEnvelope + "Envelope", envelope.Name);
+        Assert.True(envelope.Name == SoapEnvelope + "Envelope", "SOAP root element is not the SOAP 1.1 Envelope");
 
-        XElement? body = envelope.Element(SoapEnvelope + "Body");
-        Assert.NotNull(body);
+        XElement body = SingleSoapChild(
+            envelope,
+            SoapEnvelope + "Body",
+            "SOAP Envelope holds text outside its elements",
+            "SOAP Envelope does not hold exactly one element, the SOAP 1.1 Body");
+        XElement fault = SingleSoapChild(
+            body,
+            SoapEnvelope + "Fault",
+            "SOAP Body holds text outside its elements",
+            "SOAP Body does not hold exactly one element, the SOAP 1.1 Fault");
 
-        XElement fault = Assert.Single(body.Elements());
-        Assert.Equal(SoapEnvelope + "Fault", fault.Name);
+        AssertNoSoapText(fault, "SOAP Fault holds text outside its elements");
+        XElement[] fields = [.. fault.Elements()];
+        Assert.True(
+            fields.Length == 2 && fields[0].Name == XName.Get("faultcode") && fields[1].Name == XName.Get("faultstring"),
+            "SOAP Fault elements are not exactly the unqualified faultcode and faultstring, in that order");
+        XElement faultCode = fields[0];
+        XElement faultString = fields[1];
+        Assert.True(!faultCode.HasElements && !faultString.HasElements, "SOAP faultcode or faultstring holds an element");
 
-        string? faultCode = fault.Element("faultcode")?.Value;
-        Assert.Equal(ServerFaultCode, faultCode);
-        Assert.Equal(SoapFaultWriter.FaultCodeServer, faultCode);
-        return fault.Element("faultstring")?.Value;
+        // An xsd:QName collapses whitespace, and an unprefixed one takes the default namespace in scope.
+        string code = faultCode.Value.Trim(XmlWhitespace);
+        int colon = code.IndexOf(':', StringComparison.Ordinal);
+        XNamespace? codeNamespace = colon switch
+        {
+            < 0 => faultCode.GetDefaultNamespace(),
+            0 => null,
+            _ => faultCode.GetNamespaceOfPrefix(code[..colon]),
+        };
+        Assert.True(
+            codeNamespace == SoapEnvelope && string.Equals(ServerFaultLocalName, code[(colon + 1)..], StringComparison.Ordinal),
+            "SOAP faultcode does not resolve to Server in the SOAP 1.1 envelope namespace");
+        Assert.True(
+            string.Equals(SoapFaultWriter.FaultCodeServer, code, StringComparison.Ordinal),
+            "SOAP faultcode text differs from the facade's FaultCodeServer constant");
+
+        Assert.True(
+            string.Equals(expectedFaultString, faultString.Value, StringComparison.Ordinal),
+            "SOAP faultstring is not the expected text");
     }
+
+    // Asserts that an element-only SOAP container holds no text but whitespace and exactly one element, of
+    // the given name, and returns that element.
+    private static XElement SingleSoapChild(XElement container, XName name, string textMessage, string elementMessage)
+    {
+        AssertNoSoapText(container, textMessage);
+        XElement[] children = [.. container.Elements()];
+        Assert.True(children.Length == 1 && children[0].Name == name, elementMessage);
+        return children[0];
+    }
+
+    // Text and CDATA directly inside an element-only SOAP container may only be XML whitespace.
+    private static void AssertNoSoapText(XElement container, string message) =>
+        Assert.True(container.Nodes().OfType<XText>().All(text => text.Value.Trim(XmlWhitespace).Length == 0), message);
 }
 
 // The log level floors the facade applies in Program.cs to the framework categories whose lines print
@@ -582,6 +689,174 @@ public sealed class LogLevelFloorsTests
     }
 }
 
+// Backend error pass-through (class BackendErrorPassThroughTests) sits here, beside the facade's own
+// 502, 504 and Fault responses it must never be mistaken for, as a class of its own: the results report
+// counts test classes whose names end in "FailureBehaviourTests" as the unreachable and timeout check,
+// and this name matches none.
+//
+// A backend that is reached and answers with an error of its own, 502 and 504 included, with a body or
+// without, makes a forwarded call, not a failed one: the caller gets the backend's status, Content-Type,
+// end-to-end headers and body bytes unchanged, on the REST and SOAP listeners alike, and never the
+// facade's problem+json or SOAP Fault. Each case points the facade at a stub backend on real loopback
+// Kestrel listeners and calls the facade's real socket. The backend's bodies, content types and headers
+// are literals authored here, independently of BackendForwarder and SoapFaultWriter; the SOAP bodies are
+// backend Faults whose faultstring is neither of the facade's.
+//
+// Failures are identified across runs by a signature over the exception type, the failing line and the
+// assertion message, and the TRX display name holds the theory arguments, so the theory data, every
+// message and every Assert.Equal operand here are fixed literals: no port, URL or elapsed time.
+/// <summary>
+/// Shows that a backend's own error responses (400, 404, 500, and 502 and 504 with and without a body)
+/// reach the caller unchanged through the facade's REST and SOAP listeners, and that each is logged as
+/// one forwarded call with the backend's status.
+/// </summary>
+public sealed class BackendErrorPassThroughTests
+{
+    private const string GetCompanyId = "Rest.getCompany";
+    private const string PostCreateAgentId = "Rest.postCreateAgent";
+    private const string SoapGetAgentId = "Soap.getAgent";
+
+    private const string StubId = "erroring";
+    private const string StubIdHeader = "X-Stub-Id";
+    private const string BackendErrorHeader = "X-Backend-Error";
+    private const string BackendErrorValue = "raised-by-backend";
+    private const string ContentTypeHeader = "Content-Type";
+    private const string ContentLengthHeader = "Content-Length";
+
+    private const string RestContentType = "application/json; charset=utf-8";
+    private const string SoapContentType = "text/xml; charset=utf-8";
+
+    private const string ForwardedOutcome = "forwarded";
+
+    private static readonly TimeSpan LogWaitBound = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// The body-less REST read <c>getCompany</c>, the REST write <c>postCreateAgent</c> with its JSON
+    /// body, and the SOAP operation <c>getAgent</c>, each against a backend answering 502 or 504 with a
+    /// body or with none, or 400, 404 or 500 with a body.
+    /// </summary>
+    public static TheoryData<string, int, bool> BackendErrors()
+    {
+        var data = new TheoryData<string, int, bool>();
+        string[] operations = [GetCompanyId, PostCreateAgentId, SoapGetAgentId];
+        foreach (string operationId in operations)
+        {
+            data.Add(operationId, 502, false);
+            data.Add(operationId, 502, true);
+            data.Add(operationId, 504, false);
+            data.Add(operationId, 504, true);
+            data.Add(operationId, 400, false);
+            data.Add(operationId, 404, false);
+            data.Add(operationId, 500, false);
+        }
+
+        return data;
+    }
+
+    /// <summary>
+    /// The operation is sent at its normal address to the facade socket of its surface, and the backend
+    /// answers it with <paramref name="status"/>, its own Content-Type, <c>X-Stub-Id</c> and
+    /// <c>X-Backend-Error</c> headers and a fixed body, or an empty one.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(BackendErrors))]
+    public async Task BackendErrorResponsePassesThroughUnchanged(string operationId, int status, bool emptyBody)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        OperationDescriptor operation = OperationCatalogue.Default.GetById(operationId);
+        bool soap = operation.Surface == Surface.Soap;
+        string contentType = soap ? SoapContentType : RestContentType;
+        byte[] body = emptyBody ? [] : Encoding.UTF8.GetBytes(soap ? SoapFaultBody(status) : RestErrorBody(status));
+        var logs = new LogCapture();
+        await using StubBackend backend = await StubBackend.StartAsync(
+            StubId,
+            new StubBackendOptions
+            {
+                Status = status,
+                Body = body,
+                ExtraHeaders = new Dictionary<string, string>
+                {
+                    [ContentTypeHeader] = contentType,
+                    [BackendErrorHeader] = BackendErrorValue,
+                },
+            },
+            ct);
+        await using FacadeFactory facade = await FacadeFactory.StartAsync(
+            new FacadeTestSettings
+            {
+                BackendRestBaseUrl = backend.RestBaseUrl,
+                BackendSoapBaseUrl = backend.SoapBaseUrl,
+                LoggerProvider = logs,
+            },
+            ct);
+
+        PreparedRequest request = OperationRequests.For(operation);
+        Uri socket = soap ? facade.SoapBaseAddress : facade.RestBaseAddress;
+        RawResponse response;
+        using (HttpClient client = facade.CreateRawClient())
+        {
+            response = await FacadeFactory.SendAsync(client, request.ToMessage(socket), ct);
+        }
+
+        Assert.Equal(status, response.Status);
+        AssertSingleHeader(response, ContentTypeHeader, contentType);
+        AssertSingleHeader(response, StubIdHeader, StubId);
+        AssertSingleHeader(response, BackendErrorHeader, BackendErrorValue);
+        AssertSingleHeader(response, ContentLengthHeader, body.Length.ToString(CultureInfo.InvariantCulture));
+        Assert.True(response.Body.AsSpan().SequenceEqual(body), "facade response body differs from the backend's body");
+
+        // The response is the backend's answer to this very call, on the listener of its surface.
+        Assert.True(backend.Received.Count == 1, "backend did not receive exactly one request");
+        IReadOnlyList<StubRequest> received = backend.ReceivedOn(soap ? StubListener.Soap : StubListener.Rest);
+        Assert.True(received.Count == 1, "backend request did not arrive on the listener of its surface");
+        Assert.Equal(request.PathAndQuery, received[0].RawTarget);
+
+        // Assert.Single would print the entries, whose messages hold durations.
+        IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
+        Assert.True(calls.Count == 1, "backend error response did not write exactly one backend call line");
+        Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(status, calls[0].Value("Status"));
+    }
+
+    // A JSON error body of the backend's own; the 502 and 504 ones are problem documents unlike the
+    // facade's, and the 404 one carries a non-ASCII character so that its UTF-8 bytes are compared too.
+    private static string RestErrorBody(int status) => status switch
+    {
+        400 => "{\"error\":\"invalid agent\",\"status\":400}",
+        404 => "{\"error\":\"no agent named Zo\u00eb\",\"status\":404}",
+        500 => "{\"error\":\"backend failure\",\"status\":500}",
+        502 => "{\"type\":\"about:blank\",\"title\":\"Upstream unavailable\",\"status\":502,\"detail\":\"The backend's own upstream could not be reached.\"}",
+        504 => "{\"type\":\"about:blank\",\"title\":\"Upstream timed out\",\"status\":504,\"detail\":\"The backend's own upstream did not respond in time.\"}",
+        _ => throw new ArgumentOutOfRangeException(nameof(status)),
+    };
+
+    // A SOAP 1.1 Fault envelope of the backend's own, whose faultstring is neither "Backend unavailable"
+    // nor "Backend timed out".
+    private static string SoapFaultBody(int status) => status switch
+    {
+        400 => SoapFault("soap:Client", "Agent request rejected"),
+        404 => SoapFault("soap:Client", "No agent named Zo\u00eb"),
+        500 => SoapFault("soap:Server", "Agent lookup failed"),
+        502 => SoapFault("soap:Server", "Upstream unavailable"),
+        504 => SoapFault("soap:Server", "Upstream timed out"),
+        _ => throw new ArgumentOutOfRangeException(nameof(status)),
+    };
+
+    private static string SoapFault(string faultCode, string faultString) =>
+        "<soap:Envelope xmlns:soap=\"http://schemas.xmlsoap.org/soap/envelope/\"><soap:Body><soap:Fault>"
+        + "<faultcode>" + faultCode + "</faultcode><faultstring>" + faultString + "</faultstring>"
+        + "</soap:Fault></soap:Body></soap:Envelope>";
+
+    // The header must arrive exactly once with exactly the backend's value; the message names the header,
+    // so a missing header gives a signature of its own.
+    private static void AssertSingleHeader(RawResponse response, string name, string expected)
+    {
+        Assert.True(response.Headers.TryGetValue(name, out string[]? values), "facade response has no " + name + " header");
+        Assert.True(values.Length == 1, "facade response does not carry the " + name + " header exactly once");
+        Assert.Equal(expected, values[0]);
+    }
+}
+
 // Forwarding transport (class ForwardingTransportTests) sits here, because its single-delivery cases
 // end in the facade's unreachable-backend 502 or SOAP Fault, as a class of its own: the results
 // report counts test classes whose names end in "FailureBehaviourTests" as the unreachable and
@@ -590,9 +865,18 @@ public sealed class LogLevelFloorsTests
 // Transport fidelity of forwarding, observed as raw bytes on both sides of the facade: a body-less write,
 // and a write sent with Expect: 100-continue with or without a body, reaches a backend that closes the
 // connection without answering exactly once, a body-less request keeps the wire form the HTTP stack gives
-// it, and header values outside ASCII pass byte for byte in both directions. The backends are raw TcpListener sockets and the caller is a raw socket, because HttpClient
-// adds Content-Length: 0 to a body-less write and refuses non-ASCII header values on the test's own side,
-// and a Kestrel stub would decode the bytes it is meant to record.
+// it, and header values outside ASCII pass byte for byte in both directions. A backend's response head
+// larger than the HTTP stack's 64 KiB default reaches the caller unchanged. A backend that receives the
+// whole request and then gives no usable response head gets the facade's unavailable answer on every
+// operation. An upload reaches the backend without an Expect header the caller did not send, and a
+// caller's own Expect cannot hold the body back for the whole of a short deadline. A backend that answers
+// an upload the caller has paused, on a new or a reused connection, with or without the caller's own
+// Expect, has its answer reach the caller at once and unchanged, one that drops such an upload gets the
+// unavailable answer at once, and an interim response during an upload does not end it. The backends are
+// raw TcpListener sockets and the caller is a raw socket where bytes matter, because HttpClient adds
+// Content-Length: 0 to a body-less write, refuses non-ASCII header values and response heads over 64 KiB
+// on the test's own side, sends a whole body before it reads any response, and a Kestrel stub would
+// decode the bytes it is meant to record.
 //
 // Failures are identified across runs by a signature over the exception type, the failing line and the
 // assertion message, so every message and Assert.Equal operand here is run-invariant: the backend's
@@ -601,13 +885,44 @@ public sealed class LogLevelFloorsTests
 /// <summary>
 /// Raw-byte checks of what the facade sends to a backend and returns to a caller: single delivery of
 /// body-less writes and of writes sent with <c>Expect: 100-continue</c>, the unchanged wire form of
-/// body-less requests, and Latin-1 header bytes in both directions.
+/// body-less requests, Latin-1 header bytes in both directions, response heads beyond 64 KiB, the
+/// unavailable answer to a backend that breaks its reply, uploads that carry only the caller's own
+/// <c>Expect</c>, and a backend's answer to, or drop of, an upload the caller has paused.
 /// </summary>
 public sealed class ForwardingTransportTests
 {
     private const string PostCreateTenderId = "Rest.postCreateTender";
     private const string PostCreateAgentId = "Rest.postCreateAgent";
+    private const string PostCreateRetailSaleId = "Rest.postCreateRetailSale";
     private const string GetCompanyId = "Rest.getCompany";
+    private const string GetAgentNamesId = "Soap.getAgentNames";
+
+    // How a backend that has received the whole request breaks the exchange before any usable response
+    // head: bytes that are no HTTP response, a close or a reset without an answer, a status line whose code
+    // is not a number, a header line without a colon, and two Content-Length values that disagree.
+    private const string GarbageReply = "garbage";
+    private const string CloseUnanswered = "close";
+    private const string ResetUnanswered = "reset";
+    private const string BadStatusLine = "bad-status-line";
+    private const string BadHeaderLine = "bad-header-line";
+    private const string ConflictingContentLength = "conflicting-content-length";
+
+    private const string ForwardedOutcome = "forwarded";
+    private const string UnavailableOutcome = "unavailable";
+
+    private const string JsonContentType = "application/json";
+    private const string ExpectHeaderName = "Expect";
+
+    // The HTTP stack's default response-head limit, 64 KiB, and header lines that together exceed it.
+    private const int DefaultResponseHeadLimit = 64 * 1024;
+    private const int FillerLineCount = 80;
+    private const int FillerValueLength = 1000;
+
+    // An upload of 1 MiB, the size from which an HTTP client such as curl asks for 100-continue itself.
+    private const int LargeUploadLength = 1024 * 1024;
+
+    // A target deadline of one second, the handler's default wait for 100 Continue.
+    private const int ShortDeadlineSeconds = 1;
 
     // A REST target that is no catalogue operation, which the REST catch-all forwards to the default target.
     private const string UnmatchedTarget = "/x";
@@ -616,6 +931,46 @@ public sealed class ForwardingTransportTests
     private const string BackendAuthorityToken = "{backend}";
 
     private const string ProbeHeader = "X-Probe: one\r\n";
+
+    // The callers of a paused upload: a REST write, a SOAP call naming its operation in SOAPAction, and a
+    // SOAP call without SOAPAction, whose body the facade inspects and buffers before forwarding it.
+    private const string RestCaller = "rest";
+    private const string SoapActionCaller = "soap-action";
+    private const string SoapInspectedCaller = "soap-inspected";
+
+    // How an early-answering backend treats a request once it has read the head: it answers 413 and
+    // closes its side, answers and keeps the connection open, or answers 100 Continue, reads part of the
+    // body and then answers 413; it reads part of the body and closes or resets without answering; or it
+    // sends an interim response, 100 Continue after the facade's wait for it or 103 Early Hints at once,
+    // and then reads the whole body and answers 200.
+    private const string AnswerThenClose = "answer-then-close";
+    private const string AnswerKeepOpen = "answer-keep-open";
+    private const string ContinueThenAnswer = "continue-then-answer";
+    private const string LateContinue = "late-continue";
+    private const string EarlyHints = "early-hints";
+
+    // The early answer, as the backend sends it and as the caller must receive its status, headers and body.
+    private const string EarlyAnswerHead =
+        "HTTP/1.1 413 Payload Too Large\r\nContent-Type: text/plain\r\nX-Early: rejected\r\nContent-Length: 8\r\n";
+    private const string EarlyAnswerBody = "rejected";
+    private const string EarlyAnswerHeaderLine = "\r\nX-Early: rejected\r\n";
+    private const string EarlyAnswerContentTypeLine = "\r\nContent-Type: text/plain\r\n";
+
+    // A paused upload declares 4 MiB, or is chunked, and sends one 128 KiB part, then only reads. The
+    // target deadline is several seconds, and the backend's answer must arrive well inside it.
+    private const int PausedDeclaredLength = 4 * 1024 * 1024;
+    private const int PausedPartLength = 128 * 1024;
+    private const int PausedUploadDeadlineSeconds = 8;
+
+    // An upload during which the backend sends an interim response: 256 KiB, sent in two halves.
+    private const int InterimUploadLength = 256 * 1024;
+    private const int InterimDeadlineSeconds = 6;
+
+    // A paused upload carrying the caller's own Expect whose declared length is small enough, at most
+    // 1024 bytes, that the HTTP stack still sends the body after the backend has refused the expectation
+    // with a final status; the caller sends half of it.
+    private const int SmallDeclaredLength = 1000;
+    private const int SmallPartLength = 500;
 
     // Makes Kestrel report the request as upgradable; YARP tunnels only WebSocket and SPDY/* upgrades and
     // drops these hop-by-hop headers from any other request.
@@ -632,6 +987,15 @@ public sealed class ForwardingTransportTests
     private const string BackendBody = "{\"stub\":\"hdr\"}";
 
     private static readonly TimeSpan RawCallerTimeout = TimeSpan.FromSeconds(15);
+    private static readonly TimeSpan LogWaitBound = TimeSpan.FromSeconds(5);
+    private static readonly TimeSpan UnavailableBound = TimeSpan.FromSeconds(5);
+
+    // Well inside the paused upload's 8 s deadline; the answer itself takes milliseconds.
+    private static readonly TimeSpan PausedAnswerBound = TimeSpan.FromSeconds(2);
+
+    // The caller sends the second half of an interim-answered upload after this pause, by which time the
+    // facade's one-second wait for 100 Continue has ended and the late 100 Continue (1.5 s) has arrived.
+    private static readonly TimeSpan InterimUploadPause = TimeSpan.FromMilliseconds(2500);
 
     /// <summary>
     /// Body-less writes and the headers they carry: the path-only catalogue write <c>postCreateTender</c>,
@@ -667,6 +1031,60 @@ public sealed class ForwardingTransportTests
         { "GET", CatalogueTarget(GetCompanyId), false, false },
         { "DELETE", UnmatchedTarget, false, false },
     };
+
+    /// <summary>
+    /// Every way of breaking the reply, for a REST write with a JSON body, a body-less REST write, a REST
+    /// read and a SOAP operation, which always carries a body.
+    /// </summary>
+    public static MatrixTheoryData<string, string> BrokenRepliesByOperation() => new(
+        [GarbageReply, CloseUnanswered, ResetUnanswered, BadStatusLine, BadHeaderLine, ConflictingContentLength],
+        [PostCreateAgentId, PostCreateRetailSaleId, GetCompanyId, GetAgentNamesId]);
+
+    /// <summary>
+    /// A body-less read and a write with a body, each answered with a success and with an error status.
+    /// </summary>
+    public static TheoryData<string, int> LargeResponseHeads() => new()
+    {
+        { GetCompanyId, 200 },
+        { GetCompanyId, 404 },
+        { PostCreateAgentId, 200 },
+        { PostCreateAgentId, 404 },
+    };
+
+    /// <summary>Whether an upload is chunked rather than framed by <c>Content-Length</c>.</summary>
+    public static TheoryData<bool> UploadFramings() => new() { false, true };
+
+    /// <summary>
+    /// Every caller of a paused upload, of declared length or chunked, against each way a backend answers
+    /// it early: 413 and a close of its side, 413 on a connection it keeps open, and, to a caller's own
+    /// <c>Expect: 100-continue</c>, 100 Continue, part of the body read, then 413.
+    /// </summary>
+    public static MatrixTheoryData<string, bool, string> PausedUploadsAnswered() => new(
+        [RestCaller, SoapActionCaller, SoapInspectedCaller],
+        [false, true],
+        [AnswerThenClose, AnswerKeepOpen, ContinueThenAnswer]);
+
+    /// <summary>
+    /// Every caller of a paused upload, of declared length or chunked, against a backend that reads part of
+    /// it and then closes or resets the connection without answering.
+    /// </summary>
+    public static MatrixTheoryData<string, bool, string> PausedUploadsDropped() => new(
+        [RestCaller, SoapActionCaller, SoapInspectedCaller],
+        [false, true],
+        [CloseUnanswered, ResetUnanswered]);
+
+    /// <summary>
+    /// The ways a backend answers the head of an upload at once: closing its side, or keeping the
+    /// connection open.
+    /// </summary>
+    public static TheoryData<string> ImmediateAnswers() => new() { AnswerThenClose, AnswerKeepOpen };
+
+    /// <summary>
+    /// The interim responses a backend sends during an upload it goes on to read in full: a 100 Continue to
+    /// the caller's own <c>Expect</c> that arrives after the facade's wait for it, and 103 Early Hints to an
+    /// upload without <c>Expect</c>.
+    /// </summary>
+    public static TheoryData<string> InterimResponses() => new() { LateContinue, EarlyHints };
 
     [Theory]
     [MemberData(nameof(BodylessWrites))]
@@ -812,6 +1230,437 @@ public sealed class ForwardingTransportTests
         Assert.Equal(BackendBody, Encoding.Latin1.GetString(response.Body));
     }
 
+    /// <summary>
+    /// A backend's response head beyond the HTTP stack's 64 KiB default, with a success or an error
+    /// status, reaches the caller as the backend sent it, for a body-less read and for a write with a
+    /// body: the status, every header line in order and the body bytes, logged <c>forwarded</c> with the
+    /// backend's status. The facade sets no response-head limit of its own.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(LargeResponseHeads))]
+    public async Task ResponseHeadBeyond64KiBReachesCallerUnchanged(string operationId, int status)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        string filler = FillerHeaderLines();
+        Assert.True(filler.Length > DefaultResponseHeadLimit, "filler header lines do not exceed the 64 KiB default");
+        byte[] reply = Encoding.Latin1.GetBytes(
+            "HTTP/1.1 " + status.ToString(CultureInfo.InvariantCulture) + (status == 200 ? " OK" : " Not Found") + "\r\n"
+            + "Content-Type: " + JsonContentType + "\r\n"
+            + filler
+            + "Content-Length: " + BackendBody.Length.ToString(CultureInfo.InvariantCulture) + "\r\n"
+            + "\r\n"
+            + BackendBody);
+        var logs = new LogCapture();
+        await using ScriptedBackend backend = ScriptedBackend.Start(reply);
+        await using FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, timeoutSeconds: null, ct);
+
+        PreparedRequest request = OperationRequests.ForRest(OperationCatalogue.Default.GetById(operationId));
+        string body = request.Body is null ? string.Empty : Encoding.Latin1.GetString(request.Body);
+        string headers = request.Body is null
+            ? ProbeHeader
+            : "Content-Type: " + request.ContentType + "\r\nContent-Length: " + body.Length.ToString(CultureInfo.InvariantCulture) + "\r\n";
+        RawExchange response = await SendRawAsync(
+            facade.RestPort, CallerHead(request.Method.Method, request.PathAndQuery, headers, body), ct);
+
+        Assert.Equal(status, response.Status);
+        Assert.True(
+            response.Head.Contains("\r\n" + filler, StringComparison.Ordinal),
+            "backend's header lines beyond 64 KiB did not reach the caller unchanged and in order");
+        Assert.True(
+            response.Head.Contains("\r\nContent-Type: " + JsonContentType + "\r\n", StringComparison.Ordinal),
+            "backend's Content-Type did not reach the caller unchanged");
+        Assert.Equal(BackendBody, Encoding.Latin1.GetString(response.Body));
+
+        IReadOnlyList<ScriptedRequest> received = backend.Requests;
+        Assert.True(received.Count == 1, "request answered with a large head did not reach the backend exactly once");
+        Assert.True(received[0].Body.AsSpan().SequenceEqual(request.Body ?? []), "backend did not receive the request body byte for byte");
+
+        IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
+        Assert.True(calls.Count == 1, "large response head did not write exactly one backend call line");
+        Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(status, calls[0].Value("Status"));
+        Assert.Equal(LogLevel.Information, calls[0].Level);
+    }
+
+    /// <summary>
+    /// A backend that receives the whole request and then gives no usable response head gets the
+    /// facade's unavailable answer, whether or not the request carried a body: REST 502 with the fixed
+    /// problem+json body, SOAP HTTP 500 with the SOAP 1.1 "Backend unavailable" Fault, logged
+    /// <c>unavailable</c> with that status. A write reaches the backend exactly once; the HTTP stack may
+    /// resend a body-less read.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(BrokenRepliesByOperation))]
+    public async Task BackendThatBreaksItsReplyGetsTheUnavailableAnswer(string breakage, string operationId)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var logs = new LogCapture();
+        await using ScriptedBackend backend = ScriptedBackend.Start(BrokenReply(breakage), reset: breakage == ResetUnanswered);
+        await using FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, timeoutSeconds: null, ct);
+
+        OperationDescriptor operation = OperationCatalogue.Default.GetById(operationId);
+        PreparedRequest request = OperationRequests.For(operation);
+        Uri socket = operation.Surface == Surface.Rest ? facade.RestBaseAddress : facade.SoapBaseAddress;
+        using HttpClient client = facade.CreateRawClient();
+        RawResponse response = await FacadeFactory.SendAsync(client, request.ToMessage(socket), ct);
+
+        int expectedStatus = UnavailableAnswers.AssertMatches(response, operationId);
+        Assert.True(response.Elapsed <= UnavailableBound, "unavailable answer to a broken reply exceeded 5 s bound");
+
+        IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
+        Assert.True(calls.Count == 1, "broken reply did not write exactly one backend call line");
+        Assert.Equal(UnavailableOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(expectedStatus, calls[0].Value("Status"));
+        Assert.Equal(LogLevel.Warning, calls[0].Level);
+
+        int received = backend.Requests.Count;
+        if (request.Method == HttpMethod.Get)
+        {
+            Assert.True(received >= 1, "read answered with a broken reply did not reach the backend");
+        }
+        else
+        {
+            Assert.True(received == 1, "write answered with a broken reply did not reach the backend exactly once");
+        }
+    }
+
+    /// <summary>
+    /// A backend that refuses every request carrying an <c>Expect</c> header with 417, and accepts the
+    /// same upload without one, accepts a 1 MiB upload the caller sent without <c>Expect</c>, framed by
+    /// <c>Content-Length</c> or chunked: the facade adds no expectation, so the backend's 200 reaches the
+    /// caller, logged <c>forwarded</c>, and the backend receives the body byte for byte, once.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(UploadFramings))]
+    public async Task UploadWithoutExpectIsAcceptedByBackendThatRefusesExpectations(bool chunked)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var logs = new LogCapture();
+        byte[] refusal = "HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"u8.ToArray();
+        await using ScriptedBackend backend = ScriptedBackend.Start(OkReply(), expectationReply: refusal);
+        await using FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, timeoutSeconds: null, ct);
+
+        PreparedRequest write = OperationRequests.ForRest(OperationCatalogue.Default.GetById(PostCreateAgentId));
+        string body = new('x', LargeUploadLength);
+        string headers = "Content-Type: " + write.ContentType + "\r\n"
+            + (chunked
+                ? "Transfer-Encoding: chunked\r\n"
+                : "Content-Length: " + body.Length.ToString(CultureInfo.InvariantCulture) + "\r\n");
+        string framedBody = chunked
+            ? body.Length.ToString("x", CultureInfo.InvariantCulture) + "\r\n" + body + "\r\n0\r\n\r\n"
+            : body;
+
+        RawExchange response = await SendRawAsync(
+            facade.RestPort, CallerHead(write.Method.Method, write.PathAndQuery, headers, framedBody), ct);
+
+        Assert.Equal(200, response.Status);
+        Assert.Equal(BackendBody, Encoding.Latin1.GetString(response.Body));
+        IReadOnlyList<ScriptedRequest> received = backend.Requests;
+        Assert.True(received.Count == 1, "upload without Expect did not reach the backend exactly once");
+        Assert.True(received[0].HeaderCount(ExpectHeaderName) == 0, "an Expect header the caller did not send reached the backend");
+        Assert.True(received[0].Body.AsSpan().SequenceEqual(Encoding.Latin1.GetBytes(body)), "backend did not receive the upload byte for byte");
+
+        IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
+        Assert.True(calls.Count == 1, "accepted upload did not write exactly one backend call line");
+        Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(200, calls[0].Value("Status"));
+    }
+
+    /// <summary>
+    /// A caller's own <c>Expect: 100-continue</c> reaches a backend that never sends 100 Continue and
+    /// answers once the body has arrived, under a one-second target deadline: the facade's wait for 100
+    /// Continue ends inside the deadline, so the body is sent, once, and the backend's 200 reaches the
+    /// caller, logged <c>forwarded</c>, never the facade's 504.
+    /// </summary>
+    [Fact]
+    public async Task CallerExpectContinueToSilentBackendIsAnsweredWithinShortDeadline()
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var logs = new LogCapture();
+        await using ScriptedBackend backend = ScriptedBackend.Start(OkReply());
+        await using FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, ShortDeadlineSeconds, ct);
+
+        PreparedRequest write = OperationRequests.ForRest(OperationCatalogue.Default.GetById(PostCreateAgentId));
+        string body = Encoding.Latin1.GetString(write.Body!);
+        string headers = "Content-Type: " + write.ContentType + "\r\n"
+            + "Content-Length: " + body.Length.ToString(CultureInfo.InvariantCulture) + "\r\n"
+            + ExpectContinueHeader;
+
+        RawExchange response = await SendRawAsync(
+            facade.RestPort, CallerHead(write.Method.Method, write.PathAndQuery, headers, body), ct);
+
+        Assert.Equal(200, response.Status);
+        Assert.Equal(BackendBody, Encoding.Latin1.GetString(response.Body));
+        IReadOnlyList<ScriptedRequest> received = backend.Requests;
+        Assert.True(received.Count == 1, "write with the caller's Expect did not reach the backend exactly once");
+        Assert.True(received[0].HeaderCount(ExpectHeaderName) == 1, "the caller's Expect did not reach the backend exactly once");
+        Assert.Equal("100-continue", received[0].HeaderValue(ExpectHeaderName));
+        Assert.True(received[0].Body.AsSpan().SequenceEqual(write.Body!), "backend did not receive the body byte for byte");
+
+        IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
+        Assert.True(calls.Count == 1, "write with the caller's Expect did not write exactly one backend call line");
+        Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(200, calls[0].Value("Status"));
+    }
+
+    /// <summary>
+    /// A backend that answers an upload the caller has paused, before reading all of it, has its answer
+    /// reach the caller unchanged, well inside the deadline: for a REST write, a SOAP call naming its
+    /// operation in <c>SOAPAction</c> and a SOAP call whose body the facade inspects, each declaring 4 MiB
+    /// or chunked, sending 128 KiB and then only reading on its open connection. Whether the backend
+    /// answers at once and closes its side, answers and keeps the connection open, or answers a caller's
+    /// own <c>Expect: 100-continue</c>, reads part of the body and then answers, the caller gets the
+    /// backend's 413 with its headers and body, logged <c>forwarded</c>; the backend receives the request
+    /// once, with an <c>Expect</c> only when the caller sent one and no more of the body than the caller
+    /// sent, and the facade logs no error.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(PausedUploadsAnswered))]
+    public async Task BackendAnswerToPausedUploadReachesCallerAtOnce(string caller, bool chunked, string behaviour)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var logs = new LogCapture();
+        bool callerExpects = behaviour == ContinueThenAnswer;
+        PausedUpload upload = PausedUpload.For(caller, chunked, callerExpects);
+        await using EarlyAnswerBackend backend = EarlyAnswerBackend.Start(behaviour);
+        FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, PausedUploadDeadlineSeconds, ct);
+
+        UploadExchange exchange;
+        try
+        {
+            exchange = await SendUploadAsync(upload.Port(facade), upload.HeadAndPart, rest: null, ct);
+        }
+        finally
+        {
+            // Stopping the host waits for the caller's connection to end, so everything the call logs, the
+            // server's drain of the unsent body included, has been written before the log is read.
+            await facade.DisposeAsync();
+        }
+
+        AssertEarlyAnswer(exchange);
+
+        // Disposing the backend waits for its connections to end, so its count of body bytes is final. A
+        // body of declared length goes out as the caller's own bytes, so the count shows that none of the
+        // padding completing it was sent; the HTTP stack frames a chunked body in chunks of its own.
+        await backend.DisposeAsync();
+        Assert.True(chunked || backend.BodyBytesReceived <= upload.PartLength, "backend received more of the paused upload than the caller sent");
+
+        IReadOnlyList<ScriptedRequest> received = backend.Requests;
+        Assert.True(received.Count == 1, "paused upload did not reach the backend exactly once");
+        Assert.Equal(callerExpects ? 1 : 0, received[0].HeaderCount(ExpectHeaderName));
+
+        IReadOnlyList<CapturedLog> calls = logs.BackendCalls;
+        Assert.True(calls.Count == 1, "answered paused upload did not write exactly one backend call line");
+        Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(413, calls[0].Value("Status"));
+        Assert.Equal(upload.JadeMethod, calls[0].Value("Operation"));
+        Assert.Equal(LogLevel.Information, calls[0].Level);
+        Assert.True(logs.Entries.All(entry => entry.Level < LogLevel.Error), "facade logged an error for a backend's answer to a paused upload");
+    }
+
+    /// <summary>
+    /// A backend that reads part of an upload the caller has paused and then closes or resets the
+    /// connection without answering gets the facade's unavailable answer at once, well inside the
+    /// deadline, never the timeout: REST 502 with the fixed problem+json body, or the SOAP "Backend
+    /// unavailable" Fault, logged <c>unavailable</c>. The upload reaches the backend once, with no more of
+    /// the body than the caller sent, and the facade logs no error.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(PausedUploadsDropped))]
+    public async Task BackendThatDropsPausedUploadGetsTheUnavailableAnswerAtOnce(string caller, bool chunked, string behaviour)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var logs = new LogCapture();
+        PausedUpload upload = PausedUpload.For(caller, chunked, expectContinue: false);
+        await using EarlyAnswerBackend backend = EarlyAnswerBackend.Start(behaviour);
+        FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, PausedUploadDeadlineSeconds, ct);
+
+        UploadExchange exchange;
+        try
+        {
+            exchange = await SendUploadAsync(upload.Port(facade), upload.HeadAndPart, rest: null, ct);
+        }
+        finally
+        {
+            await facade.DisposeAsync();
+        }
+
+        int expectedStatus = UnavailableAnswers.AssertMatches(exchange.ToRawResponse(), upload.OperationId);
+        Assert.True(exchange.Elapsed <= PausedAnswerBound, "unavailable answer to a dropped paused upload did not arrive well inside the deadline");
+        Assert.True(backend.Requests.Count == 1 && backend.Connections == 1, "dropped paused upload did not reach the backend exactly once");
+
+        // Disposing the backend waits for its connections to end, so its count of body bytes is final. A
+        // body of declared length goes out as the caller's own bytes, so the count shows that none of the
+        // padding completing it was sent; the HTTP stack frames a chunked body in chunks of its own.
+        await backend.DisposeAsync();
+        Assert.True(chunked || backend.BodyBytesReceived <= upload.PartLength, "backend received more of the paused upload than the caller sent");
+
+        IReadOnlyList<CapturedLog> calls = logs.BackendCalls;
+        Assert.True(calls.Count == 1, "dropped paused upload did not write exactly one backend call line");
+        Assert.Equal(UnavailableOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(expectedStatus, calls[0].Value("Status"));
+        Assert.Equal(LogLevel.Warning, calls[0].Level);
+        Assert.True(logs.Entries.All(entry => entry.Level < LogLevel.Error), "facade logged an error for a dropped paused upload");
+    }
+
+    /// <summary>
+    /// On a backend connection reused from an earlier call, a backend that answers the head of a paused
+    /// upload at once, and keeps the connection open, has its 413 reach the caller unchanged well inside
+    /// the deadline, although the HTTP stack's read ahead on the reused connection takes the answer before
+    /// the facade has read any of the caller's body. Both calls are logged <c>forwarded</c> and travel on
+    /// one backend connection.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(UploadFramings))]
+    public async Task BackendAnswerToHeadOfPausedUploadOnReusedConnectionReachesCallerAtOnce(bool chunked)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var logs = new LogCapture();
+        PausedUpload upload = PausedUpload.For(RestCaller, chunked, expectContinue: false);
+        await using EarlyAnswerBackend backend = EarlyAnswerBackend.Start(AnswerKeepOpen, answerFirstRequest: true);
+        FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, PausedUploadDeadlineSeconds, ct);
+
+        RawExchange first;
+        UploadExchange exchange;
+        try
+        {
+            first = await SendRawAsync(facade.RestPort, CallerHead("GET", CatalogueTarget(GetCompanyId), ProbeHeader), ct);
+            exchange = await SendUploadAsync(facade.RestPort, upload.HeadAndPart, rest: null, ct);
+        }
+        finally
+        {
+            await facade.DisposeAsync();
+        }
+
+        Assert.Equal(200, first.Status);
+        AssertEarlyAnswer(exchange);
+        Assert.True(
+            backend.Connections == 1 && backend.Requests.Count == 2,
+            "the paused upload did not reach the backend once on the connection of the earlier call");
+
+        // Disposing the backend waits for its connections to end, so its count of body bytes is final. A
+        // body of declared length goes out as the caller's own bytes, so the count shows that none of the
+        // padding completing it was sent; the HTTP stack frames a chunked body in chunks of its own.
+        await backend.DisposeAsync();
+        Assert.True(chunked || backend.BodyBytesReceived <= upload.PartLength, "backend received more of the paused upload than the caller sent");
+
+        IReadOnlyList<CapturedLog> calls = logs.BackendCalls;
+        Assert.True(calls.Count == 2, "reused connection did not write exactly two backend call lines");
+        Assert.Equal(ForwardedOutcome, calls[1].Value("Outcome"));
+        Assert.Equal(413, calls[1].Value("Status"));
+        Assert.True(logs.Entries.All(entry => entry.Level < LogLevel.Error), "facade logged an error for an answer on a reused connection");
+    }
+
+    /// <summary>
+    /// A backend that refuses the caller's own <c>Expect: 100-continue</c> on a small paused upload with
+    /// 413 at once, before any of the body has been read, has its answer reach the caller unchanged well
+    /// inside the deadline, whether it closes its side or keeps the connection open. The HTTP stack reads
+    /// that answer before it starts sending the small body, and still sends it: the answer it read before
+    /// the upload began ends the upload as soon as it starts. Logged <c>forwarded</c>, the request reaches
+    /// the backend once, carrying the caller's <c>Expect</c>.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(ImmediateAnswers))]
+    public async Task BackendRefusalOfExpectationOnSmallPausedUploadReachesCallerAtOnce(string behaviour)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var logs = new LogCapture();
+        await using EarlyAnswerBackend backend = EarlyAnswerBackend.Start(behaviour);
+        FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, PausedUploadDeadlineSeconds, ct);
+
+        PreparedRequest write = OperationRequests.ForRest(OperationCatalogue.Default.GetById(PostCreateAgentId));
+        byte[] part = new byte[SmallPartLength];
+        Array.Fill(part, (byte)'x');
+        byte[] head = Encoding.Latin1.GetBytes(
+            "POST " + write.PathAndQuery + " HTTP/1.1\r\nHost: facade\r\n"
+            + "Content-Type: " + write.ContentType + "\r\n"
+            + ExpectContinueHeader
+            + "Content-Length: " + SmallDeclaredLength.ToString(CultureInfo.InvariantCulture) + "\r\n\r\n");
+
+        UploadExchange exchange;
+        try
+        {
+            exchange = await SendUploadAsync(facade.RestPort, [.. head, .. part], rest: null, ct);
+        }
+        finally
+        {
+            await facade.DisposeAsync();
+        }
+
+        AssertEarlyAnswer(exchange);
+        IReadOnlyList<ScriptedRequest> received = backend.Requests;
+        Assert.True(received.Count == 1, "small paused upload with the caller's Expect did not reach the backend exactly once");
+        Assert.Equal(1, received[0].HeaderCount(ExpectHeaderName));
+
+        // Disposing the backend waits for its connections to end, so its count of body bytes is final. A
+        // body of declared length goes out as the caller's own bytes, so the count shows that none of the
+        // padding completing it was sent; the HTTP stack frames a chunked body in chunks of its own.
+        await backend.DisposeAsync();
+        Assert.True(backend.BodyBytesReceived <= SmallPartLength, "backend received more of the paused upload than the caller sent");
+
+        IReadOnlyList<CapturedLog> calls = logs.BackendCalls;
+        Assert.True(calls.Count == 1, "refused expectation did not write exactly one backend call line");
+        Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(413, calls[0].Value("Status"));
+        Assert.True(logs.Entries.All(entry => entry.Level < LogLevel.Error), "facade logged an error for a refused expectation");
+    }
+
+    /// <summary>
+    /// An interim response during an upload does not end it: a 100 Continue to the caller's own
+    /// <c>Expect</c> that arrives after the facade's one-second wait for it, and 103 Early Hints to an
+    /// upload without <c>Expect</c>, both while the caller pauses between the two halves of its body. The
+    /// backend still receives the whole upload, once and byte for byte, and its 200 reaches the caller,
+    /// logged <c>forwarded</c>.
+    /// </summary>
+    [Theory]
+    [MemberData(nameof(InterimResponses))]
+    public async Task InterimResponseDuringUploadDoesNotEndIt(string interim)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var logs = new LogCapture();
+        bool callerExpects = interim == LateContinue;
+        await using EarlyAnswerBackend backend = EarlyAnswerBackend.Start(interim);
+        await using FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, InterimDeadlineSeconds, ct);
+
+        PreparedRequest write = OperationRequests.ForRest(OperationCatalogue.Default.GetById(PostCreateAgentId));
+        byte[] body = new byte[InterimUploadLength];
+        Array.Fill(body, (byte)'x');
+        byte[] head = Encoding.Latin1.GetBytes(
+            "POST " + write.PathAndQuery + " HTTP/1.1\r\nHost: facade\r\n"
+            + "Content-Type: " + write.ContentType + "\r\n"
+            + (callerExpects ? ExpectContinueHeader : string.Empty)
+            + "Content-Length: " + InterimUploadLength.ToString(CultureInfo.InvariantCulture) + "\r\n\r\n");
+        int half = InterimUploadLength / 2;
+
+        UploadExchange exchange = await SendUploadAsync(facade.RestPort, [.. head, .. body.AsSpan(0, half)], body[half..], ct);
+
+        Assert.Equal(200, exchange.Response.Status);
+        Assert.Equal(BackendBody, Encoding.Latin1.GetString(exchange.Response.Body));
+        IReadOnlyList<ScriptedRequest> received = backend.Requests;
+        Assert.True(received.Count == 1, "upload answered with an interim response did not reach the backend exactly once");
+        Assert.True(received[0].Body.AsSpan().SequenceEqual(body), "backend did not receive the whole upload byte for byte after its interim response");
+        Assert.Equal(callerExpects ? 1 : 0, received[0].HeaderCount(ExpectHeaderName));
+
+        IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
+        Assert.True(calls.Count == 1, "upload answered with an interim response did not write exactly one backend call line");
+        Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(200, calls[0].Value("Status"));
+    }
+
+    // The backend's early answer as the caller must receive it: status 413, the backend's X-Early and
+    // Content-Type lines and its body unchanged, well inside the paused upload's deadline.
+    private static void AssertEarlyAnswer(UploadExchange exchange)
+    {
+        RawExchange response = exchange.Response;
+        Assert.Equal(413, response.Status);
+        Assert.True(response.Head.Contains(EarlyAnswerHeaderLine, StringComparison.Ordinal), "backend's X-Early header did not reach the caller unchanged");
+        Assert.True(
+            response.Head.Contains(EarlyAnswerContentTypeLine, StringComparison.Ordinal),
+            "backend's Content-Type did not reach the caller unchanged");
+        Assert.Equal(EarlyAnswerBody, Encoding.Latin1.GetString(response.Body));
+        Assert.True(exchange.Elapsed <= PausedAnswerBound, "backend's answer to a paused upload did not reach the caller well inside the deadline");
+    }
+
     // The raw target of a catalogue REST operation at its normal address, with the catalogue's verb.
     private static string CatalogueTarget(string operationId) =>
         OperationRequests.ForRest(OperationCatalogue.Default.GetById(operationId)).PathAndQuery;
@@ -820,6 +1669,54 @@ public sealed class ForwardingTransportTests
         FacadeFactory.StartAsync(
             new FacadeTestSettings { BackendRestBaseUrl = backend.BaseUrl, BackendSoapBaseUrl = backend.BaseUrl },
             ct);
+
+    // Routes both surfaces to one backend, captures the facade's log and sets the target deadline; null
+    // keeps the facade's default.
+    private static Task<FacadeFactory> StartFacadeAsync(string baseUrl, LogCapture logs, int? timeoutSeconds, CancellationToken ct) =>
+        FacadeFactory.StartAsync(
+            new FacadeTestSettings
+            {
+                BackendRestBaseUrl = baseUrl,
+                BackendSoapBaseUrl = baseUrl,
+                BackendTimeoutSeconds = timeoutSeconds,
+                LoggerProvider = logs,
+            },
+            ct);
+
+    // A backend's 200 with the JSON body BackendBody, framed by Content-Length.
+    private static byte[] OkReply() => Encoding.Latin1.GetBytes(
+        "HTTP/1.1 200 OK\r\n"
+        + "Content-Type: " + JsonContentType + "\r\n"
+        + "Content-Length: " + BackendBody.Length.ToString(CultureInfo.InvariantCulture) + "\r\n"
+        + "\r\n"
+        + BackendBody);
+
+    // The bytes a backend that breaks its reply writes once it has read the request; null for none.
+    private static byte[]? BrokenReply(string breakage) => breakage switch
+    {
+        GarbageReply => "THIS IS NOT HTTP\r\n\r\n"u8.ToArray(),
+        CloseUnanswered or ResetUnanswered => null,
+        BadStatusLine => "HTTP/1.1 abc OK\r\nContent-Length: 2\r\n\r\nok"u8.ToArray(),
+        BadHeaderLine => "HTTP/1.1 200 OK\r\nThis Is Not A Header\r\nContent-Length: 2\r\n\r\nok"u8.ToArray(),
+        ConflictingContentLength => "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Length: 5\r\n\r\nok"u8.ToArray(),
+        _ => throw new ArgumentOutOfRangeException(nameof(breakage)),
+    };
+
+    // FillerLineCount lines "X-Fill-NN: vvv...", each FillerValueLength value bytes, CRLF-terminated.
+    private static string FillerHeaderLines()
+    {
+        var lines = new StringBuilder();
+        for (int line = 0; line < FillerLineCount; line++)
+        {
+            lines.Append("X-Fill-")
+                .Append(line.ToString("D2", CultureInfo.InvariantCulture))
+                .Append(": ")
+                .Append('v', FillerValueLength)
+                .Append("\r\n");
+        }
+
+        return lines.ToString();
+    }
 
     // An HTTP/1.1 request head that frames no body unless extraHeaders carries a Content-Length or
     // Transfer-Encoding, followed by the already framed body bytes. Connection: close is hop-by-hop, so it
@@ -856,6 +1753,205 @@ public sealed class ForwardingTransportTests
         }
 
         return RawExchange.Parse(received);
+    }
+
+    // Sends an upload's head and first part to a facade socket and reads the final response while the
+    // connection stays open, without waiting for the facade to close it. With no rest the upload is
+    // paused for good; otherwise the rest is sent after InterimUploadPause. The elapsed time runs from the
+    // end of the first part to the end of the final response's body.
+    private static async Task<UploadExchange> SendUploadAsync(int port, byte[] first, byte[]? rest, CancellationToken ct)
+    {
+        using var limit = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        limit.CancelAfter(RawCallerTimeout);
+        try
+        {
+            using var client = new TcpClient(AddressFamily.InterNetwork);
+            await client.ConnectAsync(IPAddress.Loopback, port, limit.Token);
+            NetworkStream stream = client.GetStream();
+            await stream.WriteAsync(first, limit.Token);
+            var stopwatch = Stopwatch.StartNew();
+
+            Task sendRest = rest is null ? Task.CompletedTask : SendAfterPauseAsync(stream, rest, limit.Token);
+            RawExchange response = await ReadFinalResponseAsync(stream, limit.Token);
+            stopwatch.Stop();
+            await sendRest;
+            return new UploadExchange(response, stopwatch.Elapsed);
+        }
+        catch (Exception exception) when (
+            exception is SocketException or IOException
+            || (exception is OperationCanceledException && !ct.IsCancellationRequested))
+        {
+            Assert.Fail("raw facade upload failed at the transport level (" + exception.GetType().Name + ")");
+            throw new UnreachableException();
+        }
+
+        static async Task SendAfterPauseAsync(NetworkStream stream, byte[] rest, CancellationToken ct)
+        {
+            await Task.Delay(InterimUploadPause, ct);
+            await stream.WriteAsync(rest, ct);
+        }
+    }
+
+    // Reads until a final response and the whole body its Content-Length declares have arrived, past any
+    // interim response, such as the 100 Continue the facade's server writes to a caller's own Expect.
+    private static async Task<RawExchange> ReadFinalResponseAsync(NetworkStream stream, CancellationToken ct)
+    {
+        using var received = new MemoryStream();
+        byte[] buffer = new byte[16 * 1024];
+        while (true)
+        {
+            if (TryTakeFinalResponse(received.GetBuffer().AsSpan(0, (int)received.Length)) is { } response)
+            {
+                return response;
+            }
+
+            int read = await stream.ReadAsync(buffer, ct);
+            Assert.True(read > 0, "facade closed the connection before a complete final response");
+            received.Write(buffer, 0, read);
+        }
+    }
+
+    // The final response in the bytes received so far, or null while its head or body is incomplete.
+    private static RawExchange? TryTakeFinalResponse(ReadOnlySpan<byte> received)
+    {
+        int start = 0;
+        while (true)
+        {
+            int end = received[start..].IndexOf("\r\n\r\n"u8);
+            if (end < 0)
+            {
+                return null;
+            }
+
+            string head = Encoding.Latin1.GetString(received.Slice(start, end + 4));
+            string[] statusLine = head[..head.IndexOf('\r', StringComparison.Ordinal)].Split(' ');
+            int status = -1;
+            Assert.True(
+                statusLine.Length >= 2 && int.TryParse(statusLine[1], NumberStyles.None, CultureInfo.InvariantCulture, out status),
+                "facade response has no status code");
+            start += end + 4;
+            if (status < 200)
+            {
+                continue;
+            }
+
+            int length = -1;
+            foreach (string line in head.Split("\r\n").Skip(1))
+            {
+                int colon = line.IndexOf(':', StringComparison.Ordinal);
+                if (colon > 0 && line.AsSpan(0, colon).Trim().Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+                {
+                    Assert.True(
+                        int.TryParse(line.AsSpan(colon + 1).Trim(), NumberStyles.None, CultureInfo.InvariantCulture, out length),
+                        "facade's final response has a malformed Content-Length");
+                }
+            }
+
+            Assert.True(length >= 0, "facade's final response has no Content-Length");
+            return received.Length - start < length ? null : new RawExchange(status, head, received.Slice(start, length).ToArray());
+        }
+    }
+
+    /// <summary>The final response to an upload as the raw caller received it, and how long it took.</summary>
+    /// <param name="Response">The final response.</param>
+    /// <param name="Elapsed">The time from the end of the upload's first part to the end of the response.</param>
+    private sealed record UploadExchange(RawExchange Response, TimeSpan Elapsed)
+    {
+        /// <summary>The response in the form <see cref="UnavailableAnswers"/> asserts on.</summary>
+        public RawResponse ToRawResponse()
+        {
+            var headers = new Dictionary<string, string[]>(StringComparer.OrdinalIgnoreCase);
+            foreach (string line in Response.Head.Split("\r\n").Skip(1))
+            {
+                int colon = line.IndexOf(':', StringComparison.Ordinal);
+                if (colon > 0)
+                {
+                    string name = line[..colon].Trim();
+                    string value = line[(colon + 1)..].Trim();
+                    headers[name] = headers.TryGetValue(name, out string[]? values) ? [.. values, value] : [value];
+                }
+            }
+
+            string? mediaType = null;
+            string? charSet = null;
+            if (headers.TryGetValue("Content-Type", out string[]? contentType)
+                && System.Net.Http.Headers.MediaTypeHeaderValue.TryParse(contentType[0], out System.Net.Http.Headers.MediaTypeHeaderValue? parsed))
+            {
+                mediaType = parsed.MediaType;
+                charSet = parsed.CharSet;
+            }
+
+            return new RawResponse(Response.Status, mediaType, charSet, headers, Response.Body, Elapsed);
+        }
+    }
+
+    /// <summary>
+    /// A paused upload as a raw caller sends it: the request head, without <c>Connection: close</c>, and the
+    /// one part of the body sent before the caller only reads. The part begins with the operation's sample
+    /// body, so a SOAP call without <c>SOAPAction</c> still resolves its operation from it, and is filled
+    /// with <c>x</c> to 128 KiB; a chunked upload sends it as one chunk and no last chunk.
+    /// </summary>
+    /// <param name="OperationId">The catalogue id of the operation called.</param>
+    /// <param name="JadeMethod">The operation's JADE method, as the facade logs it.</param>
+    /// <param name="Surface">The listener the upload is sent to.</param>
+    /// <param name="HeadAndPart">The request head followed by the framed part.</param>
+    /// <param name="PartLength">The length of the framed part the caller sends after the head.</param>
+    private sealed record PausedUpload(string OperationId, string JadeMethod, Surface Surface, byte[] HeadAndPart, int PartLength)
+    {
+        /// <summary>Composes the paused upload of the given caller.</summary>
+        /// <param name="caller"><c>rest</c>, <c>soap-action</c> or <c>soap-inspected</c>.</param>
+        /// <param name="chunked">True for a chunked upload; otherwise 4 MiB are declared.</param>
+        /// <param name="expectContinue">True to send the caller's own <c>Expect: 100-continue</c>.</param>
+        /// <returns>The upload.</returns>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="caller"/> is none of the three.</exception>
+        public static PausedUpload For(string caller, bool chunked, bool expectContinue)
+        {
+            string operationId = caller switch
+            {
+                RestCaller => PostCreateAgentId,
+                SoapActionCaller or SoapInspectedCaller => GetAgentNamesId,
+                _ => throw new ArgumentOutOfRangeException(nameof(caller)),
+            };
+            OperationDescriptor operation = OperationCatalogue.Default.GetById(operationId);
+            PreparedRequest request = caller == RestCaller
+                ? OperationRequests.ForRest(operation)
+                : OperationRequests.ForSoap(operation, includeSoapAction: caller == SoapActionCaller);
+
+            byte[] part = new byte[PausedPartLength];
+            Array.Fill(part, (byte)'x');
+            request.Body!.CopyTo(part, 0);
+
+            var head = new StringBuilder();
+            head.Append(request.Method.Method).Append(' ').Append(request.PathAndQuery).Append(" HTTP/1.1\r\nHost: facade\r\n");
+            head.Append("Content-Type: ").Append(request.ContentType).Append("\r\n");
+            if (request.SoapAction is not null)
+            {
+                head.Append("SOAPAction: ").Append(request.SoapAction).Append("\r\n");
+            }
+
+            if (expectContinue)
+            {
+                head.Append(ExpectContinueHeader);
+            }
+
+            head.Append(chunked
+                ? "Transfer-Encoding: chunked\r\n"
+                : "Content-Length: " + PausedDeclaredLength.ToString(CultureInfo.InvariantCulture) + "\r\n");
+            head.Append("\r\n");
+
+            byte[] framedPart = chunked
+                ? [.. Encoding.ASCII.GetBytes(PausedPartLength.ToString("x", CultureInfo.InvariantCulture) + "\r\n"), .. part, .. "\r\n"u8]
+                : part;
+            return new PausedUpload(
+                operationId,
+                operation.JadeMethod,
+                operation.Surface,
+                [.. Encoding.Latin1.GetBytes(head.ToString()), .. framedPart],
+                framedPart.Length);
+        }
+
+        /// <summary>The facade port of the upload's surface.</summary>
+        public int Port(FacadeFactory facade) => Surface == Surface.Rest ? facade.RestPort : facade.SoapPort;
     }
 
     /// <summary>The final response as the raw caller received it.</summary>
@@ -1043,6 +2139,634 @@ public sealed class ForwardingTransportTests
             return [.. head];
         }
     }
+
+    /// <summary>One request as a <see cref="ScriptedBackend"/> received it.</summary>
+    /// <param name="Head">The request line and header section, terminator included, one char per byte.</param>
+    /// <param name="Body">The body bytes, with any chunked framing removed; empty when none was read.</param>
+    private sealed record ScriptedRequest(string Head, byte[] Body)
+    {
+        /// <summary>The number of header lines with the given name, matched case-insensitively.</summary>
+        public int HeaderCount(string name) =>
+            Head.Split("\r\n").Skip(1).Count(line =>
+                line.IndexOf(':', StringComparison.Ordinal) is var colon and > 0
+                && line.AsSpan(0, colon).Trim().Equals(name, StringComparison.OrdinalIgnoreCase));
+
+        /// <summary>The first value of the named header, trimmed, or null.</summary>
+        public string? HeaderValue(string name)
+        {
+            foreach (string line in Head.Split("\r\n").Skip(1))
+            {
+                int colon = line.IndexOf(':', StringComparison.Ordinal);
+                if (colon > 0 && line.AsSpan(0, colon).Trim().Equals(name, StringComparison.OrdinalIgnoreCase))
+                {
+                    return line[(colon + 1)..].Trim();
+                }
+            }
+
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// A backend on a raw loopback socket that reads each request in full, its head and the body its
+    /// <c>Content-Length</c> or chunked framing declares, records it, and then writes a fixed reply, or
+    /// nothing, and closes the connection, or resets it. It never sends 100 Continue. Given an expectation
+    /// reply, it answers a request carrying <c>Expect</c> with that reply at once, before reading any of
+    /// its body. Connections are served concurrently, one request each.
+    /// </summary>
+    private sealed class ScriptedBackend : IAsyncDisposable
+    {
+        private const int MaxHeadBytes = 64 * 1024;
+
+        private static readonly byte[] LineEnd = "\r\n"u8.ToArray();
+        private static readonly byte[] HeadEnd = "\r\n\r\n"u8.ToArray();
+        private static readonly TimeSpan ConnectionLimit = TimeSpan.FromSeconds(15);
+
+        private readonly TcpListener _listener;
+        private readonly byte[]? _reply;
+        private readonly bool _reset;
+        private readonly byte[]? _expectationReply;
+        private readonly ConcurrentQueue<ScriptedRequest> _requests = new();
+        private readonly ConcurrentQueue<Task> _connections = new();
+        private readonly CancellationTokenSource _stop = new();
+        private readonly Task _acceptLoop;
+        private int _disposed;
+
+        private ScriptedBackend(byte[]? reply, bool reset, byte[]? expectationReply)
+        {
+            _reply = reply;
+            _reset = reset;
+            _expectationReply = expectationReply;
+            _listener = new TcpListener(IPAddress.Loopback, 0);
+            _listener.Start();
+            BaseUrl = "http://127.0.0.1:" + ((IPEndPoint)_listener.LocalEndpoint).Port.ToString(CultureInfo.InvariantCulture);
+            _acceptLoop = AcceptLoopAsync();
+        }
+
+        /// <summary>The base URL to route a target to.</summary>
+        public string BaseUrl { get; }
+
+        /// <summary>The requests received so far, in arrival order.</summary>
+        public IReadOnlyList<ScriptedRequest> Requests => [.. _requests];
+
+        /// <summary>Starts listening on a free loopback port.</summary>
+        /// <param name="reply">The bytes written once a request has been read; null to write nothing.</param>
+        /// <param name="reset">True to reset the connection after the reply instead of closing it.</param>
+        /// <param name="expectationReply">
+        /// The bytes written, before any body is read, to a request carrying <c>Expect</c>; null to treat
+        /// such a request like any other.
+        /// </param>
+        /// <returns>The listening backend; the caller disposes it.</returns>
+        public static ScriptedBackend Start(byte[]? reply, bool reset = false, byte[]? expectationReply = null) =>
+            new(reply, reset, expectationReply);
+
+        /// <summary>Stops listening and waits for every connection to end. Safe to call more than once; never throws.</summary>
+        public async ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            await _stop.CancelAsync();
+            _listener.Stop();
+            await _acceptLoop;
+            await Task.WhenAll(_connections);
+            _stop.Dispose();
+        }
+
+        private async Task AcceptLoopAsync()
+        {
+            while (true)
+            {
+                Socket socket;
+                try
+                {
+                    socket = await _listener.AcceptSocketAsync(_stop.Token);
+                }
+                catch (Exception exception) when (exception is OperationCanceledException or SocketException or ObjectDisposedException)
+                {
+                    return;
+                }
+
+                _connections.Enqueue(ServeAsync(socket));
+            }
+        }
+
+        // The request is recorded before anything is written or the connection ends, so by the time the
+        // facade sees the backend's reply or close, and so before it answers its caller, it is counted.
+        private async Task ServeAsync(Socket socket)
+        {
+            using (socket)
+            {
+                using var limit = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+                limit.CancelAfter(ConnectionLimit);
+                try
+                {
+                    using var stream = new NetworkStream(socket, ownsSocket: false);
+                    var reader = new ConnectionReader(stream);
+                    byte[]? headBytes = await reader.ReadThroughAsync(HeadEnd, MaxHeadBytes, limit.Token);
+                    if (headBytes is null)
+                    {
+                        return;
+                    }
+
+                    string head = Encoding.Latin1.GetString(headBytes);
+                    var received = new ScriptedRequest(head, []);
+                    if (_expectationReply is not null && received.HeaderValue(ExpectHeaderName) is not null)
+                    {
+                        _requests.Enqueue(received);
+                        await stream.WriteAsync(_expectationReply, limit.Token);
+                        socket.Shutdown(SocketShutdown.Both);
+                        return;
+                    }
+
+                    byte[]? body = await ReadBodyAsync(reader, received, limit.Token);
+                    if (body is null)
+                    {
+                        // The facade ended the connection before the declared body arrived.
+                        return;
+                    }
+
+                    _requests.Enqueue(received with { Body = body });
+                    if (_reply is not null)
+                    {
+                        await stream.WriteAsync(_reply, limit.Token);
+                    }
+
+                    if (_reset)
+                    {
+                        // A zero linger time makes the close a reset.
+                        socket.LingerState = new LingerOption(true, 0);
+                    }
+                    else
+                    {
+                        socket.Shutdown(SocketShutdown.Both);
+                    }
+                }
+                catch (Exception exception) when (exception is OperationCanceledException or SocketException or IOException or ObjectDisposedException)
+                {
+                    // The facade or the test ended the connection first; a complete request is already recorded.
+                }
+            }
+        }
+
+        // Reads the body the head declares: chunked when Transfer-Encoding names chunked, otherwise the
+        // Content-Length bytes, or none. Returns null when the connection ends first.
+        private static async Task<byte[]?> ReadBodyAsync(ConnectionReader reader, ScriptedRequest request, CancellationToken ct)
+        {
+            if (request.HeaderValue("Transfer-Encoding") is { } coding && coding.Contains("chunked", StringComparison.OrdinalIgnoreCase))
+            {
+                using var body = new MemoryStream();
+                while (true)
+                {
+                    byte[]? sizeLine = await reader.ReadThroughAsync(LineEnd, MaxHeadBytes, ct);
+                    if (sizeLine is null)
+                    {
+                        return null;
+                    }
+
+                    string size = Encoding.ASCII.GetString(sizeLine).Trim().Split(';')[0];
+                    long length = long.Parse(size, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture);
+                    if (length == 0)
+                    {
+                        // The trailer section, possibly empty, ends with a blank line.
+                        while (await reader.ReadThroughAsync(LineEnd, MaxHeadBytes, ct) is { } trailer)
+                        {
+                            if (trailer.Length == LineEnd.Length)
+                            {
+                                return body.ToArray();
+                            }
+                        }
+
+                        return null;
+                    }
+
+                    if (!await reader.CopyExactlyAsync(body, length, ct) || await reader.ReadThroughAsync(LineEnd, MaxHeadBytes, ct) is null)
+                    {
+                        return null;
+                    }
+                }
+            }
+
+            long declared = request.HeaderValue("Content-Length") is { } value
+                ? long.Parse(value, NumberStyles.None, CultureInfo.InvariantCulture)
+                : 0;
+            using var exact = new MemoryStream();
+            return await reader.CopyExactlyAsync(exact, declared, ct) ? exact.ToArray() : null;
+        }
+    }
+
+    /// <summary>
+    /// A backend on a raw loopback socket that treats each request as its behaviour scripts, once it has
+    /// read the head, without waiting for the body: it answers 413 at once and closes its side, answers
+    /// and keeps the connection open, answers 100 Continue, reads 64 KiB of the body and answers 413, reads
+    /// 32 KiB and closes or resets without answering, or sends a late 100 Continue or 103 Early Hints and
+    /// then reads the whole body its <c>Content-Length</c> declares and answers 200. It records every head
+    /// before it answers, and the body it read in full. After answering, it drains what still arrives, so
+    /// that its close is a reset only when the behaviour is one. Given a first request to answer, it
+    /// answers the first request on each connection with a 200 that keeps the connection alive and treats
+    /// the next request as scripted. Connections are served concurrently.
+    /// </summary>
+    private sealed class EarlyAnswerBackend : IAsyncDisposable
+    {
+        private const int MaxHeadBytes = 64 * 1024;
+        private const int ContinueReadLength = 64 * 1024;
+        private const int DroppedReadLength = 32 * 1024;
+
+        private static readonly byte[] HeadEnd = "\r\n\r\n"u8.ToArray();
+        private static readonly byte[] ContinueReply = "HTTP/1.1 100 Continue\r\n\r\n"u8.ToArray();
+        private static readonly byte[] EarlyHintsReply = "HTTP/1.1 103 Early Hints\r\nLink: </agent.css>; rel=preload\r\n\r\n"u8.ToArray();
+        private static readonly byte[] AnswerClosing = Encoding.Latin1.GetBytes(EarlyAnswerHead + "Connection: close\r\n\r\n" + EarlyAnswerBody);
+        private static readonly byte[] AnswerKeepingOpen = Encoding.Latin1.GetBytes(EarlyAnswerHead + "\r\n" + EarlyAnswerBody);
+        private static readonly byte[] OkClosing = Encoding.Latin1.GetBytes(
+            "HTTP/1.1 200 OK\r\n"
+            + "Content-Type: " + JsonContentType + "\r\n"
+            + "Content-Length: " + BackendBody.Length.ToString(CultureInfo.InvariantCulture) + "\r\n"
+            + "Connection: close\r\n"
+            + "\r\n"
+            + BackendBody);
+
+        private static readonly TimeSpan ConnectionLimit = TimeSpan.FromSeconds(15);
+
+        // After the facade's one-second wait for 100 Continue, and before the caller's pause ends.
+        private static readonly TimeSpan LateContinueDelay = TimeSpan.FromMilliseconds(1500);
+
+        private readonly TcpListener _listener;
+        private readonly string _behaviour;
+        private readonly bool _answerFirstRequest;
+        private readonly ConcurrentQueue<ScriptedRequest> _requests = new();
+        private readonly ConcurrentQueue<Task> _connections = new();
+        private readonly CancellationTokenSource _stop = new();
+        private readonly Task _acceptLoop;
+        private int _connectionCount;
+        private long _bodyBytesReceived;
+        private int _disposed;
+
+        private EarlyAnswerBackend(string behaviour, bool answerFirstRequest)
+        {
+            _behaviour = behaviour;
+            _answerFirstRequest = answerFirstRequest;
+            _listener = new TcpListener(IPAddress.Loopback, 0);
+            _listener.Start();
+            BaseUrl = "http://127.0.0.1:" + ((IPEndPoint)_listener.LocalEndpoint).Port.ToString(CultureInfo.InvariantCulture);
+            _acceptLoop = AcceptLoopAsync();
+        }
+
+        /// <summary>The base URL to route a target to.</summary>
+        public string BaseUrl { get; }
+
+        /// <summary>The requests received so far, in arrival order; a body only when it was read in full.</summary>
+        public IReadOnlyList<ScriptedRequest> Requests => [.. _requests];
+
+        /// <summary>The number of connections accepted so far.</summary>
+        public int Connections => Volatile.Read(ref _connectionCount);
+
+        /// <summary>
+        /// Every byte received after a request head, on every connection, whether read as a body or drained;
+        /// final once the backend has been disposed, which waits for every connection to end.
+        /// </summary>
+        public long BodyBytesReceived => Interlocked.Read(ref _bodyBytesReceived);
+
+        /// <summary>Starts listening on a free loopback port.</summary>
+        /// <param name="behaviour">One of the scripted behaviours, for example <c>answer-then-close</c>.</param>
+        /// <param name="answerFirstRequest">True to answer each connection's first request with a 200 that keeps it alive.</param>
+        /// <returns>The listening backend; the caller disposes it.</returns>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="behaviour"/> is not a scripted behaviour.</exception>
+        public static EarlyAnswerBackend Start(string behaviour, bool answerFirstRequest = false)
+        {
+            if (behaviour is not (AnswerThenClose or AnswerKeepOpen or ContinueThenAnswer or CloseUnanswered or ResetUnanswered or LateContinue or EarlyHints))
+            {
+                throw new ArgumentOutOfRangeException(nameof(behaviour));
+            }
+
+            return new EarlyAnswerBackend(behaviour, answerFirstRequest);
+        }
+
+        /// <summary>Stops listening and waits for every connection to end. Safe to call more than once; never throws.</summary>
+        public async ValueTask DisposeAsync()
+        {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0)
+            {
+                return;
+            }
+
+            await _stop.CancelAsync();
+            _listener.Stop();
+            await _acceptLoop;
+            await Task.WhenAll(_connections);
+            _stop.Dispose();
+        }
+
+        private async Task AcceptLoopAsync()
+        {
+            while (true)
+            {
+                Socket socket;
+                try
+                {
+                    socket = await _listener.AcceptSocketAsync(_stop.Token);
+                }
+                catch (Exception exception) when (exception is OperationCanceledException or SocketException or ObjectDisposedException)
+                {
+                    return;
+                }
+
+                Interlocked.Increment(ref _connectionCount);
+                _connections.Enqueue(ServeAsync(socket));
+            }
+        }
+
+        // Each head is recorded before anything is written in reply, so by the time the facade sees the
+        // reply or the close, and so before it answers its caller, the request is counted.
+        private async Task ServeAsync(Socket socket)
+        {
+            using (socket)
+            {
+                using var limit = CancellationTokenSource.CreateLinkedTokenSource(_stop.Token);
+                limit.CancelAfter(ConnectionLimit);
+                ConnectionReader? reader = null;
+                long headBytes = 0;
+                try
+                {
+                    using var stream = new NetworkStream(socket, ownsSocket: false);
+                    reader = new ConnectionReader(stream);
+                    byte[]? head = await reader.ReadThroughAsync(HeadEnd, MaxHeadBytes, limit.Token);
+                    if (head is not null && _answerFirstRequest)
+                    {
+                        headBytes += head.Length;
+                        _requests.Enqueue(new ScriptedRequest(Encoding.Latin1.GetString(head), []));
+                        await stream.WriteAsync(OkReply(), limit.Token);
+                        head = await reader.ReadThroughAsync(HeadEnd, MaxHeadBytes, limit.Token);
+                    }
+
+                    if (head is not null)
+                    {
+                        headBytes += head.Length;
+                        await ServeScriptedAsync(socket, stream, reader, new ScriptedRequest(Encoding.Latin1.GetString(head), []), limit.Token);
+                    }
+                }
+                catch (Exception exception) when (exception is OperationCanceledException or SocketException or IOException or ObjectDisposedException)
+                {
+                    // The facade or the test ended the connection first; every head read is already recorded.
+                }
+                finally
+                {
+                    // Whatever arrived after the heads, however the connection ended.
+                    Interlocked.Add(ref _bodyBytesReceived, Math.Max((reader?.BytesRead ?? 0) - headBytes, 0));
+                }
+            }
+        }
+
+        private async Task ServeScriptedAsync(Socket socket, NetworkStream stream, ConnectionReader reader, ScriptedRequest request, CancellationToken ct)
+        {
+            switch (_behaviour)
+            {
+                case AnswerThenClose:
+                    _requests.Enqueue(request);
+                    await stream.WriteAsync(AnswerClosing, ct);
+                    socket.Shutdown(SocketShutdown.Send);
+                    await reader.DrainAsync(ct);
+                    return;
+
+                case AnswerKeepOpen:
+                    // No FIN follows the answer: the connection stays open until the facade closes it.
+                    _requests.Enqueue(request);
+                    await stream.WriteAsync(AnswerKeepingOpen, ct);
+                    await reader.DrainAsync(ct);
+                    return;
+
+                case ContinueThenAnswer:
+                    _requests.Enqueue(request);
+                    await stream.WriteAsync(ContinueReply, ct);
+                    if (await reader.CopyExactlyAsync(Stream.Null, ContinueReadLength, ct))
+                    {
+                        await stream.WriteAsync(AnswerClosing, ct);
+                        socket.Shutdown(SocketShutdown.Send);
+                        await reader.DrainAsync(ct);
+                    }
+
+                    return;
+
+                case CloseUnanswered:
+                    _requests.Enqueue(request);
+                    if (await reader.CopyExactlyAsync(Stream.Null, DroppedReadLength, ct))
+                    {
+                        socket.Shutdown(SocketShutdown.Send);
+                        await reader.DrainAsync(ct);
+                    }
+
+                    return;
+
+                case ResetUnanswered:
+                    _requests.Enqueue(request);
+                    if (await reader.CopyExactlyAsync(Stream.Null, DroppedReadLength, ct))
+                    {
+                        // A zero linger time makes the close a reset.
+                        socket.LingerState = new LingerOption(true, 0);
+                    }
+
+                    return;
+
+                default:
+                    // LateContinue or EarlyHints: an interim response, then the whole declared body and a 200.
+                    if (_behaviour == LateContinue)
+                    {
+                        await Task.Delay(LateContinueDelay, ct);
+                        await stream.WriteAsync(ContinueReply, ct);
+                    }
+                    else
+                    {
+                        await stream.WriteAsync(EarlyHintsReply, ct);
+                    }
+
+                    long declared = request.HeaderValue("Content-Length") is { } value
+                        ? long.Parse(value, NumberStyles.None, CultureInfo.InvariantCulture)
+                        : 0;
+                    using (var body = new MemoryStream())
+                    {
+                        if (!await reader.CopyExactlyAsync(body, declared, ct))
+                        {
+                            return;
+                        }
+
+                        _requests.Enqueue(request with { Body = body.ToArray() });
+                    }
+
+                    await stream.WriteAsync(OkClosing, ct);
+                    socket.Shutdown(SocketShutdown.Send);
+                    await reader.DrainAsync(ct);
+                    return;
+            }
+        }
+    }
+
+    /// <summary>Reads one connection's bytes in order, keeping what arrived past the part asked for.</summary>
+    /// <param name="stream">The connection, read but not owned.</param>
+    private sealed class ConnectionReader(NetworkStream stream)
+    {
+        private readonly byte[] _chunk = new byte[16 * 1024];
+        private byte[] _pending = [];
+
+        /// <summary>The number of bytes read from the connection so far, whether taken or still pending.</summary>
+        public long BytesRead { get; private set; }
+
+        /// <summary>Reads and discards everything that arrives until the connection ends.</summary>
+        public async Task DrainAsync(CancellationToken ct)
+        {
+            _pending = [];
+            while (await FillAsync(ct))
+            {
+                _pending = [];
+            }
+        }
+
+        /// <summary>Reads up to and including <paramref name="delimiter"/>.</summary>
+        /// <returns>The bytes read, delimiter included; null when the connection ended or the bound was reached first.</returns>
+        public async Task<byte[]?> ReadThroughAsync(byte[] delimiter, int bound, CancellationToken ct)
+        {
+            while (true)
+            {
+                int end = _pending.AsSpan().IndexOf(delimiter);
+                if (end >= 0)
+                {
+                    int length = end + delimiter.Length;
+                    byte[] taken = _pending[..length];
+                    _pending = _pending[length..];
+                    return taken;
+                }
+
+                if (_pending.Length >= bound || !await FillAsync(ct))
+                {
+                    return null;
+                }
+            }
+        }
+
+        /// <summary>Copies exactly <paramref name="count"/> bytes to <paramref name="destination"/>.</summary>
+        /// <returns>False when the connection ended first.</returns>
+        public async Task<bool> CopyExactlyAsync(Stream destination, long count, CancellationToken ct)
+        {
+            long remaining = count;
+            while (remaining > 0)
+            {
+                if (_pending.Length == 0 && !await FillAsync(ct))
+                {
+                    return false;
+                }
+
+                int take = (int)Math.Min(remaining, _pending.Length);
+                destination.Write(_pending, 0, take);
+                _pending = _pending[take..];
+                remaining -= take;
+            }
+
+            return true;
+        }
+
+        private async Task<bool> FillAsync(CancellationToken ct)
+        {
+            int read = await stream.ReadAsync(_chunk, ct);
+            if (read == 0)
+            {
+                return false;
+            }
+
+            BytesRead += read;
+            byte[] next = new byte[_pending.Length + read];
+            _pending.CopyTo(next, 0);
+            _chunk.AsSpan(0, read).CopyTo(next.AsSpan(_pending.Length));
+            _pending = next;
+            return true;
+        }
+    }
+}
+
+// The facade's unavailable answer as a caller receives it (class UnavailableAnswers) sits here, between
+// the two test classes whose real-socket cases end in it: a backend that breaks its reply and a backend
+// that drops an upload without answering. It holds assertions only and no tests.
+//
+// Every expected value is the plan's literal, authored here rather than taken from the facade's
+// constants, and every assertion message is fixed.
+/// <summary>
+/// Asserts the facade's unavailable answer exactly as the plan states it: REST 502 with the fixed
+/// problem+json body, SOAP HTTP 500 with the SOAP 1.1 "Backend unavailable" Fault.
+/// </summary>
+internal static class UnavailableAnswers
+{
+    private const string ProblemMediaType = "application/problem+json";
+    private const string SoapMediaType = "text/xml";
+    private const string SoapCharSet = "utf-8";
+    private const string UnavailableText = "Backend unavailable";
+    private const string ServerFaultCode = "Server";
+
+    private static readonly XNamespace SoapEnvelope = "http://schemas.xmlsoap.org/soap/envelope/";
+
+    /// <summary>Asserts the unavailable answer of the operation's surface.</summary>
+    /// <param name="response">The caller's response.</param>
+    /// <param name="operationId">The catalogue id of the operation called, for example <c>Rest.getCompany</c>.</param>
+    /// <returns>The status asserted: 502 on REST, 500 on SOAP.</returns>
+    public static int AssertMatches(RawResponse response, string operationId)
+    {
+        if (OperationCatalogue.Default.GetById(operationId).Surface == Surface.Rest)
+        {
+            AssertProblem(response, operationId);
+            return 502;
+        }
+
+        AssertFault(response);
+        return 500;
+    }
+
+    // Status 502, one Content-Type value that is exactly application/problem+json, and the body bytes of
+    // the fixed object naming the operation's JADE method, the part of the operation id after its surface.
+    private static void AssertProblem(RawResponse response, string operationId)
+    {
+        Assert.Equal(502, response.Status);
+        Assert.True(
+            response.Headers.TryGetValue("Content-Type", out string[]? contentType)
+            && contentType.Length == 1
+            && string.Equals(ProblemMediaType, contentType[0], StringComparison.Ordinal),
+            "unavailable answer does not carry exactly the Content-Type application/problem+json");
+
+        string jadeMethod = operationId[(operationId.IndexOf('.', StringComparison.Ordinal) + 1)..];
+        string expected = "{\"type\":\"about:blank\",\"title\":\"" + UnavailableText + "\",\"status\":502,"
+            + "\"detail\":\"The backend for operation " + jadeMethod + " could not be reached.\"}";
+        Assert.True(
+            response.Body.AsSpan().SequenceEqual(Encoding.UTF8.GetBytes(expected)),
+            "unavailable answer body is not the fixed problem+json object for the operation");
+    }
+
+    // HTTP 500 with text/xml; charset=utf-8, and an Envelope in the SOAP 1.1 envelope namespace whose only
+    // child is a Body, whose only child is a Fault holding one faultcode that resolves to the envelope
+    // namespace's Server and one faultstring "Backend unavailable", as a SOAP 1.1 receiver reads them.
+    private static void AssertFault(RawResponse response)
+    {
+        Assert.Equal(500, response.Status);
+        Assert.Equal(SoapMediaType, response.MediaType);
+        Assert.Equal(SoapCharSet, response.CharSet);
+
+        XElement envelope = XDocument.Parse(Encoding.UTF8.GetString(response.Body)).Root
+            ?? throw new InvalidOperationException("fault document has no root element");
+        Assert.True(envelope.Name == SoapEnvelope + "Envelope", "fault root is not a SOAP 1.1 Envelope");
+        XElement[] bodies = [.. envelope.Elements()];
+        Assert.True(bodies.Length == 1 && bodies[0].Name == SoapEnvelope + "Body", "fault Envelope does not hold exactly one SOAP 1.1 Body");
+        XElement[] faults = [.. bodies[0].Elements()];
+        Assert.True(faults.Length == 1 && faults[0].Name == SoapEnvelope + "Fault", "fault Body does not hold exactly one SOAP 1.1 Fault");
+
+        XElement[] codes = [.. faults[0].Elements("faultcode")];
+        Assert.True(codes.Length == 1, "Fault does not hold exactly one unqualified faultcode");
+        string[] qualifiedName = codes[0].Value.Trim().Split(':');
+        Assert.True(
+            qualifiedName.Length == 2
+            && codes[0].GetNamespaceOfPrefix(qualifiedName[0]) == SoapEnvelope
+            && string.Equals(ServerFaultCode, qualifiedName[1], StringComparison.Ordinal),
+            "faultcode does not resolve to the SOAP 1.1 envelope namespace's Server");
+
+        XElement[] strings = [.. faults[0].Elements("faultstring")];
+        Assert.True(strings.Length == 1, "Fault does not hold exactly one unqualified faultstring");
+        Assert.Equal(UnavailableText, strings[0].Value);
+    }
 }
 
 // BackendForwarder's own handling of every other failure (class BackendForwarderTests) sits here,
@@ -1099,6 +2823,9 @@ public sealed class BackendForwarderTests
     private const string NameNotResolvedCause = "name-not-resolved";
     private const string SendFailedCause = "send-failed";
     private const string ResponseEndedCause = "response-ended";
+    private const string InvalidStatusLineCause = "invalid-status-line";
+    private const string InvalidResponseHeadCause = "invalid-response-head";
+    private const string InvalidRequestCause = "invalid-request";
 
     // Where an exception escapes the forwarder.
     private const string ThrowsFromForwarder = "forwarder";
@@ -1118,8 +2845,7 @@ public sealed class BackendForwarderTests
     private const int SmallBodyLength = 1000;
     private const int LargeBodyLength = 1024 * 1024;
 
-    // The early-rejecting backend's own body-size limit, and an upload well beyond it and beyond the
-    // facade's 1 MiB 100-continue threshold.
+    // The early-rejecting backend's own body-size limit, and an upload well beyond it.
     private const long BackendBodyLimit = 64 * 1024;
     private const int OverLimitBodyLength = 2 * 1024 * 1024;
 
@@ -1143,7 +2869,8 @@ public sealed class BackendForwarderTests
     /// Every YARP error kind ends in exactly one line whose outcome, level and status say what happened,
     /// and the caller gets the facade response, the bare 500, nothing, or an aborted connection that
     /// outcome stands for. Caller aborts never report YARP's placeholder status; a backend that dropped
-    /// the connection is never reported unavailable.
+    /// the upload or sent a head the facade cannot relay, before its response was taken over, gets the
+    /// unavailable answer, and one that failed after it is aborted.
     /// </summary>
     [Theory]
     [InlineData(ForwarderError.None, NoCause, false, true, Forwarded, LogLevel.Information, 200, false, null)]
@@ -1153,10 +2880,12 @@ public sealed class BackendForwarderTests
     [InlineData(ForwarderError.RequestBodyCanceled, TruncatedUploadCause, false, false, Aborted, LogLevel.Information, 0, false, null)]
     [InlineData(ForwarderError.RequestBodyClient, CallerResetCause, false, false, Aborted, LogLevel.Information, 0, false, null)]
     [InlineData(ForwarderError.ResponseBodyCanceled, CallerCancelledCause, true, true, Aborted, LogLevel.Information, 200, false, null)]
+    [InlineData(ForwarderError.ResponseHeaders, CallerCancelledCause, true, false, Aborted, LogLevel.Information, 0, false, null)]
     [InlineData(ForwarderError.RequestBodyClient, TempSpaceFullCause, false, false, Failed, LogLevel.Warning, 500, false, null)]
-    [InlineData(ForwarderError.RequestBodyDestination, BackendResetCause, false, false, Failed, LogLevel.Warning, 0, true, null)]
+    [InlineData(ForwarderError.RequestBodyDestination, BackendResetCause, false, false, Unavailable, LogLevel.Warning, 502, false, UnavailableTitle)]
     [InlineData(ForwarderError.ResponseBodyDestination, BackendResetCause, true, true, Failed, LogLevel.Warning, 200, true, null)]
-    [InlineData(ForwarderError.ResponseHeaders, NoCause, false, false, Failed, LogLevel.Warning, 500, false, null)]
+    [InlineData(ForwarderError.ResponseHeaders, InvalidResponseHeadCause, false, false, Unavailable, LogLevel.Warning, 502, false, UnavailableTitle)]
+    [InlineData(ForwarderError.RequestCreation, InvalidRequestCause, false, false, Failed, LogLevel.Warning, 500, false, null)]
     public async Task CallEndIsLoggedOnceWithItsOutcomeLevelAndStatus(
         ForwarderError error,
         string cause,
@@ -1296,25 +3025,25 @@ public sealed class BackendForwarderTests
     }
 
     /// <summary>
-    /// A <see cref="ForwarderError.Request"/> failure is answered "Backend unavailable" only when the
-    /// backend could not be reached or received no more than the request head: a failed connect or name
-    /// lookup, or a connection that broke before any response and before any body byte was sent, as for a
-    /// request without a body or a body still waiting for 100 Continue. A backend that was reached and
-    /// dropped an upload it had begun to receive, without an answer, ends the caller's connection
-    /// instead, logged <c>failed</c> with status 0.
+    /// A <see cref="ForwarderError.Request"/> failure is answered "Backend unavailable", logged
+    /// <c>unavailable</c> with status 502 and never aborted, whatever its cause and however far the
+    /// upload got: a failed connect or name lookup, and a backend that was reached and then broke the
+    /// connection or answered with an invalid status line, before or after any body byte was sent to it,
+    /// for a request with or without a body.
     /// </summary>
     [Theory]
-    [InlineData(ConnectFailedCause, true, true, Unavailable, 502, false)]
-    [InlineData(NameNotResolvedCause, true, true, Unavailable, 502, false)]
-    [InlineData(RefusedCause, true, true, Unavailable, 502, false)]
-    [InlineData(SendFailedCause, true, true, Failed, 0, true)]
-    [InlineData(ResponseEndedCause, true, true, Failed, 0, true)]
-    [InlineData(SendFailedCause, true, false, Unavailable, 502, false)]
-    [InlineData(ResponseEndedCause, true, false, Unavailable, 502, false)]
-    [InlineData(SendFailedCause, false, false, Unavailable, 502, false)]
-    [InlineData(ResponseEndedCause, false, false, Unavailable, 502, false)]
-    public async Task RequestFailureIsUnavailableOnlyWhenBackendWasNotReached(
-        string cause, bool carriesBody, bool uploadStarted, string expectedOutcome, int expectedStatus, bool expectedConnectionAbort)
+    [InlineData(ConnectFailedCause, true, true)]
+    [InlineData(NameNotResolvedCause, true, true)]
+    [InlineData(RefusedCause, true, true)]
+    [InlineData(SendFailedCause, true, true)]
+    [InlineData(ResponseEndedCause, true, true)]
+    [InlineData(InvalidStatusLineCause, true, true)]
+    [InlineData(SendFailedCause, true, false)]
+    [InlineData(ResponseEndedCause, true, false)]
+    [InlineData(SendFailedCause, false, false)]
+    [InlineData(ResponseEndedCause, false, false)]
+    [InlineData(InvalidStatusLineCause, false, false)]
+    public async Task RequestFailureIsUnavailableWhateverTheUploadReached(string cause, bool carriesBody, bool uploadStarted)
     {
         using var call = new UnitCall();
         if (carriesBody)
@@ -1344,20 +3073,14 @@ public sealed class BackendForwarderTests
 
         IReadOnlyList<CapturedLog> calls = harness.Logs.BackendCalls;
         Assert.True(calls.Count == 1, "request failure did not write exactly one backend call line");
-        Assert.Equal(expectedOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(Unavailable, calls[0].Value("Outcome"));
         Assert.Equal(LogLevel.Warning, calls[0].Level);
-        Assert.Equal(expectedStatus, calls[0].Value("Status"));
-        Assert.Equal(expectedConnectionAbort, call.Lifetime.AbortCalled);
+        Assert.Equal(502, calls[0].Value("Status"));
+        Assert.False(call.Lifetime.AbortCalled, "request failure aborted the caller's connection instead of answering");
 
-        if (expectedOutcome == Unavailable)
-        {
-            using JsonDocument problem = JsonDocument.Parse(call.Body.ToArray());
-            Assert.True(problem.RootElement.TryGetProperty("title", out JsonElement title), "problem body has no title member");
-            Assert.Equal(UnavailableTitle, title.GetString());
-            return;
-        }
-
-        Assert.True(call.Body.Length == 0, "facade answered an upload the backend dropped");
+        using JsonDocument problem = JsonDocument.Parse(call.Body.ToArray());
+        Assert.True(problem.RootElement.TryGetProperty("title", out JsonElement title), "problem body has no title member");
+        Assert.Equal(UnavailableTitle, title.GetString());
     }
 
     /// <summary>
@@ -1579,16 +3302,17 @@ public sealed class BackendForwarderTests
     }
 
     /// <summary>
-    /// An upload of 1 MiB or more, or of unknown length, reaches the backend with
-    /// <c>Expect: 100-continue</c>; a smaller one is sent exactly as before, and a caller's own
-    /// <c>Expect</c> passes unchanged. The body arrives whole either way.
+    /// An upload reaches the backend with an <c>Expect</c> header only when the caller sent one: a small
+    /// upload, one of 1 MiB and one of unknown length arrive without <c>Expect</c>, and a caller's own
+    /// <c>Expect: 100-continue</c> arrives exactly once, unchanged. The body arrives whole either way.
     /// </summary>
     [Theory]
     [InlineData(SmallBodyLength, false, false, null)]
-    [InlineData(LargeBodyLength, false, false, ContinueExpectation)]
-    [InlineData(SmallBodyLength, true, false, ContinueExpectation)]
+    [InlineData(LargeBodyLength, false, false, null)]
+    [InlineData(SmallBodyLength, true, false, null)]
+    [InlineData(LargeBodyLength, true, false, null)]
     [InlineData(SmallBodyLength, false, true, ContinueExpectation)]
-    public async Task UploadAsksForContinueOnlyWhenLargeOrOfUnknownLength(
+    public async Task UploadCarriesOnlyTheCallersOwnExpect(
         int bodyLength, bool unknownLength, bool callerExpectsContinue, string? expectedExpect)
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
@@ -1624,10 +3348,10 @@ public sealed class BackendForwarderTests
 
     /// <summary>
     /// A backend that rejects an upload beyond its own body-size limit and closes the connection has its
-    /// 413 reach the caller unchanged and logged <c>forwarded</c>, even though the caller sent no
-    /// <c>Expect</c>: the facade adds no body-size limit and never reports such a backend unavailable. A
-    /// declared length over the limit is rejected before any body byte is read; a chunked upload only once
-    /// it crosses the limit, while the facade is still sending it.
+    /// 413 reach the caller unchanged and logged <c>forwarded</c>, although neither the caller nor the
+    /// facade sent <c>Expect</c>: the facade adds no body-size limit and never reports such a backend
+    /// unavailable. A declared length over the limit is rejected before the backend reads any body byte,
+    /// while the facade is still sending the body; a chunked upload once it crosses the limit.
     /// </summary>
     [Theory]
     [InlineData(UploadOperationId, false)]
@@ -1664,13 +3388,14 @@ public sealed class BackendForwarderTests
         Assert.Equal("0", response.Header("Content-Length"));
         Assert.True(response.Body.Length == 0, "early rejection reached the caller with a body");
         Assert.True(backend.Requests == 1, "backend did not receive exactly one request");
+        Assert.True(backend.Expectations == 0, "an Expect header the caller did not send reached the backend");
         if (unknownLength)
         {
             Assert.True(backend.BodyBytesRead <= bodyLimit, "backend read more of the upload than its own limit");
         }
         else
         {
-            Assert.True(backend.BodyBytesRead == 0, "backend received body bytes before it rejected the upload");
+            Assert.True(backend.BodyBytesRead == 0, "backend read body bytes of a declared length over its limit");
         }
 
         IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
@@ -1725,16 +3450,17 @@ public sealed class BackendForwarderTests
     }
 
     /// <summary>
-    /// A backend that reads an upload and then closes or resets the connection without answering was
-    /// reached, so the caller never gets "Backend unavailable": its connection ends as the backend's did,
-    /// the call is logged <c>failed</c> with status 0, and the upload is sent once.
+    /// A backend that reads an upload and then closes or resets the connection without answering gave
+    /// no response to take over, so the caller gets the facade's unavailable answer: REST 502 with the
+    /// fixed problem+json body, or the SOAP "Backend unavailable" Fault, logged <c>unavailable</c> with
+    /// that status. The upload is sent once.
     /// </summary>
     [Theory]
     [InlineData(UploadOperationId, false)]
     [InlineData(UploadOperationId, true)]
     [InlineData(SoapOperationId, false)]
     [InlineData(SoapOperationId, true)]
-    public async Task BackendThatDropsUploadWithoutAnswerIsNeverReportedUnavailable(string operationId, bool reset)
+    public async Task BackendThatDropsUploadWithoutAnswerGetsTheUnavailableAnswer(string operationId, bool reset)
     {
         CancellationToken ct = TestContext.Current.CancellationToken;
         var logs = new LogCapture();
@@ -1746,15 +3472,14 @@ public sealed class BackendForwarderTests
         OperationDescriptor operation = Operation(operationId);
         Uri socket = operation.Surface == Surface.Rest ? facade.RestBaseAddress : facade.SoapBaseAddress;
         using HttpClient client = facade.CreateRawClient();
-        using HttpRequestMessage message = OperationRequests.For(operation).ToMessage(socket);
+        RawResponse response = await FacadeFactory.SendAsync(client, OperationRequests.For(operation).ToMessage(socket), ct);
 
-        // An answer of any kind, the facade's 502 or Fault included, would let the send succeed.
-        await Assert.ThrowsAnyAsync<HttpRequestException>(() => client.SendAsync(message, ct));
+        int expectedStatus = UnavailableAnswers.AssertMatches(response, operationId);
 
         IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
         Assert.True(calls.Count == 1, "dropped upload did not write exactly one backend call line");
-        Assert.Equal(Failed, calls[0].Value("Outcome"));
-        Assert.Equal(0, calls[0].Value("Status"));
+        Assert.Equal(Unavailable, calls[0].Value("Outcome"));
+        Assert.Equal(expectedStatus, calls[0].Value("Status"));
         Assert.Equal(LogLevel.Warning, calls[0].Level);
         Assert.True(backend.Connections == 1, "backend was not sent the upload exactly once");
     }
@@ -1802,6 +3527,11 @@ public sealed class BackendForwarderTests
             HttpRequestError.ResponseEnded,
             "An error occurred while sending the request.",
             new HttpIOException(HttpRequestError.ResponseEnded, "The response ended prematurely.")),
+        InvalidStatusLineCause => new HttpRequestException(
+            HttpRequestError.InvalidResponse, "Received an invalid status line: 'THIS IS NOT HTTP'."),
+        InvalidResponseHeadCause => new InvalidOperationException(
+            "Invalid Content-Length: \"2,5\". Value must be a positive integral number."),
+        InvalidRequestCause => new InvalidOperationException("The outgoing request could not be created."),
         _ => throw new ArgumentOutOfRangeException(nameof(cause)),
     };
 
@@ -1999,6 +3729,7 @@ public sealed class BackendForwarderTests
 
         private readonly WebApplication _app;
         private int _requests;
+        private int _expectations;
         private long _bodyBytesRead;
 
         private LimitedBackend(WebApplication app) => _app = app;
@@ -2006,6 +3737,9 @@ public sealed class BackendForwarderTests
         public string BaseUrl { get; private set; } = string.Empty;
 
         public int Requests => Volatile.Read(ref _requests);
+
+        /// <summary>The number of requests received with an <c>Expect</c> header.</summary>
+        public int Expectations => Volatile.Read(ref _expectations);
 
         public long BodyBytesRead => Interlocked.Read(ref _bodyBytesRead);
 
@@ -2068,6 +3802,11 @@ public sealed class BackendForwarderTests
         private async Task HandleAsync(HttpContext context)
         {
             Interlocked.Increment(ref _requests);
+            if (context.Request.Headers.Expect.Count > 0)
+            {
+                Interlocked.Increment(ref _expectations);
+            }
+
             byte[] buffer = new byte[16 * 1024];
             try
             {
