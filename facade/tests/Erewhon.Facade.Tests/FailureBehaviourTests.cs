@@ -1007,6 +1007,7 @@ public sealed class ForwardingTransportTests
     // drops these hop-by-hop headers from any other request.
     private const string UntunnelledUpgradeHeaders = "Connection: Upgrade\r\nUpgrade: foo\r\n";
     private const string ContentLengthZero = "Content-Length: 0\r\n";
+    private const string ContentLengthZeroLine = "\r\n" + ContentLengthZero;
     private const string ExpectContinueHeader = "Expect: 100-continue\r\n";
     private const string ProblemContentTypeLine = "\r\nContent-Type: application/problem+json\r\n";
 
@@ -1436,6 +1437,41 @@ public sealed class ForwardingTransportTests
         Assert.True(calls.Count == 1, "large response head did not write exactly one backend call line");
         Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
         Assert.Equal(status, calls[0].Value("Status"));
+        Assert.Equal(LogLevel.Information, calls[0].Level);
+    }
+
+    /// <summary>
+    /// The first call a freshly started facade forwards, on the REST or the SOAP listener, which the
+    /// backend answers with a 404 whose head is the whole response (<c>Content-Length: 0</c>), reaches a
+    /// caller that reads that response and closes its connection at once, as curl does, complete, and its
+    /// one line says <c>forwarded</c> with the backend's 404 at Information: the caller left only once the
+    /// backend's whole response had been sent to it.
+    /// </summary>
+    [Theory]
+    [InlineData(ListenerKind.Rest, "/company")]
+    [InlineData(ListenerKind.Soap, "/jade/jadehttp.dll?x=wsdl")]
+    public async Task FirstCallWhoseEmptyBodiedAnswerTheCallerReadsAndLeavesIsForwarded(ListenerKind listener, string target)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        var logs = new LogCapture();
+        await using RawBackend backend = RawBackend.Start(EmptyNotFoundReply());
+        await using FacadeFactory facade = await StartFacadeAsync(backend.BaseUrl, logs, timeoutSeconds: null, ct);
+
+        int port = listener == ListenerKind.Rest ? facade.RestPort : facade.SoapPort;
+        RawExchange response = await SendAndLeaveAsync(
+            port, Encoding.Latin1.GetBytes("GET " + target + " HTTP/1.1\r\nHost: facade\r\n\r\n"), ct);
+
+        Assert.Equal(404, response.Status);
+        Assert.True(
+            response.Head.Contains(ContentLengthZeroLine, StringComparison.Ordinal),
+            "backend's Content-Length: 0 did not reach the caller unchanged");
+        Assert.True(response.Body.Length == 0, "empty-bodied answer reached the caller with a body");
+        Assert.True(backend.Heads.Count == 1, "first call did not reach the backend exactly once");
+
+        IReadOnlyList<CapturedLog> calls = await logs.WaitForBackendCallsAsync(1, LogWaitBound, ct);
+        Assert.True(calls.Count == 1, "first call did not write exactly one backend call line");
+        Assert.Equal(ForwardedOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(404, calls[0].Value("Status"));
         Assert.Equal(LogLevel.Information, calls[0].Level);
     }
 
@@ -2332,6 +2368,9 @@ public sealed class ForwardingTransportTests
         return last ? [.. chunk, .. "0\r\n\r\n"u8] : chunk;
     }
 
+    // A backend's 404 whose head is the whole response: Content-Length: 0 and no body.
+    private static byte[] EmptyNotFoundReply() => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"u8.ToArray();
+
     // A backend's 200 with the JSON body BackendBody, framed by Content-Length.
     private static byte[] OkReply() => Encoding.Latin1.GetBytes(
         "HTTP/1.1 200 OK\r\n"
@@ -2447,6 +2486,29 @@ public sealed class ForwardingTransportTests
         }
 
         return RawExchange.Parse(received);
+    }
+
+    // Sends the raw request to a facade socket on a connection it keeps open, reads the final response and
+    // closes the connection as soon as that response is complete, without waiting for the facade.
+    private static async Task<RawExchange> SendAndLeaveAsync(int port, byte[] request, CancellationToken ct)
+    {
+        using var limit = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        limit.CancelAfter(RawCallerTimeout);
+        try
+        {
+            using var client = new TcpClient(AddressFamily.InterNetwork);
+            await client.ConnectAsync(IPAddress.Loopback, port, limit.Token);
+            NetworkStream stream = client.GetStream();
+            await stream.WriteAsync(request, limit.Token);
+            return await ReadFinalResponseAsync(stream, limit.Token);
+        }
+        catch (Exception exception) when (
+            exception is SocketException or IOException
+            || (exception is OperationCanceledException && !ct.IsCancellationRequested))
+        {
+            Assert.Fail("raw facade request failed at the transport level (" + exception.GetType().Name + ")");
+            throw new UnreachableException();
+        }
     }
 
     // Sends an upload's head and first part to a facade socket and reads the final response while the
@@ -2812,8 +2874,11 @@ public sealed class ForwardingTransportTests
                 {
                     socket = await _listener.AcceptSocketAsync(_stop.Token);
                 }
-                catch (Exception exception) when (exception is OperationCanceledException or SocketException or ObjectDisposedException)
+                catch (Exception exception) when (exception is OperationCanceledException or SocketException or ObjectDisposedException
+                    || (exception is InvalidOperationException && _stop.IsCancellationRequested))
                 {
+                    // TcpListener.AcceptSocketAsync throws InvalidOperationException when DisposeAsync ran Stop()
+                    // between two accepts, so during disposal that ends the loop too.
                     return;
                 }
 
@@ -3002,8 +3067,10 @@ public sealed class ForwardingTransportTests
                 {
                     socket = await _listener.AcceptSocketAsync(_stop.Token);
                 }
-                catch (Exception exception) when (exception is OperationCanceledException or SocketException or ObjectDisposedException)
+                catch (Exception exception) when (exception is OperationCanceledException or SocketException or ObjectDisposedException
+                    || (exception is InvalidOperationException && _stop.IsCancellationRequested))
                 {
+                    // Stop() between two accepts during disposal: AcceptSocketAsync throws InvalidOperationException.
                     return;
                 }
 
@@ -3343,8 +3410,10 @@ public sealed class ForwardingTransportTests
                 {
                     socket = await _listener.AcceptSocketAsync(_stop.Token);
                 }
-                catch (Exception exception) when (exception is OperationCanceledException or SocketException or ObjectDisposedException)
+                catch (Exception exception) when (exception is OperationCanceledException or SocketException or ObjectDisposedException
+                    || (exception is InvalidOperationException && _stop.IsCancellationRequested))
                 {
+                    // Stop() between two accepts during disposal: AcceptSocketAsync throws InvalidOperationException.
                     return;
                 }
 
@@ -3787,6 +3856,10 @@ public sealed class BackendForwarderTests
     private const int SmallBodyLength = 1000;
     private const int LargeBodyLength = 1024 * 1024;
 
+    // A backend response body the forwarder writes to the caller in full, or only half of.
+    private const int RelayedBodyLength = 1000;
+    private const int PartlyRelayedBodyLength = 500;
+
     // The early-rejecting backend's own body-size limit, and an upload well beyond it.
     private const long BackendBodyLimit = 64 * 1024;
     private const int OverLimitBodyLength = 2 * 1024 * 1024;
@@ -4161,6 +4234,103 @@ public sealed class BackendForwarderTests
         Assert.Equal(expectedConnectionAbort, call.Lifetime.AbortCalled);
         Assert.Equal(StatusCodes.Status413PayloadTooLarge, call.Context.Response.StatusCode);
         Assert.True(call.Body.Length == 0, "facade wrote into the backend's relayed response");
+    }
+
+    /// <summary>
+    /// A caller that leaves once the backend's whole response has been sent to it, which YARP then reports
+    /// as a cancelled or failed copy of the response body, ends the call <c>forwarded</c> with the backend's
+    /// status at Information, never aborted and with nothing added to what the backend sent: a response
+    /// whose head is all of it, because it declares <c>Content-Length: 0</c>, has status 204 or 304 or
+    /// answers a <c>HEAD</c> request, and a response whose declared body has been written in full. A caller
+    /// that leaves before the declared body has been written in full, or while a body of unknown length is
+    /// still being copied, is <c>aborted</c> with the backend's status already sent. An expired deadline is
+    /// a timeout even once the whole response has been sent, and the connection is aborted.
+    /// </summary>
+    [Theory]
+    [InlineData("GET", 404, 0, 0, ForwarderError.ResponseBodyCanceled, CallerCancelledCause, false, Forwarded, LogLevel.Information, false)]
+    [InlineData("GET", 404, 0, 0, ForwarderError.ResponseBodyClient, CallerResetCause, false, Forwarded, LogLevel.Information, false)]
+    [InlineData("GET", 204, null, 0, ForwarderError.ResponseBodyCanceled, CallerCancelledCause, false, Forwarded, LogLevel.Information, false)]
+    [InlineData("GET", 304, null, 0, ForwarderError.ResponseBodyCanceled, CallerCancelledCause, false, Forwarded, LogLevel.Information, false)]
+    [InlineData("HEAD", 200, RelayedBodyLength, 0, ForwarderError.ResponseBodyCanceled, CallerCancelledCause, false, Forwarded, LogLevel.Information, false)]
+    [InlineData("GET", 200, RelayedBodyLength, RelayedBodyLength, ForwarderError.ResponseBodyCanceled, CallerCancelledCause, false, Forwarded, LogLevel.Information, false)]
+    [InlineData("GET", 200, RelayedBodyLength, RelayedBodyLength, ForwarderError.ResponseBodyClient, CallerResetCause, false, Forwarded, LogLevel.Information, false)]
+    [InlineData("GET", 200, RelayedBodyLength, PartlyRelayedBodyLength, ForwarderError.ResponseBodyCanceled, CallerCancelledCause, false, Aborted, LogLevel.Information, false)]
+    [InlineData("GET", 200, RelayedBodyLength, PartlyRelayedBodyLength, ForwarderError.ResponseBodyClient, CallerResetCause, false, Aborted, LogLevel.Information, false)]
+    [InlineData("GET", 200, null, RelayedBodyLength, ForwarderError.ResponseBodyCanceled, CallerCancelledCause, false, Aborted, LogLevel.Information, false)]
+    [InlineData("GET", 404, 0, 0, ForwarderError.ResponseBodyCanceled, CallerCancelledCause, true, TimedOut, LogLevel.Warning, true)]
+    public async Task CallerThatLeavesIsForwardedOnlyOnceTheWholeResponseWasSent(
+        string method,
+        int status,
+        int? declaredLength,
+        int writtenLength,
+        ForwarderError error,
+        string cause,
+        bool deadlineExpires,
+        string expectedOutcome,
+        LogLevel expectedLevel,
+        bool expectedConnectionAbort)
+    {
+        CancellationToken ct = TestContext.Current.CancellationToken;
+        using var call = new UnitCall();
+        call.Context.Request.Method = method;
+        byte[] body = new byte[writtenLength];
+        Array.Fill(body, (byte)'b');
+        bool headForwarded = false;
+        using var harness = new ForwarderHarness(
+            async (context, token) =>
+            {
+                // YARP copies the backend's status, has the transformer copy the backend's headers and send
+                // the head, and then copies the body through the caller's response stream, which it takes
+                // only after the transformer has run.
+                context.Response.StatusCode = status;
+                using var backendResponse = new HttpResponseMessage((HttpStatusCode)status) { Content = new UnknownLengthContent([]) };
+                backendResponse.Content.Headers.ContentLength = declaredLength;
+                headForwarded = await new PassThroughTransformer().TransformResponseAsync(context, backendResponse, token);
+                call.Response.Started = true;
+                await context.Response.Body.WriteAsync(body, token);
+
+                if (deadlineExpires)
+                {
+                    // The copy stalls; the call's 1 s deadline cancels the token.
+                    try
+                    {
+                        await Task.Delay(Timeout.InfiniteTimeSpan, token);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        // YARP reports the cancelled copy with the error under test.
+                    }
+                }
+                else
+                {
+                    // The caller closes its connection, which cancels the copy or fails its next write.
+                    call.Lifetime.CancelRequestAborted();
+                }
+
+                context.Features.Set<IForwarderErrorFeature>(new ErrorFeature(error, CauseOf(cause)));
+                return error;
+            },
+            timeoutSeconds: deadlineExpires ? 1 : 30);
+
+        try
+        {
+            await harness.Forwarder.ForwardAsync(call.Context, Surface.Rest, Operation(RestOperationId)).WaitAsync(HangGuard, ct);
+        }
+        catch (TimeoutException)
+        {
+            Assert.Fail("call whose caller left after the response head never ended");
+        }
+
+        Assert.True(headForwarded, "transformer did not forward the backend's response head");
+        IReadOnlyList<CapturedLog> calls = harness.Logs.BackendCalls;
+        Assert.True(calls.Count == 1, "call whose caller left after the response head did not write exactly one backend call line");
+        Assert.Equal(expectedOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(expectedLevel, calls[0].Level);
+        Assert.Equal(status, calls[0].Value("Status"));
+        Assert.Equal(BackendTarget, calls[0].Value("Target"));
+        Assert.Equal(expectedConnectionAbort, call.Lifetime.AbortCalled);
+        Assert.Equal(status, call.Context.Response.StatusCode);
+        Assert.True(call.Body.ToArray().AsSpan().SequenceEqual(body), "facade changed or added to the backend's body bytes");
     }
 
     /// <summary>
@@ -4718,7 +4888,10 @@ public sealed class BackendForwarderTests
         public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
     }
 
-    /// <summary>Request content that reports no length, so the client sends it chunked.</summary>
+    /// <summary>
+    /// Content that reports no length: an upload the client sends chunked, or a backend response that
+    /// declares no length unless one is set on its headers.
+    /// </summary>
     private sealed class UnknownLengthContent(byte[] body) : HttpContent
     {
         protected override Task SerializeToStreamAsync(Stream stream, TransportContext? context) => stream.WriteAsync(body, 0, body.Length);
@@ -4908,8 +5081,10 @@ public sealed class BackendForwarderTests
                     }
                 }
             }
-            catch (Exception exception) when (exception is OperationCanceledException or SocketException or ObjectDisposedException)
+            catch (Exception exception) when (exception is OperationCanceledException or SocketException or ObjectDisposedException
+                || (exception is InvalidOperationException && _stopping.IsCancellationRequested))
             {
+                // Stop() between two accepts during disposal: AcceptSocketAsync throws InvalidOperationException.
                 // Stopped by DisposeAsync, or the facade closed its side first: nothing more is served.
             }
         }

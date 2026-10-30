@@ -42,7 +42,17 @@ public static class SeedFingerprint
     /// <exception cref="ArgumentException"><paramref name="directory"/> is empty or white space.</exception>
     /// <exception cref="ArgumentNullException"><paramref name="directory"/> is null.</exception>
     /// <exception cref="DirectoryNotFoundException">The directory does not exist.</exception>
-    /// <exception cref="IOException">A file changed length while it was being hashed, or could not be read.</exception>
+    /// <exception cref="IOException">
+    /// A file changed length while it was being hashed, or the directory could not be listed or a
+    /// file in it could not be opened or read.
+    /// </exception>
+    /// <exception cref="NotSupportedException">
+    /// A file in the directory cannot seek, so its length cannot be taken, such as a FIFO once a
+    /// writer has opened it.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// Permission to list the directory, or to open a file in it for reading, is denied.
+    /// </exception>
     public static string ComputeSha256Hex(string directory)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(directory);

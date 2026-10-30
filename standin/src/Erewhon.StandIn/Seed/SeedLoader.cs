@@ -551,10 +551,11 @@ public static class SeedLoader
     // TenderItems.txt:12) is still open, keeps its 20 tenders and is closed by the load's tender
     // closure; items 64, 86, 98 and 100 stay open.
     //
-    // The agents therefore give 100 tenders and one tender sale (item 70, won by Philip Jenkins with
-    // 6500931.00, Tenders.txt:121-140), not the 160 tenders and four tender sales (items 70, 80, 92 and
-    // 106) stated for the seed. The rule is ported as written and validation is never bypassed to reach
-    // four sales; the difference is a registered assumption. PROP/70 is still a sold tender item.
+    // The agents therefore give 100 tenders and one tender sale (item 70, won by the seeded client
+    // whose offer, Tenders.txt:137, is the highest of the item's 20 tenders, Tenders.txt:121-140), not
+    // the 160 tenders and four tender sales (items 70, 80, 92 and 106) stated for the seed. The rule is
+    // ported as written and validation is never bypassed to reach four sales; the difference is a
+    // registered assumption. PROP/70 is still a sold tender item.
     /// <summary>
     /// JADE <c>loadTenders</c> (<c>ErewhonModelSchema.scm:8852-8927</c>): offer, date, time, client,
     /// tender-item guid.

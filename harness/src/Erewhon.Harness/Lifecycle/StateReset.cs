@@ -384,7 +384,18 @@ public sealed class StateReset : IDisposable
     /// <param name="options">The harness settings; <see cref="HarnessOptions.Backend"/> names the stand-in.</param>
     /// <exception cref="ArgumentNullException"><paramref name="options"/> is null.</exception>
     public StateReset(HarnessOptions options)
-        : this(options ?? throw new ArgumentNullException(nameof(options)), CreateHandler(), null)
+        : this(options, output: null)
+    {
+    }
+
+    /// <summary>
+    /// Creates a reset client over its own HTTP handler that writes its console lines to <paramref name="output"/>.
+    /// </summary>
+    /// <param name="options">The harness settings; <see cref="HarnessOptions.Backend"/> names the stand-in.</param>
+    /// <param name="output">Where console lines go, for example the mode's writer; null means <see cref="Console.Out"/>.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="options"/> is null.</exception>
+    internal StateReset(HarnessOptions options, TextWriter? output)
+        : this(options ?? throw new ArgumentNullException(nameof(options)), CreateHandler(), output)
     {
     }
 

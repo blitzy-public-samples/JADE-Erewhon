@@ -70,7 +70,8 @@ namespace Erewhon.Facade.Forwarding;
 /// <para>
 /// The instance holds no state, so one singleton serves every request concurrently; the one fact it
 /// reports about a call, that the backend's whole response has been relayed, goes to that call's own
-/// <see cref="BackendCallState"/>.
+/// <see cref="BackendCallState"/>, and the body that counts a declared length on its way to the caller
+/// is installed on that call's own response.
 /// </para>
 /// </remarks>
 public sealed class PassThroughTransformer : HttpTransformer
@@ -283,6 +284,16 @@ public sealed class PassThroughTransformer : HttpTransformer
     /// <c>Connection</c> header nominates and sends the response head to the caller. The forwarder
     /// has already copied the status code and streams the body afterwards.
     /// </summary>
+    /// <remarks>
+    /// Once the head has been sent, the call's <see cref="BackendCallState"/> learns when the backend's
+    /// whole response has been relayed, as soon as the end of the response can be seen: at once when the
+    /// head is the whole response, because it answers a <c>HEAD</c> request, has status 204 or 304 or
+    /// declares <c>Content-Length: 0</c>, and, for a declared non-zero length, once the forwarder has
+    /// written that many body bytes to the caller's response, counted by a pass-through body installed
+    /// on this call's response alone. A chunked or unknown-length response is relayed only once its body
+    /// has been copied to the end, which <see cref="TransformResponseTrailersAsync"/> records. A head the
+    /// flush did not finish sending, and a 101 response, record nothing here.
+    /// </remarks>
     /// <param name="httpContext">The incoming request, whose response is being written.</param>
     /// <param name="proxyResponse">The backend's response, or null when the backend did not respond.</param>
     /// <param name="cancellationToken">Cancelled when the call is abandoned or its deadline expires.</param>
@@ -328,15 +339,22 @@ public sealed class PassThroughTransformer : HttpTransformer
             // nothing for a caller that left. On HTTP/1.1 StartAsync only commits the head to
             // Kestrel's output pipe; the flush puts it on the wire.
             await httpContext.Response.StartAsync(cancellationToken).ConfigureAwait(false);
+            var headSent = false;
             try
             {
                 await httpContext.Response.Body.FlushAsync(cancellationToken).ConfigureAwait(false);
+                headSent = true;
             }
             catch (OperationCanceledException) when (httpContext.Response.HasStarted)
             {
                 // The head is the caller's now and cannot be replaced: an exception here would make
                 // YARP clear the started response, which throws. YARP's body copy observes the same
                 // cancellation and reports it, and BackendForwarder then aborts the response.
+            }
+
+            if (headSent && BackendCallState.Current is { } callState)
+            {
+                TrackRelayedResponse(httpContext, callState);
             }
         }
 
@@ -346,7 +364,9 @@ public sealed class PassThroughTransformer : HttpTransformer
     /// <summary>
     /// Copies the backend's response trailers unchanged, if the caller's response supports them, and
     /// records on the call's <see cref="BackendCallState"/> that the backend's whole response has been
-    /// relayed.
+    /// relayed. This is where a chunked or unknown-length response is first known to be relayed; a
+    /// response without a body or with a declared length was recorded as soon as it had been sent
+    /// (<see cref="TransformResponseAsync"/>).
     /// </summary>
     /// <param name="httpContext">The incoming request, whose response is being written.</param>
     /// <param name="proxyResponse">The backend's response, whose body has been copied in full.</param>
@@ -363,6 +383,31 @@ public sealed class PassThroughTransformer : HttpTransformer
         // body, and checks the upload only after this: BackendForwarder then keeps the backend's answer
         // even when the upload did not complete.
         BackendCallState.Current?.MarkResponseRelayed();
+    }
+
+    // Called once the response head has been sent. Kestrel sends no body after the head of a response
+    // to HEAD, of a 204 or 304, or of one that declares Content-Length: 0, so such a head is the whole
+    // response. A declared non-zero length is reached by the forwarder's body writes, which a pass-through
+    // body counts; the forwarder takes the caller's body stream only after this transform. A chunked or
+    // unknown-length body ends with framing Kestrel writes after the forwarder returns, so its end is
+    // left to the trailers step.
+    private static void TrackRelayedResponse(HttpContext httpContext, BackendCallState callState)
+    {
+        var response = httpContext.Response;
+        if (HttpMethods.IsHead(httpContext.Request.Method)
+            || response.StatusCode is StatusCodes.Status204NoContent or StatusCodes.Status304NotModified
+            || response.ContentLength == 0)
+        {
+            callState.MarkResponseRelayed();
+            return;
+        }
+
+        if (response.ContentLength is { } declaredLength
+            && declaredLength > 0
+            && httpContext.Features.Get<IHttpResponseBodyFeature>() is { } body)
+        {
+            httpContext.Features.Set<IHttpResponseBodyFeature>(new DeclaredLengthResponseBody(body, declaredLength, callState));
+        }
     }
 
     // The field names a sender's Connection header values nominate: every element of each
@@ -450,6 +495,161 @@ public sealed class PassThroughTransformer : HttpTransformer
         var upgrade = httpContext.Request.Headers.Upgrade.ToString();
         return string.Equals(upgrade, "websocket", StringComparison.OrdinalIgnoreCase)
             || upgrade.StartsWith("SPDY/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// The caller's response body for one call whose response declares a non-zero <c>Content-Length</c>:
+    /// every member passes to the server's own body feature unchanged, and the body stream counts the
+    /// bytes written through it, so the call is recorded as relayed once the declared length has been
+    /// written.
+    /// </summary>
+    /// <remarks>
+    /// Bytes are neither altered, buffered nor reordered: each write and flush goes straight to the
+    /// server's stream, which keeps enforcing the declared length and the server's synchronous-IO policy.
+    /// A write is counted only once it has completed, so a write that fails or is cancelled adds nothing.
+    /// Writes through <see cref="Writer"/> or <see cref="SendFileAsync"/>, which the forwarder does not
+    /// use, go to the server's feature uncounted.
+    /// </remarks>
+    private sealed class DeclaredLengthResponseBody : IHttpResponseBodyFeature
+    {
+        private readonly IHttpResponseBodyFeature _inner;
+        private readonly long _declaredLength;
+        private readonly BackendCallState _callState;
+        private long _written;
+
+        /// <summary>Wraps the server's body feature for a call whose response declares a length.</summary>
+        /// <param name="inner">The server's body feature of the call's response.</param>
+        /// <param name="declaredLength">The response's declared <c>Content-Length</c>, greater than 0.</param>
+        /// <param name="callState">The call recorded as relayed once that many bytes have been written.</param>
+        public DeclaredLengthResponseBody(IHttpResponseBodyFeature inner, long declaredLength, BackendCallState callState)
+        {
+            ArgumentNullException.ThrowIfNull(inner);
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(declaredLength);
+            ArgumentNullException.ThrowIfNull(callState);
+
+            _inner = inner;
+            _declaredLength = declaredLength;
+            _callState = callState;
+            Stream = new CountingStream(inner.Stream, this);
+        }
+
+        public Stream Stream { get; }
+
+        public PipeWriter Writer => _inner.Writer;
+
+        public void DisableBuffering() => _inner.DisableBuffering();
+
+        public Task StartAsync(CancellationToken cancellationToken = default) => _inner.StartAsync(cancellationToken);
+
+        public Task SendFileAsync(string path, long offset, long? count, CancellationToken cancellationToken = default) =>
+            _inner.SendFileAsync(path, offset, count, cancellationToken);
+
+        public Task CompleteAsync() => _inner.CompleteAsync();
+
+        private void Count(long bytes)
+        {
+            if (bytes > 0 && Interlocked.Add(ref _written, bytes) >= _declaredLength)
+            {
+                _callState.MarkResponseRelayed();
+            }
+        }
+
+        /// <summary>Passes every member to the server's body stream and counts each completed write.</summary>
+        private sealed class CountingStream(Stream inner, DeclaredLengthResponseBody owner) : Stream
+        {
+            public override bool CanRead => inner.CanRead;
+
+            public override bool CanSeek => inner.CanSeek;
+
+            public override bool CanWrite => inner.CanWrite;
+
+            public override bool CanTimeout => inner.CanTimeout;
+
+            public override long Length => inner.Length;
+
+            public override long Position
+            {
+                get => inner.Position;
+                set => inner.Position = value;
+            }
+
+            public override int ReadTimeout
+            {
+                get => inner.ReadTimeout;
+                set => inner.ReadTimeout = value;
+            }
+
+            public override int WriteTimeout
+            {
+                get => inner.WriteTimeout;
+                set => inner.WriteTimeout = value;
+            }
+
+            public override void Write(byte[] buffer, int offset, int count)
+            {
+                inner.Write(buffer, offset, count);
+                owner.Count(count);
+            }
+
+            public override void Write(ReadOnlySpan<byte> buffer)
+            {
+                inner.Write(buffer);
+                owner.Count(buffer.Length);
+            }
+
+            public override void WriteByte(byte value)
+            {
+                inner.WriteByte(value);
+                owner.Count(1);
+            }
+
+            public override async Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+            {
+                await inner.WriteAsync(buffer, offset, count, cancellationToken).ConfigureAwait(false);
+                owner.Count(count);
+            }
+
+            public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
+            {
+                await inner.WriteAsync(buffer, cancellationToken).ConfigureAwait(false);
+                owner.Count(buffer.Length);
+            }
+
+            public override IAsyncResult BeginWrite(byte[] buffer, int offset, int count, AsyncCallback? callback, object? state) =>
+                TaskToAsyncResult.Begin(WriteAsync(buffer, offset, count, CancellationToken.None), callback, state);
+
+            public override void EndWrite(IAsyncResult asyncResult) => TaskToAsyncResult.End(asyncResult);
+
+            public override void Flush() => inner.Flush();
+
+            public override Task FlushAsync(CancellationToken cancellationToken) => inner.FlushAsync(cancellationToken);
+
+            public override int Read(byte[] buffer, int offset, int count) => inner.Read(buffer, offset, count);
+
+            public override int Read(Span<byte> buffer) => inner.Read(buffer);
+
+            public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
+                inner.ReadAsync(buffer, offset, count, cancellationToken);
+
+            public override ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default) =>
+                inner.ReadAsync(buffer, cancellationToken);
+
+            public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
+
+            public override void SetLength(long value) => inner.SetLength(value);
+
+            public override ValueTask DisposeAsync() => inner.DisposeAsync();
+
+            protected override void Dispose(bool disposing)
+            {
+                if (disposing)
+                {
+                    inner.Dispose();
+                }
+
+                base.Dispose(disposing);
+            }
+        }
     }
 }
 

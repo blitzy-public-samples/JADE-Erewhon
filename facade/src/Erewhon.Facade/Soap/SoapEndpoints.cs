@@ -357,7 +357,6 @@ public sealed partial class WsdlDocument
         }
     }
 
-
     private static LoadResult Read(string path, ILogger logger)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(path);

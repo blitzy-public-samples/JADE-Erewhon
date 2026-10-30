@@ -32,11 +32,11 @@ Console.WriteLine(SourceLabels.Banner);
 
 // One boundary covers everything from reading configuration to mapping the endpoints. A configuration
 // file that does not parse, a setting that does not convert, a bind address that does not parse, a
-// missing seed directory, an invalid reference date or a failed registration or mapping therefore
-// stops the process with one line on standard error and exit code 1, instead of an
-// unhandled-exception abort or a listener answering from an empty model. Build (which applies the
-// Kestrel settings) and the first seed load run before any endpoint is mapped or served, so after the
-// load /admin/info reports generation 1 and mutations 0.
+// port out of range or shared, a missing seed directory, an invalid reference date or a failed
+// registration or mapping therefore stops the process with one line on standard error and exit code
+// 1, instead of an unhandled-exception abort or a listener answering from an empty model. Build
+// (which applies the Kestrel settings) and the first seed load run before any endpoint is mapped or
+// served, so after the load /admin/info reports generation 1 and mutations 0.
 IConfiguration? configuration = null;
 StandInState? state = null;
 WebApplication app;
@@ -66,9 +66,18 @@ try
         StandInOptions settings = BindStandInOptions(context.Configuration);
         IPAddress address = ParseBindAddress(settings.BindAddress);
 
-        kestrel.Listen(address, ListenerPort(settings.RestPort, nameof(StandInOptions.RestPort)));
-        kestrel.Listen(address, ListenerPort(settings.SoapPort, nameof(StandInOptions.SoapPort)));
-        kestrel.Listen(address, ListenerPort(settings.AdminPort, nameof(StandInOptions.AdminPort)));
+        // Every port is checked on its own and against the others before any listener is added.
+        int restPort = ListenerPort(settings.RestPort, nameof(StandInOptions.RestPort));
+        int soapPort = ListenerPort(settings.SoapPort, nameof(StandInOptions.SoapPort));
+        int adminPort = ListenerPort(settings.AdminPort, nameof(StandInOptions.AdminPort));
+        RequireDistinctPorts(
+            (nameof(StandInOptions.RestPort), restPort),
+            (nameof(StandInOptions.SoapPort), soapPort),
+            (nameof(StandInOptions.AdminPort), adminPort));
+
+        kestrel.Listen(address, restPort);
+        kestrel.Listen(address, soapPort);
+        kestrel.Listen(address, adminPort);
 
         // A response carries only the headers its handler sets, plus Kestrel's unavoidable Date.
         kestrel.AddServerHeader = false;
@@ -116,8 +125,8 @@ try
 }
 catch (Exception ex)
 {
-    // Only a host start or stop failure leaves Run, such as a listener that cannot bind or an invalid
-    // port layout. The host has already logged it with its stack trace.
+    // Only a host start or stop failure leaves Run, such as a listener that cannot bind. The host has
+    // already logged it with its stack trace.
     Console.Error.WriteLine($"{SourceLabels.ConsolePrefix} host failed: {ex.Message}");
     return 1;
 }
@@ -134,13 +143,36 @@ static IPAddress ParseBindAddress(string? value) =>
             $"{StandInOptions.SectionName}:{nameof(StandInOptions.BindAddress)} must be an IP address; the value is '{value}'.");
 
 // Kestrel options are built while the app is built, before the listener-port validation registered by
-// AddListenerPortMatcherPolicy runs, so an out-of-range port is reported here under its own key. Port 0
-// is rejected too: the matcher policy needs the exact port each listener is bound to.
+// AddListenerPortMatcherPolicy runs, so an out-of-range or shared port is reported here under its own
+// key. Port 0 is rejected too: the matcher policy needs the exact port each listener is bound to.
 static int ListenerPort(int port, string key) =>
     port is >= 1 and <= IPEndPoint.MaxPort
         ? port
         : throw new InvalidOperationException(
             $"{StandInOptions.SectionName}:{key} must be between 1 and {IPEndPoint.MaxPort}; the value is {port}.");
+
+// The matcher policy tells the listeners apart only by port, so each needs its own. Every pair that
+// shares one is named in a single message, in the order the listeners are given.
+static void RequireDistinctPorts(params (string Key, int Port)[] listeners)
+{
+    var conflicts = new List<string>();
+    for (var first = 0; first < listeners.Length; first++)
+    {
+        for (var second = first + 1; second < listeners.Length; second++)
+        {
+            if (listeners[first].Port == listeners[second].Port)
+            {
+                conflicts.Add(
+                    $"{StandInOptions.SectionName}:{listeners[first].Key} and {StandInOptions.SectionName}:{listeners[second].Key} are both {listeners[first].Port}; each listener needs its own port.");
+            }
+        }
+    }
+
+    if (conflicts.Count > 0)
+    {
+        throw new InvalidOperationException(string.Join(" ", conflicts));
+    }
+}
 
 // Names the StandIn:SeedDirectory value a start-up failure concerns, and never throws, so the failure
 // itself is always reported. Once the state exists it is the state's directory. Before that, the raw

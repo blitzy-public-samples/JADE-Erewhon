@@ -116,7 +116,7 @@ public sealed class ExportOpenApiMode(HarnessOptions options, TextWriter stdout)
         Print(string.Create(
             CultureInfo.InvariantCulture,
             $"waiting up to {_options.ReadinessTimeout.TotalSeconds:0} s for the {Component} admin listener"));
-        using (var readiness = new Readiness(_options))
+        using (var readiness = new Readiness(_options, _stdout))
         {
             var notReady = await readiness.WaitAsync(Component, adminUrl, ct).ConfigureAwait(false);
             if (notReady is not null)

@@ -1972,9 +1972,11 @@ public sealed class PassThroughTransformerTests
                     client = await _listener.AcceptTcpClientAsync(_stopping.Token);
                 }
                 catch (Exception exception)
-                    when (exception is OperationCanceledException or SocketException or ObjectDisposedException)
+                    when (exception is OperationCanceledException or SocketException or ObjectDisposedException
+                        || (exception is InvalidOperationException && _stopping.IsCancellationRequested))
                 {
-                    // The backend is stopping.
+                    // The backend is stopping. TcpListener.AcceptTcpClientAsync throws InvalidOperationException
+                    // when DisposeAsync ran Stop() between two accepts, so during disposal that ends the loop too.
                     return;
                 }
 

@@ -81,6 +81,10 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
     private static readonly OperationDescriptor GetCompany = OperationCatalogue.Default.Find(Surface.Rest, "getCompany");
     private static readonly PreparedRequest GetCompanyRequest = OperationRequests.ForRest(GetCompany);
 
+    // How long after the shutdown endpoint's 202 the facade may take to begin stopping. It signals
+    // ApplicationStopping as soon as the response completes, well under a second.
+    private static readonly TimeSpan StoppingSignalBound = TimeSpan.FromSeconds(10);
+
     private StubBackend? _backend;
     private StubBackend? _reroute;
     private FacadeFactory? _facade;
@@ -339,6 +343,45 @@ public sealed class ListenerIsolationTests : IAsyncLifetime
         }
 
         AssertNoSniff(response, label);
+        AssertNothingForwarded(label);
+    }
+
+    // The positive control of the forged-Host shutdown cases: on its own socket the shutdown endpoint
+    // answers and stops the facade. It calls StopApplication only once the 202 has completed, so the
+    // stopping signal may come after the response and is awaited within a fixed bound.
+    [Fact]
+    public async Task ShutdownAnswersOnAdminSocket()
+    {
+        string label = $"admin socket POST {AdminRoutes.Shutdown}";
+
+        IHostApplicationLifetime lifetime = Facade.Services.GetRequiredService<IHostApplicationLifetime>();
+        Assert.False(
+            lifetime.ApplicationStopping.IsCancellationRequested,
+            $"{label}: facade was already stopping before the request was sent");
+
+        var stopping = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using CancellationTokenRegistration registration = lifetime.ApplicationStopping.Register(() => stopping.TrySetResult());
+
+        RawResponse response = await SendAsync(Facade.AdminBaseAddress, HttpMethod.Post, AdminRoutes.Shutdown, host: null);
+
+        Assert.Equal(202, response.Status);
+        Assert.True(
+            response.Body.Length == 0,
+            $"{label}: shutdown endpoint answered 202 with a non-empty body, expected an empty body");
+        AssertNoSniff(response, label);
+
+        bool stopped;
+        try
+        {
+            await stopping.Task.WaitAsync(StoppingSignalBound, TestContext.Current.CancellationToken);
+            stopped = true;
+        }
+        catch (TimeoutException)
+        {
+            stopped = false;
+        }
+
+        Assert.True(stopped, $"{label}: facade did not begin stopping within the fixed bound");
         AssertNothingForwarded(label);
     }
 

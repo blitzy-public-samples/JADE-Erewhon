@@ -1020,7 +1020,7 @@ public sealed class ReplayBody(
         var catalogue = _catalogue ?? throw new InvalidOperationException("Operation catalogue unavailable");
 
         using var runner = CaseRunner.FromOptions(_options);
-        using var reset = new StateReset(_options);
+        using var reset = new StateReset(_options, _stdout);
         var execution = new Execution(
             _options, catalogue, _register, state, runner, reset, _stdout, _cancelledRestorationLimit, _keptEvidenceLimit, ct);
         await execution.RunAsync().ConfigureAwait(false);

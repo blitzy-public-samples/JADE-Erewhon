@@ -482,15 +482,33 @@ public sealed partial class StandInState
     /// <returns>The <see cref="StandInInfo"/> of the new state.</returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="kind"/> is not a defined kind.</exception>
     /// <exception cref="DirectoryNotFoundException">The seed directory does not exist.</exception>
-    /// <exception cref="IOException">A seed file could not be read or is not a regular file.</exception>
+    /// <exception cref="IOException">
+    /// A file in the seed directory changed length while it was fingerprinted or could not be read,
+    /// or a seed file is missing or not a regular file.
+    /// </exception>
     /// <exception cref="InvalidDataException">
     /// A seed row cannot be loaded: a value does not convert, an offset date is out of range, a photo
-    /// name is refused, its image file is missing, unreadable or not a regular file, or an agent rate
-    /// names a missing agent, category or rate or repeats an agent the rate already holds (see
+    /// name is refused, its image file is missing, not a regular file or longer than an image can
+    /// hold, or an agent rate names a missing agent, category or rate or repeats an agent the rate
+    /// already holds (see
     /// <see cref="SeedLoader.Load(string, DateOnly, ModelContext, CancellationToken)"/>). The message
-    /// names the seed file, its line and the field, category or rate at fault.
+    /// names the seed file, its line and the field, category or rate at fault. An image file that
+    /// cannot be opened or read fails <see cref="SeedFingerprint.ComputeSha256Hex(string)"/> first,
+    /// as an <see cref="UnauthorizedAccessException"/> or <see cref="IOException"/>, because every
+    /// file directly in the seed directory is fingerprinted before the load; the loader reports such
+    /// an open or read failure as this exception only when it first arises after the fingerprint, as
+    /// for a file that changed between the two.
     /// </exception>
     /// <exception cref="InvalidOperationException">The seed company could not be created.</exception>
+    /// <exception cref="NotSupportedException">
+    /// A file in the seed directory cannot seek, so the fingerprint cannot take its length, such as a
+    /// FIFO once a writer has opened it.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// Permission to list the seed directory, or to read a file in it or search a directory on that
+    /// file's path, is denied, which <see cref="SeedFingerprint.ComputeSha256Hex(string)"/> reports
+    /// before any row is loaded; or a seed file is a directory or a symbolic link to one.
+    /// </exception>
     public StandInInfo Reset(ResetKind kind)
     {
         string kindText = ResetKinds.ToQueryValue(kind);

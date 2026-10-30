@@ -48,7 +48,9 @@ namespace Erewhon.Facade.Forwarding;
 /// <item><description>
 /// <c>forwarded</c>: the backend's response was taken over; the status is the backend's. That includes an
 /// answer the backend gave before it had read the whole upload, such as 413 for its own body-size limit,
-/// and a response relayed in full before YARP found the upload incomplete.
+/// a response relayed in full before YARP found the upload incomplete, and a response relayed in full
+/// before the caller left, such as a response with no body to a caller that closes its connection as
+/// soon as it has read the head.
 /// </description></item>
 /// <item><description>
 /// <c>unavailable</c>: before the deadline, the backend gave no response whose status line and headers
@@ -64,8 +66,9 @@ namespace Erewhon.Facade.Forwarding;
 /// </description></item>
 /// <item><description>
 /// <c>aborted</c>: the caller left or broke its own request (disconnected, reset or truncated its upload)
-/// before the call completed, including while the backend's response head was being sent to it. Nothing
-/// is written; the status is the one already sent, or 0 when no response was sent.
+/// before the backend's whole response had been relayed to it, including while the backend's response
+/// head was being sent to it. Nothing is written; the status is the one already sent, or 0 when no
+/// response was sent.
 /// </description></item>
 /// <item><description>
 /// <c>failed</c>: anything else. The backend failed the call after its status line and headers had been
@@ -362,10 +365,11 @@ public sealed partial class BackendForwarder : IDisposable
 
     /// <summary>Decides and writes what the caller receives after a failed backend call.</summary>
     /// <remarks>
-    /// The checks run in a fixed order: an expired deadline, a backend response already relayed in full,
-    /// a caller that left, a timeout YARP or the handler reported, a backend response already taken over,
-    /// a backend that gave no usable response, and last every other failure, which is the facade's own
-    /// and is aborted with no response.
+    /// The checks run in a fixed order: an expired deadline, which stays a timeout even for a response
+    /// already relayed in full; a backend response already relayed in full, after which only the upload
+    /// or the copy towards the caller failed; a caller that left before that; a timeout YARP or the
+    /// handler reported; a backend response already taken over; a backend that gave no usable response;
+    /// and last every other failure, which is the facade's own and is aborted with no response.
     /// </remarks>
     /// <returns>The logged outcome and status.</returns>
     private async Task<CallResult> HandleFailureAsync(
@@ -393,10 +397,14 @@ public sealed partial class BackendForwarder : IDisposable
             return await AnswerAsync(context, surface, opName, responseTaken, isTimeout: true).ConfigureAwait(false);
         }
 
-        // YARP checks the upload only after it has copied the backend's whole response, so a request-body
-        // error it reports then, a backend that stopped reading or a caller that stopped sending, leaves
-        // the caller with the backend's complete answer, which stands as it was sent.
-        if (responseRelayed && IsRequestBodyError(error))
+        // Once the backend's whole response has been relayed, the caller has the backend's complete answer,
+        // which stands as it was sent. YARP checks the upload only after it has copied that response, so a
+        // request-body error it reports then is a backend that stopped reading or a caller that stopped
+        // sending. A cancelled or failed copy towards the caller is a caller that left once it had the whole
+        // response, for example one that closes its connection as soon as it has read a head with no body
+        // after it, before YARP has finished its copy.
+        if (responseRelayed
+            && (IsRequestBodyError(error) || error is ForwarderError.ResponseBodyCanceled or ForwarderError.ResponseBodyClient))
         {
             return new CallResult(OutcomeForwarded, response.StatusCode);
         }
@@ -1503,7 +1511,9 @@ internal sealed class BackendCallState
 
     /// <summary>
     /// Whether the backend's whole response, status line, headers and body, has been copied to the
-    /// caller's response.
+    /// caller's response: its head has been sent and no body follows it, its declared body length has
+    /// been written, or its body has been copied to the end. A caller that leaves after this has the
+    /// backend's complete answer.
     /// </summary>
     public bool ResponseRelayed => Volatile.Read(ref _responseRelayed) != 0;
 
@@ -1539,7 +1549,12 @@ internal sealed class BackendCallState
         CurrentCall.Value = null;
     }
 
-    /// <summary>Records that the backend's whole response has been copied to the caller's response.</summary>
+    /// <summary>
+    /// Records that the backend's whole response has been copied to the caller's response.
+    /// <see cref="PassThroughTransformer"/> calls it as soon as it sees the end of the response: once a
+    /// head with no body after it has been sent, once the declared body length has been written, or once
+    /// a body of unknown length has been copied to the end. Calling it again changes nothing.
+    /// </summary>
     public void MarkResponseRelayed() => Volatile.Write(ref _responseRelayed, 1);
 
     /// <summary>

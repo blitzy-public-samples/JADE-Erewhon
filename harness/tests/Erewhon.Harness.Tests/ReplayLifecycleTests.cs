@@ -361,7 +361,7 @@ public sealed partial class ReplayLifecycleTests : IDisposable
     [InlineData(0L)]
     [InlineData(-1L)]
     [InlineData(int.MaxValue + 1L)]
-    public void ReportWriteLimit_NotPositiveOrNotFinite_IsRefused(long milliseconds)
+    public void ReportWriteLimit_NotPositiveOrAboveIntMaxMilliseconds_IsRefused(long milliseconds)
     {
         Assert.Throws<ArgumentOutOfRangeException>(() => new ReplayMode(
             Options(), FakeBody.NoOp(), new RecordingReportWriter(), new RecordingShutdown(), KnownLimitationsRegister.Empty, _stdout)
@@ -572,7 +572,7 @@ public sealed partial class ReplayLifecycleTests : IDisposable
     [InlineData(0L)]
     [InlineData(-1L)]
     [InlineData(int.MaxValue + 1L)]
-    public void CancelledRunLimits_NotPositiveOrNotFinite_AreRefused(long milliseconds)
+    public void CancelledRunLimits_NotPositiveOrAboveIntMaxMilliseconds_AreRefused(long milliseconds)
     {
         var limit = TimeSpan.FromMilliseconds(milliseconds);
         Assert.Throws<ArgumentOutOfRangeException>(() => new ReplayMode(
@@ -3735,7 +3735,8 @@ public sealed partial class ReplayLifecycleTests
 // POST /admin/reset?state=empty has been sent for the getCompany empty-state case, a run cancelled while
 // that reset's confirmation read or the case's own request is outstanding still sends
 // POST /admin/reset?state=seed and has it confirmed, and the cancellation still ends the run: replay's
-// body throws it, capture exits 1. A run cancelled while that seed reset itself is outstanding abandons it
+// body throws it, capture exits 1, and each reset it confirms is printed on the writer the mode was given.
+// A run cancelled while that seed reset itself is outstanding abandons it
 // at the cancelled-run limit, records that it did and still ends. Each run works in a temporary repository
 // root of its own holding copies of the committed case matrix and harness settings (and, for replay, the
 // committed empty-state record), against one in-process loopback stub that serves the stand-in's admin
@@ -3856,6 +3857,10 @@ public sealed partial class ReplayLifecycleTests
         Assert.False(
             state.Failures.Any(item => item.Detail?.StartsWith(SeedRestorationLabel, StringComparison.Ordinal) == true),
             "the seed restoration after the empty-state case threw");
+        AssertResetLinesOnModeWriter(
+            console.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
+            ResetPoints.ReplayStart,
+            hang);
     }
 
     [Theory(Timeout = BracketTestTimeoutMilliseconds)]
@@ -3890,6 +3895,7 @@ public sealed partial class ReplayLifecycleTests
         Assert.False(
             lines.Any(line => line.Contains(SeedRestorationLabel, StringComparison.Ordinal)),
             "the seed restoration after the empty-state case threw");
+        AssertResetLinesOnModeWriter(lines, ResetPoints.CaptureStart, hang);
     }
 
     // The seed restoration itself is held: the stub never answers the POST /admin/reset?state=seed that follows
@@ -4003,6 +4009,25 @@ public sealed partial class ReplayLifecycleTests
         Assert.True(
             IndexOf(requests, InfoRequest, seed + 1) > seed,
             "the seed reset after the empty reset was not followed by its confirmation read");
+    }
+
+    // The reset lines of a bracket whose seed restoration was confirmed, on the writer the mode was given: the
+    // start reset, the empty reset when the stub answered its confirmation, then the seed restoration, each
+    // with the generation the stub reached and no other reset line among them.
+    private static void AssertResetLinesOnModeWriter(string[] lines, string startPoint, HangPoint hang)
+    {
+        var expected = new List<string> { ResetLine(AdminRoutes.ResetStateSeed, startPoint, 1) };
+        if (hang == HangPoint.CaseRequest)
+        {
+            expected.Add(ResetLine(AdminRoutes.ResetStateEmpty, ResetPoints.Before(EmptyStateCaseId), 2));
+        }
+
+        expected.Add(ResetLine(AdminRoutes.ResetStateSeed, ResetPoints.After(EmptyStateCaseId), 3));
+        Assert.Equal(expected, lines.Where(line => line.StartsWith($"{SourceLabels.ConsolePrefix} reset ", StringComparison.Ordinal)));
+
+        static string ResetLine(string state, string point, int generation) => string.Create(
+            CultureInfo.InvariantCulture,
+            $"{SourceLabels.ConsolePrefix} reset {state} at {point}: generation {generation}");
     }
 
     private static int IndexOf(IReadOnlyList<string> requests, string request, int start)
@@ -5597,9 +5622,10 @@ public sealed partial class ReplayLifecycleTests
 
     // ---- export-openapi ------------------------------------------------------------------------
 
-    // The readiness wait is announced with the configured limit, then the outcome follows as one line. The
-    // root holds contracts/, so the mode reaches readiness; a regular file where contracts/openapi belongs
-    // makes the write fail.
+    // The readiness wait is announced with the configured limit, its unprefixed ready line with the measured
+    // wait follows on the mode's own writer, and then the outcome follows as one line. The root holds
+    // contracts/, so the mode reaches readiness; a regular file where contracts/openapi belongs makes the
+    // write fail.
     [Theory]
     [InlineData(ExportOutcome.Written, "export-openapi: wrote 2 bytes to ")]
     [InlineData(ExportOutcome.WriteFailed, "export-openapi: failed: System.IO.")]
@@ -5634,9 +5660,10 @@ public sealed partial class ReplayLifecycleTests
             new[] { $"GET {AdminRoutes.Health}", $"GET {AdminRoutes.OpenApiDocument}" },
             await answering.WaitAsync(AnswerLimit, ct));
         var lines = ModeDiagnosticLines(ModeRedacted(stdout.ToString()));
-        Assert.Equal(2, lines.Count);
+        Assert.Equal(3, lines.Count);
         Assert.Equal("export-openapi: waiting up to 10 s for the facade admin listener", lines[0]);
-        var line = lines[1];
+        Assert.Matches(@"^ready: facade \([0-9]+ ms\)\z", lines[1]);
+        var line = lines[2];
         if (outcome == ExportOutcome.Written)
         {
             AssertEscaped(line, expectedStart, ModeRedacted(LifecycleConsole.Display(root)));

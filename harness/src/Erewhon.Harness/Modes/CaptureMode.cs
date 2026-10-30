@@ -196,7 +196,7 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
             }
         }
 
-        using var reset = new StateReset(_options);
+        using var reset = new StateReset(_options, _stdout);
         var start = await reset
             .ResetAsync(ResetPoints.CaptureStart, AdminRoutes.ResetStateSeed, expectations, ct)
             .ConfigureAwait(false);

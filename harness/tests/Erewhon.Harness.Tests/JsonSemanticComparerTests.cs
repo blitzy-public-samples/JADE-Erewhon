@@ -34,9 +34,10 @@ namespace Erewhon.Harness.Tests;
 /// It also covers the OpenAPI drift check, which compares the live OpenAPI document with the checked-in
 /// contract under this JSON semantic comparison, against an in-process loopback stub in a temporary
 /// repository root of its own. It also covers the <c>export-openapi</c> mode, which writes that checked-in
-/// contract: its repository-root guard, the creation of only the <c>contracts/openapi</c> leaf, the refusal
-/// of a link on the way to the contract, and the served document written byte for byte over a previous
-/// contract that a failed fetch keeps, in a temporary directory of its own.
+/// contract: its repository-root guard, the readiness wait's ready and not-ready lines on the mode's own writer,
+/// the creation of only the <c>contracts/openapi</c> leaf, the refusal of a link on the way to the contract, and
+/// the served document written byte for byte over a previous contract that a failed fetch keeps, in a temporary
+/// directory of its own.
 /// </summary>
 public sealed partial class JsonSemanticComparerTests : IDisposable
 {
@@ -2487,8 +2488,10 @@ public sealed partial class JsonSemanticComparerTests
 // holding the served document byte for byte; and a contracts directory removed after the check is never
 // recreated. A link at contracts, contracts/openapi or the contract is refused and left in place, and the
 // outside file it reaches is untouched; a previous contract is replaced by exactly the served bytes, leaving
-// no temporary file, or kept byte for byte when the fetched document is unusable. The facade admin listener
-// is a loopback port nothing listens on, or a stub the test owns.
+// no temporary file, or kept byte for byte when the fetched document is unusable. Every line goes to the mode's
+// own writer, the readiness wait's ready or not-ready line included, and a facade admin listener that never
+// answers fails the export once the wait expires, writing nothing. The facade admin listener is a loopback
+// port nothing listens on, or a stub the test owns.
 // These members live in this class because the harness test project keeps its fixed set of test classes,
 // and the export writes the checked-in contract that the OpenAPI drift check above compares under the JSON
 // semantic comparison this class covers.
@@ -2504,6 +2507,17 @@ public sealed partial class JsonSemanticComparerTests
     // Printed once the root is accepted, before the readiness wait of ReadinessLimitSeconds; a refusal never prints it.
     private const string WaitLine = "export-openapi: waiting up to 30 s for the facade admin listener";
 
+    // Stands for the measured wait of the facade's ready line, which differs in every run, in ExportConsoleText;
+    // the mode prints no such token.
+    private const string ElapsedToken = "<elapsed>";
+
+    // Printed by the readiness wait, unprefixed and on the mode's own writer, once the facade answers /health.
+    private const string ReadyLine = "ready: facade (" + ElapsedToken + " ms)";
+
+    // The not-ready test's readiness limit: the closed port refuses the first probe, and the wait expires
+    // after this limit with no second probe.
+    private const int NotReadyLimitSeconds = 1;
+
     // Stands for ExportScratch, which differs in every run, in the console text and entries a failure message
     // shows; the mode prints no such token.
     private const string ExportScratchToken = "<export-scratch>";
@@ -2514,6 +2528,10 @@ public sealed partial class JsonSemanticComparerTests
 
     // Well inside the readiness limit, and generous for a loaded host.
     private static readonly TimeSpan RefusalLimit = TimeSpan.FromSeconds(10);
+
+    // The digits of the measured wait in a whole line that is exactly the facade's ready line.
+    private static readonly Regex ReadyMilliseconds =
+        new(@"(?<=^ready: facade \()[0-9]+(?= ms\)\r?$)", RegexOptions.Multiline | RegexOptions.CultureInvariant);
 
     // Compact, with irregular spacing and a trailing newline, so a re-serialised write would differ.
     private static readonly byte[] Document =
@@ -2592,6 +2610,42 @@ public sealed partial class JsonSemanticComparerTests
         }
     }
 
+    // The root holds contracts/, so the mode waits on the facade admin listener, a closed loopback port. The
+    // readiness wait's not-ready line, which names the probe URL and the last refusal, reaches the mode's own
+    // writer between the announcement and the mode's outcome, and nothing is written.
+    [Fact]
+    public async Task FacadeAdminNeverReady_PrintsTheNotReadyLineOnTheModeWriter_AndWritesNothing()
+    {
+        var repoRoot = Directory.CreateDirectory(Path.Combine(ExportScratch, "root")).FullName;
+        Directory.CreateDirectory(Path.Combine(repoRoot, "contracts"));
+        var before = Entries();
+        var adminUrl = string.Create(CultureInfo.InvariantCulture, $"http://{IPAddress.Loopback}:{ClosedPorts.Take(1).Single()}");
+        var options = ExportOptions(repoRoot, adminUrl);
+        options.ReadinessTimeoutSeconds = NotReadyLimitSeconds;
+
+        var exitCode = await new ExportOpenApiMode(options, ExportConsole).RunAsync(TestContext.Current.CancellationToken);
+
+        Assert.Equal(1, exitCode);
+        var lines = ExportConsoleText().Split(Environment.NewLine);
+        Assert.Equal(4, lines.Length);
+        Assert.Equal("", lines[3]);
+        Assert.Equal(
+            string.Create(CultureInfo.InvariantCulture, $"{LinePrefix}waiting up to {NotReadyLimitSeconds} s for the facade admin listener"),
+            lines[0]);
+        Assert.StartsWith(
+            ExportRedacted(string.Create(
+                CultureInfo.InvariantCulture,
+                $"not ready: facade after {NotReadyLimitSeconds} s (no 200 from {adminUrl}{AdminRoutes.Health} within {NotReadyLimitSeconds} s; "
+                + $"last: {nameof(HttpRequestException)} ({HttpRequestError.ConnectionError}): ")),
+            lines[1],
+            StringComparison.Ordinal);
+        Assert.EndsWith(")", lines[1], StringComparison.Ordinal);
+        Assert.Equal(
+            ExportRedacted($"{LinePrefix}facade admin not ready at {new Uri(adminUrl)} ({FailureItemIds.Ready("facade")} {FailureItemIds.Timeout})"),
+            lines[2]);
+        Assert.Equal(before, Entries());
+    }
+
     [Fact]
     public async Task RootWithContractsButNoOpenApiDirectory_CreatesOnlyTheLeaf_AndWritesTheServedBytes()
     {
@@ -2607,8 +2661,8 @@ public sealed partial class JsonSemanticComparerTests
         Assert.Equal(
             ExportRedacted(string.Create(
                 CultureInfo.InvariantCulture,
-                $"{WaitLine}{Environment.NewLine}{LinePrefix}wrote {Document.Length} bytes to {target}{Environment.NewLine}")),
-            ExportRedacted(ExportConsole.ToString()));
+                $"{WaitLine}{Environment.NewLine}{ReadyLine}{Environment.NewLine}{LinePrefix}wrote {Document.Length} bytes to {target}{Environment.NewLine}")),
+            ExportConsoleText());
         string[] created = [repoRoot, Path.Combine(repoRoot, "contracts"), Path.GetDirectoryName(target)!, target];
         Assert.Equal(created.Select(ExportRedacted), Entries());
         Assert.Equal(Document, File.ReadAllBytes(target));
@@ -2632,10 +2686,11 @@ public sealed partial class JsonSemanticComparerTests
         Assert.Equal(1, exitCode);
         Assert.Equal(
             ExportRedacted(
-                $"{WaitLine}{Environment.NewLine}{LinePrefix}failed: {typeof(IOException).FullName}: ConfinedTree could not publish "
-                + $"'{TargetBelowRoot}': the directory 'contracts' does not exist, and only the file's own directory is ever created."
+                $"{WaitLine}{Environment.NewLine}{ReadyLine}{Environment.NewLine}{LinePrefix}failed: {typeof(IOException).FullName}: "
+                + $"ConfinedTree could not publish '{TargetBelowRoot}': the directory 'contracts' does not exist, and only the file's "
+                + "own directory is ever created."
                 + Environment.NewLine),
-            ExportRedacted(ExportConsole.ToString()));
+            ExportConsoleText());
         Assert.Equal(new[] { ExportRedacted(repoRoot) }, Entries());
     }
 
@@ -2692,8 +2747,10 @@ public sealed partial class JsonSemanticComparerTests
 
         Assert.Equal(1, exitCode);
         Assert.Equal(
-            ExportRedacted($"{WaitLine}{Environment.NewLine}{LinePrefix}failed: {typeof(IOException).FullName}: {refusal}{Environment.NewLine}"),
-            ExportRedacted(ExportConsole.ToString()));
+            ExportRedacted(
+                $"{WaitLine}{Environment.NewLine}{ReadyLine}{Environment.NewLine}{LinePrefix}failed: {typeof(IOException).FullName}: "
+                + $"{refusal}{Environment.NewLine}"),
+            ExportConsoleText());
         Assert.Equal(AdminRoutes.OpenApiDocument, facade.Requests[^1]);
         Assert.Equal(OutsideContract, File.ReadAllBytes(outsideContract));
         Assert.Equal(before, Entries());
@@ -2716,8 +2773,8 @@ public sealed partial class JsonSemanticComparerTests
         Assert.Equal(
             ExportRedacted(string.Create(
                 CultureInfo.InvariantCulture,
-                $"{WaitLine}{Environment.NewLine}{LinePrefix}wrote {Document.Length} bytes to {target}{Environment.NewLine}")),
-            ExportRedacted(ExportConsole.ToString()));
+                $"{WaitLine}{Environment.NewLine}{ReadyLine}{Environment.NewLine}{LinePrefix}wrote {Document.Length} bytes to {target}{Environment.NewLine}")),
+            ExportConsoleText());
         Assert.Equal(Document, File.ReadAllBytes(target));
         string[] entries = [repoRoot, Path.Combine(repoRoot, "contracts"), openApiDirectory, target];
         Assert.Equal(entries.Select(ExportRedacted), Entries());
@@ -2738,9 +2795,9 @@ public sealed partial class JsonSemanticComparerTests
         Assert.Equal(1, exitCode);
         Assert.Equal(
             ExportRedacted(
-                $"{WaitLine}{Environment.NewLine}{LinePrefix}{facade.BaseUrl}{AdminRoutes.OpenApiDocument} did not return a JSON object "
-                + $"(root is Array). Nothing written.{Environment.NewLine}"),
-            ExportRedacted(ExportConsole.ToString()));
+                $"{WaitLine}{Environment.NewLine}{ReadyLine}{Environment.NewLine}{LinePrefix}{facade.BaseUrl}{AdminRoutes.OpenApiDocument} "
+                + $"did not return a JSON object (root is Array). Nothing written.{Environment.NewLine}"),
+            ExportConsoleText());
         Assert.Equal(PreviousContract, File.ReadAllBytes(target));
         string[] entries = [repoRoot, Path.Combine(repoRoot, "contracts"), openApiDirectory, target];
         Assert.Equal(entries.Select(ExportRedacted), Entries());
@@ -2770,6 +2827,13 @@ public sealed partial class JsonSemanticComparerTests
     /// </summary>
     private string ExportRedacted(string text) =>
         LoopbackPort.Replace(text.Replace(ExportScratch, ExportScratchToken, StringComparison.Ordinal), PortToken);
+
+    /// <summary>
+    /// The text the mode printed to <see cref="ExportConsole"/>, through <see cref="ExportRedacted"/>, with the
+    /// measured wait of a line that is exactly the facade's ready line shown as <see cref="ElapsedToken"/>, so an
+    /// expectation holds <see cref="ReadyLine"/> where the console holds that line. Only those digits change.
+    /// </summary>
+    private string ExportConsoleText() => ReadyMilliseconds.Replace(ExportRedacted(ExportConsole.ToString()), ElapsedToken);
 
     /// <summary>
     /// An in-process facade admin listener on 127.0.0.1 and an ephemeral port: <c>GET /health</c> answers 200, and

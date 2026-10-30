@@ -1605,8 +1605,6 @@ public sealed partial class XmlSemanticComparerTests : IDisposable
         }
     }
 
-    // ---- Helpers ---------------------------------------------------------------------------------
-
     /// <summary>The message of a comparison refused because its discrepancy evidence exceeds <paramref name="limit"/> characters.</summary>
     private static string EvidenceRefusal(int limit) =>
         string.Create(
@@ -2599,8 +2597,6 @@ public sealed partial class XmlSemanticComparerTests
 
         Assert.NotEqual(natures[0], natures[1]);
     }
-
-    // ---- Helpers ---------------------------------------------------------------------------------------
 
     /// <summary>
     /// Runs the check against the given base URLs. Without <paramref name="facadeAdminUrl"/>, the facade's admin

@@ -1,9 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!--
-    Facade-only behaviour tests (per-operation routing, unreachable and timeout responses, listener
-    isolation) against the facade hosted on real loopback Kestrel sockets, and socket-free tests of the
-    log level floors the facade applies to its logging configuration.
+    Facade behaviour tests against the facade hosted on real loopback Kestrel sockets, and unit tests
+    of facade components that run without hosting the facade.
 
     Target framework, runtime pin, nullable, implicit usings, central package management and lock
     files are inherited from facade/Directory.Build.props, which imports Erewhon.Strangler.props;
