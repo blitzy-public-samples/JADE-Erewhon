@@ -5085,18 +5085,15 @@ public sealed partial class KnownLimitationsRegisterTests
             WriteExitCode(file == "xunit-xml" ? "2" : "0");
         }
 
-        var path = Temp.PathOf($"artifacts/facade-tests/{name}");
+        var relative = $"artifacts/facade-tests/{name}";
+        var path = Temp.PathOf(relative);
         PlantRefusedFile(path, kind, byteLimit, validContent);
 
         var summary = await Task.Run(() => Read(), ct).WaitAsync(PromptReadLimit, ct);
 
-        // The refusal names the planted file by its full path, which both sides show with Temp's root redacted.
-        var refusal = Redacted(path) + kind switch
-        {
-            "fifo" => " is not a regular file (a FIFO)",
-            "oversized" => string.Create(CultureInfo.InvariantCulture, $" exceeds the {byteLimit}-byte limit"),
-            _ => " is a symbolic link, which is never followed",
-        };
+        // The refusal is ConfinedTree's, with that file's own byte limit, and names the planted file relative to
+        // Temp's root.
+        var refusal = ConfinedReadRefusal(relative, kind, byteLimit);
         switch (file)
         {
             case "trx":
@@ -5140,12 +5137,16 @@ public sealed partial class KnownLimitationsRegisterTests
 
     // The results directory, or the artifacts directory above it, replaced by a link to a directory of valid
     // results is never followed, and replaced by a file is never read, so every file is unreadable for that
-    // reason and nothing from the link's target counts.
+    // reason and nothing from the link's target counts. expectedRefusal is ConfinedTree's refusal of each file,
+    // with {0} standing for that file's path relative to Temp's root.
     [Theory]
-    [InlineData("artifacts/facade-tests", true, "is a symbolic link, which is never followed")]
-    [InlineData("artifacts", true, "is a symbolic link, which is never followed")]
-    [InlineData("artifacts/facade-tests", false, "is not a directory")]
-    public async Task Read_ResultsDirectoryBehindALinkOrAFile_ReadsNothing(string component, bool link, string expectedReason)
+    [InlineData(
+        "artifacts/facade-tests",
+        true,
+        "ConfinedTree never reads through a link: refused '{0}', because 'artifacts/facade-tests' is a symbolic link.")]
+    [InlineData("artifacts", true, "ConfinedTree never reads through a link: refused '{0}', because 'artifacts' is a symbolic link.")]
+    [InlineData("artifacts/facade-tests", false, "ConfinedTree could not open 'artifacts/facade-tests': it is not a directory.")]
+    public async Task Read_ResultsDirectoryBehindALinkOrAFile_ReadsNothing(string component, bool link, string expectedRefusal)
     {
         Assert.SkipUnless(OperatingSystem.IsLinux(), "the facade test results are read only on Linux");
         var ct = TestContext.Current.CancellationToken;
@@ -5167,13 +5168,13 @@ public sealed partial class KnownLimitationsRegisterTests
 
         AssertThreeNotRunChecks(summary);
 
-        // The detail names each file and the refused component by full path, which both sides show with Temp's
-        // root redacted.
-        var reason = $"{componentPath} {expectedReason}";
+        // ConfinedTree's refusals name their paths relative to Temp's root, so the detail reads the same in every run.
+        var trxRefusal = string.Format(
+            CultureInfo.InvariantCulture, expectedRefusal, $"artifacts/facade-tests/{FacadeTestResults.TrxFileName}");
+        var exitCodeRefusal = string.Format(
+            CultureInfo.InvariantCulture, expectedRefusal, $"artifacts/facade-tests/{FacadeTestResults.ExitCodeFileName}");
         Assert.Equal(
-            Redacted(
-                $"TRX file unreadable: {Temp.PathOf($"artifacts/facade-tests/{FacadeTestResults.TrxFileName}")}: {reason}; "
-                    + $"exit-code file unreadable: {Temp.PathOf($"artifacts/facade-tests/{FacadeTestResults.ExitCodeFileName}")}: {reason}"),
+            $"TRX file unreadable: {trxRefusal}; exit-code file unreadable: {exitCodeRefusal}",
             Redacted(AssertSingleTrxItem(summary).Detail));
         Assert.Null(summary.ExitCode);
     }
@@ -5210,16 +5211,17 @@ public sealed partial class KnownLimitationsRegisterTests
         }
     }
 
-    // The refusal ConfinedTree gives, reading with the evidence limit below Temp's root, for what PlantRefusedFile
-    // planted at relative. The message names the path relative to the root, so it reads the same in every run.
-    private static string ConfinedReadRefusal(string relative, string kind) => kind switch
+    // The refusal ConfinedTree gives, reading with byteLimit (the evidence limit unless the reader sets its own)
+    // below Temp's root, for what PlantRefusedFile planted at relative. The message names the path relative to
+    // the root, so it reads the same in every run.
+    private static string ConfinedReadRefusal(string relative, string kind, int byteLimit = HarnessOptions.EvidenceByteLimit) => kind switch
     {
         "fifo" => $"ConfinedTree could not read '{relative}': it is not a regular file (a FIFO).",
         "link-to-fifo" or "link-to-file" =>
             $"ConfinedTree never reads through a link: refused '{relative}', because '{relative}' is a symbolic link.",
         "oversized" => string.Create(
             CultureInfo.InvariantCulture,
-            $"ConfinedTree could not read '{relative}': it exceeds the {HarnessOptions.EvidenceByteLimit}-byte limit."),
+            $"ConfinedTree could not read '{relative}': it exceeds the {byteLimit}-byte limit."),
         _ => throw new ArgumentOutOfRangeException(nameof(kind), kind, "unknown kind of refused file"),
     };
 

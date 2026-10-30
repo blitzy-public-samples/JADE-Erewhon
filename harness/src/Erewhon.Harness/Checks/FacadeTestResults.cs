@@ -1,11 +1,9 @@
 using System.Globalization;
-using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.RegularExpressions;
 using System.Xml;
 using System.Xml.Linq;
 using Erewhon.Harness.Report;
-using Microsoft.Win32.SafeHandles;
 
 namespace Erewhon.Harness.Checks;
 
@@ -74,15 +72,16 @@ public sealed record FacadeTestSummary(
 /// detail lists them in a fixed order: the TRX file itself, the test classes it holds no results for,
 /// the failed results whose exception type was not recorded, then the completion evidence. An absent
 /// or unusable xunit XML file is a problem only when some failed result needed it.</para>
-/// <para>The directory is shared with the <c>facade-tests</c> service and writable by others, so it is read
-/// defensively, and only on Linux. It is opened once, and all three files are read relative to that one
-/// handle, so they come from the same directory. The repository root is trusted and opened by its path; the
-/// directories below it and the three files are opened without following a symbolic link, so a link is
-/// refused, never followed. Each file's type is taken from the opened descriptor, never from its path, and
-/// only a regular file is read: a directory, FIFO, socket or device is refused, and opening never waits on
-/// one. Each read is bounded (<see cref="ResultsFileByteLimit"/> bytes for the TRX and xunit XML files,
-/// <see cref="ExitCodeByteLimit"/> for <c>exit-code</c>), and a larger file is refused. A refused file is
-/// unreadable, with the same consequence as any other unreadable file.</para>
+/// <para>The directory is shared with the <c>facade-tests</c> service and writable by others, so each of the
+/// three files is read on its own through <see cref="ConfinedTree"/>, rooted at the repository root, and only
+/// on Linux. A read stays strictly below the root, and a symbolic link on the way or at the file is refused,
+/// never followed. Only a regular file is read: a FIFO, a socket or a device is refused without being waited
+/// on, and a directory at a file's name is refused too. Each read is bounded
+/// (<see cref="ResultsFileByteLimit"/> bytes for the TRX and xunit XML files, <see cref="ExitCodeByteLimit"/>
+/// for <c>exit-code</c>), and a larger file is refused, never read in part. A refused file is unreadable, with
+/// the same consequence as any other unreadable file. A refusal by <see cref="ConfinedTree"/> names the refused
+/// path relative to the repository root; a directory at a file's name is named by the file's full path, as an
+/// absent file is.</para>
 /// <para>Nothing is ever written. Instances hold no mutable state and are thread-safe.</para>
 /// </remarks>
 public sealed partial class FacadeTestResults(HarnessOptions options)
@@ -125,10 +124,6 @@ public sealed partial class FacadeTestResults(HarnessOptions options)
     /// </summary>
     internal const int ExitCodeByteLimit = 4096;
 
-    // The first buffer of a bounded read; it grows only as the file's content arrives, so a small file never
-    // costs the whole limit.
-    private const int InitialReadBytes = 64 * 1024;
-
     private const string NoExitStatus = "no valid dotnet test exit status was recorded";
 
     private const string NoXunitXml = "no xunit XML results were supplied";
@@ -152,31 +147,32 @@ public sealed partial class FacadeTestResults(HarnessOptions options)
     /// that is absent, unreadable (a directory included) or holds no integer, or an exit status the TRX
     /// results contradict, also gives that item, its detail naming the precise problem. So does an xunit
     /// XML file that is absent, unreadable (a directory included) or unparseable, but only when a failed
-    /// result's exception type is therefore not recorded. All three files are read through one handle of the
-    /// directory. Symbolic links are never followed, only regular files are read, and each read is bounded,
-    /// so a link, a FIFO, a socket, a device or an oversized file is unreadable and nothing blocks on a special
-    /// file. On any operating system other than Linux every file is unreadable, its detail naming that
-    /// requirement. I/O failures never escape.
+    /// result's exception type is therefore not recorded. Each file is read on its own through
+    /// <see cref="ConfinedTree"/>, strictly below the repository root. Symbolic links are never followed, only
+    /// regular files are read, and each read is bounded, so a link, a FIFO, a socket, a device or an oversized
+    /// file is unreadable, its detail naming the refused path relative to the repository root, and nothing
+    /// blocks on a special file. On any operating system other than Linux every file is unreadable, its detail
+    /// naming that requirement. I/O failures never escape.
     /// </summary>
     /// <returns>The counts, failure items and recorded exit status.</returns>
     public FacadeTestSummary Read()
     {
         var directory = _options.FacadeTestsDirectory;
-        using var results = ResultsDirectory.Open(_options.ResolvePath("."), directory);
-        var exit = ReadExitCode(results.Read(ExitCodeFileName, ExitCodeByteLimit), Path.Combine(directory, ExitCodeFileName));
+        var tree = new ConfinedTree(_options.ResolvePath("."));
+        var exitCodePath = Path.Combine(directory, ExitCodeFileName);
+        var exit = ReadExitCode(ReadResultFile(tree, exitCodePath, ExitCodeByteLimit), exitCodePath);
 
-        var trx = results.Read(TrxFileName, ResultsFileByteLimit);
+        var trxPath = Path.Combine(directory, TrxFileName);
+        var trx = ReadResultFile(tree, trxPath, ResultsFileByteLimit);
         if (trx.Text is not { } trxXml)
         {
             return Unavailable(
-                trx.Problem is { } problem
-                    ? $"TRX file unreadable: {problem}"
-                    : $"TRX file absent: {Path.Combine(directory, TrxFileName)}",
+                trx.Problem is { } problem ? $"TRX file unreadable: {problem}" : $"TRX file absent: {trxPath}",
                 exit);
         }
 
-        var xunitXml = results.Read(XunitXmlFileName, ResultsFileByteLimit);
-        return Parse(trxXml, ReadXunitXml(xunitXml, Path.Combine(directory, XunitXmlFileName)), exit);
+        var xunitXmlPath = Path.Combine(directory, XunitXmlFileName);
+        return Parse(trxXml, ReadXunitXml(ReadResultFile(tree, xunitXmlPath, ResultsFileByteLimit), xunitXmlPath), exit);
     }
 
     /// <summary>
@@ -534,7 +530,35 @@ public sealed partial class FacadeTestResults(HarnessOptions options)
         };
     }
 
-    // The exit status the exit-code file at path records, as ResultsDirectory.Read found the file.
+    // The result file at path, read through tree, at most byteLimit bytes, and decoded as File.ReadAllText
+    // decodes: UTF-8 unless a byte order mark names another encoding. Every refusal and I/O failure, and an
+    // operating system without Linux directory handles, makes the file unreadable with ConfinedTree's message.
+    private static ResultFile ReadResultFile(ConfinedTree tree, string path, int byteLimit)
+    {
+        byte[]? content;
+        try
+        {
+            content = tree.ReadFile(path, byteLimit);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            return ResultFile.Unreadable(ex.Message);
+        }
+
+        if (content is null)
+        {
+            // The read finds nothing at a directory, which would read as an absent file, so it is named here.
+            // ReadFile has already refused a link at the name or on the way, so this only tells a directory
+            // from no entry at all, and reads nothing.
+            return Directory.Exists(path) ? ResultFile.Unreadable($"{path} is a directory") : ResultFile.Absent;
+        }
+
+        using var reader = new StreamReader(
+            new MemoryStream(content, writable: false), Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
+        return ResultFile.Read(reader.ReadToEnd());
+    }
+
+    // The exit status the exit-code file at path records, as ReadResultFile found the file.
     private static ExitStatus ReadExitCode(ResultFile file, string path)
     {
         if (file.Text is not { } content)
@@ -549,7 +573,7 @@ public sealed partial class FacadeTestResults(HarnessOptions options)
             : ExitStatus.Invalid($"exit-code file {path} does not hold an integer: '{Excerpt(text)}'");
     }
 
-    // The xunit XML results of the file at path, as ResultsDirectory.Read found the file.
+    // The xunit XML results of the file at path, as ReadResultFile found the file.
     private static XunitXmlSource ReadXunitXml(ResultFile file, string path)
     {
         if (file.Text is { } text)
@@ -829,8 +853,8 @@ public sealed partial class FacadeTestResults(HarnessOptions options)
         }
     }
 
-    // One result file as ResultsDirectory.Read found it: its text; or, with no text, Problem saying why it is
-    // unreadable, naming its path first; or neither, when it is absent.
+    // One result file as ReadResultFile found it: its text; or, with no text, Problem saying why it is
+    // unreadable, naming the file or the entry on the way that was refused; or neither, when it is absent.
     private readonly record struct ResultFile(string? Text, string? Problem)
     {
         public static ResultFile Absent => default;
@@ -838,334 +862,5 @@ public sealed partial class FacadeTestResults(HarnessOptions options)
         public static ResultFile Read(string text) => new(text, Problem: null);
 
         public static ResultFile Unreadable(string problem) => new(Text: null, problem);
-    }
-
-    // The results directory held open by one Linux directory handle, so that every file is read from the one
-    // directory the handle holds, whatever is later renamed, removed or linked at its path. The repository root
-    // is the caller's and trusted, so it is opened by its path, following any link in it. Each directory below
-    // it is opened relative to the handle of the one above it without following a link, and so is each file,
-    // non-blocking, so that opening a FIFO returns at once. A file's type is then read from the opened
-    // descriptor, so what is read is exactly what was opened, and only a regular file is read, at most its
-    // limit plus one byte. A missing directory on the way makes every file absent; any other directory that
-    // cannot be opened makes every file unreadable for that reason. Nothing here throws for an operating-system
-    // error: each one becomes the problem of the file it concerns.
-    private sealed class ResultsDirectory : IDisposable
-    {
-        private static readonly char[] PathSeparators = [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar];
-
-        private readonly string _path;
-        private readonly DirectoryHandle? _handle;
-        private readonly string? _unreadable;
-        private readonly int _openFile;
-
-        // handle is null when the directory is missing or unreadable; unreadable says why for every file, after
-        // the file's path. openFile is the open(2) flags of a file inside it.
-        private ResultsDirectory(string path, DirectoryHandle? handle, string? unreadable, int openFile)
-        {
-            _path = path;
-            _handle = handle;
-            _unreadable = unreadable;
-            _openFile = openFile;
-        }
-
-        // Opens path, a directory below root, component by component.
-        public static ResultsDirectory Open(string root, string path)
-        {
-            var (flags, unsupported) = LinuxReadFlags();
-            if (unsupported is not null)
-            {
-                return new ResultsDirectory(path, handle: null, unsupported, openFile: 0);
-            }
-
-            var segments = Path.GetRelativePath(root, path).Split(PathSeparators, StringSplitOptions.RemoveEmptyEntries);
-            if (segments.Length == 0 || segments.Contains("..", StringComparer.Ordinal))
-            {
-                return new ResultsDirectory(path, handle: null, $"{path} is not below the repository root {root}", flags.OpenFile);
-            }
-
-            int descriptor;
-            using (var current = DirectoryHandle.CurrentDirectory())
-            {
-                descriptor = Native.OpenAt(current, root, flags.OpenRoot, mode: 0);
-            }
-
-            if (descriptor < 0)
-            {
-                var errno = Marshal.GetLastPInvokeError();
-                var problem = errno switch
-                {
-                    Native.ENOENT => null,
-                    Native.ENOTDIR => $"{root} is not a directory",
-                    _ => $"{root}: {Marshal.GetPInvokeErrorMessage(errno)}",
-                };
-                return new ResultsDirectory(path, handle: null, problem, flags.OpenFile);
-            }
-
-            var directory = DirectoryHandle.Own(descriptor);
-            var component = root;
-            foreach (var segment in segments)
-            {
-                component = Path.Join(component, segment);
-                using var parent = directory;
-                descriptor = Native.OpenAt(parent, segment, flags.OpenDirectory, mode: 0);
-                if (descriptor < 0)
-                {
-                    var errno = Marshal.GetLastPInvokeError();
-                    var problem = errno == Native.ENOENT ? null : DirectoryProblem(parent, segment, component, errno);
-                    return new ResultsDirectory(path, handle: null, problem, flags.OpenFile);
-                }
-
-                directory = DirectoryHandle.Own(descriptor);
-            }
-
-            return new ResultsDirectory(path, directory, unreadable: null, flags.OpenFile);
-        }
-
-        // The file name inside the directory, read only when it is a regular file of at most byteLimit bytes,
-        // and decoded as File.ReadAllText decodes: UTF-8 unless a byte order mark names another encoding.
-        public ResultFile Read(string name, int byteLimit)
-        {
-            var path = Path.Combine(_path, name);
-            if (_unreadable is not null)
-            {
-                return ResultFile.Unreadable($"{path}: {_unreadable}");
-            }
-
-            if (_handle is null)
-            {
-                return ResultFile.Absent;
-            }
-
-            var descriptor = Native.OpenAt(_handle, name, _openFile, mode: 0);
-            if (descriptor < 0)
-            {
-                var errno = Marshal.GetLastPInvokeError();
-                return errno switch
-                {
-                    Native.ENOENT => ResultFile.Absent,
-
-                    // O_NOFOLLOW fails a link at the name itself, dangling or not, as ELOOP.
-                    Native.ELOOP => ResultFile.Unreadable($"{path} is a symbolic link, which is never followed"),
-                    _ => ResultFile.Unreadable($"{path}: {Marshal.GetPInvokeErrorMessage(errno)}"),
-                };
-            }
-
-            using var file = new SafeFileHandle(descriptor, ownsHandle: true);
-            if (NotRegularFile(file, path) is { } problem)
-            {
-                return ResultFile.Unreadable(problem);
-            }
-
-            byte[] content;
-            int length;
-            try
-            {
-                (content, length) = ReadAtMost(file, byteLimit + 1);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                return ResultFile.Unreadable($"{path}: {ex.Message}");
-            }
-
-            if (length > byteLimit)
-            {
-                return ResultFile.Unreadable(
-                    string.Create(CultureInfo.InvariantCulture, $"{path} exceeds the {byteLimit}-byte limit"));
-            }
-
-            using var reader = new StreamReader(
-                new MemoryStream(content, 0, length, writable: false), Encoding.UTF8, detectEncodingFromByteOrderMarks: true);
-            return ResultFile.Read(reader.ReadToEnd());
-        }
-
-        public void Dispose() => _handle?.Dispose();
-
-        // Why the directory name inside parent, which component stands for, could not be opened. With O_DIRECTORY
-        // and O_NOFOLLOW a link, dangling or not, fails as ELOOP or ENOTDIR exactly as a file does, so the entry's
-        // own type, read without following it, tells them apart.
-        private static string DirectoryProblem(DirectoryHandle parent, string name, string component, int errno)
-        {
-            if (errno is not (Native.ENOTDIR or Native.ELOOP))
-            {
-                return $"{component}: {Marshal.GetPInvokeErrorMessage(errno)}";
-            }
-
-            return FileType(parent, name, Native.AT_SYMLINK_NOFOLLOW, out _) == Native.S_IFLNK
-                ? $"{component} is a symbolic link, which is never followed"
-                : $"{component} is not a directory";
-        }
-
-        // Why the opened file is not read, or null when it is a regular file. The type comes from the descriptor
-        // itself (AT_EMPTY_PATH), never from the path, so nothing swapped in at the name since the open counts.
-        private static string? NotRegularFile(SafeFileHandle file, string path)
-        {
-            var type = FileType(file, string.Empty, Native.AT_EMPTY_PATH, out var errno);
-            return type switch
-            {
-                Native.S_IFREG => null,
-                Native.S_IFDIR => $"{path} is a directory",
-                null when errno == 0 => $"{path}: its file type was not reported",
-                null => $"{path}: {Marshal.GetPInvokeErrorMessage(errno)}",
-                _ => $"{path} is not a regular file ({Kind(type.Value)})",
-            };
-        }
-
-        private static string Kind(int type) => type switch
-        {
-            Native.S_IFIFO => "a FIFO",
-            Native.S_IFSOCK => "a socket",
-            Native.S_IFCHR => "a character device",
-            Native.S_IFBLK => "a block device",
-            Native.S_IFLNK => "a symbolic link",
-            _ => string.Create(CultureInfo.InvariantCulture, $"file type 0x{type:x4}"),
-        };
-
-        // The S_IFMT bits statx reports for path relative to handle, or null when statx fails, with errno set,
-        // or reports no type, with errno 0.
-        private static int? FileType(SafeHandle handle, string path, int flags, out int errno)
-        {
-            Span<byte> status = stackalloc byte[Native.StatxSize];
-            if (Native.Statx(handle, path, flags, Native.STATX_TYPE, ref MemoryMarshal.GetReference(status)) != 0)
-            {
-                errno = Marshal.GetLastPInvokeError();
-                return null;
-            }
-
-            // The kernel writes the structure in the process's own byte order.
-            errno = 0;
-            return (MemoryMarshal.Read<uint>(status) & Native.STATX_TYPE) == 0
-                ? null
-                : MemoryMarshal.Read<ushort>(status[Native.StatxModeOffset..]) & Native.S_IFMT;
-        }
-
-        // Reads from the start of file until its end or until count bytes are in, whichever comes first, so a
-        // file longer than count - 1 bytes is told apart without reading the rest of it.
-        private static (byte[] Content, int Length) ReadAtMost(SafeFileHandle file, int count)
-        {
-            var content = new byte[Math.Min(count, InitialReadBytes)];
-            var length = 0;
-            while (true)
-            {
-                if (length == content.Length)
-                {
-                    if (length == count)
-                    {
-                        return (content, length);
-                    }
-
-                    Array.Resize(ref content, (int)Math.Min(2L * content.Length, count));
-                }
-
-                var read = RandomAccess.Read(file, content.AsSpan(length), fileOffset: length);
-                if (read == 0)
-                {
-                    return (content, length);
-                }
-
-                length += read;
-            }
-        }
-
-        // The open(2) flags of the reads for this process, or the reason every file is unreadable on a platform
-        // without Linux directory handles.
-        private static (ReadFlags Flags, string? Unsupported) LinuxReadFlags()
-        {
-            if (!OperatingSystem.IsLinux())
-            {
-                return (default, "the facade test results are read only on Linux, through directory handles that "
-                    + "refuse links and special files, which this operating system does not provide");
-            }
-
-            // O_DIRECTORY and O_NOFOLLOW are the only flags used here whose values differ between architectures.
-            (int Directory, int NoFollow)? known = RuntimeInformation.ProcessArchitecture switch
-            {
-                Architecture.X64 or Architecture.X86 or Architecture.S390x or Architecture.RiscV64
-                    or Architecture.LoongArch64 => (0x10000, 0x20000),
-                Architecture.Arm or Architecture.Arm64 or Architecture.Armv6 or Architecture.Ppc64le => (0x4000, 0x8000),
-                _ => null,
-            };
-            if (known is not { } bits)
-            {
-                return (default, "the facade test results are read only where the Linux open flags are known, "
-                    + $"which they are not for {RuntimeInformation.ProcessArchitecture}");
-            }
-
-            var (directory, noFollow) = bits;
-            return (new ReadFlags(
-                Native.O_RDONLY | directory | Native.O_CLOEXEC,
-                Native.O_RDONLY | directory | noFollow | Native.O_CLOEXEC,
-                Native.O_RDONLY | noFollow | Native.O_NONBLOCK | Native.O_NOCTTY | Native.O_CLOEXEC), null);
-        }
-    }
-
-    // The open(2) flags of one read: the trusted root opened read-only by its path, a directory below it opened
-    // read-only without following a link, and a file opened read-only without following a link, without
-    // waiting on a FIFO's writer and without becoming a controlling terminal, all closed on exec.
-    private readonly record struct ReadFlags(int OpenRoot, int OpenDirectory, int OpenFile);
-
-    // A directory held open by its file descriptor, so a call relative to it acts on that directory whatever is
-    // later renamed, removed or linked at the path it was opened by.
-    private sealed class DirectoryHandle : SafeHandleMinusOneIsInvalid
-    {
-        private DirectoryHandle(int descriptor, bool ownsHandle)
-            : base(ownsHandle)
-        {
-            SetHandle(descriptor);
-        }
-
-        // AT_FDCWD, which resolves an absolute path as given; it owns no descriptor and closes nothing.
-        public static DirectoryHandle CurrentDirectory() => new(Native.AT_FDCWD, ownsHandle: false);
-
-        public static DirectoryHandle Own(int descriptor) => new(descriptor, ownsHandle: true);
-
-        protected override bool ReleaseHandle() => Native.Close((int)handle) == 0;
-    }
-
-    // The Linux C library calls behind the reads, with the flag, type and errno values they use. Paths are
-    // passed as UTF-8, and a handle stays open for the whole of each call it is passed to. A handle is passed
-    // pointer-sized; its value is the descriptor sign-extended, the form in which every Linux calling convention
-    // passes the C int the calls declare. The calls use DllImport, not the LibraryImport that SYSLIB1054
-    // suggests, because its generated marshalling needs unsafe code, which this project does not enable; and
-    // strings stay UTF-8 despite CA2101, which asks for the UTF-16 of Windows APIs, because a Linux path is the
-    // UTF-8 bytes the kernel reads.
-    private static class Native
-    {
-        public const int AT_FDCWD = -100;
-        public const int AT_SYMLINK_NOFOLLOW = 0x100;
-        public const int AT_EMPTY_PATH = 0x1000;
-
-        // struct statx has one layout on every architecture: 256 bytes, with the u32 stx_mask at byte 0 and the
-        // u16 stx_mode at byte 28, whose S_IFMT bits give the file's type.
-        public const uint STATX_TYPE = 0x1;
-        public const int StatxSize = 256;
-        public const int StatxModeOffset = 28;
-        public const int S_IFMT = 0xF000;
-        public const int S_IFIFO = 0x1000;
-        public const int S_IFCHR = 0x2000;
-        public const int S_IFDIR = 0x4000;
-        public const int S_IFBLK = 0x6000;
-        public const int S_IFREG = 0x8000;
-        public const int S_IFLNK = 0xA000;
-        public const int S_IFSOCK = 0xC000;
-
-        public const int O_RDONLY = 0;
-        public const int O_NOCTTY = 0x100;
-        public const int O_NONBLOCK = 0x800;
-        public const int O_CLOEXEC = 0x80000;
-
-        public const int ENOENT = 2;
-        public const int ENOTDIR = 20;
-        public const int ELOOP = 40;
-
-        [DllImport("libc", EntryPoint = "openat", SetLastError = true)]
-        public static extern int OpenAt(
-            DirectoryHandle directory, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags, uint mode);
-
-        [DllImport("libc", EntryPoint = "statx", SetLastError = true)]
-        public static extern int Statx(
-            SafeHandle handle, [MarshalAs(UnmanagedType.LPUTF8Str)] string path, int flags, uint mask, ref byte buffer);
-
-        [DllImport("libc", EntryPoint = "close", SetLastError = true)]
-        public static extern int Close(int descriptor);
     }
 }
