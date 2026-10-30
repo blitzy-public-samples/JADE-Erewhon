@@ -66,9 +66,12 @@ namespace Erewhon.Harness.Baseline;
 /// hold one case at a time: the index checks every record's path and members and keeps only its
 /// <see cref="BaselineRecordKey"/>, which holds no request or response, and the per-case reader later reads
 /// one key's record and body once and verifies both, the label with the body. A record labelled otherwise,
-/// like a damaged body, is therefore listed by the index and refused only when its own case is read. A
-/// <c>bodyText</c> is unescaped into memory its record alone references, never into a pooled buffer, so
-/// dropping a record or entry releases its body.</para>
+/// like a damaged body, is therefore listed by the index and refused only when its own case is read.
+/// <see cref="ReadRecordAsync(BaselineRecordKey, CancellationToken)"/> reads one key's record with exactly the
+/// per-case reader's record checks and stops before the body, for a caller that must hold what each record
+/// states against another source before any case is read in full. A <c>bodyText</c> is unescaped into memory
+/// its record alone references, never into a pooled buffer, so dropping a record or entry releases its
+/// body.</para>
 /// <para>Every file read and write also has an asynchronous form that takes a
 /// <see cref="CancellationToken"/>, passes it to the file I/O and observes it before each record file.
 /// Deletes stay synchronous, because file deletion has no asynchronous form;
@@ -1073,26 +1076,58 @@ public sealed class BaselineStore
     public async Task<BaselineEntry> ReadEntryAsync(
         BaselineRecordKey key, CancellationToken cancellationToken = default)
     {
-        var (file, surface) = RecordFileOf(key);
-        cancellationToken.ThrowIfCancellationRequested();
-        var json = await TryReadAllBytesAsync(file, cancellationToken).ConfigureAwait(false)
-            ?? throw new InvalidDataException($"Baseline record {Display(file)} of case {key.CaseId} is missing.");
-        var record = Deserialize<BaselineRecord>(json, file);
-        var bodyPath = CheckedBodyPath(record, file, surface);
-        if (record.Order != key.Order
-            || !string.Equals(record.CaseId, key.CaseId, StringComparison.Ordinal)
-            || !string.Equals(record.Operation, key.Operation, StringComparison.Ordinal))
-        {
-            throw new InvalidDataException(
-                $"Baseline record {Display(file)} is invalid: it holds case {record.CaseId} of operation "
-                + $"{record.Operation} at position {record.Order}, not the indexed case {key.CaseId} of operation "
-                + $"{key.Operation} at position {key.Order}.");
-        }
-
+        var (record, file, bodyPath) = await ReadKeyedRecordAsync(key, cancellationToken).ConfigureAwait(false);
         var fileBytes = bodyPath is null
             ? null
             : await TryReadAllBytesAsync(bodyPath, cancellationToken).ConfigureAwait(false);
         return new BaselineEntry(record, VerifiedRecordBody(record, file, bodyPath, fileBytes));
+    }
+
+    /// <summary>
+    /// Reads the record file of the one case <paramref name="key"/> names without blocking, checked exactly as
+    /// <see cref="ReadEntryAsync(BaselineRecordKey, CancellationToken)"/> checks it, without reading or verifying
+    /// its body.
+    /// </summary>
+    /// <remarks>
+    /// <para>The record file is the one <see cref="ReadEntryAsync(BaselineRecordKey, CancellationToken)"/> reads,
+    /// read again in the same way: a record rewritten or removed since it was indexed is refused, because it must
+    /// pass every record check and still hold the key's order, case id and operation, with the same exceptions
+    /// and messages.</para>
+    /// <para>No <c>.body.bin</c> file is read, no body is encoded or hashed and no label is checked, so a missing
+    /// or damaged body, or a source other than <see cref="SourceLabels.StandIn"/>, does not stop the record from
+    /// being returned; <see cref="ReadEntryAsync(BaselineRecordKey, CancellationToken)"/> refuses it when its case
+    /// is read. A caller can therefore hold what each record states, its identity and its request, against
+    /// another source one record at a time before any case is read in full. The store keeps no reference to the
+    /// record, so dropping it releases its <c>bodyText</c>.</para>
+    /// </remarks>
+    /// <param name="key">A key <see cref="ReadRecordIndexAsync"/> returned.</param>
+    /// <param name="cancellationToken">Cancels the read.</param>
+    /// <returns>The checked record, its body unverified.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="key"/> or one of its names is null.</exception>
+    /// <exception cref="ArgumentException">
+    /// The key's case id, order or names do not form a record file name.
+    /// </exception>
+    /// <exception cref="InvalidDataException">
+    /// The record file is missing, fails any record check or no longer holds the key's case; the message names
+    /// the record file.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// The record file, or a directory above it at or below <c>baseline/</c>, is a symbolic link or reparse point;
+    /// the link is left in place. A body file is not read, so a link there is refused only when its case is read.
+    /// </exception>
+    /// <exception cref="IOException">
+    /// The record file cannot be read, is not a regular file or exceeds
+    /// <see cref="HarnessOptions.EvidenceByteLimit"/>.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
+    /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
+    public async Task<BaselineRecord> ReadRecordAsync(
+        BaselineRecordKey key, CancellationToken cancellationToken = default)
+    {
+        var (record, _, _) = await ReadKeyedRecordAsync(key, cancellationToken).ConfigureAwait(false);
+        return record;
     }
 
     /// <summary>
@@ -1763,6 +1798,32 @@ public sealed class BaselineStore
         var record = Deserialize<BaselineRecord>(json, file);
         _ = CheckedBodyPath(record, file, surface);
         return new BaselineRecordKey(record.Order, record.CaseId, record.Operation);
+    }
+
+    // The record file a key names, read once and checked as the index checked it, which must still hold the
+    // key's order, case id and operation; with that file and its body file's path, or null when its bodyText
+    // holds the body. ReadEntryAsync and ReadRecordAsync both read through it, so they refuse exactly the same
+    // records with the same messages and differ only in whether the body is then read and verified.
+    private async Task<(BaselineRecord Record, string File, string? BodyPath)> ReadKeyedRecordAsync(
+        BaselineRecordKey key, CancellationToken cancellationToken)
+    {
+        var (file, surface) = RecordFileOf(key);
+        cancellationToken.ThrowIfCancellationRequested();
+        var json = await TryReadAllBytesAsync(file, cancellationToken).ConfigureAwait(false)
+            ?? throw new InvalidDataException($"Baseline record {Display(file)} of case {key.CaseId} is missing.");
+        var record = Deserialize<BaselineRecord>(json, file);
+        var bodyPath = CheckedBodyPath(record, file, surface);
+        if (record.Order != key.Order
+            || !string.Equals(record.CaseId, key.CaseId, StringComparison.Ordinal)
+            || !string.Equals(record.Operation, key.Operation, StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                $"Baseline record {Display(file)} is invalid: it holds case {record.CaseId} of operation "
+                + $"{record.Operation} at position {record.Order}, not the indexed case {key.CaseId} of operation "
+                + $"{key.Operation} at position {key.Order}.");
+        }
+
+        return (record, file, bodyPath);
     }
 
     // The record file the index read a key from, with its surface directory, as GetRecordPath forms it for the
@@ -2602,7 +2663,8 @@ public sealed record BaselineEntry(BaselineRecord Record, ReadOnlyMemory<byte> B
 /// <summary>
 /// The identity of one checked baseline record, as <see cref="BaselineStore.ReadRecordIndexAsync"/> lists it:
 /// enough to count the captured cases and operations, to replay them in order and to read each one with
-/// <see cref="BaselineStore.ReadEntryAsync(BaselineRecordKey, CancellationToken)"/>.
+/// <see cref="BaselineStore.ReadEntryAsync(BaselineRecordKey, CancellationToken)"/>, or its record alone with
+/// <see cref="BaselineStore.ReadRecordAsync(BaselineRecordKey, CancellationToken)"/>.
 /// </summary>
 /// <remarks>
 /// A key holds no request, response or body, so a list of keys stays small however large the recorded

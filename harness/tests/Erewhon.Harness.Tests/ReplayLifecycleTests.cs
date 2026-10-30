@@ -871,13 +871,16 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         int limitOffset, string refusedCaseId)
     {
         const string contentType = "application/json; charset=utf-8";
-        (int Order, string CaseId, string Operation, string PathAndQuery, string Body)[] records =
+
+        // Each record states its planned case's kind and request, which sends no header, so the reconciliation
+        // with the committed matrix keeps all five.
+        (int Order, string CaseId, string Operation, string Kind, string PathAndQuery, string Body)[] records =
         [
-            (1, "REST-getAgent-01", "Rest.getAgent", "/agent/Hank%20Williams", """{"name":"Hank Williams"}"""),
-            (2, "REST-getAgent-02", "Rest.getAgent", "/agent/Nobody%20Agent", "{}"),
-            (3, "REST-getAllAgents-01", "Rest.getAllAgents", "/allAgents", $$"""[{"name":"{{new string('x', 200)}}"}]"""),
-            (4, "REST-getAllClients-01", "Rest.getAllClients", "/allClients", "[]"),
-            (5, "REST-getAllSales-01", "Rest.getAllSales", "/allSales", "{}"),
+            (1, "REST-getAgent-01", "Rest.getAgent", CaseKinds.Success, "/agent/Hank%20Williams", """{"name":"Hank Williams"}"""),
+            (2, "REST-getAgent-02", "Rest.getAgent", CaseKinds.Error, "/agent/Nobody%20Agent", "{}"),
+            (3, "REST-getAllAgents-01", "Rest.getAllAgents", CaseKinds.Success, "/allAgents", $$"""[{"name":"{{new string('x', 200)}}"}]"""),
+            (4, "REST-getAllClients-01", "Rest.getAllClients", CaseKinds.Success, "/allClients", "[]"),
+            (5, "REST-getAllSales-01", "Rest.getAllSales", CaseKinds.Success, "/allSales", "{}"),
         ];
 
         await using var facade = await CaptureStandInStub.StartAsync(
@@ -890,7 +893,7 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         var store = new BaselineStore(options);
         var comparer = new ResponseComparer(OperationCatalogue.Default, new Normaliser(NormalisationRules.FromCatalogue(OperationCatalogue.Default)));
         var evidence = new Dictionary<string, long>(StringComparer.Ordinal);
-        foreach (var (order, caseId, operation, pathAndQuery, text) in records)
+        foreach (var (order, caseId, operation, kind, pathAndQuery, text) in records)
         {
             var body = Encoding.UTF8.GetBytes(text);
             store.WriteRecord(
@@ -898,11 +901,11 @@ public sealed partial class ReplayLifecycleTests : IDisposable
                     order,
                     caseId,
                     operation,
-                    CaseKinds.Success,
+                    kind,
                     StateChanging: false,
                     CasePreStates.Seed,
                     SourceLabels.StandIn,
-                    new BaselineRequest("GET", pathAndQuery, new Dictionary<string, string> { ["Accept"] = "application/json" }, null),
+                    new BaselineRequest("GET", pathAndQuery, new Dictionary<string, string>(), null),
                     BaselineResponse.FromRawBody(200, contentType, body, bodyFile: null)),
                 body);
             evidence[caseId] = KeptEvidence(comparer.Compare(
@@ -1161,7 +1164,10 @@ public sealed partial class ReplayLifecycleTests : IDisposable
     // committed case matrix. Every evidence problem becomes one never-documentable CHK-EXCEPTION, printed as a
     // [jade-standin] line, and the records the reconciliation keeps are still compared. A record of a case the
     // manifest lists as not captured, or one the matrix does not plan where it stands, is neither compared nor
-    // counted as captured; a planned case among them is reported as not captured exactly once. A captured
+    // counted as captured; a planned case among them is reported as not captured exactly once. So is a record
+    // whose request (method, pathAndQuery, headers or bodyText), kind, stateChanging or preState is not its
+    // planned case's, each problem naming the recorded and the planned value, and one whose preState is neither
+    // seed nor empty, which is refused even when the matrix cannot be loaded. A captured
     // manifest must state its source and label, while the hand-written not-run fallback, with no record, every
     // case listed and neither member, raises no evidence item; a stated label other than the baseline label
     // text is a problem in either. Each scenario starts from the committed REST-getAgent-01 record and a
@@ -1181,6 +1187,15 @@ public sealed partial class ReplayLifecycleTests : IDisposable
     [InlineData("other-position", "baseline/records/rest/002-getAgent-01.json records case REST-getAgent-01 at position 2 of operation Rest.getAgent, but harness/config/case-matrix.json plans it at position 1 of operation Rest.getAgent; it is not compared", null, "REST-getAgent-01", "planned in harness/config/case-matrix.json, but its baseline record was refused: baseline/records/rest/002-getAgent-01.json records case REST-getAgent-01 at position 2")]
     [InlineData("not-run-every-case-listed", null, null, "REST-getAgent-01", "listed in baseline/manifest.json notCaptured")]
     [InlineData("not-run-label-other", "baseline/manifest.json has label 'Recorded from live JADE', but the baseline is stand-in output and carries the label text 'Recorded from the JADE stand-in, not from live JADE'", null, "REST-getAgent-01", "listed in baseline/manifest.json notCaptured")]
+    [InlineData("request-path-other", "baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with request pathAndQuery '/agent/Suzie%20Wu', but harness/config/case-matrix.json plans '/agent/Hank%20Williams'; it is not compared", null, "REST-getAgent-01", "planned in harness/config/case-matrix.json, but its baseline record was refused: baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with request pathAndQuery '/agent/Suzie%20Wu', but harness/config/case-matrix.json plans '/agent/Hank%20Williams'; it is not compared")]
+    [InlineData("request-method-other", "baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with request method 'POST', but harness/config/case-matrix.json plans 'GET'; it is not compared", null, "REST-getAgent-01", "planned in harness/config/case-matrix.json, but its baseline record was refused: baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with request method 'POST', but harness/config/case-matrix.json plans 'GET'; it is not compared")]
+    [InlineData("request-header-added", "baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with request headers {Accept: 'application/json'}, but harness/config/case-matrix.json plans {}; it is not compared", null, "REST-getAgent-01", "planned in harness/config/case-matrix.json, but its baseline record was refused: baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with request headers {Accept: 'application/json'}, but harness/config/case-matrix.json plans {}; it is not compared")]
+    [InlineData("request-body-set", "baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with request bodyText of 2 characters (SHA-256 44136fa355b3678a…), but harness/config/case-matrix.json plans none; it is not compared", null, "REST-getAgent-01", "planned in harness/config/case-matrix.json, but its baseline record was refused: baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with request bodyText of 2 characters (SHA-256 44136fa355b3678a…), but harness/config/case-matrix.json plans none; it is not compared")]
+    [InlineData("kind-error", "baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with kind 'error', but harness/config/case-matrix.json plans 'success'; it is not compared", null, "REST-getAgent-01", "planned in harness/config/case-matrix.json, but its baseline record was refused: baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with kind 'error', but harness/config/case-matrix.json plans 'success'; it is not compared")]
+    [InlineData("state-changing", "baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with stateChanging true, but harness/config/case-matrix.json plans false; it is not compared", null, "REST-getAgent-01", "planned in harness/config/case-matrix.json, but its baseline record was refused: baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with stateChanging true, but harness/config/case-matrix.json plans false; it is not compared")]
+    [InlineData("pre-state-invalid", "baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with preState 'bogus', which is neither 'seed' nor 'empty', but harness/config/case-matrix.json plans 'seed'; it is not compared", null, "REST-getAgent-01", "planned in harness/config/case-matrix.json, but its baseline record was refused: baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with preState 'bogus', which is neither 'seed' nor 'empty', but harness/config/case-matrix.json plans 'seed'; it is not compared")]
+    [InlineData("pre-state-empty", "baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with preState 'empty', but harness/config/case-matrix.json plans 'seed'; it is not compared", null, "REST-getAgent-01", "planned in harness/config/case-matrix.json, but its baseline record was refused: baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with preState 'empty', but harness/config/case-matrix.json plans 'seed'; it is not compared")]
+    [InlineData("pre-state-invalid-no-plan", "baseline/records/rest/001-getAgent-01.json records case REST-getAgent-01 with preState 'bogus', which is neither 'seed' nor 'empty'; it is not compared", null, "REST-getAgent-01", null)]
     public async Task BaselineEvidence_IsReconciledBeforeAnyCaseIsCountedOrCompared(
         string scenario, string? problem, string? comparedCaseId, string? uncomparedCaseId, string? notCapturedReason)
     {
@@ -1257,6 +1272,35 @@ public sealed partial class ReplayLifecycleTests : IDisposable
                 }
 
                 record = null;
+                break;
+            case "request-path-other":
+                record["request"]!["pathAndQuery"] = "/agent/Suzie%20Wu";
+                break;
+            case "request-method-other":
+                record["request"]!["method"] = "POST";
+                break;
+            case "request-header-added":
+                record["request"]!["headers"] = new JsonObject { ["Accept"] = "application/json" };
+                break;
+            case "request-body-set":
+                record["request"]!["bodyText"] = "{}";
+                break;
+            case "kind-error":
+                record["kind"] = CaseKinds.Error;
+                break;
+            case "state-changing":
+                record["stateChanging"] = true;
+                break;
+            case "pre-state-invalid":
+                record["preState"] = "bogus";
+                break;
+            case "pre-state-empty":
+                record["preState"] = CasePreStates.Empty;
+                break;
+            case "pre-state-invalid-no-plan":
+                // Without the plan, whose load then fails the run on its own, the preState is still checked.
+                File.Delete(RepoRootDirectory.PathOf(CaseMatrixPath));
+                record["preState"] = "bogus";
                 break;
             default:
                 throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null);
@@ -1337,6 +1381,124 @@ public sealed partial class ReplayLifecycleTests : IDisposable
                 Assert.StartsWith(notCapturedReason, item.Detail is null ? null : Redacted(item.Detail), StringComparison.Ordinal);
             }
         }
+    }
+
+    // The evidence is confirmed first, and each record is read again when its case is replayed, so a record
+    // rewritten in between is held to the plan again: the real body refuses it as its own never-documentable
+    // CHK-EXCEPTION, naming the record and the planned value, before any reset or request, so the empty-state
+    // bracket never opens and the case is neither sent nor compared. The committed matrix and empty-state record
+    // REST-getCompany-03 are copied in, the capture stub serves as both facade and stand-in, and the record is
+    // rewritten as the console announces the normalisation rules, the step between the confirmation and the
+    // first case.
+    [Theory]
+    [InlineData("preState", "bogus", "preState 'bogus', which is neither 'seed' nor 'empty', but harness/config/case-matrix.json plans 'empty'")]
+    [InlineData("request.pathAndQuery", "/company.json", "request pathAndQuery '/company.json', but harness/config/case-matrix.json plans '/company'")]
+    public async Task RecordRewrittenAfterTheEvidenceIsConfirmed_IsRefusedAsItsCaseBeforeAnyResetOrRequest(
+        string member, string value, string divergence)
+    {
+        const string caseStep = "replay case REST-getCompany-03: ";
+        var seedSha256 = new string('a', 64);
+        await using var stub = await CaptureStandInStub.StartAsync(seedSha256, DefaultReferenceDate, failEmptyReset: false, TestCancellation);
+        var options = Options();
+        options.Target = new HarnessEndpoints { RestBaseUrl = stub.BaseUrl, SoapBaseUrl = stub.BaseUrl, AdminUrl = stub.BaseUrl };
+        options.Backend = new HarnessEndpoints { RestBaseUrl = stub.BaseUrl, SoapBaseUrl = stub.BaseUrl, AdminUrl = stub.BaseUrl };
+        options.RequestTimeoutSeconds = LimitSeconds;
+        RepoRootDirectory.Write(CaseMatrixPath, File.ReadAllText(Path.Combine(FindRepoRoot(), CaseMatrixPath)));
+        var recordText = File.ReadAllText(Path.Combine(FindRepoRoot(), EmptyStateRecordFile));
+        RepoRootDirectory.Write(EmptyStateRecordFile, recordText);
+        WriteManifest(options, seedSha256, DefaultReferenceDate);
+
+        // No baseline/normalisation-rules.json is copied in, so the rules line is the derived-rules one.
+        using var console = new TriggeringConsole("the normalisation rules are derived from the catalogue", () =>
+        {
+            var record = JsonNode.Parse(recordText)!.AsObject();
+            var owner = member.StartsWith("request.", StringComparison.Ordinal) ? record["request"]!.AsObject() : record;
+            owner[member.Split('.')[^1]] = value;
+            RepoRootDirectory.Write(EmptyStateRecordFile, record.ToJsonString());
+        });
+
+        // Readiness writes from two probes at once.
+        using var output = TextWriter.Synchronized(console);
+        var state = new ReplayRunState();
+        using (var limit = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken))
+        {
+            limit.CancelAfter(RunLimit);
+            await new ReplayBody(options, OperationCatalogue.Default, KnownLimitationsRegister.Empty, output)
+                .ExecuteAsync(state, limit.Token)
+                .WaitAsync(limit.Token);
+        }
+
+        Assert.True(console.Fired, "the record was rewritten between the confirmation and the first case");
+        Assert.DoesNotContain(state.Failures, item => item.Detail?.StartsWith("confirm the baseline evidence: ", StringComparison.Ordinal) == true);
+        var refusal = Assert.Single(state.Failures, item => item.Detail?.StartsWith(caseStep, StringComparison.Ordinal) == true);
+        Assert.Equal((FailureItemIds.Exception, typeof(InvalidDataException).FullName), (refusal.ItemId, refusal.Nature));
+        Assert.True(refusal.IsNeverDocumentable, "a record refused at its replay can never be documented");
+        Assert.Equal(
+            $"{caseStep}The baseline record of case REST-getCompany-03 is refused before any reset or request: "
+            + $"{EmptyStateRecordFile} records case REST-getCompany-03 with {divergence}; it is not compared.",
+            refusal.Detail);
+        Assert.Empty(state.Cases);
+
+        // Only the replay-start reset reached the stand-in, and no case request reached the facade.
+        var requests = stub.Requests;
+        Assert.Equal([SeedResetRequest], requests.Where(request => request.StartsWith("POST " + AdminRoutes.Reset, StringComparison.Ordinal)));
+        Assert.DoesNotContain(requests, request => request.StartsWith("GET /company", StringComparison.Ordinal));
+    }
+
+    // The confirmation reads each indexed record again, so a record that can no longer be read by then is an
+    // evidence problem of its own: the real body names the record and why in the one evidence CHK-EXCEPTION,
+    // and the planned case is reported as not captured with that refusal, never replayed. The committed
+    // REST-getAgent-01 record and case matrix are copied in, and the record is removed as the console announces
+    // the records read, the step before the confirmation.
+    [Fact]
+    public async Task RecordUnreadableWhenTheEvidenceIsConfirmed_IsRefusedAsEvidence_AndReportedNotCaptured()
+    {
+        const string recordFile = "baseline/records/rest/001-getAgent-01.json";
+        const string problem =
+            $"{recordFile} of case REST-getAgent-01 cannot be read again (Baseline record {recordFile} of case "
+            + "REST-getAgent-01 is missing.); it is not compared";
+        RepoRootDirectory.Write(CaseMatrixPath, File.ReadAllText(Path.Combine(FindRepoRoot(), CaseMatrixPath)));
+        RepoRootDirectory.Write(recordFile, File.ReadAllText(Path.Combine(FindRepoRoot(), recordFile)));
+        RepoRootDirectory.Write("baseline/manifest.json", new JsonObject
+        {
+            ["source"] = SourceLabels.StandIn,
+            ["label"] = SourceLabels.BaselineLabel,
+            ["seedSha256"] = new string('a', 64),
+            ["referenceDate"] = DefaultReferenceDate,
+            ["notCaptured"] = new JsonArray(),
+            ["wsdlCaptured"] = false,
+            ["captureExecution"] = CaptureExecutionValues.LocalProcesses,
+        }.ToJsonString());
+        using var console = new TriggeringConsole(
+            "baseline record(s) read; each body is verified when its case is replayed",
+            () => File.Delete(RepoRootDirectory.PathOf(recordFile)));
+
+        // Readiness writes from two probes at once.
+        using var output = TextWriter.Synchronized(console);
+        var state = new ReplayRunState();
+        using (var limit = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken))
+        {
+            limit.CancelAfter(RunLimit);
+            await new ReplayBody(ClosedPortOptions(), OperationCatalogue.Default, KnownLimitationsRegister.Empty, output)
+                .ExecuteAsync(state, limit.Token)
+                .WaitAsync(limit.Token);
+        }
+
+        Assert.True(console.Fired, "the record was removed between the index and the confirmation");
+        var evidence = Assert.Single(
+            state.Failures, item => item.Detail?.StartsWith("confirm the baseline evidence: ", StringComparison.Ordinal) == true);
+        Assert.Equal((FailureItemIds.Exception, typeof(InvalidDataException).FullName), (evidence.ItemId, evidence.Nature));
+        Assert.Equal(
+            $"confirm the baseline evidence: The baseline evidence is incomplete or inconsistent (1 problem(s)): {problem}.",
+            evidence.Detail);
+        Assert.True(console.ToString().Contains($"[jade-standin] baseline evidence: {problem}", StringComparison.Ordinal), "the console states the problem");
+        var notCaptured = Assert.Single(
+            state.Failures,
+            item => item.ItemId == FailureItemIds.Case("REST-getAgent-01") && item.Nature == FailureItemIds.NotCaptured);
+        Assert.Equal($"planned in {CaseMatrixPath}, but its baseline record was refused: {problem}", notCaptured.Detail);
+        Assert.Empty(state.Cases);
+        Assert.Empty(state.CapturedCasesByOperation.Values.SelectMany(ids => ids));
+        Assert.DoesNotContain(state.Failures, item => item.Detail?.StartsWith("replay case ", StringComparison.Ordinal) == true);
     }
 
     // A stand-in WSDL record that is a link to a file outside the repository root is refused, and the refusal
@@ -1630,6 +1792,27 @@ public sealed partial class ReplayLifecycleTests : IDisposable
             {
                 Thrown = ex;
                 throw;
+            }
+        }
+    }
+
+    /// <summary>
+    /// A console that keeps what is written to it and runs an action once, as the first line containing a marker
+    /// is written, so a test can change the repository between two steps of a run. Wrap it in
+    /// <see cref="TextWriter.Synchronized"/> where lines arrive from several threads.
+    /// </summary>
+    private sealed class TriggeringConsole(string marker, Action action) : StringWriter(CultureInfo.InvariantCulture)
+    {
+        /// <summary>Whether the marker was written and the action ran.</summary>
+        public bool Fired { get; private set; }
+
+        public override void WriteLine(string? value)
+        {
+            base.WriteLine(value);
+            if (!Fired && value?.Contains(marker, StringComparison.Ordinal) == true)
+            {
+                Fired = true;
+                action();
             }
         }
     }

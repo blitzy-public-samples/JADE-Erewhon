@@ -1095,6 +1095,38 @@ public sealed partial class BinaryComparerTests
     }
 
     /// <summary>
+    /// Each change to the fixture's REST record after it was indexed and the refusal it must give, for the
+    /// per-case reader and the record reader, which read and check a key's record file the same way.
+    /// </summary>
+    public static TheoryData<string, string, string> RecordsChangedAfterIndexing()
+    {
+        (string Change, string Message)[] changes =
+        [
+            ("deleted", $"Baseline record {RestRecordPath} of case REST-getAgent-01 is missing."),
+            ("other-position",
+                $"Baseline record {RestRecordPath} is invalid: case REST-getAgent-01 at position 3 must be stored as "
+                + "003-getAgent-01.json."),
+            ("other-case",
+                $"Baseline record {RestRecordPath} is invalid: case REST-getAgent-02 at position 1 must be stored as "
+                + "001-getAgent-02.json."),
+            ("other-operation",
+                $"Baseline record {RestRecordPath} is invalid: it holds case REST-getAgent-01 of operation REST.getAgent "
+                + "at position 1, not the indexed case REST-getAgent-01 of operation Rest.getAgent at position 1."),
+        ];
+
+        var data = new TheoryData<string, string, string>();
+        foreach (var (change, message) in changes)
+        {
+            foreach (var reader in (string[])["ReadEntryAsync", "ReadRecordAsync"])
+            {
+                data.Add(change, reader, message);
+            }
+        }
+
+        return data;
+    }
+
+    /// <summary>
     /// Each reader, in its synchronous and asynchronous forms, with the baseline file it reads and each place a
     /// link can stand on that file's way: at the file itself, to a real file outside the temporary root or
     /// dangling, and at each directory from <c>baseline/</c> down to it. The record index reads no body, so a
@@ -1621,6 +1653,49 @@ public sealed partial class BinaryComparerTests
         }
     }
 
+    // The record reader applies the per-case reader's record checks and stops before the body: for each key it
+    // returns the record the per-case reader returns, and it still returns the getPhoto record once its body file
+    // is missing or damaged, which only the per-case reader then refuses.
+    [Theory]
+    [InlineData(null)]
+    [InlineData("missing-body-file")]
+    [InlineData("tampered-body-file")]
+    public async Task ReadRecord_IsTheRecordReadEntryReads_AndReadsNoBody(string? damage)
+    {
+        await WriteFixture(Store, useAsync: false);
+        var keys = await Store.ReadRecordIndexAsync(TestCancellation);
+        var entries = new List<BaselineEntry>();
+        foreach (var key in keys)
+        {
+            entries.Add(await Store.ReadEntryAsync(key, TestCancellation));
+        }
+
+        if (damage is not null)
+        {
+            await Damage(damage);
+        }
+
+        var records = new List<BaselineRecord>();
+        foreach (var key in keys)
+        {
+            records.Add(await Store.ReadRecordAsync(key, TestCancellation));
+        }
+
+        Assert.Equal([KeyOf(AgentRecord), KeyOf(PhotoRecord)], keys);
+        Assert.Equal(
+            entries.Select(static entry => Text(entry.Record)),
+            records.Select(static record => Text(record)));
+        if (damage is null)
+        {
+            Assert.Equal(PhotoBody, (await Store.ReadEntryAsync(keys[1], TestCancellation)).Body.ToArray());
+        }
+        else
+        {
+            var ex = await Assert.ThrowsAsync<InvalidDataException>(() => Store.ReadEntryAsync(keys[1], TestCancellation));
+            Assert.StartsWith($"Baseline record {PhotoRecordPath} is invalid: its body ", ex.Message, StringComparison.Ordinal);
+        }
+    }
+
     // The label is checked where the body is verified, so a record labelled other than jade-standin, or with no
     // source, is still listed by the index, and every reader that verifies bodies refuses it, naming its record
     // file; the other case still reads as written.
@@ -1662,29 +1737,24 @@ public sealed partial class BinaryComparerTests
         Assert.Equal(PhotoBody, (await Store.ReadEntryAsync(keys[1], TestCancellation)).Body.ToArray());
     }
 
-    // The per-case reader reads the record file again, so a record changed or removed after it was indexed is
-    // refused, naming the file, rather than replayed as the indexed case; the other case still reads.
+    // The per-case reader and the record reader read the record file again, so a record changed or removed after
+    // it was indexed is refused by either, with the same message naming the file, rather than replayed as the
+    // indexed case; the other case still reads.
     [Theory]
-    [InlineData("deleted", $"Baseline record {RestRecordPath} of case REST-getAgent-01 is missing.")]
-    [InlineData(
-        "other-position",
-        $"Baseline record {RestRecordPath} is invalid: case REST-getAgent-01 at position 3 must be stored as "
-        + "003-getAgent-01.json.")]
-    [InlineData(
-        "other-case",
-        $"Baseline record {RestRecordPath} is invalid: case REST-getAgent-02 at position 1 must be stored as "
-        + "001-getAgent-02.json.")]
-    [InlineData(
-        "other-operation",
-        $"Baseline record {RestRecordPath} is invalid: it holds case REST-getAgent-01 of operation REST.getAgent at "
-        + "position 1, not the indexed case REST-getAgent-01 of operation Rest.getAgent at position 1.")]
-    public async Task ReadEntry_RecordChangedAfterIndexing_IsInvalidDataNamingTheFile(string change, string message)
+    [MemberData(nameof(RecordsChangedAfterIndexing))]
+    public async Task KeyedReaders_RecordChangedAfterIndexing_IsInvalidDataNamingTheFile(
+        string change, string reader, string message)
     {
         await WriteFixture(Store, useAsync: false);
         var keys = await Store.ReadRecordIndexAsync(TestCancellation);
         await ChangeAgentRecord(change);
 
-        var ex = await Assert.ThrowsAsync<InvalidDataException>(() => Store.ReadEntryAsync(keys[0], TestCancellation));
+        var ex = await Assert.ThrowsAsync<InvalidDataException>(() => reader switch
+        {
+            "ReadEntryAsync" => Store.ReadEntryAsync(keys[0], TestCancellation),
+            "ReadRecordAsync" => Store.ReadRecordAsync(keys[0], TestCancellation),
+            _ => throw new ArgumentOutOfRangeException(nameof(reader), reader, null),
+        });
 
         Assert.Equal(message, ex.Message);
         Assert.Equal(PhotoBody, (await Store.ReadEntryAsync(keys[1], TestCancellation)).Body.ToArray());

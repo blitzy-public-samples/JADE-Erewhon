@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using Erewhon.Contracts;
 using Erewhon.Contracts.Admin;
 using Erewhon.Contracts.Catalogue;
@@ -1130,6 +1131,11 @@ public sealed class ReplayBody(
         private const string BaselineWsdlName = "baseline/wsdl/standin-ErewhonWebService.wsdl";
         private const string IncompleteDetail = "the check did not complete";
 
+        // The characters of a recorded value, and of the message of a record that cannot be read, that an
+        // evidence problem quotes; a record can hold up to HarnessOptions.EvidenceByteLimit bytes.
+        private const int ExcerptLimit = 120;
+        private const int MessageExcerptLimit = 400;
+
         private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
         private readonly BaselineStore _store = new(options);
 
@@ -1138,7 +1144,7 @@ public sealed class ReplayBody(
         private readonly EvidenceBudget _keptEvidence = EvidenceBudget.OfReplayRun(keptEvidenceLimit);
 
         // Evidence problems the manifest shows by itself, found when it is read and reported with the
-        // reconciliation of the records (ConfirmEvidence).
+        // reconciliation of the records (ConfirmEvidenceAsync).
         private readonly List<string> _manifestProblems = [];
 
         // Planned cases whose record the reconciliation refused, with why; each is reported as not captured.
@@ -1149,8 +1155,9 @@ public sealed class ReplayBody(
         // True only when the read found no manifest file, as distinct from one that could not be read.
         private bool _manifestAbsent;
         private CaseMatrix? _matrix;
-        // Keys only, with no request, response or body: each record and its body are read and verified when
-        // its case is replayed, and dropped when that case ends.
+        // Keys only, with no request, response or body: each record is read without its body when the evidence
+        // is confirmed and dropped once checked, then read again with its body, verified, when its case is
+        // replayed, and dropped when that case ends.
         private IReadOnlyList<BaselineRecordKey> _keys = [];
         private bool _recordsRead;
         private ResetExpectations _expectations = ResetExpectations.None;
@@ -1183,7 +1190,7 @@ public sealed class ReplayBody(
             GuardSync($"load {MatrixName}", LoadMatrix);
             state.SetPlanned(PlannedByOperation());
             await Guard("read baseline records", ReadRecordsAsync).ConfigureAwait(false);
-            GuardSync("confirm the baseline evidence", ConfirmEvidence);
+            await Guard("confirm the baseline evidence", ConfirmEvidenceAsync).ConfigureAwait(false);
             GuardSync("count the baseline", () => state.Baseline = DescribeBaseline());
             GuardSync("record not-captured cases", RecordNotCaptured);
             await Guard($"load {RulesName}", LoadRulesAsync).ConfigureAwait(false);
@@ -1263,7 +1270,7 @@ public sealed class ReplayBody(
         // it states confirmed; one it lacks or leaves blank cannot be, which is an evidence problem. So is
         // provenance that is not shown: a manifest other than not-run that omits its source or its label (the
         // hand-written not-run manifest holds neither), and any manifest whose stated source is not
-        // jade-standin or whose stated label is not the baseline label text. ConfirmEvidence reports them all,
+        // jade-standin or whose stated label is not the baseline label text. ConfirmEvidenceAsync reports them all,
         // and an absent manifest, once the records are read.
         private async Task ReadManifestAsync()
         {
@@ -1397,7 +1404,7 @@ public sealed class ReplayBody(
         }
 
         // The capture evidence, recorded before any case is replayed, so a case that is never compared (no
-        // comparer, cancellation, a failed case step) is still reported as captured. ConfirmEvidence then
+        // comparer, cancellation, a failed case step) is still reported as captured. ConfirmEvidenceAsync then
         // removes every record the manifest or the plan does not account for and records the kept ones again,
         // so only a record that is compared, or fails as its case, counts as captured.
         private async Task ReadRecordsAsync()
@@ -1431,9 +1438,17 @@ public sealed class ReplayBody(
         //    captured and never as compared.
         //  - Once the plan is loaded, a record of a case it does not plan, or at another position or of another
         //    operation than it plans, is removed; a planned case whose record is removed is reported as not
-        //    captured. Without the plan, whose load already failed the run, the records are kept.
+        //    captured.
+        //  - Every record the checks above keep is then read on its own, without its body, and dropped once
+        //    checked, so one record is held at a time. Replay sends the recorded request and brackets by the
+        //    recorded preState, so a record is removed when its preState is neither seed nor empty, the plan
+        //    loaded or not, and, once the plan is loaded, when its kind, stateChanging, preState or request
+        //    (method, pathAndQuery, headers, bodyText) is not its planned case's; a record that cannot be read
+        //    is removed too. A planned case whose record is removed is reported as not captured. Without the
+        //    plan, whose load already failed the run, only the preState is checked and the other records are
+        //    kept.
         //  - Records beside a not-run manifest that remain after these removals: that fallback holds no record.
-        private void ConfirmEvidence()
+        private async Task ConfirmEvidenceAsync()
         {
             var problems = new List<string>(_manifestProblems);
             if (_manifestAbsent && _keys.Count > 0)
@@ -1466,6 +1481,18 @@ public sealed class ReplayBody(
                     if (!removed && _matrix.TryGetCase(key.CaseId, out _))
                     {
                         _refusedRecords[key.CaseId] = planProblem;
+                    }
+
+                    removed = true;
+                }
+
+                // Only a record the checks above keep is read, so a record they refused is named once.
+                if (!removed && await StatedRecordProblemAsync(key, file).ConfigureAwait(false) is { } recordProblem)
+                {
+                    problems.Add(recordProblem);
+                    if (_matrix is not null && _matrix.TryGetCase(key.CaseId, out _))
+                    {
+                        _refusedRecords[key.CaseId] = recordProblem;
                     }
 
                     removed = true;
@@ -1527,6 +1554,204 @@ public sealed class ReplayBody(
                 + $"plans it at position {position} of operation {definition.Operation}; it is not compared");
         }
 
+        // Reads the one record a kept key names, without its body, and returns why what it states refuses it, or
+        // null when it holds. A record that can no longer be read is refused with why, so its case is reported
+        // as not captured rather than replayed; the caller's cancellation still ends the run.
+        private async Task<string?> StatedRecordProblemAsync(BaselineRecordKey key, string file)
+        {
+            BaselineRecord record;
+            try
+            {
+                record = await _store.ReadRecordAsync(key, ct).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is InvalidDataException or IOException or UnauthorizedAccessException or InvalidOperationException)
+            {
+                return $"{file} of case {key.CaseId} cannot be read again ({Excerpt(ReplayMode.SafeMessage(ex), MessageExcerptLimit)}); "
+                    + "it is not compared";
+            }
+
+            return StatedRecordProblem(_matrix, record, file);
+        }
+
+        // Why what a record states refuses it, or null when it holds: the one comparison the evidence
+        // confirmation and each case's replay apply. Replay sends the recorded request and brackets the case by
+        // its recorded preState, so:
+        //  - a preState other than seed or empty is refused whether or not the plan is loaded, because no reset
+        //    establishes it and no bracketing decision can rest on it;
+        //  - with the plan, the kind, stateChanging, preState and request must be the planned case's: method,
+        //    pathAndQuery and bodyText ordinally, a null bodyText equal only to null; the headers as HTTP compares
+        //    them, the same number of headers with every planned one present under a name equal ignoring case and
+        //    with an ordinally equal value, in any order.
+        // Each divergence names the recorded and the planned value. A value is quoted only as a bounded one-line
+        // excerpt, and a bodyText never, only its length and SHA-256 prefix, so a hand-edited record of any size
+        // keeps the detail short. PlanProblem has already matched the case, position and operation.
+        private static string? StatedRecordProblem(CaseMatrix? matrix, BaselineRecord record, string file)
+        {
+            CaseDefinition? planned = null;
+            if (matrix is not null && matrix.TryGetCase(record.CaseId, out var definition))
+            {
+                planned = definition;
+            }
+
+            var divergences = new List<string>();
+            if (planned is not null && !string.Equals(record.Kind, planned.Kind, StringComparison.Ordinal))
+            {
+                divergences.Add($"kind {Quoted(record.Kind)}, but {MatrixName} plans {Quoted(planned.Kind)}");
+            }
+
+            if (planned is not null && record.StateChanging != planned.StateChanging)
+            {
+                divergences.Add(
+                    $"stateChanging {JsonBoolean(record.StateChanging)}, but {MatrixName} plans {JsonBoolean(planned.StateChanging)}");
+            }
+
+            if (record.PreState is not (CasePreStates.Seed or CasePreStates.Empty))
+            {
+                var invalid = $"preState {Quoted(record.PreState)}, which is neither '{CasePreStates.Seed}' nor '{CasePreStates.Empty}'";
+                divergences.Add(planned is null ? invalid : $"{invalid}, but {MatrixName} plans {Quoted(planned.PreState)}");
+            }
+            else if (planned is not null && !string.Equals(record.PreState, planned.PreState, StringComparison.Ordinal))
+            {
+                divergences.Add($"preState {Quoted(record.PreState)}, but {MatrixName} plans {Quoted(planned.PreState)}");
+            }
+
+            if (planned is not null)
+            {
+                AddRequestDivergences(divergences, record.Request, planned.Request);
+            }
+
+            return divergences.Count == 0
+                ? null
+                : $"{file} records case {record.CaseId} with {string.Join(", and with ", divergences)}; it is not compared";
+        }
+
+        private static void AddRequestDivergences(List<string> divergences, BaselineRequest recorded, CaseRequest planned)
+        {
+            if (!string.Equals(recorded.Method, planned.Method, StringComparison.Ordinal))
+            {
+                divergences.Add($"request method {Quoted(recorded.Method)}, but {MatrixName} plans {Quoted(planned.Method)}");
+            }
+
+            if (!string.Equals(recorded.PathAndQuery, planned.PathAndQuery, StringComparison.Ordinal))
+            {
+                divergences.Add(
+                    $"request pathAndQuery {Quoted(recorded.PathAndQuery)}, but {MatrixName} plans {Quoted(planned.PathAndQuery)}");
+            }
+
+            if (!SameHeaders(recorded.Headers, planned.Headers))
+            {
+                divergences.Add(
+                    $"request headers {HeaderList(recorded.Headers)}, but {MatrixName} plans {HeaderList(planned.Headers)}");
+            }
+
+            if (!string.Equals(recorded.BodyText, planned.BodyText, StringComparison.Ordinal))
+            {
+                var plannedBody = planned.BodyText is null ? "none" : $"one of {BodyTextSummary(planned.BodyText)}";
+                divergences.Add(recorded.BodyText is null
+                    ? $"no request bodyText, but {MatrixName} plans {plannedBody}"
+                    : $"request bodyText of {BodyTextSummary(recorded.BodyText)}, but {MatrixName} plans {plannedBody}");
+            }
+        }
+
+        // Header names are case-insensitive in HTTP and their order carries no meaning, so the recorded headers
+        // equal the planned ones when there are as many and each planned header is present under a name equal
+        // ignoring case with an ordinally equal value. The planned names are distinct ignoring case (the matrix
+        // keys them so), so equal counts leave no recorded header unmatched. The headers are searched in order
+        // rather than through either dictionary's comparer, which the record's deserialisation does not fix.
+        private static bool SameHeaders(IReadOnlyDictionary<string, string> recorded, IReadOnlyDictionary<string, string> planned)
+        {
+            if (recorded.Count != planned.Count)
+            {
+                return false;
+            }
+
+            foreach (var (name, value) in planned)
+            {
+                if (!recorded.Any(header => string.Equals(header.Key, name, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(header.Value, value, StringComparison.Ordinal)))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        // The headers on one line as {name: 'value', ...} in their own order, each name and value cut as Quoted
+        // cuts a value, and the list cut once it passes ExcerptLimit characters, so a record of any number of
+        // headers keeps the detail short.
+        private static string HeaderList(IReadOnlyDictionary<string, string> headers)
+        {
+            var list = new StringBuilder("{");
+            foreach (var (name, value) in headers)
+            {
+                if (list.Length > 1)
+                {
+                    list.Append(", ");
+                }
+
+                if (list.Length > ExcerptLimit)
+                {
+                    list.Append('…');
+                    break;
+                }
+
+                list.Append(Excerpt(name, ExcerptLimit)).Append(": ").Append(Quoted(value));
+            }
+
+            return list.Append('}').ToString();
+        }
+
+        // A request body text, which can be as long as a record, is never quoted: its length and the first 16 hex
+        // digits of the SHA-256 of its UTF-8 bytes name it, and tell two bodies of the same length apart.
+        private static string BodyTextSummary(string text) => string.Create(
+            CultureInfo.InvariantCulture,
+            $"{text.Length} characters (SHA-256 {BaselineResponse.ComputeSha256Hex(Encoding.UTF8.GetBytes(text))[..16]}…)");
+
+        // A value as the evidence lines quote it: 'text' as Excerpt cuts it, or null for a member the record omits.
+        private static string Quoted(string? value) => value is null ? "null" : $"'{Excerpt(value, ExcerptLimit)}'";
+
+        private static string JsonBoolean(bool value) => value ? "true" : "false";
+
+        // The text on one line, cut after limit characters with an ellipsis, as FacadeTestResults cuts its
+        // excerpts: a hand-edited value of any length keeps an item's detail and its console line short. Each
+        // control character is shown as an escape (\n, \r, \t or \uXXXX) instead of being dropped, so a line break
+        // or a NUL stays visible, and the cut never falls between the two halves of a surrogate pair.
+        private static string Excerpt(string text, int limit)
+        {
+            var line = new StringBuilder(Math.Min(text.Length, limit) + 1);
+            var index = 0;
+            for (; index < text.Length && line.Length < limit; index++)
+            {
+                var character = text[index];
+                if (char.IsHighSurrogate(character) && line.Length == limit - 1)
+                {
+                    break;
+                }
+
+                switch (character)
+                {
+                    case '\n':
+                        line.Append("\\n");
+                        break;
+                    case '\r':
+                        line.Append("\\r");
+                        break;
+                    case '\t':
+                        line.Append("\\t");
+                        break;
+                    case var control when char.IsControl(control):
+                        line.Append(CultureInfo.InvariantCulture, $"\\u{(int)control:x4}");
+                        break;
+                    default:
+                        line.Append(character);
+                        break;
+                }
+            }
+
+            return index < text.Length ? line.Append('…').ToString() : line.ToString();
+        }
+
         // The WSDL probe is guarded on its own: a WSDL whose read is refused (a link) or fails is recorded as
         // CHK-EXCEPTION and counted as not captured, and every other baseline fact is still reported.
         private BaselineFacts DescribeBaseline()
@@ -1552,9 +1777,9 @@ public sealed class ReplayBody(
             return present;
         }
 
-        // Works from the records ConfirmEvidence kept, so each case is reported once, as not captured or as
+        // Works from the records ConfirmEvidenceAsync kept, so each case is reported once, as not captured or as
         // compared, never as both. Every case the manifest's notCaptured lists is not captured, whether or not
-        // a record of it was found (ConfirmEvidence removed any such record). Beyond that list, a planned case
+        // a record of it was found (ConfirmEvidenceAsync removed any such record). Beyond that list, a planned case
         // without a kept record is also reported as not-captured: left unreported, its operation would read as
         // a difference with no failing item behind it, and the exit code, which judges failing items only,
         // would pass an undocumented gap. Its reason says when its record was refused against the plan rather
@@ -1647,13 +1872,22 @@ public sealed class ReplayBody(
             // Each record and its body are read and verified once, inside the case's guard, and are unreachable
             // once the iteration ends, so replay holds one baseline record and one body at a time. A record file
             // changed or removed since it was indexed, or a body that is missing or does not hash to its
-            // bodySha256, becomes that case's CHK-EXCEPTION, and the other cases still run.
+            // bodySha256, becomes that case's CHK-EXCEPTION, and the other cases still run. So does a record whose
+            // statements no longer hold as the evidence confirmation held them (its preState and, with the plan,
+            // its kind, stateChanging, preState and request): it is read again here, so one rewritten since then is
+            // refused before any reset or request, and nothing of it is sent.
             foreach (var key in _keys)
             {
                 ct.ThrowIfCancellationRequested();
                 await Guard($"replay case {key.CaseId}", async () =>
                 {
                     var entry = await _store.ReadEntryAsync(key, ct).ConfigureAwait(false);
+                    if (StatedRecordProblem(_matrix, entry.Record, _store.DisplayRecordPath(key)) is { } problem)
+                    {
+                        throw new InvalidDataException(
+                            $"The baseline record of case {key.CaseId} is refused before any reset or request: {problem}.");
+                    }
+
                     await ReplayCaseAsync(entry, _comparer).ConfigureAwait(false);
                 }).ConfigureAwait(false);
             }
@@ -1666,8 +1900,17 @@ public sealed class ReplayBody(
         {
             var record = entry.Record;
             var operation = catalogue.GetById(record.Operation);
-            var bracketed = string.Equals(record.PreState, CasePreStates.Empty, StringComparison.Ordinal)
-                && !options.IsExternalBackend;
+
+            // Each valid preState decides the bracket explicitly. The record was held to seed or empty when it was
+            // read for its case, so any other value is refused here as well, never replayed as seed.
+            var bracketed = record.PreState switch
+            {
+                CasePreStates.Empty => !options.IsExternalBackend,
+                CasePreStates.Seed => false,
+                _ => throw new InvalidDataException(
+                    $"Baseline case {record.CaseId} has preState {Quoted(record.PreState)}, which is neither "
+                    + $"'{CasePreStates.Seed}' nor '{CasePreStates.Empty}', so no reset establishes it."),
+            };
 
             try
             {
