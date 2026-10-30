@@ -930,6 +930,13 @@ public sealed class ReplayMode
 /// <para>Every step runs inside a guard that records an exception as <c>CHK-EXCEPTION</c> and carries on,
 /// so one failing case or check never prevents the others. Only the caller's cancellation ends the body
 /// early, and <see cref="ReplayMode"/> still writes the report and shuts the components down.</para>
+/// <para>Before any case is counted or compared, the records are reconciled with the manifest and the case
+/// matrix. A record of a case the manifest lists as not captured, or one the matrix does not plan at its
+/// position for its operation, is never compared or counted as captured. Those records, records without a
+/// manifest, records beside a <c>not-run</c> manifest, a manifest whose stated source is not
+/// <c>jade-standin</c> or whose stated label is not the baseline label text, a captured manifest that omits
+/// its source or its label, and a captured manifest without both seed facts are reported together as one
+/// <c>CHK-EXCEPTION</c>, and the other records are still compared.</para>
 /// <para>The body reads <c>baseline/**</c>, <c>harness/config/case-matrix.json</c> and the checked-in
 /// contracts, and writes only <c>artifacts/discrepancies/**</c> and <c>artifacts/replay/**</c> (the checks
 /// write their own <c>artifacts/openapi/**</c> and <c>artifacts/wsdl/**</c>). It never writes
@@ -1091,12 +1098,23 @@ public sealed class ReplayBody(
         private const string ConformanceName = "baseline/conformance.json";
         private const string RulesName = "baseline/normalisation-rules.json";
         private const string MatrixName = "harness/config/case-matrix.json";
+        private const string BaselineWsdlName = "baseline/wsdl/standin-ErewhonWebService.wsdl";
         private const string IncompleteDetail = "the check did not complete";
 
         private readonly DateTimeOffset _startedAt = DateTimeOffset.UtcNow;
         private readonly BaselineStore _store = new(options);
 
+        // Evidence problems the manifest shows by itself, found when it is read and reported with the
+        // reconciliation of the records (ConfirmEvidence).
+        private readonly List<string> _manifestProblems = [];
+
+        // Planned cases whose record the reconciliation refused, with why; each is reported as not captured.
+        private readonly Dictionary<string, string> _refusedRecords = new(StringComparer.Ordinal);
+
         private BaselineManifest? _manifest;
+
+        // True only when the read found no manifest file, as distinct from one that could not be read.
+        private bool _manifestAbsent;
         private CaseMatrix? _matrix;
         // Keys only, with no request, response or body: each record and its body are read and verified when
         // its case is replayed, and dropped when that case ends.
@@ -1127,10 +1145,12 @@ public sealed class ReplayBody(
             await Guard("reset at replay start", ResetAtStartAsync).ConfigureAwait(false);
             ct.ThrowIfCancellationRequested();
 
-            // Step 3: the plan, the records, the counts and the normalisation rules.
+            // Step 3: the plan, the records, their reconciliation with the manifest and the plan, the counts
+            // and the normalisation rules.
             GuardSync($"load {MatrixName}", LoadMatrix);
             state.SetPlanned(PlannedByOperation());
             await Guard("read baseline records", ReadRecordsAsync).ConfigureAwait(false);
+            GuardSync("confirm the baseline evidence", ConfirmEvidence);
             GuardSync("count the baseline", () => state.Baseline = DescribeBaseline());
             GuardSync("record not-captured cases", RecordNotCaptured);
             await Guard($"load {RulesName}", LoadRulesAsync).ConfigureAwait(false);
@@ -1204,22 +1224,103 @@ public sealed class ReplayBody(
             }
         }
 
+        // The manifest is the capture's completion record and holds the seed facts every reset is confirmed
+        // against, so its expectations are set here, before the start reset. A not-run manifest holds no seed
+        // facts, and only the generation, mutations and source are confirmed. Any other manifest has each fact
+        // it states confirmed; one it lacks or leaves blank cannot be, which is an evidence problem. So is
+        // provenance that is not shown: a manifest other than not-run that omits its source or its label (the
+        // hand-written not-run manifest holds neither), and any manifest whose stated source is not
+        // jade-standin or whose stated label is not the baseline label text. ConfirmEvidence reports them all,
+        // and an absent manifest, once the records are read.
         private async Task ReadManifestAsync()
         {
             _manifest = await _store.TryReadManifestAsync(ct).ConfigureAwait(false);
             if (_manifest is null)
             {
+                _manifestAbsent = true;
                 PrintBaseline($"{ManifestName} absent: no seed facts to confirm");
                 return;
             }
 
-            _expectations = _manifest.HasSeedFacts
-                ? ResetExpectations.FromManifest(_manifest.SeedSha256, _manifest.ReferenceDate)
-                : ResetExpectations.None;
+            var manifest = _manifest;
+            var execution = manifest.CaptureExecution ?? "not recorded";
+            var missing = MissingSeedFacts(manifest);
+            _expectations = manifest.IsNotRun
+                ? ResetExpectations.None
+                : ResetExpectations.FromManifest(manifest.SeedSha256, manifest.ReferenceDate);
+
+            // An omitted member keeps its default value, so only a stated source or label can differ from it.
+            if (!manifest.IsNotRun && !manifest.SourceStated)
+            {
+                _manifestProblems.Add(
+                    $"{ManifestName} records capture execution {execution} but states no source, so the baseline is "
+                    + $"not shown to be stand-in output; a captured manifest states source '{SourceLabels.StandIn}', "
+                    + $"and only a {CaptureExecutionValues.NotRun} manifest omits it");
+            }
+
+            if (!string.Equals(manifest.Source, SourceLabels.StandIn, StringComparison.Ordinal))
+            {
+                _manifestProblems.Add(
+                    $"{ManifestName} has source '{manifest.Source}', but the baseline is stand-in output and is labelled "
+                    + $"'{SourceLabels.StandIn}' in every place");
+            }
+
+            if (!manifest.IsNotRun && !manifest.LabelStated)
+            {
+                _manifestProblems.Add(
+                    $"{ManifestName} records capture execution {execution} but states no label, so the baseline is "
+                    + "not shown to be stand-in output; a captured manifest carries the label text "
+                    + $"'{SourceLabels.BaselineLabel}', and only a {CaptureExecutionValues.NotRun} manifest omits it");
+            }
+
+            if (!string.Equals(manifest.Label, SourceLabels.BaselineLabel, StringComparison.Ordinal))
+            {
+                _manifestProblems.Add(
+                    $"{ManifestName} has label '{manifest.Label}', but the baseline is stand-in output and carries the "
+                    + $"label text '{SourceLabels.BaselineLabel}'");
+            }
+
+            if (missing.Count > 0)
+            {
+                _manifestProblems.Add(
+                    $"{ManifestName} records capture execution {execution} but leaves {string.Join(" and ", missing)} "
+                    + $"missing or blank, so the seed state cannot be confirmed; only a {CaptureExecutionValues.NotRun} "
+                    + "manifest holds no seed facts");
+            }
+
+            var seedFacts = manifest.IsNotRun
+                ? $"absent, as in every {CaptureExecutionValues.NotRun} manifest"
+                : missing.Count == 0
+                    ? "recorded; to be confirmed at every reset"
+                    : $"incomplete ({string.Join(" and ", missing)} missing or blank)";
             PrintBaseline(string.Create(
                 CultureInfo.InvariantCulture,
-                $"{ManifestName}: source {_manifest.Source}, capture execution {_manifest.CaptureExecution ?? "not recorded"}, "
-                + $"{_manifest.NotCaptured.Count} case(s) not captured, seed facts {(_manifest.HasSeedFacts ? "recorded; to be confirmed at every reset" : "absent")}"));
+                $"{ManifestName}: source {(manifest.SourceStated ? manifest.Source : "not stated")}, capture execution {execution}, "
+                + $"{manifest.NotCaptured.Count} case(s) not captured, seed facts {seedFacts}"));
+        }
+
+        // The seed facts, by their JSON names, that a manifest other than not-run lacks or leaves blank.
+        // BaselineManifest.HasSeedFacts counts a blank value as present, which capture relies on; replay cannot
+        // confirm a blank fact, so it judges here whether each one is usable.
+        private static List<string> MissingSeedFacts(BaselineManifest manifest)
+        {
+            var missing = new List<string>(2);
+            if (manifest.IsNotRun)
+            {
+                return missing;
+            }
+
+            if (string.IsNullOrWhiteSpace(manifest.SeedSha256))
+            {
+                missing.Add("seedSha256");
+            }
+
+            if (string.IsNullOrWhiteSpace(manifest.ReferenceDate))
+            {
+                missing.Add("referenceDate");
+            }
+
+            return missing;
         }
 
         private async Task ResetAtStartAsync()
@@ -1262,46 +1363,172 @@ public sealed class ReplayBody(
             return planned;
         }
 
+        // The capture evidence, recorded before any case is replayed, so a case that is never compared (no
+        // comparer, cancellation, a failed case step) is still reported as captured. ConfirmEvidence then
+        // removes every record the manifest or the plan does not account for and records the kept ones again,
+        // so only a record that is compared, or fails as its case, counts as captured.
         private async Task ReadRecordsAsync()
         {
             _keys = await _store.ReadRecordIndexAsync(ct).ConfigureAwait(false);
             _recordsRead = true;
-
-            // The capture evidence, recorded before any case is replayed, so a case that is never compared
-            // (no comparer, cancellation, a failed case step) is still reported as captured.
-            state.SetCaptured(_keys
-                .Where(key => !string.IsNullOrWhiteSpace(key.Operation))
-                .GroupBy(key => key.Operation, StringComparer.Ordinal)
-                .ToDictionary(
-                    group => group.Key,
-                    group => (IReadOnlyList<string>)group.Select(key => key.CaseId).ToArray(),
-                    StringComparer.Ordinal));
+            state.SetCaptured(CapturedByOperation());
             PrintBaseline(string.Create(
                 CultureInfo.InvariantCulture,
                 $"{_keys.Count} baseline record(s) read; each body is verified when its case is replayed"));
         }
 
+        private Dictionary<string, IReadOnlyList<string>> CapturedByOperation() => _keys
+            .Where(key => !string.IsNullOrWhiteSpace(key.Operation))
+            .GroupBy(key => key.Operation, StringComparer.Ordinal)
+            .ToDictionary(
+                group => group.Key,
+                group => (IReadOnlyList<string>)group.Select(key => key.CaseId).ToArray(),
+                StringComparer.Ordinal);
+
+        // Reconciles the records with the manifest and the plan before anything is counted or compared, and
+        // reports every problem as one never-documentable CHK-EXCEPTION, so the run cannot exit 0 on unproven
+        // evidence; the kept records are still compared, and the report and cleanup still run.
+        //  - The manifest problems ReadManifestAsync found: a stated source other than jade-standin or label other
+        //    than the baseline label text, and a manifest other than not-run that omits its source or its label
+        //    or lacks a seed fact.
+        //  - Records without a manifest: capture publishes the manifest last, as its completion record, so the
+        //    capture is not shown complete and no seed fact can be confirmed. With neither, nothing was
+        //    captured and nothing is missing.
+        //  - A record of a case the manifest lists in notCaptured is removed, so the case is reported as not
+        //    captured and never as compared.
+        //  - Once the plan is loaded, a record of a case it does not plan, or at another position or of another
+        //    operation than it plans, is removed; a planned case whose record is removed is reported as not
+        //    captured. Without the plan, whose load already failed the run, the records are kept.
+        //  - Records beside a not-run manifest that remain after these removals: that fallback holds no record.
+        private void ConfirmEvidence()
+        {
+            var problems = new List<string>(_manifestProblems);
+            if (_manifestAbsent && _keys.Count > 0)
+            {
+                problems.Add(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{ManifestName} is absent although {_keys.Count} baseline record(s) were read; capture publishes "
+                    + $"it last, as its completion record, so the capture is not shown complete and no seed fact can be confirmed"));
+            }
+
+            var listed = (_manifest?.NotCaptured ?? [])
+                .Where(caseId => !string.IsNullOrWhiteSpace(caseId))
+                .ToHashSet(StringComparer.Ordinal);
+            var kept = new List<BaselineRecordKey>(_keys.Count);
+            foreach (var key in _keys)
+            {
+                var file = _store.DisplayRecordPath(key);
+                var removed = false;
+                if (listed.Contains(key.CaseId))
+                {
+                    problems.Add(
+                        $"{ManifestName} lists case {key.CaseId} in notCaptured, but {file} records it; the case is "
+                        + "reported as not captured and never compared");
+                    removed = true;
+                }
+
+                if (_matrix is not null && PlanProblem(_matrix, key, file) is { } planProblem)
+                {
+                    problems.Add(planProblem);
+                    if (!removed && _matrix.TryGetCase(key.CaseId, out _))
+                    {
+                        _refusedRecords[key.CaseId] = planProblem;
+                    }
+
+                    removed = true;
+                }
+
+                if (!removed)
+                {
+                    kept.Add(key);
+                }
+            }
+
+            if (_manifest is { IsNotRun: true } && kept.Count > 0)
+            {
+                problems.Add(string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{ManifestName} records capture execution {CaptureExecutionValues.NotRun}, which holds no record, "
+                    + $"but {kept.Count} record(s) remain: {string.Join(", ", kept.Select(_store.DisplayRecordPath))}"));
+            }
+
+            if (kept.Count != _keys.Count)
+            {
+                _keys = kept;
+                state.SetCaptured(CapturedByOperation());
+            }
+
+            if (problems.Count == 0)
+            {
+                return;
+            }
+
+            foreach (var problem in problems)
+            {
+                PrintBaseline($"baseline evidence: {problem}");
+            }
+
+            throw new InvalidDataException(string.Create(
+                CultureInfo.InvariantCulture,
+                $"The baseline evidence is incomplete or inconsistent ({problems.Count} problem(s)): {string.Join("; ", problems)}."));
+        }
+
+        // Why the plan refuses a record, or null when it plans the record's case at the record's position for
+        // the record's operation.
+        private static string? PlanProblem(CaseMatrix matrix, BaselineRecordKey key, string file)
+        {
+            if (!matrix.TryGetCase(key.CaseId, out var definition))
+            {
+                return $"{file} records case {key.CaseId}, which {MatrixName} does not plan; it is not compared";
+            }
+
+            var position = matrix.PositionOf(key.CaseId);
+            if (key.Order == position && string.Equals(key.Operation, definition.Operation, StringComparison.Ordinal))
+            {
+                return null;
+            }
+
+            return string.Create(
+                CultureInfo.InvariantCulture,
+                $"{file} records case {key.CaseId} at position {key.Order} of operation {key.Operation}, but {MatrixName} "
+                + $"plans it at position {position} of operation {definition.Operation}; it is not compared");
+        }
+
+        // The WSDL probe is guarded on its own: a WSDL whose read is refused (a link) or fails is recorded as
+        // CHK-EXCEPTION and counted as not captured, and every other baseline fact is still reported.
         private BaselineFacts DescribeBaseline()
         {
             var manifest = _manifest;
+            var wsdlPresent = BaselineWsdlPresent();
             return new BaselineFacts(
                 _matrix?.PlannedOperationCount ?? manifest?.Counts.PlannedOperations ?? 0,
                 _matrix?.PlannedCaseCount ?? manifest?.Counts.PlannedCases ?? 0,
                 _keys.Select(key => key.Operation).Distinct(StringComparer.Ordinal).Count(),
                 _keys.Count,
                 manifest?.NotCaptured ?? [],
-                _store.WsdlExists && (manifest is null || manifest.WsdlCaptured),
+                wsdlPresent && (manifest is null || manifest.WsdlCaptured),
                 manifest is not null,
                 manifest?.CaptureExecution);
         }
 
-        // Beyond the manifest's notCaptured list, a planned case without a baseline record is also reported
-        // as not-captured: left unreported, its operation would read as a difference with no failing item
-        // behind it, and the exit code, which judges failing items only, would pass an undocumented gap.
-        // Unlisted gaps are derived only from the record keys that were read, so a damaged record file is
-        // reported once, as the exception, rather than as every planned case. A damaged body does not stop its
-        // record from being indexed: its case is listed as recorded and reports the exception when it is
-        // replayed.
+        // False when the stand-in WSDL record is absent, or when probing it failed, which GuardSync records.
+        private bool BaselineWsdlPresent()
+        {
+            var present = false;
+            GuardSync($"read {BaselineWsdlName}", () => present = _store.WsdlExists);
+            return present;
+        }
+
+        // Works from the records ConfirmEvidence kept, so each case is reported once, as not captured or as
+        // compared, never as both. Every case the manifest's notCaptured lists is not captured, whether or not
+        // a record of it was found (ConfirmEvidence removed any such record). Beyond that list, a planned case
+        // without a kept record is also reported as not-captured: left unreported, its operation would read as
+        // a difference with no failing item behind it, and the exit code, which judges failing items only,
+        // would pass an undocumented gap. Its reason says when its record was refused against the plan rather
+        // than absent. Unlisted gaps are derived only from the record keys that were read, so a damaged record
+        // file is reported once, as the exception, rather than as every planned case. A damaged body does not
+        // stop its record from being indexed: its case is listed as recorded and reports the exception when it
+        // is replayed.
         private void RecordNotCaptured()
         {
             var reasons = new List<(string CaseId, string Reason)>();
@@ -1321,7 +1548,9 @@ public sealed class ReplayBody(
                 {
                     if (!recorded.Contains(definition.Id) && seen.Add(definition.Id))
                     {
-                        reasons.Add((definition.Id, $"planned in {MatrixName} but has no baseline record"));
+                        reasons.Add((definition.Id, _refusedRecords.TryGetValue(definition.Id, out var refusal)
+                            ? $"planned in {MatrixName}, but its baseline record was refused: {refusal}"
+                            : $"planned in {MatrixName} but has no baseline record"));
                     }
                 }
             }

@@ -40,8 +40,8 @@ namespace Erewhon.Harness.Tests;
 /// real writer anchored at a temporary repository root, and a shutdown client that records its calls.
 /// Whatever the body, the report write or a shutdown does, every component is shut down, the final line is
 /// the last line printed and the exit code is 0 or 1. The admin URLs name reserved <c>.invalid</c> hosts
-/// that nothing contacts, because every request goes through the fakes. The
-/// conformance-evidence tests run the real <see cref="ReplayBody"/> instead, against a temporary
+/// that nothing contacts, because every request goes through the fakes. The conformance-evidence
+/// and baseline-evidence tests run the real <see cref="ReplayBody"/> instead, against a temporary
 /// repository root and a closed loopback port, so every network step fails at once. The test of a blank
 /// facade admin URL runs it too, and contacts nothing: its backend is external and its facade listeners
 /// are a loopback socket that is only checked for connections. It also
@@ -883,7 +883,8 @@ public sealed partial class ReplayLifecycleTests : IDisposable
     // Without baseline/conformance.json, a captured baseline (its manifest names how capture ran) fails
     // the run through a never-documentable CHK-EXCEPTION item, while a baseline from which nothing was
     // captured (the hand-written not-run manifest, or no manifest, and no record) reports the check as
-    // not run and adds no item. The committed case matrix is copied in, so no other step throws.
+    // not run and adds no item. The committed case matrix is copied in, and the captured manifest states
+    // its label and both seed facts, so no other step throws.
     [Theory]
     [InlineData("local-processes", true)]
     [InlineData("not-run", false)]
@@ -893,7 +894,10 @@ public sealed partial class ReplayLifecycleTests : IDisposable
         RepoRootDirectory.Write(CaseMatrixPath, File.ReadAllText(Path.Combine(FindRepoRoot(), CaseMatrixPath)));
         if (captureExecution is not null)
         {
-            RepoRootDirectory.Write("baseline/manifest.json", $$"""{"source":"jade-standin","captureExecution":"{{captureExecution}}","notCaptured":[],"wsdlCaptured":false}""");
+            var capturedFacts = captureExecution == CaptureExecutionValues.NotRun
+                ? ""
+                : $",\"label\":\"{SourceLabels.BaselineLabel}\",\"seedSha256\":\"{new string('a', 64)}\",\"referenceDate\":\"2026-01-01\"";
+            RepoRootDirectory.Write("baseline/manifest.json", $$"""{"source":"jade-standin","captureExecution":"{{captureExecution}}"{{capturedFacts}},"notCaptured":[],"wsdlCaptured":false}""");
         }
 
         var state = new ReplayRunState();
@@ -923,6 +927,251 @@ public sealed partial class ReplayLifecycleTests : IDisposable
             Assert.Empty(exceptions);
             Assert.Equal("baseline/conformance.json absent", check.Detail);
             Assert.Contains("[jade-standin] conformance: baseline/conformance.json absent; not run", StdoutText, StringComparison.Ordinal);
+        }
+    }
+
+    // Before any case is counted or compared, the real body reconciles the records with the manifest and the
+    // committed case matrix. Every evidence problem becomes one never-documentable CHK-EXCEPTION, printed as a
+    // [jade-standin] line, and the records the reconciliation keeps are still compared. A record of a case the
+    // manifest lists as not captured, or one the matrix does not plan where it stands, is neither compared nor
+    // counted as captured; a planned case among them is reported as not captured exactly once. A captured
+    // manifest must state its source and label, while the hand-written not-run fallback, with no record, every
+    // case listed and neither member, raises no evidence item; a stated label other than the baseline label
+    // text is a problem in either. Each scenario starts from the committed REST-getAgent-01 record and a
+    // manifest that states source jade-standin, the baseline label text and both seed facts.
+    [Theory]
+    [InlineData("manifest-absent", "baseline/manifest.json is absent although 1 baseline record(s) were read; capture publishes it last, as its completion record, so the capture is not shown complete and no seed fact can be confirmed", "REST-getAgent-01", null, null)]
+    [InlineData("seed-sha-missing", "baseline/manifest.json records capture execution local-processes but leaves seedSha256 missing or blank, so the seed state cannot be confirmed; only a not-run manifest holds no seed facts", "REST-getAgent-01", null, null)]
+    [InlineData("seed-sha-blank", "baseline/manifest.json records capture execution local-processes but leaves seedSha256 missing or blank, so the seed state cannot be confirmed; only a not-run manifest holds no seed facts", "REST-getAgent-01", null, null)]
+    [InlineData("reference-date-blank", "baseline/manifest.json records capture execution local-processes but leaves referenceDate missing or blank, so the seed state cannot be confirmed; only a not-run manifest holds no seed facts", "REST-getAgent-01", null, null)]
+    [InlineData("source-live-jade", "baseline/manifest.json has source 'live-jade', but the baseline is stand-in output and is labelled 'jade-standin' in every place", "REST-getAgent-01", null, null)]
+    [InlineData("source-missing", "baseline/manifest.json records capture execution local-processes but states no source, so the baseline is not shown to be stand-in output; a captured manifest states source 'jade-standin', and only a not-run manifest omits it", "REST-getAgent-01", null, null)]
+    [InlineData("label-missing", "baseline/manifest.json records capture execution local-processes but states no label, so the baseline is not shown to be stand-in output; a captured manifest carries the label text 'Recorded from the JADE stand-in, not from live JADE', and only a not-run manifest omits it", "REST-getAgent-01", null, null)]
+    [InlineData("label-other", "baseline/manifest.json has label 'Recorded from live JADE', but the baseline is stand-in output and carries the label text 'Recorded from the JADE stand-in, not from live JADE'", "REST-getAgent-01", null, null)]
+    [InlineData("not-run-with-record", "baseline/manifest.json records capture execution not-run, which holds no record, but 1 record(s) remain: baseline/records/rest/001-getAgent-01.json", "REST-getAgent-01", null, null)]
+    [InlineData("listed-not-captured", "baseline/manifest.json lists case REST-getAgent-01 in notCaptured, but baseline/records/rest/001-getAgent-01.json records it; the case is reported as not captured and never compared", null, "REST-getAgent-01", "listed in baseline/manifest.json notCaptured")]
+    [InlineData("unplanned-case", "baseline/records/rest/057-getAgent-99.json records case REST-getAgent-99, which harness/config/case-matrix.json does not plan; it is not compared", "REST-getAgent-01", "REST-getAgent-99", null)]
+    [InlineData("other-position", "baseline/records/rest/002-getAgent-01.json records case REST-getAgent-01 at position 2 of operation Rest.getAgent, but harness/config/case-matrix.json plans it at position 1 of operation Rest.getAgent; it is not compared", null, "REST-getAgent-01", "planned in harness/config/case-matrix.json, but its baseline record was refused: baseline/records/rest/002-getAgent-01.json records case REST-getAgent-01 at position 2")]
+    [InlineData("not-run-every-case-listed", null, null, "REST-getAgent-01", "listed in baseline/manifest.json notCaptured")]
+    [InlineData("not-run-label-other", "baseline/manifest.json has label 'Recorded from live JADE', but the baseline is stand-in output and carries the label text 'Recorded from the JADE stand-in, not from live JADE'", null, "REST-getAgent-01", "listed in baseline/manifest.json notCaptured")]
+    public async Task BaselineEvidence_IsReconciledBeforeAnyCaseIsCountedOrCompared(
+        string scenario, string? problem, string? comparedCaseId, string? uncomparedCaseId, string? notCapturedReason)
+    {
+        const string recordFile = "baseline/records/rest/001-getAgent-01.json";
+        var matrixText = File.ReadAllText(Path.Combine(FindRepoRoot(), CaseMatrixPath));
+        RepoRootDirectory.Write(CaseMatrixPath, matrixText);
+        var record = JsonNode.Parse(File.ReadAllText(Path.Combine(FindRepoRoot(), recordFile)))!.AsObject();
+        var manifest = new JsonObject
+        {
+            ["source"] = SourceLabels.StandIn,
+            ["label"] = SourceLabels.BaselineLabel,
+            ["seedSha256"] = new string('a', 64),
+            ["referenceDate"] = "2026-01-01",
+            ["notCaptured"] = new JsonArray(),
+            ["wsdlCaptured"] = false,
+            ["captureExecution"] = CaptureExecutionValues.LocalProcesses,
+        };
+
+        switch (scenario)
+        {
+            case "manifest-absent":
+                manifest = null;
+                break;
+            case "seed-sha-missing":
+                manifest.Remove("seedSha256");
+                break;
+            case "seed-sha-blank":
+                manifest["seedSha256"] = "";
+                break;
+            case "reference-date-blank":
+                manifest["referenceDate"] = "  ";
+                break;
+            case "source-live-jade":
+                manifest["source"] = "live-jade";
+                break;
+            case "source-missing":
+                manifest.Remove("source");
+                break;
+            case "label-missing":
+                manifest.Remove("label");
+                break;
+            case "label-other":
+                manifest["label"] = "Recorded from live JADE";
+                break;
+            case "not-run-with-record":
+                manifest = new JsonObject { ["source"] = SourceLabels.StandIn, ["captureExecution"] = CaptureExecutionValues.NotRun };
+                break;
+            case "listed-not-captured":
+                manifest["notCaptured"] = new JsonArray("REST-getAgent-01");
+                break;
+            case "unplanned-case":
+                var unplanned = record.DeepClone().AsObject();
+                unplanned["order"] = 57;
+                unplanned["caseId"] = "REST-getAgent-99";
+                RepoRootDirectory.Write("baseline/records/rest/057-getAgent-99.json", unplanned.ToJsonString());
+                break;
+            case "other-position":
+                record["order"] = 2;
+                RepoRootDirectory.Write("baseline/records/rest/002-getAgent-01.json", record.ToJsonString());
+                record = null;
+                break;
+            case "not-run-every-case-listed":
+            case "not-run-label-other":
+                // The hand-written fallback, which states neither source nor label.
+                var planned = CaseMatrix.Parse(matrixText, OperationCatalogue.Default).Cases.Select(definition => (JsonNode?)definition.Id);
+                manifest = new JsonObject
+                {
+                    ["captureExecution"] = CaptureExecutionValues.NotRun,
+                    ["notCaptured"] = new JsonArray([.. planned]),
+                };
+                if (scenario == "not-run-label-other")
+                {
+                    manifest["label"] = "Recorded from live JADE";
+                }
+
+                record = null;
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(scenario), scenario, null);
+        }
+
+        if (record is not null)
+        {
+            RepoRootDirectory.Write(recordFile, record.ToJsonString());
+        }
+
+        if (manifest is not null)
+        {
+            RepoRootDirectory.Write("baseline/manifest.json", manifest.ToJsonString());
+        }
+
+        var state = new ReplayRunState();
+        var body = new ReplayBody(ClosedPortOptions(), OperationCatalogue.Default, KnownLimitationsRegister.Empty, _stdout);
+        using (var limit = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken))
+        {
+            limit.CancelAfter(RunLimit);
+            await body.ExecuteAsync(state, limit.Token).WaitAsync(limit.Token);
+        }
+
+        const string evidenceStep = "confirm the baseline evidence: ";
+        var evidence = state.Failures
+            .Where(item => item.ItemId == FailureItemIds.Exception && item.Detail?.StartsWith(evidenceStep, StringComparison.Ordinal) == true)
+            .ToList();
+        if (problem is null)
+        {
+            Assert.Empty(evidence);
+            Assert.DoesNotContain("[jade-standin] baseline evidence: ", StdoutText, StringComparison.Ordinal);
+        }
+        else
+        {
+            var item = Assert.Single(evidence);
+            Assert.Equal(typeof(InvalidDataException).FullName, item.Nature);
+            Assert.True(item.IsNeverDocumentable, "an evidence problem can never be documented");
+            Assert.Equal(
+                $"{evidenceStep}The baseline evidence is incomplete or inconsistent (1 problem(s)): {problem}.",
+                item.Detail);
+            Assert.Contains($"[jade-standin] baseline evidence: {problem}", StdoutText, StringComparison.Ordinal);
+        }
+
+        var captured = state.CapturedCasesByOperation.Values.SelectMany(ids => ids).ToList();
+        if (comparedCaseId is not null)
+        {
+            var result = Assert.Single(state.Cases);
+            Assert.Equal(comparedCaseId, result.CaseId);
+            Assert.True(result.Compared, "a kept record is still compared");
+            Assert.Equal([comparedCaseId], captured);
+        }
+        else
+        {
+            Assert.Empty(state.Cases);
+            Assert.Empty(captured);
+        }
+
+        if (uncomparedCaseId is not null)
+        {
+            Assert.DoesNotContain(state.Cases, result => result.CaseId == uncomparedCaseId);
+            Assert.DoesNotContain(uncomparedCaseId, captured);
+            var notCaptured = state.Failures
+                .Where(item => item.ItemId == FailureItemIds.Case(uncomparedCaseId) && item.Nature == FailureItemIds.NotCaptured)
+                .ToList();
+            if (notCapturedReason is null)
+            {
+                Assert.Empty(notCaptured);
+            }
+            else
+            {
+                var item = Assert.Single(notCaptured);
+                Assert.StartsWith(notCapturedReason, item.Detail, StringComparison.Ordinal);
+            }
+        }
+    }
+
+    // A stand-in WSDL record that is a link to a file outside the repository root is refused, and the refusal
+    // hides no other baseline fact: the real body records it as one never-documentable CHK-EXCEPTION naming the
+    // WSDL, counts the WSDL as not captured, and still counts the plan, the captured record and the manifest's
+    // facts. The manifest records the WSDL as captured, so only the refusal makes it absent. The committed
+    // REST-getAgent-01 record, case matrix and WSDL are copied in, and the manifest states its source, its
+    // label and both seed facts.
+    [Fact]
+    public async Task BaselineWsdlLink_IsRefused_OtherBaselineFactsStillCounted()
+    {
+        const string recordFile = "baseline/records/rest/001-getAgent-01.json";
+        const string wsdlFile = "baseline/wsdl/standin-ErewhonWebService.wsdl";
+        var matrixText = File.ReadAllText(Path.Combine(FindRepoRoot(), CaseMatrixPath));
+        RepoRootDirectory.Write(CaseMatrixPath, matrixText);
+        RepoRootDirectory.Write(recordFile, File.ReadAllText(Path.Combine(FindRepoRoot(), recordFile)));
+        RepoRootDirectory.Write("baseline/manifest.json", new JsonObject
+        {
+            ["source"] = SourceLabels.StandIn,
+            ["label"] = SourceLabels.BaselineLabel,
+            ["seedSha256"] = new string('a', 64),
+            ["referenceDate"] = "2026-01-01",
+            ["notCaptured"] = new JsonArray(),
+            ["wsdlCaptured"] = true,
+            ["captureExecution"] = CaptureExecutionValues.LocalProcesses,
+        }.ToJsonString());
+        using var outside = new TempDirectory();
+        var target = outside.Write("standin-ErewhonWebService.wsdl", File.ReadAllText(Path.Combine(FindRepoRoot(), wsdlFile)));
+        var link = RepoRootDirectory.PathOf(wsdlFile);
+        Directory.CreateDirectory(Path.GetDirectoryName(link)!);
+        File.CreateSymbolicLink(link, target);
+        try
+        {
+            var state = new ReplayRunState();
+            var body = new ReplayBody(ClosedPortOptions(), OperationCatalogue.Default, KnownLimitationsRegister.Empty, _stdout);
+            using (var limit = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken))
+            {
+                limit.CancelAfter(RunLimit);
+                await body.ExecuteAsync(state, limit.Token).WaitAsync(limit.Token);
+            }
+
+            var step = $"read {wsdlFile}";
+            var refused = Assert.Single(
+                state.Failures,
+                item => item.ItemId == FailureItemIds.Exception && item.Detail?.StartsWith($"{step}: ", StringComparison.Ordinal) == true);
+            Assert.Equal(typeof(InvalidOperationException).FullName, refused.Nature);
+            Assert.True(refused.IsNeverDocumentable, "a refused WSDL record can never be documented");
+            Assert.Contains($"{step} failed: ", StdoutText, StringComparison.Ordinal);
+            Assert.DoesNotContain(
+                state.Failures,
+                item => item.ItemId == FailureItemIds.Exception && item.Detail?.StartsWith("count the baseline: ", StringComparison.Ordinal) == true);
+
+            var matrix = CaseMatrix.Parse(matrixText, OperationCatalogue.Default);
+            var baseline = state.Baseline;
+            Assert.Equal(matrix.PlannedOperationCount, baseline.PlannedOperations);
+            Assert.Equal(matrix.PlannedCaseCount, baseline.PlannedCases);
+            Assert.Equal(1, baseline.CapturedOperations);
+            Assert.Equal(1, baseline.CapturedCases);
+            Assert.Empty(baseline.NotCaptured);
+            Assert.False(baseline.WsdlCaptured, "a refused WSDL record counts as not captured");
+            Assert.True(baseline.ManifestPresent, "the manifest facts are still counted");
+            Assert.Equal(CaptureExecutionValues.LocalProcesses, baseline.CaptureExecution);
+            Assert.Equal(target, new FileInfo(link).LinkTarget);
+        }
+        finally
+        {
+            // The link goes before its target's directory, so the repository root never holds a dangling link.
+            File.Delete(link);
         }
     }
 

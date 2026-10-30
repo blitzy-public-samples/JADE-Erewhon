@@ -50,24 +50,62 @@ public sealed record ManifestCounts(int PlannedOperations, int PlannedCases, int
 /// time, machine name, path or duration: a re-capture of an unchanged stand-in must reproduce the file byte
 /// for byte, apart from <see cref="CaptureCommit"/>.</para>
 /// <para>Reading is tolerant, because the execution agent hand-writes the manifest when capture cannot
-/// start. Every member is optional and keeps its default when absent, and unknown members are skipped. A
-/// JSON <c>null</c> for a member typed non-nullable is read as that member's empty value, so a consumer
-/// never meets a null where the type promises none.</para>
-/// <para>The compiler-generated equality compares <see cref="NotCaptured"/> by reference; compare its
-/// contents explicitly where two manifests read separately must be judged equal.</para>
+/// start. Every member is optional and keeps its default when absent, and unknown members are skipped;
+/// <see cref="SourceStated"/> and <see cref="LabelStated"/> record whether the provenance members were
+/// stated, because their defaults alone would present an unlabelled file as labelled. A JSON <c>null</c>
+/// for a member typed non-nullable is read as that member's empty value, so a consumer never meets a null
+/// where the type promises none.</para>
+/// <para>The compiler-generated equality compares <see cref="NotCaptured"/> by reference and includes
+/// <see cref="SourceStated"/> and <see cref="LabelStated"/>; compare the contents explicitly where two
+/// manifests read separately must be judged equal.</para>
 /// </remarks>
 public sealed record BaselineManifest
 {
     private static readonly ManifestCounts Zero = new(0, 0, 0, 0);
 
-    // A JSON null source or label reads as "" rather than the default, so a file that states no label is
-    // never presented as labelled stand-in output.
+    // An omitted source or label keeps its default, so a manifest built in code serialises labelled, but it is
+    // recorded as not stated: the initialiser sets the field directly, and only setting the member (in an
+    // object initializer, a with-expression or deserialisation) runs the init accessor that records it as
+    // stated. A JSON null source or label is stated and reads as "" rather than the default, so a file that
+    // states no label is never presented as labelled stand-in output.
 
     /// <summary>The source label, <see cref="SourceLabels.StandIn"/> (<c>jade-standin</c>).</summary>
-    public string Source { get; init => field = value ?? ""; } = SourceLabels.StandIn;
+    public string Source
+    {
+        get;
+        init
+        {
+            field = value ?? "";
+            SourceStated = true;
+        }
+    } = SourceLabels.StandIn;
 
     /// <summary>The label text, <see cref="SourceLabels.BaselineLabel"/>.</summary>
-    public string Label { get; init => field = value ?? ""; } = SourceLabels.BaselineLabel;
+    public string Label
+    {
+        get;
+        init
+        {
+            field = value ?? "";
+            LabelStated = true;
+        }
+    } = SourceLabels.BaselineLabel;
+
+    /// <summary>
+    /// Whether <see cref="Source"/> was stated: set by an object initializer or by a <c>source</c> member in
+    /// the file, a JSON <c>null</c> or empty one included. False when the member was omitted, while
+    /// <see cref="Source"/> still holds its default. Never serialised.
+    /// </summary>
+    [JsonIgnore]
+    public bool SourceStated { get; private init; }
+
+    /// <summary>
+    /// Whether <see cref="Label"/> was stated: set by an object initializer or by a <c>label</c> member in
+    /// the file, a JSON <c>null</c> or empty one included. False when the member was omitted, while
+    /// <see cref="Label"/> still holds its default. Never serialised.
+    /// </summary>
+    [JsonIgnore]
+    public bool LabelStated { get; private init; }
 
     /// <summary>
     /// The stand-in's <c>/admin/info</c> values at capture start; null in a

@@ -816,6 +816,54 @@ public sealed partial class BinaryComparerTests
         Assert.Equal(JsonValueKind.Null, root.GetProperty("blockingError").ValueKind);
     }
 
+    // A source or label is recorded as stated only when it is set: by a member of the file the store reads,
+    // whatever its value (an empty string or a JSON null included), or by an object initializer. An omitted
+    // member keeps its default but is recorded as not stated. Neither fact is written, so stating a member
+    // changes no byte of the serialised manifest and adds no key.
+    [Theory]
+    [InlineData("""{"source":"jade-standin","label":"Recorded from the JADE stand-in, not from live JADE"}""", true, SourceLabels.StandIn, true, SourceLabels.BaselineLabel)]
+    [InlineData("""{"source":"","label":null}""", true, "", true, "")]
+    [InlineData("""{"source":null,"label":""}""", true, "", true, "")]
+    [InlineData("""{"label":"Recorded from live JADE"}""", false, SourceLabels.StandIn, true, "Recorded from live JADE")]
+    [InlineData("""{"source":"live-jade"}""", true, "live-jade", false, SourceLabels.BaselineLabel)]
+    [InlineData("""{"captureExecution":"not-run","notCaptured":["REST-getAgent-01"]}""", false, SourceLabels.StandIn, false, SourceLabels.BaselineLabel)]
+    public async Task Manifest_SourceAndLabelStated_RecordWhetherEachWasSet(
+        string json, bool sourceStated, string source, bool labelStated, string label)
+    {
+        await WriteRaw(ManifestFile, Encoding.UTF8.GetBytes(json));
+
+        Assert.True(Store.TryReadManifest(out var syncManifest));
+        var asyncManifest = await Store.TryReadManifestAsync(TestCancellation);
+        foreach (var manifest in new[] { syncManifest, asyncManifest })
+        {
+            Assert.NotNull(manifest);
+            Assert.Equal(sourceStated, manifest.SourceStated);
+            Assert.Equal(source, manifest.Source);
+            Assert.Equal(labelStated, manifest.LabelStated);
+            Assert.Equal(label, manifest.Label);
+
+            var restated = manifest with { Source = manifest.Source, Label = manifest.Label };
+            Assert.True(restated.SourceStated, "setting the source states it");
+            Assert.True(restated.LabelStated, "setting the label states it");
+            var written = BaselineStore.SerializeDocument(manifest);
+            Assert.Equal(BaselineStore.SerializeDocument(restated), written);
+            using var document = JsonDocument.Parse(written);
+            Assert.DoesNotContain(
+                PropertyNames(document.RootElement),
+                name => name.EndsWith("Stated", StringComparison.OrdinalIgnoreCase));
+        }
+
+        var initialised = new BaselineManifest { Source = source, Label = label };
+        var defaults = new BaselineManifest();
+        Assert.True(initialised.SourceStated, "an object initializer states the source");
+        Assert.True(initialised.LabelStated, "an object initializer states the label");
+        Assert.False(defaults.SourceStated, "the default source is not stated");
+        Assert.False(defaults.LabelStated, "the default label is not stated");
+        Assert.Equal(
+            BaselineStore.SerializeDocument(new BaselineManifest { Source = SourceLabels.StandIn, Label = SourceLabels.BaselineLabel }),
+            BaselineStore.SerializeDocument(defaults));
+    }
+
     // ---- Record JSON shape -------------------------------------------------------------------------
 
     [Fact]
@@ -876,10 +924,11 @@ public sealed partial class BinaryComparerTests
 // root, writes and reads it only through BaselineStore, and checks file names, byte-exact and
 // deterministic output, verified reads, the refusal of inconsistent, malformed and damaged records,
 // the manifest's withdrawal and its atomic publication through one fixed temporary file, and
-// physical containment: no write or delete reaches outside baseline/ through a symbolic link,
+// physical containment: no read, write or delete reaches outside baseline/ through a symbolic link,
 // whether the link sits on baseline/ itself, on a directory below it or at the target, dangles, or is
-// swapped in for a directory while the store works. Links point into a simulated Erewhon/DataFiles
-// inside the temporary root; the repository's own tree is never touched. These members live in this
+// swapped in for a directory while the store works. Write and delete links point into a simulated
+// Erewhon/DataFiles inside the temporary root, and read links into a directory of their own beside it;
+// the repository's own tree is never touched. These members live in this
 // class because the harness test project keeps its fixed set of test classes, and the store writes
 // and reads the byte-exact .body.bin files and body hashes that the binary comparison works on.
 public sealed partial class BinaryComparerTests
@@ -898,6 +947,7 @@ public sealed partial class BinaryComparerTests
     private const string StartingCommit = "19a5189e9075349aca54de1fb5fdf2d8727403e7";
 
     private const string LinkRefusal = "BaselineStore never writes or deletes through a link";
+    private const string ReadLinkRefusal = "BaselineStore never reads through a link";
     private const string SentinelName = "Clients.txt";
     private const string ProtectedPath = "Erewhon/DataFiles";
     private const string SentinelPath = ProtectedPath + "/" + SentinelName;
@@ -1007,6 +1057,68 @@ public sealed partial class BinaryComparerTests
         {
             data.Add(damage, false, message);
             data.Add(damage, true, message);
+        }
+
+        return data;
+    }
+
+    /// <summary>
+    /// Each source a record may not carry (null: the member is removed), the reason the refusal must give, for
+    /// the per-case reader and every record reader.
+    /// </summary>
+    public static TheoryData<string?, string, string> UnlabelledRecordReads()
+    {
+        (string? Source, string Reason)[] labels =
+        [
+            ("live-jade", "it has source 'live-jade'"),
+            ("", "it has source ''"),
+            (null, "it has no source"),
+        ];
+
+        var data = new TheoryData<string?, string, string>();
+        foreach (var (source, reason) in labels)
+        {
+            foreach (var reader in ReaderNames.Prepend("ReadEntryAsync"))
+            {
+                data.Add(source, reader, reason);
+            }
+        }
+
+        return data;
+    }
+
+    /// <summary>
+    /// Each reader, in its synchronous and asynchronous forms, with the baseline file it reads and each place a
+    /// link can stand on that file's way: at the file itself, to a real file outside the temporary root or
+    /// dangling, and at each directory from <c>baseline/</c> down to it. The record index reads no body, so a
+    /// linked body file is left to the case read.
+    /// </summary>
+    public static TheoryData<string, string, string> LinkedReads()
+    {
+        string[] directories = ["baseline/records/soap", "baseline/records", "baseline"];
+        (string Document, string[] Readers, string[] Placements)[] reads =
+        [
+            ("manifest", ["TryReadManifest", "TryReadManifestAsync"], ["file", "dangling", "baseline"]),
+            ("normalisation-rules", ["ReadNormalisationRules", "ReadNormalisationRulesAsync"],
+                ["file", "dangling", "baseline"]),
+            ("conformance", ["TryReadConformance", "TryReadConformanceAsync"], ["file", "dangling", "baseline"]),
+            ("wsdl", ["ReadWsdlBytes", "ReadWsdlBytesAsync", "WsdlExists"],
+                ["file", "dangling", "baseline/wsdl", "baseline"]),
+            ("record", [.. ReaderNames, RecordIndexReader, "ReadEntryAsync"], ["file", "dangling", .. directories]),
+            ("body-file", [.. ReaderNames, "ReadEntryAsync"], ["file", "dangling"]),
+            ("body-file", ["ReadBodyBytes", "ReadBodyBytesAsync"], ["file", "dangling", .. directories]),
+        ];
+
+        var data = new TheoryData<string, string, string>();
+        foreach (var (document, readers, placements) in reads)
+        {
+            foreach (var placement in placements)
+            {
+                foreach (var reader in readers)
+                {
+                    data.Add(document, placement, reader);
+                }
+            }
         }
 
         return data;
@@ -1467,6 +1579,47 @@ public sealed partial class BinaryComparerTests
                 Assert.Equal(body, entry.Body.ToArray());
             }
         }
+    }
+
+    // The label is checked where the body is verified, so a record labelled other than jade-standin, or with no
+    // source, is still listed by the index, and every reader that verifies bodies refuses it, naming its record
+    // file; the other case still reads as written.
+    [Theory]
+    [MemberData(nameof(UnlabelledRecordReads))]
+    public async Task Readers_RecordNotLabelledStandIn_IsListedAndRefusedWhereItsBodyIsVerified(
+        string? source, string reader, string reason)
+    {
+        await WriteFixture(Store, useAsync: false);
+        await EditRecord(RestRecordPath, json =>
+        {
+            if (source is null)
+            {
+                json.Remove("source");
+            }
+            else
+            {
+                json["source"] = source;
+            }
+        });
+
+        var keys = await Store.ReadRecordIndexAsync(TestCancellation);
+        var ex = await Assert.ThrowsAsync<InvalidDataException>(async () =>
+        {
+            if (string.Equals(reader, "ReadEntryAsync", StringComparison.Ordinal))
+            {
+                await Store.ReadEntryAsync(keys[0], TestCancellation);
+            }
+            else
+            {
+                await ReadWith(reader);
+            }
+        });
+
+        Assert.Equal([KeyOf(AgentRecord), KeyOf(PhotoRecord)], keys);
+        Assert.Equal(
+            $"Baseline record {RestRecordPath} is invalid: {reason}; every record must be labelled 'jade-standin'.",
+            ex.Message);
+        Assert.Equal(PhotoBody, (await Store.ReadEntryAsync(keys[1], TestCancellation)).Body.ToArray());
     }
 
     // The per-case reader reads the record file again, so a record changed or removed after it was indexed is
@@ -2052,6 +2205,117 @@ public sealed partial class BinaryComparerTests
         Assert.Equal(before, Snapshot(StoreRoot));
     }
 
+    // ---- Containment of reads through links --------------------------------------------------------
+
+    // A link at the file or on a directory above it refuses the read, whatever a link-following read would
+    // have found there: the verified getPhoto body included, since the real file keeps the bytes its record
+    // hashes. The refusal names the link and a path at or below it, and the link and its target stay as they were.
+    [Theory]
+    [MemberData(nameof(LinkedReads))]
+    public async Task LinkOnTheWay_RefusesTheReadAndIsLeftInPlace(string document, string placement, string reader)
+    {
+        await WriteFixture(Store, useAsync: false);
+        var file = ReadFile(document);
+        var link = placement is "file" or "dangling" ? file : placement;
+        var outside = Path.Combine(Path.GetTempPath(), "erewhon-baseline-outside-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(outside);
+        try
+        {
+            var target = Path.Combine(outside, Path.GetFileName(Full(link)));
+            if (placement == "dangling")
+            {
+                File.Delete(Full(link));
+                File.CreateSymbolicLink(Full(link), target);
+            }
+            else if (placement == "file")
+            {
+                File.Move(Full(link), target);
+                File.CreateSymbolicLink(Full(link), target);
+                Assert.Equal(await File.ReadAllBytesAsync(target, TestCancellation), await ReadBytes(file));
+            }
+            else
+            {
+                Directory.Move(Full(link), target);
+                Directory.CreateSymbolicLink(Full(link), target);
+                Assert.True(File.Exists(Full(file)), $"{file} is reachable through {link}");
+            }
+
+            var refusal = await Assert.ThrowsAsync<InvalidOperationException>(() => ReadThrough(reader));
+
+            AssertReadLinkRefusal(refusal, link);
+            Assert.Equal(target, new FileInfo(Full(link)).LinkTarget);
+        }
+        finally
+        {
+            Directory.Delete(outside, recursive: true);
+        }
+    }
+
+    // A directory standing at a file's name is no file: each reader of it reads the file as absent, as File.Exists
+    // reports it, and the directory is left as it is.
+    [Theory]
+    [InlineData("manifest", false)]
+    [InlineData("manifest", true)]
+    [InlineData("normalisation-rules", false)]
+    [InlineData("normalisation-rules", true)]
+    [InlineData("conformance", false)]
+    [InlineData("conformance", true)]
+    [InlineData("wsdl", false)]
+    [InlineData("wsdl", true)]
+    [InlineData("record", false)]
+    [InlineData("record", true)]
+    [InlineData("body-file", false)]
+    [InlineData("body-file", true)]
+    public async Task DirectoryAtFileName_ReadsAsAbsent(string document, bool useAsync)
+    {
+        await WriteFixture(Store, useAsync: false);
+        var file = ReadFile(document);
+        File.Delete(Full(file));
+        Directory.CreateDirectory(Full(file));
+
+        switch (document)
+        {
+            case "manifest":
+                Assert.Null(useAsync ? await Store.TryReadManifestAsync(TestCancellation) : ReadManifest());
+                break;
+            case "normalisation-rules":
+                Assert.Null(useAsync
+                    ? await Store.ReadNormalisationRulesAsync(TestCancellation)
+                    : Store.ReadNormalisationRules());
+                break;
+            case "conformance":
+                Assert.Null(useAsync
+                    ? await Store.TryReadConformanceAsync(TestCancellation)
+                    : Store.TryReadConformance());
+                break;
+            case "wsdl":
+                Assert.Null(useAsync ? await Store.ReadWsdlBytesAsync(TestCancellation) : Store.ReadWsdlBytes());
+                Assert.False(Store.WsdlExists);
+                break;
+            case "record":
+                Assert.Equal([KeyOf(AgentRecord)], await ReadWith(useAsync ? "ReadRecordsAsync" : "ReadRecords"));
+                var missing = await Assert.ThrowsAsync<InvalidDataException>(
+                    () => Store.ReadEntryAsync(KeyOf(PhotoRecord), TestCancellation));
+                Assert.Equal(
+                    $"Baseline record {PhotoRecordPath} of case SOAP-getPhoto-02 is missing.", missing.Message);
+                break;
+            case "body-file":
+                var absent = useAsync
+                    ? await Assert.ThrowsAsync<InvalidDataException>(
+                        () => Store.ReadBodyBytesAsync(PhotoRecord, TestCancellation))
+                    : Assert.Throws<InvalidDataException>(() => Store.ReadBodyBytes(PhotoRecord));
+                Assert.Equal(
+                    $"Baseline case SOAP-getPhoto-02 is invalid: its body file {PhotoBodyPath} is missing.",
+                    absent.Message);
+                break;
+            default:
+                throw new ArgumentOutOfRangeException(nameof(document), document, null);
+        }
+
+        Assert.True(Directory.Exists(Full(file)));
+    }
+
+
     // ---- Helpers ------------------------------------------------------------------------------------
 
     private static BaselineRecord NewRecord(
@@ -2172,6 +2436,31 @@ public sealed partial class BinaryComparerTests
         Assert.Contains(
             $"because '{linkedComponent}' is a symbolic link or reparse point", refusal.Message, StringComparison.Ordinal);
     }
+
+    // A read refusal names the link, and as the refused path the link itself or a path below it.
+    private static void AssertReadLinkRefusal(InvalidOperationException refusal, string linkedComponent)
+    {
+        const string refused = ReadLinkRefusal + ": refused '";
+        Assert.StartsWith(refused, refusal.Message, StringComparison.Ordinal);
+        var refusedPath = refusal.Message[refused.Length..refusal.Message.IndexOf('\'', refused.Length)];
+        Assert.True(
+            string.Equals(refusedPath, linkedComponent, StringComparison.Ordinal)
+                || refusedPath.StartsWith(linkedComponent + "/", StringComparison.Ordinal),
+            $"the refused path {refusedPath} is neither {linkedComponent} nor below it");
+        Assert.EndsWith(
+            $", because '{linkedComponent}' is a symbolic link or reparse point.",
+            refusal.Message,
+            StringComparison.Ordinal);
+    }
+
+    // The fixture file each read-containment case reads: the getPhoto record or its body, which sit in
+    // records/soap, or the single file of any other document.
+    private static string ReadFile(string document) => document switch
+    {
+        "record" => PhotoRecordPath,
+        "body-file" => PhotoBodyPath,
+        _ => Writer(document).File,
+    };
 
     // Every regular file below a directory, as "relative/path=hex" in ordinal order.
     private static List<string> Snapshot(string directory) =>
@@ -2340,6 +2629,24 @@ public sealed partial class BinaryComparerTests
         "ReadEntriesAsync" => Keys((await Store.ReadEntriesAsync(TestCancellation)).Select(static entry => entry.Record)),
         RecordIndexReader => await Store.ReadRecordIndexAsync(TestCancellation),
         _ => throw new ArgumentOutOfRangeException(nameof(reader), reader, null),
+    };
+
+    // What any reader of the fixture returns; a reader of one case reads the getPhoto record or its key.
+    private async Task<object?> ReadThrough(string reader) => reader switch
+    {
+        "TryReadManifest" => ReadManifest(),
+        "TryReadManifestAsync" => await Store.TryReadManifestAsync(TestCancellation),
+        "ReadNormalisationRules" => Store.ReadNormalisationRules(),
+        "ReadNormalisationRulesAsync" => await Store.ReadNormalisationRulesAsync(TestCancellation),
+        "TryReadConformance" => Store.TryReadConformance(),
+        "TryReadConformanceAsync" => await Store.TryReadConformanceAsync(TestCancellation),
+        "ReadWsdlBytes" => Store.ReadWsdlBytes(),
+        "ReadWsdlBytesAsync" => await Store.ReadWsdlBytesAsync(TestCancellation),
+        "WsdlExists" => Store.WsdlExists,
+        "ReadEntryAsync" => await Store.ReadEntryAsync(KeyOf(PhotoRecord), TestCancellation),
+        "ReadBodyBytes" => Store.ReadBodyBytes(PhotoRecord),
+        "ReadBodyBytesAsync" => await Store.ReadBodyBytesAsync(PhotoRecord, TestCancellation),
+        _ => await ReadWith(reader),
     };
 
     private static BaselineRecordKey KeyOf(BaselineRecord record) => new(record.Order, record.CaseId, record.Operation);

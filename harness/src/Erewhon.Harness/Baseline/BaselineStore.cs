@@ -19,23 +19,30 @@ namespace Erewhon.Harness.Baseline;
 /// <c>capture</c> writes, and <c>replay</c> only reads.
 /// </summary>
 /// <remarks>
-/// <para>Every path comes from <see cref="HarnessOptions"/>. A write or delete whose path resolves outside
-/// <c>baseline/</c> is refused, so this store never writes <c>contracts/</c> or anything else.</para>
-/// <para>Containment is physical as well as lexical: this store never writes or deletes through a link, even
-/// while another process renames or replaces directories under it. Components above <c>baseline/</c> belong
-/// to the repository root the caller chose and are trusted. From <c>baseline/</c> itself down to the target's
-/// directory, each component is opened as a directory handle relative to the handle of the one above it,
-/// without following a link, and is created first when a write needs it and it is missing. The write or
-/// delete then names only the final entry inside the last handle, so no directory on the way is looked up
-/// again once checked: one swapped for a link after it was opened cannot redirect the operation. A symbolic
-/// link or other reparse point on that chain or at the target, dangling or not, refuses the operation and is
-/// left in place. <see cref="ClearRecords(CancellationToken)"/> also lists each records directory through its
-/// handle. A file is replaced, never rewritten in place: the old entry is removed and the new file created
+/// <para>Every path comes from <see cref="HarnessOptions"/>. A read, write or delete whose path resolves
+/// outside <c>baseline/</c> is refused, so this store never reads or writes <c>contracts/</c> or anything
+/// else.</para>
+/// <para>Containment is physical as well as lexical: this store never reads, writes or deletes through a link,
+/// even while another process renames or replaces directories under it. Components above <c>baseline/</c>
+/// belong to the repository root the caller chose and are trusted. From <c>baseline/</c> itself down to the
+/// target's directory, each component is opened as a directory handle relative to the handle of the one above
+/// it, without following a link, and is created first when a write needs it and it is missing; a read creates
+/// nothing, and a missing component leaves its file absent. The read, write or delete then names only the
+/// final entry inside the last handle, and a read opens it without following a link, so no directory on the
+/// way is looked up again once checked: one swapped for a link after it was opened cannot redirect the
+/// operation. A symbolic link or other reparse point on that chain or at the target, dangling or not, refuses
+/// the operation and is left in place, so no read returns bytes from outside <c>baseline/</c>.
+/// <see cref="ClearRecords(CancellationToken)"/> and the record readers also list each records directory
+/// through its handle; a link listed in one refuses the clear, and a record file that is a link refuses its read.
+/// A file is replaced, never rewritten in place: the old entry is removed and the new file created
 /// exclusively without following a link, so neither a link planted at the final name after the check nor a
 /// hard link to a file elsewhere is written through.</para>
 /// <para>Directory handles of this kind are a Linux facility, so every write and delete throws
 /// <see cref="PlatformNotSupportedException"/> on any other operating system, and on a processor architecture
-/// whose Linux open flags this store does not know. Reads use ordinary paths and run on every platform.</para>
+/// whose Linux open flags this store does not know. Reads run on every platform. Where those handles are
+/// unavailable, a read first checks <c>baseline/</c>, each directory below it and the file itself by path with
+/// lstat-level attributes, refusing a link exactly as above, and then reads the file by its path, which cannot
+/// rule out a link swapped in between the check and the read.</para>
 /// <para>Files are written with one fixed JSON format and no timestamp, so a re-capture of an unchanged
 /// stand-in reproduces every file byte for byte (the manifest's <c>captureCommit</c> aside). Every file but
 /// the manifest is written straight to its final path. The manifest is the capture's completion record, so
@@ -46,15 +53,18 @@ namespace Erewhon.Harness.Baseline;
 /// removes its temporary file; one a crash interrupts leaves at most that one file, which the next
 /// publication replaces and <see cref="DeleteManifest"/> removes. No other temporary file is ever left in
 /// the tree.</para>
-/// <para>Reads verify what they return: every record must sit at the path its own members name, and its
-/// body must match its <c>bodySha256</c>, so replay never compares against a damaged baseline. Each body is
-/// read once: <see cref="ReadEntries"/> returns the verified bytes with their record, and
-/// <see cref="ReadBodyBytes"/> verifies the bytes it returns. <see cref="ReadRecordIndexAsync"/> and
+/// <para>Reads verify what they return: every record must sit at the path its own members name, be labelled
+/// <see cref="SourceLabels.StandIn"/>, as every written record is, and its body must match its
+/// <c>bodySha256</c>, so replay never compares against a damaged or foreign baseline. Each body is read once:
+/// <see cref="ReadEntries"/> returns the verified bytes with their record, and <see cref="ReadBodyBytes"/>
+/// verifies the bytes it returns. <see cref="ReadRecordIndexAsync"/> and
 /// <see cref="ReadEntryAsync(BaselineRecordKey, CancellationToken)"/> split that work for a caller that must
-/// hold one case at a time: the index checks every record and keeps only its <see cref="BaselineRecordKey"/>,
-/// which holds no request or response, and the per-case reader later reads one key's record and body once and
-/// verifies both. A <c>bodyText</c> is unescaped into memory its record alone references, never into a pooled
-/// buffer, so dropping a record or entry releases its body.</para>
+/// hold one case at a time: the index checks every record's path and members and keeps only its
+/// <see cref="BaselineRecordKey"/>, which holds no request or response, and the per-case reader later reads
+/// one key's record and body once and verifies both, the label with the body. A record labelled otherwise,
+/// like a damaged body, is therefore listed by the index and refused only when its own case is read. A
+/// <c>bodyText</c> is unescaped into memory its record alone references, never into a pooled buffer, so
+/// dropping a record or entry releases its body.</para>
 /// <para>Every file read and write also has an asynchronous form that takes a
 /// <see cref="CancellationToken"/>, passes it to the file I/O and observes it before each record file.
 /// Deletes stay synchronous, because file deletion has no asynchronous form;
@@ -120,8 +130,33 @@ public sealed class BaselineStore
     /// </summary>
     public static JsonSerializerOptions SerializerOptions { get; } = CreateSerializerOptions();
 
-    /// <summary>Whether <c>baseline/wsdl/standin-ErewhonWebService.wsdl</c> exists.</summary>
-    public bool WsdlExists => File.Exists(options.BaselineWsdlPath);
+    /// <summary>
+    /// Whether <c>baseline/wsdl/standin-ErewhonWebService.wsdl</c> exists as a file that
+    /// <see cref="ReadWsdlBytes"/> would read.
+    /// </summary>
+    /// <remarks>
+    /// The file is reached as every read reaches its file. A missing file, or a directory at its name, does not
+    /// exist; a link at it or on a directory above it is never reported as an existing WSDL, but refused as the
+    /// read refuses it, and left in place.
+    /// </remarks>
+    /// <exception cref="InvalidOperationException">
+    /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
+    /// symbolic link or reparse point.
+    /// </exception>
+    /// <exception cref="IOException">
+    /// The file cannot be opened, or a component on the way is not a directory.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
+    public bool WsdlExists
+    {
+        get
+        {
+            using var handle = OpenForReading(options.BaselineWsdlPath);
+            return handle is not null;
+        }
+    }
 
     /// <summary>
     /// Serialises <paramref name="value"/> in the baseline format as UTF-8 without a byte-order mark,
@@ -258,6 +293,19 @@ public sealed class BaselineStore
 
         return Path.Combine(options.RecordsDirectory, SurfaceDirectoryName(record.CaseId), expected);
     }
+
+    /// <summary>
+    /// The record file a key of <see cref="ReadRecordIndexAsync"/> was read from, as this store's messages name
+    /// it: relative to the repository root with <c>/</c> separators, for example
+    /// <c>baseline/records/rest/019-getSale-01.json</c>.
+    /// </summary>
+    /// <param name="key">A key <see cref="ReadRecordIndexAsync"/> returned.</param>
+    /// <returns>The path; the file is not read.</returns>
+    /// <exception cref="ArgumentNullException"><paramref name="key"/> or one of its names is null.</exception>
+    /// <exception cref="ArgumentException">
+    /// The key's case id, order or names do not form a record file name.
+    /// </exception>
+    public string DisplayRecordPath(BaselineRecordKey key) => Display(RecordFileOf(key).File);
 
     /// <summary>
     /// Deletes every file directly inside <c>baseline/records/rest</c> and <c>baseline/records/soap</c>,
@@ -733,6 +781,16 @@ public sealed class BaselineStore
     /// <param name="manifest">The manifest, or null when the file is absent.</param>
     /// <returns>True when the file exists and was read.</returns>
     /// <exception cref="InvalidDataException">The file is not a JSON manifest, or holds a JSON <c>null</c>.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
+    /// symbolic link or reparse point; the link is left in place.
+    /// </exception>
+    /// <exception cref="IOException">
+    /// The file cannot be read, or a component on the way is not a directory.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     public bool TryReadManifest([NotNullWhen(true)] out BaselineManifest? manifest)
     {
         var path = options.ManifestPath;
@@ -753,6 +811,16 @@ public sealed class BaselineStore
     /// <param name="cancellationToken">Cancels the read.</param>
     /// <returns>The manifest, or null when the file is absent.</returns>
     /// <exception cref="InvalidDataException">The file is not a JSON manifest, or holds a JSON <c>null</c>.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
+    /// symbolic link or reparse point; the link is left in place.
+    /// </exception>
+    /// <exception cref="IOException">
+    /// The file cannot be read, or a component on the way is not a directory.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public async Task<BaselineManifest?> TryReadManifestAsync(CancellationToken cancellationToken = default)
     {
@@ -767,16 +835,24 @@ public sealed class BaselineStore
     /// </summary>
     /// <remarks>
     /// Each record must sit in the directory of its case id's surface under the file name its order, method
-    /// and case number give, and its body (the <c>.body.bin</c> file, or <c>bodyText</c> encoded as UTF-8)
-    /// must hash to its <c>bodySha256</c>. No two records may share an order or a case id. A missing records
-    /// directory holds no records. Each body is verified and then dropped, so only one is held at a time; use
-    /// <see cref="ReadEntries"/> to keep the verified bodies.
+    /// and case number give, be labelled <see cref="SourceLabels.StandIn"/>, and its body (the <c>.body.bin</c>
+    /// file, or <c>bodyText</c> encoded as UTF-8) must hash to its <c>bodySha256</c>. No two records may share
+    /// an order or a case id. A missing records directory holds no records. Each body is verified and then
+    /// dropped, so only one is held at a time; use <see cref="ReadEntries"/> to keep the verified bodies.
     /// </remarks>
     /// <returns>The records sorted by <see cref="BaselineRecord.Order"/>.</returns>
     /// <exception cref="InvalidDataException">
-    /// A record file fails any of these checks; the message names it.
+    /// A record file fails any of these checks, a source other than <see cref="SourceLabels.StandIn"/>
+    /// included; the message names it.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// A records directory, a record or body file, or a directory above them at or below <c>baseline/</c> is a
+    /// symbolic link or reparse point; the link is left in place.
     /// </exception>
     /// <exception cref="IOException">A record or body file cannot be read.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     public IReadOnlyList<BaselineRecord> ReadRecords()
     {
         var entries = new EntrySet(this);
@@ -794,8 +870,18 @@ public sealed class BaselineStore
     /// </summary>
     /// <param name="cancellationToken">Cancels the reads; it is also observed before each record file.</param>
     /// <returns>The records sorted by <see cref="BaselineRecord.Order"/>.</returns>
-    /// <exception cref="InvalidDataException">A record file fails any check; the message names it.</exception>
+    /// <exception cref="InvalidDataException">
+    /// A record file fails any check, a source other than <see cref="SourceLabels.StandIn"/> included; the
+    /// message names it.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// A records directory, a record or body file, or a directory above them at or below <c>baseline/</c> is a
+    /// symbolic link or reparse point; the link is left in place.
+    /// </exception>
     /// <exception cref="IOException">A record or body file cannot be read.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public async Task<IReadOnlyList<BaselineRecord>> ReadRecordsAsync(CancellationToken cancellationToken = default)
     {
@@ -822,8 +908,18 @@ public sealed class BaselineStore
     /// <see cref="ReadBodyBytes"/> is needed. The store keeps no reference to the entries it returns.
     /// </remarks>
     /// <returns>The entries sorted by <see cref="BaselineRecord.Order"/>.</returns>
-    /// <exception cref="InvalidDataException">A record file fails any check; the message names it.</exception>
+    /// <exception cref="InvalidDataException">
+    /// A record file fails any check, a source other than <see cref="SourceLabels.StandIn"/> included; the
+    /// message names it.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// A records directory, a record or body file, or a directory above them at or below <c>baseline/</c> is a
+    /// symbolic link or reparse point; the link is left in place.
+    /// </exception>
     /// <exception cref="IOException">A record or body file cannot be read.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     public IReadOnlyList<BaselineEntry> ReadEntries()
     {
         var entries = new EntrySet(this);
@@ -841,8 +937,18 @@ public sealed class BaselineStore
     /// </summary>
     /// <param name="cancellationToken">Cancels the reads; it is also observed before each record file.</param>
     /// <returns>The entries sorted by <see cref="BaselineRecord.Order"/>.</returns>
-    /// <exception cref="InvalidDataException">A record file fails any check; the message names it.</exception>
+    /// <exception cref="InvalidDataException">
+    /// A record file fails any check, a source other than <see cref="SourceLabels.StandIn"/> included; the
+    /// message names it.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// A records directory, a record or body file, or a directory above them at or below <c>baseline/</c> is a
+    /// symbolic link or reparse point; the link is left in place.
+    /// </exception>
     /// <exception cref="IOException">A record or body file cannot be read.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public async Task<IReadOnlyList<BaselineEntry>> ReadEntriesAsync(CancellationToken cancellationToken = default)
     {
@@ -860,8 +966,8 @@ public sealed class BaselineStore
 
     /// <summary>
     /// The key of every record under <c>baseline/records/rest</c> and <c>baseline/records/soap</c>, read without
-    /// blocking, in replay order, after every record check of <see cref="ReadRecords"/> but without reading or
-    /// hashing a body.
+    /// blocking, in replay order, after every record check of <see cref="ReadRecords"/> but the label check made
+    /// with the body, and without reading or hashing a body.
     /// </summary>
     /// <remarks>
     /// <para>Each record must hold every required member and sit in the directory of its case id's surface under
@@ -870,15 +976,24 @@ public sealed class BaselineStore
     /// case id. A missing records directory holds no records.</para>
     /// <para>Each record file is parsed and checked on its own and reduced to its key at once, so one parsed
     /// record, with its <c>bodyText</c>, is held at a time and none is held once this returns. No
-    /// <c>.body.bin</c> file is read and no body is encoded or hashed, so a missing or damaged body does not stop
-    /// its record from being listed. The caller reads each case when it needs it with
+    /// <c>.body.bin</c> file is read, no body is encoded or hashed and no label is checked, so a missing or
+    /// damaged body, or a source other than <see cref="SourceLabels.StandIn"/>, does not stop its record from
+    /// being listed. The caller reads each case when it needs it with
     /// <see cref="ReadEntryAsync(BaselineRecordKey, CancellationToken)"/>, which checks the record again and
-    /// verifies its body exactly once.</para>
+    /// verifies its label and its body exactly once.</para>
     /// </remarks>
     /// <param name="cancellationToken">Cancels the reads; it is also observed before each record file.</param>
     /// <returns>The keys sorted by <see cref="BaselineRecordKey.Order"/>, then by case id (ordinal).</returns>
     /// <exception cref="InvalidDataException">A record file fails any check; the message names it.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// A records directory, a record file, or a directory above them at or below <c>baseline/</c> is a symbolic
+    /// link or reparse point; the link is left in place. A body file is not read, so a link there is refused
+    /// only when its case is read.
+    /// </exception>
     /// <exception cref="IOException">A record file cannot be read.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public async Task<IReadOnlyList<BaselineRecordKey>> ReadRecordIndexAsync(
         CancellationToken cancellationToken = default)
@@ -904,9 +1019,11 @@ public sealed class BaselineStore
     /// method of its operation and its case number give, in the directory of its case id's surface. It is read
     /// again, so a record rewritten or removed since it was indexed is refused rather than replayed: it must
     /// pass every record check and still hold the key's order, case id and operation.</para>
-    /// <para>The body is read from the <c>.body.bin</c> file, or encoded from <c>bodyText</c> as UTF-8, exactly
-    /// once, and the bytes hashed against <c>bodySha256</c> are the bytes the entry holds. The store keeps no
-    /// reference to the entry, so dropping it releases the record and its body.</para>
+    /// <para>The record must be labelled <see cref="SourceLabels.StandIn"/>, which is checked here, with the
+    /// body, and not by the index. The body is read from the <c>.body.bin</c> file, or encoded from
+    /// <c>bodyText</c> as UTF-8, exactly once, and the bytes hashed against <c>bodySha256</c> are the bytes the
+    /// entry holds. The store keeps no reference to the entry, so dropping it releases the record and its
+    /// body.</para>
     /// </remarks>
     /// <param name="key">A key <see cref="ReadRecordIndexAsync"/> returned.</param>
     /// <param name="cancellationToken">Cancels the reads.</param>
@@ -916,10 +1033,18 @@ public sealed class BaselineStore
     /// The key's case id, order or names do not form a record file name.
     /// </exception>
     /// <exception cref="InvalidDataException">
-    /// The record file is missing, fails any record check, no longer holds the key's case, or its body is
-    /// missing or does not hash to <c>bodySha256</c>; the message names the record file.
+    /// The record file is missing, fails any record check, no longer holds the key's case, has a source other
+    /// than <see cref="SourceLabels.StandIn"/>, or its body is missing or does not hash to <c>bodySha256</c>; the
+    /// message names the record file.
+    /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// The record or body file, or a directory above it at or below <c>baseline/</c>, is a symbolic link or
+    /// reparse point; the link is left in place.
     /// </exception>
     /// <exception cref="IOException">The record or body file cannot be read.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public async Task<BaselineEntry> ReadEntryAsync(
         BaselineRecordKey key, CancellationToken cancellationToken = default)
@@ -959,7 +1084,14 @@ public sealed class BaselineStore
     /// The named body file is not the record's own, comes with body text or is missing, or the body does not
     /// hash to <c>bodySha256</c>.
     /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// The body file, or a directory above it at or below <c>baseline/</c>, is a symbolic link or reparse point;
+    /// the link is left in place.
+    /// </exception>
     /// <exception cref="IOException">The body file cannot be read.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     public byte[] ReadBodyBytes(BaselineRecord record)
     {
         var bodyPath = CaseBodyPath(record);
@@ -979,7 +1111,14 @@ public sealed class BaselineStore
     /// The named body file is not the record's own, comes with body text or is missing, or the body does not
     /// hash to <c>bodySha256</c>.
     /// </exception>
+    /// <exception cref="InvalidOperationException">
+    /// The body file, or a directory above it at or below <c>baseline/</c>, is a symbolic link or reparse point;
+    /// the link is left in place.
+    /// </exception>
     /// <exception cref="IOException">The body file cannot be read.</exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public async Task<byte[]> ReadBodyBytesAsync(BaselineRecord record, CancellationToken cancellationToken = default)
     {
@@ -995,6 +1134,17 @@ public sealed class BaselineStore
     /// The text of <c>baseline/normalisation-rules.json</c>, decoded as UTF-8 with a leading byte-order mark
     /// removed, for the caller to parse; null when the file is absent.
     /// </summary>
+    /// <returns>The file text, or null.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
+    /// symbolic link or reparse point; the link is left in place.
+    /// </exception>
+    /// <exception cref="IOException">
+    /// The file cannot be read, or a component on the way is not a directory.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     public string? ReadNormalisationRules() =>
         TryReadAllBytes(options.NormalisationRulesPath, out var bytes)
             ? DecodeText(bytes)
@@ -1006,6 +1156,16 @@ public sealed class BaselineStore
     /// </summary>
     /// <param name="cancellationToken">Cancels the read.</param>
     /// <returns>The file text, or null.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
+    /// symbolic link or reparse point; the link is left in place.
+    /// </exception>
+    /// <exception cref="IOException">
+    /// The file cannot be read, or a component on the way is not a directory.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public async Task<string?> ReadNormalisationRulesAsync(CancellationToken cancellationToken = default)
     {
@@ -1016,6 +1176,16 @@ public sealed class BaselineStore
     /// <summary>The parsed <c>baseline/conformance.json</c>, or null when the file is absent.</summary>
     /// <returns>The document as written by capture.</returns>
     /// <exception cref="InvalidDataException">The file is not JSON, or holds a JSON <c>null</c>.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
+    /// symbolic link or reparse point; the link is left in place.
+    /// </exception>
+    /// <exception cref="IOException">
+    /// The file cannot be read, or a component on the way is not a directory.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     public JsonNode? TryReadConformance()
     {
         var path = options.ConformancePath;
@@ -1028,6 +1198,16 @@ public sealed class BaselineStore
     /// <param name="cancellationToken">Cancels the read.</param>
     /// <returns>The document as written by capture.</returns>
     /// <exception cref="InvalidDataException">The file is not JSON, or holds a JSON <c>null</c>.</exception>
+    /// <exception cref="InvalidOperationException">
+    /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
+    /// symbolic link or reparse point; the link is left in place.
+    /// </exception>
+    /// <exception cref="IOException">
+    /// The file cannot be read, or a component on the way is not a directory.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public async Task<JsonNode?> TryReadConformanceAsync(CancellationToken cancellationToken = default)
     {
@@ -1039,6 +1219,17 @@ public sealed class BaselineStore
     /// <summary>
     /// The exact bytes of <c>baseline/wsdl/standin-ErewhonWebService.wsdl</c>, or null when the file is absent.
     /// </summary>
+    /// <returns>The file bytes, or null.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
+    /// symbolic link or reparse point; the link is left in place.
+    /// </exception>
+    /// <exception cref="IOException">
+    /// The file cannot be read, or a component on the way is not a directory.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     public byte[]? ReadWsdlBytes() => TryReadAllBytes(options.BaselineWsdlPath, out var bytes) ? bytes : null;
 
     /// <summary>
@@ -1047,6 +1238,16 @@ public sealed class BaselineStore
     /// </summary>
     /// <param name="cancellationToken">Cancels the read.</param>
     /// <returns>The file bytes, or null.</returns>
+    /// <exception cref="InvalidOperationException">
+    /// The path resolves outside <c>baseline/</c>, or it or a directory on it at or below <c>baseline/</c> is a
+    /// symbolic link or reparse point; the link is left in place.
+    /// </exception>
+    /// <exception cref="IOException">
+    /// The file cannot be read, or a component on the way is not a directory.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The operating system denies access to a directory or file on the way.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public Task<byte[]?> ReadWsdlBytesAsync(CancellationToken cancellationToken = default) =>
         TryReadAllBytesAsync(options.BaselineWsdlPath, cancellationToken);
@@ -1176,43 +1377,209 @@ public sealed class BaselineStore
         BaselineResponse.IsTextRoundTrippable(rawBody)
         && string.Equals(Encoding.UTF8.GetString(rawBody), text, StringComparison.Ordinal);
 
-    private static bool TryReadAllBytes(string path, [NotNullWhen(true)] out byte[]? bytes)
+    // The bytes of the file at path, at or below baseline/, reached as OpenForReading reaches it; false when it
+    // is absent or a directory.
+    private bool TryReadAllBytes(string path, [NotNullWhen(true)] out byte[]? bytes)
     {
-        bytes = null;
-        if (!File.Exists(path))
-        {
-            return false;
-        }
-
-        try
-        {
-            bytes = File.ReadAllBytes(path);
-            return true;
-        }
-        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
-        {
-            return false;
-        }
+        using var handle = OpenForReading(path);
+        bytes = handle is null ? null : ReadToEnd(handle, path);
+        return bytes is not null;
     }
 
-    // The file's bytes, or null when it is absent, as TryReadAllBytes reads them.
-    private static async Task<byte[]?> TryReadAllBytesAsync(string path, CancellationToken cancellationToken)
+    // The file's bytes, or null when it is absent or a directory, as TryReadAllBytes reads them.
+    private async Task<byte[]?> TryReadAllBytesAsync(string path, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (!File.Exists(path))
+        using var handle = OpenForReading(path);
+        return handle is null ? null : await ReadToEndAsync(handle, path, cancellationToken).ConfigureAwait(false);
+    }
+
+    // The bytes of a record file the listing returned. A file removed or replaced by a directory since then
+    // cannot be read.
+    private byte[] ReadListedFile(string file) =>
+        TryReadAllBytes(file, out var bytes) ? bytes : throw ListedFileGone(file);
+
+    // ReadListedFile without blocking.
+    private async Task<byte[]> ReadListedFileAsync(string file, CancellationToken cancellationToken) =>
+        await TryReadAllBytesAsync(file, cancellationToken).ConfigureAwait(false) ?? throw ListedFileGone(file);
+
+    private FileNotFoundException ListedFileGone(string file) =>
+        new($"BaselineStore could not read '{Display(file)}': it is no longer a file.", file);
+
+    // Opens the file at path, at or below baseline/, for reading, or returns null when it is absent: when a
+    // directory on its way or the file itself is missing, or a directory stands at its name, as File.Exists
+    // reports one. On Linux the directories from baseline/ down are opened as handles, each relative to the one
+    // above it without following a link, and the file is opened inside the last one without following a link,
+    // so no link on the way or at the file is followed, even one swapped in meanwhile. Elsewhere, and where the
+    // Linux open flags are unknown, CheckedEntryExists checks each component by its path first. A link refuses
+    // the read and is left in place. The caller disposes the handle.
+    private SafeFileHandle? OpenForReading(string path)
+    {
+        var target = ResolveReadPath(path);
+        if (LinuxTraversal() is not { } flags)
+        {
+            return OpenCheckedPath(target);
+        }
+
+        using var directory = OpenDirectory(target, target.Segments.Length - 1, create: false, flags);
+        if (directory is null)
+        {
+            return null;
+        }
+
+        var name = target.Segments[^1];
+        var descriptor = Native.OpenAt(directory, name, flags.OpenFile, mode: 0);
+        if (descriptor < 0)
+        {
+            var errno = Marshal.GetLastPInvokeError();
+            if (errno == Native.ENOENT)
+            {
+                return null;
+            }
+
+            // With O_NOFOLLOW a link at the name, dangling or not, fails as ELOOP, so only reading the entry as a
+            // link tells it apart from another failure.
+            if ((errno is Native.ELOOP or Native.ENOTDIR) && IsLink(directory, name, target.FullPath))
+            {
+                throw ReadLinkRefusal(target.FullPath, target.FullPath);
+            }
+
+            throw Failure(errno, "read", target.FullPath);
+        }
+
+        // Opening read-only also succeeds on a directory, which reads as absent, as File.Exists reports it.
+        var handle = new SafeFileHandle(descriptor, ownsHandle: true);
+        var isDirectory = true;
+        try
+        {
+            isDirectory = (File.GetAttributes(handle) & FileAttributes.Directory) != 0;
+        }
+        finally
+        {
+            if (isDirectory)
+            {
+                handle.Dispose();
+            }
+        }
+
+        return isDirectory ? null : handle;
+    }
+
+    // OpenForReading where directory handles are unavailable: the file is opened by its path once
+    // CheckedEntryExists has found it a file reached without a link. Unlike a handle, this cannot rule out a
+    // link swapped in between the check and the open.
+    private SafeFileHandle? OpenCheckedPath(BaselinePath target)
+    {
+        if (!CheckedEntryExists(target, directory: false))
         {
             return null;
         }
 
         try
         {
-            return await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false);
+            return File.OpenHandle(target.FullPath, FileMode.Open, FileAccess.Read, FileShare.Read);
         }
         catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
         {
             return null;
         }
     }
+
+    // Where directory handles are unavailable: whether target exists as the entry a read expects, a directory
+    // when directory is set and a file otherwise, after baseline/, each directory below it and the target itself
+    // were checked with lstat-level attributes. A symbolic link or other reparse point among them refuses the
+    // read. A missing component, or a directory where a file is expected, is absent, as File.Exists reports
+    // it; any other entry where a directory is expected is an error, as it is for a directory handle.
+    private bool CheckedEntryExists(BaselinePath target, bool directory)
+    {
+        var component = target.BaselineDirectory;
+        for (var index = 0; ; index++)
+        {
+            var entry = new FileInfo(component);
+            var attributes = entry.Attributes;
+            if (attributes == MissingEntryAttributes)
+            {
+                return false;
+            }
+
+            if ((attributes & FileAttributes.ReparsePoint) != 0 || entry.LinkTarget is not null)
+            {
+                throw ReadLinkRefusal(target.FullPath, component);
+            }
+
+            var isDirectory = (attributes & FileAttributes.Directory) != 0;
+            var isTarget = index == target.Segments.Length;
+            if (isTarget && !directory)
+            {
+                return !isDirectory;
+            }
+
+            if (!isDirectory)
+            {
+                throw NotADirectory(component);
+            }
+
+            if (isTarget)
+            {
+                return true;
+            }
+
+            component = Path.Join(component, target.Segments[index]);
+        }
+    }
+
+    // The whole file a read handle holds, as File.ReadAllBytes reads it: the length the file reports, every byte
+    // of it, and an error when the file ends sooner.
+    private byte[] ReadToEnd(SafeFileHandle handle, string path)
+    {
+        var bytes = new byte[FileLength(handle, path)];
+        var offset = 0;
+        while (offset < bytes.Length)
+        {
+            var read = RandomAccess.Read(handle, bytes.AsSpan(offset), offset);
+            if (read == 0)
+            {
+                throw EndedEarly(path);
+            }
+
+            offset += read;
+        }
+
+        return bytes;
+    }
+
+    // ReadToEnd without blocking, passing the token to every read.
+    private async Task<byte[]> ReadToEndAsync(SafeFileHandle handle, string path, CancellationToken cancellationToken)
+    {
+        var bytes = new byte[FileLength(handle, path)];
+        var offset = 0;
+        while (offset < bytes.Length)
+        {
+            var read = await RandomAccess.ReadAsync(handle, bytes.AsMemory(offset), offset, cancellationToken)
+                .ConfigureAwait(false);
+            if (read == 0)
+            {
+                throw EndedEarly(path);
+            }
+
+            offset += read;
+        }
+
+        return bytes;
+    }
+
+    private int FileLength(SafeFileHandle handle, string path)
+    {
+        var length = RandomAccess.GetLength(handle);
+        return length <= Array.MaxLength
+            ? (int)length
+            : throw new IOException(string.Create(
+                CultureInfo.InvariantCulture,
+                $"BaselineStore could not read '{Display(path)}': its {length} bytes exceed the largest array."));
+    }
+
+    private EndOfStreamException EndedEarly(string path) =>
+        new($"BaselineStore could not read '{Display(path)}': it ended before the length it reported.");
 
     private JsonNode ParseConformance(byte[] bytes, string path)
     {
@@ -1236,23 +1603,54 @@ public sealed class BaselineStore
         foreach (var surface in SurfaceDirectoryNames)
         {
             var directory = Path.Combine(options.RecordsDirectory, surface);
-            if (!Directory.Exists(directory))
-            {
-                continue;
-            }
-
-            foreach (var file in Directory.GetFiles(directory, "*" + RecordExtension).Order(StringComparer.Ordinal))
+            foreach (var file in RecordFilesIn(directory).Order(StringComparer.Ordinal))
             {
                 yield return (file, surface);
             }
         }
     }
 
+    // The path of every *.json entry directly inside the records directory at path that is not a directory,
+    // or none when the directory is missing. The directory is reached as every read reaches a file, so a link at
+    // baseline/, records/ or the directory itself refuses the listing; on Linux it is listed through its handle,
+    // via /proc/self/fd. A link inside it is listed like a file, and reading it refuses the link.
+    private List<string> RecordFilesIn(string path)
+    {
+        var target = ResolveReadPath(path);
+        if (LinuxTraversal() is not { } flags)
+        {
+            return CheckedEntryExists(target, directory: true)
+                ? [.. Directory.GetFiles(path, "*" + RecordExtension)]
+                : [];
+        }
+
+        using var directory = OpenDirectory(target, target.Segments.Length, create: false, flags);
+        if (directory is null)
+        {
+            return [];
+        }
+
+        var files = new List<string>();
+        foreach (var (name, attributes) in ListEntries(directory, path))
+        {
+            // An entry removed since the directory was read is no record. lstat marks a link, dangling or not, as
+            // a reparse point.
+            if (attributes != MissingEntryAttributes
+                && name.EndsWith(RecordExtension, StringComparison.Ordinal)
+                && ((attributes & FileAttributes.ReparsePoint) != 0 || (attributes & FileAttributes.Directory) == 0))
+            {
+                files.Add(Path.Join(path, name));
+            }
+        }
+
+        return files;
+    }
+
     // Reads one record file and its body once each. keepBody false drops the verified body, so ReadRecords
     // holds one body at a time.
     private BaselineEntry ReadEntry(string file, string surface, bool keepBody)
     {
-        var record = Deserialize<BaselineRecord>(File.ReadAllBytes(file), file);
+        var record = Deserialize<BaselineRecord>(ReadListedFile(file), file);
         var bodyPath = CheckedBodyPath(record, file, surface);
         var fileBytes = bodyPath is not null && TryReadAllBytes(bodyPath, out var bytes) ? bytes : null;
         var body = VerifiedRecordBody(record, file, bodyPath, fileBytes);
@@ -1263,7 +1661,7 @@ public sealed class BaselineStore
     private async Task<BaselineEntry> ReadEntryAsync(
         string file, string surface, bool keepBody, CancellationToken cancellationToken)
     {
-        var json = await File.ReadAllBytesAsync(file, cancellationToken).ConfigureAwait(false);
+        var json = await ReadListedFileAsync(file, cancellationToken).ConfigureAwait(false);
         var record = Deserialize<BaselineRecord>(json, file);
         var bodyPath = CheckedBodyPath(record, file, surface);
         var fileBytes = bodyPath is null
@@ -1278,7 +1676,7 @@ public sealed class BaselineStore
     private async Task<BaselineRecordKey> ReadRecordKeyAsync(
         string file, string surface, CancellationToken cancellationToken)
     {
-        var json = await File.ReadAllBytesAsync(file, cancellationToken).ConfigureAwait(false);
+        var json = await ReadListedFileAsync(file, cancellationToken).ConfigureAwait(false);
         var record = Deserialize<BaselineRecord>(json, file);
         _ = CheckedBodyPath(record, file, surface);
         return new BaselineRecordKey(record.Order, record.CaseId, record.Operation);
@@ -1342,15 +1740,30 @@ public sealed class BaselineStore
         }
     }
 
+    // The body of a record read from its file, verified, once the record is known to be labelled stand-in
+    // output. The label is checked here, beside the body, rather than with the record checks the index also
+    // applies, so a record labelled otherwise is still listed and refused only when its own case is read.
     private byte[] VerifiedRecordBody(BaselineRecord record, string file, string? bodyPath, byte[]? fileBytes)
     {
         try
         {
+            RequireStandInSource(record);
             return VerifiedBody(record, bodyPath, fileBytes);
         }
         catch (InvalidDataException ex)
         {
             throw InvalidRecord(file, ex);
+        }
+    }
+
+    // Every record is labelled jade-standin, as WriteRecord requires; a label is never inferred from a missing one.
+    private static void RequireStandInSource(BaselineRecord record)
+    {
+        if (!string.Equals(record.Source, SourceLabels.StandIn, StringComparison.Ordinal))
+        {
+            throw new InvalidDataException(
+                (record.Source is null ? "it has no source" : $"it has source '{record.Source}'")
+                + $"; every record must be labelled '{SourceLabels.StandIn}'.");
         }
     }
 
@@ -1636,23 +2049,7 @@ public sealed class BaselineStore
     // refuses the clear before anything is deleted, and a directory is kept.
     private void ListFiles(DirectoryHandle directory, string path, List<string> files)
     {
-        var listing = new DirectoryInfo(
-            string.Create(CultureInfo.InvariantCulture, $"/proc/self/fd/{directory.DangerousGetHandle()}"));
-        List<(string Name, FileAttributes Attributes)> entries;
-        try
-        {
-            entries = [.. listing.EnumerateFileSystemInfos().Select(static entry => (entry.Name, entry.Attributes))];
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            // The listing path names a descriptor, so the message names the records directory instead.
-            var message = $"BaselineStore could not list '{Display(path)}'.";
-            throw ex is UnauthorizedAccessException
-                ? new UnauthorizedAccessException(message, ex)
-                : new IOException(message, ex);
-        }
-
-        foreach (var (name, attributes) in entries)
+        foreach (var (name, attributes) in ListEntries(directory, path))
         {
             // An entry removed since the directory was read has nothing left to delete.
             if (attributes == MissingEntryAttributes)
@@ -1673,9 +2070,34 @@ public sealed class BaselineStore
         }
     }
 
+    // The name and lstat attributes of every entry directly inside a directory handle, listed through
+    // /proc/self/fd, which the kernel resolves to the directory the handle holds, not to whatever sits at its
+    // path now. path is the directory the handle was opened by, which a failure names.
+    private List<(string Name, FileAttributes Attributes)> ListEntries(DirectoryHandle directory, string path)
+    {
+        var listing = new DirectoryInfo(
+            string.Create(CultureInfo.InvariantCulture, $"/proc/self/fd/{directory.DangerousGetHandle()}"));
+        try
+        {
+            return [.. listing.EnumerateFileSystemInfos().Select(static entry => (entry.Name, entry.Attributes))];
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // The listing path names a descriptor, so the message names the records directory instead.
+            var message = $"BaselineStore could not list '{Display(path)}'.";
+            throw ex is UnauthorizedAccessException
+                ? new UnauthorizedAccessException(message, ex)
+                : new IOException(message, ex);
+        }
+    }
+
+    private BaselinePath ResolveWritePath(string path) => ResolveBaselinePath(path, read: false);
+
+    private BaselinePath ResolveReadPath(string path) => ResolveBaselinePath(path, read: true);
+
     // Refuses a path that leaves baseline/ lexically or names baseline/ itself, and splits the rest into the
     // components below baseline/ that the directory handles walk.
-    private BaselinePath ResolveWritePath(string path)
+    private BaselinePath ResolveBaselinePath(string path, bool read)
     {
         var baselineDirectory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(options.BaselineDirectory));
         var baselineRoot = baselineDirectory + Path.DirectorySeparatorChar;
@@ -1686,10 +2108,11 @@ public sealed class BaselineStore
         if (segments.Length == 0)
         {
             throw new InvalidOperationException(
-                $"BaselineStore never writes outside baseline/: refused '{fullPath}' (baseline is '{baselineRoot}').");
+                $"BaselineStore never {(read ? "reads" : "writes")} outside baseline/: refused '{fullPath}' "
+                + $"(baseline is '{baselineRoot}').");
         }
 
-        return new BaselinePath(baselineDirectory, fullPath, segments);
+        return new BaselinePath(baselineDirectory, fullPath, segments, read);
     }
 
     // Opens the directory that the first depth segments of target name, starting at baseline/ itself. Each
@@ -1709,7 +2132,7 @@ public sealed class BaselineStore
         using (var trusted = DirectoryHandle.CurrentDirectory())
         {
             directory = OpenComponent(
-                trusted, target.BaselineDirectory, target.BaselineDirectory, target.FullPath, create, flags);
+                trusted, target.BaselineDirectory, target.BaselineDirectory, target, create, flags);
         }
 
         var component = target.BaselineDirectory;
@@ -1717,7 +2140,7 @@ public sealed class BaselineStore
         {
             component = Path.Join(component, target.Segments[index]);
             using var parent = directory;
-            directory = OpenComponent(parent, target.Segments[index], component, target.FullPath, create, flags);
+            directory = OpenComponent(parent, target.Segments[index], component, target, create, flags);
         }
 
         return directory;
@@ -1725,9 +2148,9 @@ public sealed class BaselineStore
 
     // The directory name inside parent, opened without following a link at name and, with create, made first
     // when it is missing; null when it is missing without create. component is the path name stands for, and
-    // refusedPath the target a refusal names.
+    // target the read, write or delete a refusal names.
     private DirectoryHandle? OpenComponent(
-        DirectoryHandle parent, string name, string component, string refusedPath, bool create, TraversalFlags flags)
+        DirectoryHandle parent, string name, string component, BaselinePath target, bool create, TraversalFlags flags)
     {
         var descriptor = Native.OpenAt(parent, name, flags.OpenDirectory, mode: 0);
         var errno = descriptor < 0 ? Marshal.GetLastPInvokeError() : 0;
@@ -1760,9 +2183,11 @@ public sealed class BaselineStore
         // does, so only reading the entry as a link tells the two apart.
         if (errno is Native.ENOTDIR or Native.ELOOP)
         {
-            throw IsLink(parent, name, component)
-                ? LinkRefusal(refusedPath, component)
-                : new IOException($"BaselineStore could not open '{Display(component)}': it is not a directory.");
+            throw !IsLink(parent, name, component)
+                ? NotADirectory(component)
+                : target.Read
+                    ? ReadLinkRefusal(target.FullPath, component)
+                    : LinkRefusal(target.FullPath, component);
         }
 
         throw Failure(errno, "open the directory", component);
@@ -1788,8 +2213,17 @@ public sealed class BaselineStore
     }
 
     private InvalidOperationException LinkRefusal(string refusedPath, string component) =>
-        new($"BaselineStore never writes or deletes through a link: refused '{Display(refusedPath)}', because "
+        LinkRefusal("writes or deletes", refusedPath, component);
+
+    private InvalidOperationException ReadLinkRefusal(string refusedPath, string component) =>
+        LinkRefusal("reads", refusedPath, component);
+
+    private InvalidOperationException LinkRefusal(string operations, string refusedPath, string component) =>
+        new($"BaselineStore never {operations} through a link: refused '{Display(refusedPath)}', because "
             + $"'{Display(component)}' is a symbolic link or reparse point.");
+
+    private IOException NotADirectory(string component) =>
+        new($"BaselineStore could not open '{Display(component)}': it is not a directory.");
 
     // An operating-system error as the exception .NET raises for it, naming the path relative to the
     // repository root.
@@ -1812,19 +2246,41 @@ public sealed class BaselineStore
                 + "directory handles, which this operating system does not provide.");
         }
 
-        // O_DIRECTORY and O_NOFOLLOW are the only flags used here whose values differ between architectures.
-        var (directory, noFollow) = RuntimeInformation.ProcessArchitecture switch
+        return LinuxTraversal() ?? throw new PlatformNotSupportedException(
+            $"BaselineStore writes and deletes only where it knows the Linux open flags, which it does not for "
+            + $"{RuntimeInformation.ProcessArchitecture}.");
+    }
+
+    // The open(2) flags of this process, or null on another operating system or on a processor architecture
+    // whose Linux open flags this store does not know. Writes and deletes then refuse to run; reads check each
+    // component by its path instead.
+    private static TraversalFlags? LinuxTraversal()
+    {
+        if (!OperatingSystem.IsLinux())
         {
-            Architecture.X64 or Architecture.X86 or Architecture.S390x or Architecture.RiscV64
-                or Architecture.LoongArch64 => (0x10000, 0x20000),
-            Architecture.Arm or Architecture.Arm64 or Architecture.Armv6 or Architecture.Ppc64le => (0x4000, 0x8000),
-            var architecture => throw new PlatformNotSupportedException(
-                $"BaselineStore writes and deletes only where it knows the Linux open flags, which it does not for "
-                + $"{architecture}."),
-        };
+            return null;
+        }
+
+        // O_DIRECTORY and O_NOFOLLOW are the only flags used here whose values differ between architectures.
+        int directory;
+        int noFollow;
+        switch (RuntimeInformation.ProcessArchitecture)
+        {
+            case Architecture.X64 or Architecture.X86 or Architecture.S390x or Architecture.RiscV64
+                or Architecture.LoongArch64:
+                (directory, noFollow) = (0x10000, 0x20000);
+                break;
+            case Architecture.Arm or Architecture.Arm64 or Architecture.Armv6 or Architecture.Ppc64le:
+                (directory, noFollow) = (0x4000, 0x8000);
+                break;
+            default:
+                return null;
+        }
+
         return new TraversalFlags(
             Native.O_RDONLY | directory | noFollow | Native.O_CLOEXEC,
-            Native.O_WRONLY | Native.O_CREAT | Native.O_EXCL | noFollow | Native.O_CLOEXEC);
+            Native.O_WRONLY | Native.O_CREAT | Native.O_EXCL | noFollow | Native.O_CLOEXEC,
+            Native.O_RDONLY | noFollow | Native.O_CLOEXEC);
     }
 
     // Messages name paths relative to the repository root, so an error quoted in a report reads the same in
@@ -1936,13 +2392,15 @@ public sealed class BaselineStore
             writer.WriteStringValue(value);
     }
 
-    // A write or delete target inside baseline/: the baseline directory, the target's full path and the
-    // components below baseline/ that lead to it, the target's own name last.
-    private readonly record struct BaselinePath(string BaselineDirectory, string FullPath, string[] Segments);
+    // A read, write or delete target inside baseline/: the baseline directory, the target's full path and the
+    // components below baseline/ that lead to it, the target's own name last. Read marks a read target, whose
+    // refusals name a read.
+    private readonly record struct BaselinePath(
+        string BaselineDirectory, string FullPath, string[] Segments, bool Read);
 
-    // The open(2) flags of one write or delete: a directory opened read-only, and a file created write-only and
-    // exclusively, both without following a link and both closed on exec.
-    private readonly record struct TraversalFlags(int OpenDirectory, int CreateFile);
+    // The open(2) flags of one read, write or delete: a directory opened read-only, a file created write-only and
+    // exclusively, and a file opened read-only, all without following a link and all closed on exec.
+    private readonly record struct TraversalFlags(int OpenDirectory, int CreateFile, int OpenFile);
 
     // A directory held open by its file descriptor, so a call relative to it acts on that directory whatever is
     // later renamed, removed or linked at the path it was opened by.
