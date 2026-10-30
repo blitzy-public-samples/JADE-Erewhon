@@ -6,34 +6,12 @@
 # Runs the routing, failure-behaviour and listener-isolation tests and leaves three files in the results
 # directory for harness/src/Erewhon.Harness/Checks/FacadeTestResults.cs: facade-tests.trx (VS TeamTest
 # TRX), facade-tests.xunit.xml (xunit XML, the only record of each failure's exception type) and
-# exit-code (the status of the last dotnet command). The script always exits 0, because the harness
-# service depends on this one with condition service_completed_successfully; the real outcome travels
-# in those files.
-#
-# Before any dotnet command the previous run's three files are removed and must be gone, and exit-code
-# is published afresh holding the non-integer marker `running`, which the harness reads as unverified
-# until the runner status replaces it. When the old files survive or exit-code cannot be published,
-# nothing runs and status 1 is recorded wherever exit-code can still be published.
-#
-# dotnet test writes its TRX and xunit XML into a private staging directory (mktemp -d in TMPDIR,
-# default /tmp; mode 0700, outside the repository, removed when the script exits), never into the
-# results directory. A directory is private only while no other user can rename entries on its path,
-# so the staging directory is used only when the physical TMPDIR directory and every directory above it
-# are each owned by root or the effective user and either sticky or writable by neither group nor
-# others; otherwise it is removed, nothing runs and status 1 is recorded. Everything that reaches the
-# results directory, the marker, every status, the TRX and the xunit XML, goes through one publication
-# step, which works from inside the results directory with relative names only. It writes the content
-# to a fresh dot-prefixed name holding 64 random bits, which the creating open makes exclusively (it
-# fails on any entry already there, a symlink included), and then renames that name over the final one,
-# which replaces whatever entry is there without following it. The script never opens an existing entry
-# of the results directory for writing, never truncates one and never changes a mode by path, so a
-# symlink planted there cannot redirect a write or a mode change of this (in the container, root)
-# process to another file. The TRX and xunit XML are published before the status, so a reader that sees
-# this run's status also sees this run's TRX.
-#
-# A later local run can replace the results of a root-run container: a results directory this run
-# creates is made 0777 as it is created, every published file is created 0666 by its own creating open,
-# and an existing results directory keeps its owner's mode.
+# exit-code (the status of the last dotnet command, holding `running` while a run is in progress). The
+# script always exits 0, because the harness service depends on this one with condition
+# service_completed_successfully; the real outcome travels in those files. Once the results directory
+# is accepted, a run that cannot start records a nonzero status in exit-code instead, wherever exit-code
+# can still be published. dotnet test writes into a private staging directory, and everything reaches
+# the results directory only through publish (below).
 #
 # Usage: run-tests.sh [-h | --help]. Any other argument is reported and nothing runs.
 #
@@ -207,8 +185,11 @@ random_name_part() {
 #   - the command writes through the descriptor of that creating open, which is then closed;
 #   - mv -fT renames the temporary name over <name>: rename(2) replaces a file or symlink there without
 #     following it, and fails on a directory.
-# No existing entry is opened for writing, truncated or has its mode changed. On a failure after the
-# creation the temporary name is unlinked. False when <name> was not published.
+# No existing entry is opened for writing, truncated or has its mode changed, so a symlink planted in
+# the results directory cannot redirect a write or a mode change of this (in the container, root)
+# process to another file. Mode 0666 keeps what a root-run container published writable by a later
+# local run. On a failure after the creation the temporary name is unlinked. False when <name> was not
+# published.
 publish() {
     local name="$1"
     shift
@@ -370,8 +351,8 @@ if [ -z "$FACADE_DIR" ] || ! cd -- "$FACADE_DIR"; then
 fi
 
 export DOTNET_NOLOGO=1 DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
-# No MSBuild node, MSBuild server or compiler server outlives the run or is shared with other builds
-# on the host; a caller's own settings are kept.
+# By default MSBuild node reuse, the MSBuild server and the compiler server are off, so none outlives
+# the run or is shared with other host builds; non-empty caller values are kept and can re-enable them.
 export MSBUILDDISABLENODEREUSE="${MSBUILDDISABLENODEREUSE:-1}"
 export DOTNET_CLI_USE_MSBUILD_SERVER="${DOTNET_CLI_USE_MSBUILD_SERVER:-0}"
 export UseSharedCompilation="${UseSharedCompilation:-false}"

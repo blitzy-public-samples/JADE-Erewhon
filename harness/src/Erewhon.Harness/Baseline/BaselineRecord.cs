@@ -123,9 +123,10 @@ public sealed record BaselineRequest(
 /// </param>
 /// <param name="BodySha256">The lowercase hexadecimal SHA-256 of the raw body bytes.</param>
 /// <param name="BodyFile">
-/// The file name, without a directory, of the sibling <c>.body.bin</c> file that holds the raw body,
-/// <c>NNN-getPhoto-&lt;NN&gt;.body.bin</c> for the <c>Soap.getPhoto</c> cases; otherwise
-/// <see langword="null"/>.
+/// The file name, without a directory, of the sibling <c>.body.bin</c> file that holds the raw body. It
+/// shares the record's own stem, <c>NNN-&lt;jadeMethod&gt;-&lt;NN&gt;.body.bin</c>, for example
+/// <c>NNN-getPhoto-&lt;NN&gt;.body.bin</c>. It is present for every <c>Soap.getPhoto</c> case and for any
+/// other case whose body fails <see cref="IsTextRoundTrippable"/>; otherwise <see langword="null"/>.
 /// </param>
 public sealed record BaselineResponse(
     int Status,

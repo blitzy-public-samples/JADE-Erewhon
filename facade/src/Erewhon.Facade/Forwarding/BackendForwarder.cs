@@ -18,8 +18,8 @@ namespace Erewhon.Facade.Forwarding;
 
 /// <summary>
 /// Forwards one REST or SOAP request to the target its operation is routed to, within that target's
-/// deadline, and builds the only responses the facade makes besides the WSDL: backend unavailable,
-/// backend timed out, and a bare 500 when the facade itself fails a call.
+/// deadline, and builds the only responses the facade makes besides the WSDL: backend unavailable and
+/// backend timed out.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -35,7 +35,9 @@ namespace Erewhon.Facade.Forwarding;
 /// backend's status line has already been taken over and must never be replaced. Neither path outlasts
 /// the deadline: a linked token cancels the call when it expires, even while
 /// <see cref="ForwarderRequestConfig.ActivityTimeout"/> is still being reset by activity, and writing a
-/// failure response has a budget of its own, after which the connection is aborted.
+/// failure response has a budget of its own, after which the connection is aborted. Any other failure
+/// the caller did not cause, short of an exception escaping the call, aborts the connection with
+/// nothing written, so the facade builds no failure response besides these two.
 /// </para>
 /// <para>
 /// The logged outcome says how the call ended:
@@ -66,8 +68,8 @@ namespace Erewhon.Facade.Forwarding;
 /// <c>failed</c>: anything else. The backend failed the call after its status line and headers had been
 /// taken over, for example by dropping the connection during the response body; the facade could not
 /// read the request body (for example when the temporary storage of a buffered SOAP body is full) or
-/// create the outgoing request; or an exception escaped. A response already taken over is aborted, with
-/// the status already sent; otherwise the caller gets a bare 500 and the connection is closed. An
+/// create the outgoing request; or an exception escaped. The connection is aborted and nothing is
+/// written; the status is the backend's already taken over, or 0 when no response was sent. An
 /// escaping exception is rethrown unchanged and logged with the status already sent, or the 500 the
 /// server sends for an unhandled exception.
 /// </description></item>
@@ -322,9 +324,9 @@ public sealed partial class BackendForwarder : IDisposable
     /// <summary>Decides and writes what the caller receives after a failed backend call.</summary>
     /// <remarks>
     /// The checks run in a fixed order: an expired deadline, a backend response already relayed in full,
-    /// a caller that left, a client-side error the caller did not cause, a timeout YARP or the handler
-    /// reported, a backend response already taken over, a backend that gave no usable response, and last
-    /// every other failure, which is the facade's own.
+    /// a caller that left, a timeout YARP or the handler reported, a backend response already taken over,
+    /// a backend that gave no usable response, and last every other failure, which is the facade's own
+    /// and is aborted with no response.
     /// </remarks>
     /// <returns>The logged outcome and status.</returns>
     private async Task<CallResult> HandleFailureAsync(
@@ -367,16 +369,9 @@ public sealed partial class BackendForwarder : IDisposable
             return new CallResult(OutcomeAborted, response.HasStarted ? response.StatusCode : NoResponseStatus);
         }
 
-        // A client-side copy error the caller did not cause is the facade's own: it could not read the
-        // request body, for example because the temporary storage of a buffered SOAP body is full.
-        if (error is ForwarderError.RequestBodyClient
-            or ForwarderError.ResponseBodyClient
-            or ForwarderError.UpgradeRequestClient
-            or ForwarderError.UpgradeResponseClient)
-        {
-            return Fail(context, responseTaken);
-        }
-
+        // A client-side copy error the caller did not cause, such as a buffered SOAP body whose temporary
+        // storage is full, takes the checks below like any other error: the timeout it carries, a response
+        // already taken over, a backend that ended the upload, or else the facade's own failure.
         if (error is ForwarderError.RequestTimedOut or ForwarderError.UpgradeActivityTimeout
             || HasTimeoutInChain(exception)
             || Stopwatch.GetElapsedTime(start) >= timeout)
@@ -408,7 +403,8 @@ public sealed partial class BackendForwarder : IDisposable
             return await AnswerAsync(context, surface, opName, responseTaken: false, isTimeout: false).ConfigureAwait(false);
         }
 
-        // The facade failed the call itself, for example when YARP could not create the outgoing request.
+        // The facade failed the call itself, for example when YARP could not create the outgoing request or
+        // could not read the caller's upload: the connection is aborted with no response.
         return Fail(context, responseTaken: false);
     }
 
@@ -462,30 +458,18 @@ public sealed partial class BackendForwarder : IDisposable
         return new CallResult(outcome, response.StatusCode);
     }
 
-    /// <summary>Ends a call that failed for a reason the facade has no failure response for.</summary>
+    /// <summary>
+    /// Ends a call that failed for a reason the facade has no failure response for by aborting the
+    /// connection and writing nothing: the facade's only failure responses are the unavailable and
+    /// timed-out answers, and a backend status line already taken over is never replaced.
+    /// </summary>
     /// <param name="context">The call's context.</param>
-    /// <param name="responseTaken">
-    /// Whether the backend's status line and headers are already the response's, which aborts the
-    /// connection; otherwise the caller gets a bare 500.
-    /// </param>
-    /// <returns>Outcome <c>failed</c> with the 500 sent or the backend's taken-over status.</returns>
+    /// <param name="responseTaken">Whether the backend's status line and headers are already the response's.</param>
+    /// <returns>Outcome <c>failed</c> with the backend's taken-over status, or 0 when no response was sent.</returns>
     private static CallResult Fail(HttpContext context, bool responseTaken)
     {
-        var response = context.Response;
-        if (responseTaken)
-        {
-            context.Abort();
-            return new CallResult(OutcomeFailed, response.StatusCode);
-        }
-
-        // A bare 500, as for an unhandled exception, with no body that could pass for the backend's or for
-        // an unavailable or timed-out backend. The request body may be partly unread, so the connection is
-        // closed after the response.
-        response.Clear();
-        response.StatusCode = StatusCodes.Status500InternalServerError;
-        response.ContentLength = 0;
-        response.Headers.Connection = "close";
-        return new CallResult(OutcomeFailed, StatusCodes.Status500InternalServerError);
+        context.Abort();
+        return new CallResult(OutcomeFailed, responseTaken ? context.Response.StatusCode : NoResponseStatus);
     }
 
     // YARP reports these only after the backend's status line and headers were copied to the response.

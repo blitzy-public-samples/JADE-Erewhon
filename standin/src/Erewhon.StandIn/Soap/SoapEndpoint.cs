@@ -23,8 +23,10 @@ namespace Erewhon.StandIn.Soap;
 /// <para>
 /// <c>POST</c> on the catalogue's SOAP path, with any query string, is resolved to its operation by the
 /// shared <see cref="SoapOperationResolver"/> (<c>SOAPAction</c> first, then the first <c>Body</c> child),
-/// and the whole buffered body is then parsed for the wrapped request element and its parameters. Each
-/// handler runs under <see cref="StandInState.Mutate{T}"/> exactly when the operation is
+/// and the whole buffered body is then parsed for the wrapped request element and its parameters. A body
+/// with an element nested more than 64 deep below <c>soap:Envelope</c> is answered as malformed XML before
+/// any tree is built, so parsing stays linear in body size. Each handler runs under
+/// <see cref="StandInState.Mutate{T}"/> exactly when the operation is
 /// <see cref="OperationDescriptor.StateChanging"/>, and under <see cref="StandInState.Read{T}"/>
 /// otherwise, building its DTO tree inside the lock; <see cref="SoapEnvelopeWriter"/> serialises it after
 /// the lock is released. Business errors travel as a <c>DTOResult</c> with HTTP 200, never as a Fault.
@@ -51,8 +53,10 @@ namespace Erewhon.StandIn.Soap;
 /// </para>
 /// <para>
 /// Every endpoint, the catch-all included, is dispatched only for requests arriving on the SOAP socket
-/// (<see cref="ListenerKind.Soap"/>), whatever <c>Host</c> header they carry. No caller header is read
-/// except through the resolver, nothing is authenticated, and no payload is logged.
+/// (<see cref="ListenerKind.Soap"/>), whatever <c>Host</c> header they carry. A <c>POST</c> reads no
+/// caller header except through the resolver; the WSDL <c>GET</c> reads only <c>Host</c>, which
+/// <see cref="WsdlGenerator.BuildAddressLocation"/> writes into <c>soap:address</c>; no other request
+/// reads one. Nothing is authenticated, and no payload is logged.
 /// </para>
 /// </remarks>
 public static partial class SoapEndpoint
@@ -200,6 +204,12 @@ public static partial class SoapEndpoint
         private const string NoCompanyLoaded = $"{SoapEnvelopeWriter.FaultStringPrefix} no company loaded";
         private const string InternalError = $"{SoapEnvelopeWriter.FaultStringPrefix} internal error";
 
+        // The deepest element the request parser admits, as XmlReader.Depth with soap:Envelope at 0.
+        // Building the tree costs time super-linear in nesting depth, so a body with an element nested
+        // deeper is answered as malformed XML before any tree is built, which keeps every parse linear in
+        // body size. Characterised requests nest 4 deep at most: a DTO parameter's member.
+        private const int MaxElementDepth = 64;
+
         private static readonly XName EnvelopeName = XName.Get("Envelope", SoapEnvelopeWriter.SoapEnvelopeNamespace);
         private static readonly XName BodyName = XName.Get("Body", SoapEnvelopeWriter.SoapEnvelopeNamespace);
         private static readonly XName NilName = XName.Get("nil", SoapEnvelopeWriter.XsiNamespace);
@@ -209,9 +219,10 @@ public static partial class SoapEndpoint
 
         // The whole body is parsed; the reader resolves nothing external and expands no DTD. The body is
         // buffered in full before it is parsed, so the reader never reads Kestrel's stream, and it runs in
-        // async mode, which XDocument.LoadAsync requires. The reader reports whitespace-only text and the
-        // load keeps it, so whitespace-only and padded parameter text such as <pName> </pName> reaches the
-        // ported body exactly as sent; the TAs do their own trimming.
+        // async mode, which XDocument.LoadAsync requires. Each body is read with these settings twice: first
+        // to check its depth against MaxElementDepth, then, within the bound, to load it. The reader reports
+        // whitespace-only text and the load keeps it, so whitespace-only and padded parameter text such as
+        // <pName> </pName> reaches the ported body exactly as sent; the TAs do their own trimming.
         private static readonly XmlReaderSettings RequestSettings = new()
         {
             Async = true,
@@ -295,13 +306,18 @@ public static partial class SoapEndpoint
                 // throw, so the answer would depend on how the body was chunked in transit.
                 await request.Body.DrainAsync(aborted).ConfigureAwait(false);
                 request.Body.Position = 0;
-                XDocument document;
+                XDocument? document;
                 try
                 {
-                    using XmlReader reader = XmlReader.Create(request.Body, RequestSettings);
-                    document = await XDocument.LoadAsync(reader, LoadOptions.PreserveWhitespace, aborted).ConfigureAwait(false);
+                    document = await LoadRequestAsync(request.Body, aborted).ConfigureAwait(false);
                 }
                 catch (XmlException)
+                {
+                    document = null;
+                }
+
+                // Malformed XML and a body nested deeper than MaxElementDepth get the same answer.
+                if (document is null)
                 {
                     accounted = true;
                     CountRejected(operation);
@@ -542,6 +558,29 @@ public static partial class SoapEndpoint
             address.Fax = values.Fax;
             address.Email = values.Email;
             address.WebSite = values.Website;
+        }
+
+        // The buffered body, positioned at its start, loaded as a tree; null when an element nests deeper
+        // than MaxElementDepth. A first pass reads to the end of the document, or to the first element past
+        // the bound, and builds nothing, so the load that follows is linear in body size. Malformed XML or
+        // a DTD throws its XmlException from the first pass, as it would from the load.
+        private static async Task<XDocument?> LoadRequestAsync(Stream body, CancellationToken cancellationToken)
+        {
+            using (XmlReader scan = XmlReader.Create(body, RequestSettings))
+            {
+                while (await scan.ReadAsync().ConfigureAwait(false))
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+                    if (scan.NodeType == XmlNodeType.Element && scan.Depth > MaxElementDepth)
+                    {
+                        return null;
+                    }
+                }
+            }
+
+            body.Position = 0;
+            using XmlReader reader = XmlReader.Create(body, RequestSettings);
+            return await XDocument.LoadAsync(reader, LoadOptions.PreserveWhitespace, cancellationToken).ConfigureAwait(false);
         }
 
         // soap:Envelope/soap:Body, then the first Body child that is the operation's request element. This

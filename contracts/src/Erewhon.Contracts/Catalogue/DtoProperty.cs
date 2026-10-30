@@ -117,7 +117,12 @@ public sealed record DtoProperty(
     SurfaceEvidence? Evidence,
     string? Note)
 {
-    /// <summary>True when <see cref="Normalisation"/> names a rule, so the value is not compared exactly.</summary>
+    /// <summary>
+    /// True when this property declares a normalisation rule (<see cref="Normalisation"/> is not null).
+    /// Whether a compared value escapes exact comparison depends on the surface, which may not emit the
+    /// property (SOAP never emits <c>guid</c>; see <see cref="SoapExposed"/>), and on pairwise validity:
+    /// two values that are both invalid for the rule's form are still compared exactly.
+    /// </summary>
     [JsonIgnore]
     public bool IsNormalised => Normalisation is not null;
 }

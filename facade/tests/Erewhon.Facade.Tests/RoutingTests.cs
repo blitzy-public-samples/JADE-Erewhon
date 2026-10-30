@@ -13,20 +13,21 @@
 // its request line reaches the facade byte for byte. Its raw-target, method-token and asterisk-form
 // cases prove that the shared RestOperationMatcher, applied to the raw path alone, decides which target
 // a REST request reaches, whichever endpoint ASP.NET Core routing selected for it, and that the target
-// receives the caller's method token and request target unchanged, whatever their form. They are a
-// class of their own because the results report counts every test class whose name ends in
-// "RoutingTests" as the per-operation routing check, which is the two reroute cases alone.
+// receives the caller's method token and request target unchanged, whatever their form.
 //
-// Base-URL credential handling (class BaseUrlCredentialTests) proves, in-process, that a routing
-// target's base URL carrying user information is rejected and never echoed. It is a separate class for
-// the same reason: the results report counts every test class whose name ends in "RoutingTests" as the
-// two-case per-operation routing check.
+// The results report (harness/src/Erewhon.Harness/Checks/FacadeTestResults.cs) counts test classes by
+// the name suffixes "RoutingTests", "FailureBehaviourTests" and "ListenerIsolationTests", and every
+// class ending in "RoutingTests" counts as the per-operation routing check, which must stay the two
+// reroute cases alone. Every other class in this file is therefore a class of its own whose name ends
+// in none of the three suffixes.
 //
 // Facade test failures are identified across runs by a signature over the exception type, the failing
-// line and the assertion message, so every message here is built only from fixed values: operation ids,
-// stub ids, listener names, request targets, content types and status codes. No port, URL, elapsed time
-// or GUID ever reaches a message, which is also why no Assert.Single, Assert.Empty or Assert.Equal is
-// applied to a recorded StubRequest: its dump would print the Host header and with it a port.
+// assertion's file and line and the assertion message, so every message in this file is built only
+// from run-invariant values: fixed literals, operation and case ids, stub ids, target and listener
+// names, configuration paths, methods, request targets, SOAP actions, content types, status codes and
+// byte counts. None holds a port assigned at run time, a URL or Host value that carries one, an elapsed
+// time or a GUID, which is also why no Assert.Single, Assert.Empty or Assert.Equal is applied to a
+// recorded StubRequest: its dump would print the Host header and with it a port.
 
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -617,30 +618,14 @@ public sealed class RequestLinePassThroughTests
 
 }
 
-// SOAP operation resolution (class SoapResolutionTests) sits here, beside the request-line
-// pass-through, as a class of its own: the results report counts test classes by the name suffixes
-// "RoutingTests", "FailureBehaviourTests" and "ListenerIsolationTests", and this name matches none, so
-// the per-operation routing check stays the two reroute cases alone.
-//
-// Which target a SOAP POST reaches, through the facade's real SOAP socket. The SOAPAction header,
-// quotes stripped, is matched first and decides whatever the body holds: another operation, an unknown
-// element, malformed XML or no body at all. Only an absent, empty or unmatched header lets the body
-// decide, through the first child element of the SOAP 1.1 Body read within the first 64 KiB. A request
-// that names neither goes unchanged to Routing:DefaultTarget: malformed XML, a document that is not a
-// SOAP 1.1 envelope, an empty Body, a first Body child in no or another namespace or of an unknown name,
-// and a Body whose first child starts beyond the bound. Three stubs tell the outcomes apart:
+// SOAP operation resolution (class SoapResolutionTests). Three stubs tell the outcomes apart:
 // getAgentNames is routed to stub B, every other operation stays with the backend, stub A, and the
-// default target is stub C. The conflicting cases name one operation in the header and the other in
-// the body, in both directions, so a resolver that ignores the header, or reads the body first, sends
-// one of them to the wrong stub; and each non-empty unmatched header that leaves the body to decide is
-// one a lenient matcher (ignoring case, trimming quotes one by one, or matching a prefix or suffix)
-// would take for getClientNames, which the backend serves. Whichever stub is reached receives the
-// caller's method, raw target, Content-Type, SOAPAction or its absence and every body byte, bodies of
-// twice the inspection bound included, and the facade returns that stub's status, X-Stub-Id and body.
-//
-// Facade test failures are identified across runs by a signature over the exception type, the failing
-// line and the assertion message, so every message here is built from the case id, stub ids, listener
-// names, status codes and the byte count the case sends: no port, URL, elapsed time or GUID.
+// default target is stub C. The SOAPAction header, quotes stripped, is matched before the body. The
+// conflicting cases name one operation in the header and the other in the body, in both directions, so
+// a resolver that ignores the header, or reads the body first, sends one of them to the wrong stub; and
+// each non-empty unmatched header that leaves the body to decide is one a lenient matcher (ignoring
+// case, trimming quotes one by one, or matching a prefix or suffix) would take for getClientNames,
+// which the backend serves. Bodies of twice the inspection bound still reach the stub with every byte.
 /// <summary>
 /// Proves, on the facade hosted on real loopback Kestrel listeners, that a SOAP <c>POST</c> reaches the
 /// target of the operation its <c>SOAPAction</c> header names, else of the operation the first child of
@@ -1051,28 +1036,13 @@ public sealed class SoapResolutionTests
     }
 }
 
-// Header pass-through (class PassThroughTransformerTests) sits here, beside the request-line
-// pass-through, as a class of its own: the results report counts test classes by the name suffixes
-// "RoutingTests", "FailureBehaviourTests" and "ListenerIsolationTests", and this name matches none.
-//
-// Hop-by-hop handling and response timing of the facade's pass-through transform, through the facade's
-// real REST and SOAP sockets. A field that a Connection header nominates belongs to one hop (RFC 9110,
-// section 7.6.1), so neither the caller's nominated request fields nor the backend's nominated response
-// fields may cross the facade, while every other end-to-end field, the Content-Length framing and the
-// body bytes pass unchanged. That holds when the caller's Connection list also holds close, keep-alive
-// or upgrade, to which Kestrel reduces its own copy of the header, and for every request of a
-// keep-alive connection, whatever the framing of the request before it. The backend's status line and
-// headers reach the caller as soon as the backend sends them, before its first body byte; once they
-// have, a deadline that passes before the body ends aborts the response instead of re-heading it.
-//
-// The caller's request is written on a raw socket, because HttpClient joins repeated header lines into
-// one, and the backend's responses come from a raw listener, because Kestrel would not write a response
-// head with Connection lines naming other fields or send a head before its body is released.
-//
-// Facade test failures are identified across runs by a signature over the exception type, the failing
-// line and the assertion message, so every message here is a fixed literal: no port, URL or elapsed
-// time. The order check is deterministic: the backend withholds its body until the test releases it,
-// and the 10 s bound only ends the wait of a facade that holds the head back.
+// Header pass-through (class PassThroughTransformerTests). A field that a Connection header nominates
+// belongs to one hop (RFC 9110, section 7.6.1). The caller's request is written on a raw socket,
+// because HttpClient joins repeated header lines into one, and the backend's responses come from a raw
+// listener, because Kestrel would not write a response head with Connection lines naming other fields
+// or send a head before its body is released. The order check is deterministic: the backend withholds
+// its body until the test releases it, and the 10 s bound only ends the wait of a facade that holds the
+// head back.
 /// <summary>
 /// Shows that fields nominated by a <c>Connection</c> header are dropped on the request and the response
 /// hop while the other end-to-end fields pass, mixed lists and keep-alive connections included, that the
@@ -1876,16 +1846,11 @@ public sealed class PassThroughTransformerTests
 
 // Configuration of the facade under test (class FacadeTestHostSettingsTests). FacadeFactory starts the
 // facade with its shipped appsettings.json and the settings the test supplies, and with nothing taken
-// from the environment of the process that runs the tests. An extra setting replaces the value a typed
-// FacadeTestSettings property or the factory gives the same key, however the key is spelled, and a
-// Routing__*, Backend__* or Facade__* variable exported in the shell, plain or with the ASPNETCORE_ or
-// DOTNET_ prefix the host also reads, never reaches the facade. The class name ends in none of the
-// suffixes "RoutingTests", "FailureBehaviourTests" and "ListenerIsolationTests" by which the results
-// report counts its checks.
-//
-// The shell cases set process environment variables for the length of one test and restore them
-// afterwards, which is safe because the assembly runs no two tests at once (FacadeFactory.cs). Every
-// assertion message is a fixed literal: no port, URL or elapsed time.
+// from the environment of the process that runs the tests: a Routing__*, Backend__* or Facade__*
+// variable exported in the shell, plain or with the ASPNETCORE_ or DOTNET_ prefix the host also reads,
+// never reaches the facade. The shell cases set process environment variables for the length of one
+// test and restore them afterwards, which is safe because the assembly runs no two tests at once
+// (FacadeFactory.cs).
 /// <summary>
 /// Proves that an extra setting overrides the typed or factory value of the same key whatever its letter
 /// case, and that environment variables of the test process neither reroute an operation of the facade
@@ -1919,8 +1884,9 @@ public sealed class FacadeTestHostSettingsTests
     private const string UnusedRestBaseUrl = "http://127.0.0.1:2";
     private const string UnusedSoapBaseUrl = "http://127.0.0.1:3";
 
-    // The rerouting example of the routing design, as exported in QA's shell: one operation moved to a new
-    // target whose base URL is a closed port.
+    // An ambient reroute exported in the test process's environment: one operation moved to a new target
+    // whose base URL is a closed loopback port. The facade under test must ignore it, so the operation still
+    // reaches stub A and the facade defines no target of this name.
     private const string ShellTargetName = "orders";
     private const string ShellTargetBaseUrl = "http://127.0.0.1:2";
 
@@ -2121,30 +2087,15 @@ public sealed class FacadeTestHostSettingsTests
     }
 }
 
-// WSDL dispatch (class WsdlDispatchTests) sits here, beside the request-line and header pass-through, as
-// a class of its own: the results report counts test classes by the name suffixes "RoutingTests",
-// "FailureBehaviourTests" and "ListenerIsolationTests", and this name matches none.
-//
-// GET dispatch on the facade's real SOAP socket, with stub A as target "backend" and a distinct stub C
-// as Routing:DefaultTarget. While a WSDL is loaded, a GET on the catalogue's SOAP endpoint path whose
-// query has a wsdl key is answered by the facade itself, and no target receives anything: the answer is
-// the loaded file byte for byte, except the value of its one soap:address/@location, which becomes the
-// request's scheme, its Host header as sent and the endpoint path and query, XML-escaped. Every other
-// GET, and every WSDL request while no WSDL is loaded, goes to the default target unchanged, and
-// /admin/info reports which of the two applies. "No WSDL" is the factory's default Facade:WsdlPath, a
-// file that does not exist.
-//
-// The WSDL is a small fixture written for each test into a directory of its own under the temporary
-// directory, never contracts/wsdl/ErewhonWebService.wsdl itself. Its CRLF line breaks, single-quoted
-// attributes and doubled space would not survive a facade that re-serialised the document, nor its
-// non-ASCII text one that re-encoded it. The expected address is built from the literal endpoint the
-// facade must publish, not from the catalogue or the facade's own escaping. Requests are written on a
-// raw socket, so the request target and the Host header reach the facade exactly as written.
-//
-// Facade test failures are identified across runs by a signature over the exception type, the failing
-// line and the assertion message, so every message here is built only from fixed values: case ids,
-// stub ids, listener names, methods, status codes and expected header values. No port, URL, Host value
-// or GUID ever reaches a message.
+// WSDL dispatch (class WsdlDispatchTests) on the facade's real SOAP socket, with stub A as target
+// "backend" and a distinct stub C as Routing:DefaultTarget. "No WSDL" is the factory's default
+// Facade:WsdlPath, a file that does not exist. The WSDL is a small fixture written for each test into a
+// directory of its own under the temporary directory, never contracts/wsdl/ErewhonWebService.wsdl
+// itself. Its CRLF line breaks, single-quoted attributes and doubled space would not survive a facade
+// that re-serialised the document, nor its non-ASCII text one that re-encoded it. The expected address
+// is built from the literal endpoint the facade must publish, not from the catalogue or the facade's
+// own escaping. Requests are written on a raw socket, so the request target and the Host header reach
+// the facade exactly as written.
 /// <summary>
 /// Proves that a WSDL request on the SOAP socket publishes the loaded WSDL with only its
 /// <c>soap:address/@location</c> set to the caller's XML-escaped address and reaches no target, that
@@ -2592,20 +2543,13 @@ public sealed class WsdlDispatchTests
     }
 }
 
-// Credential handling of the routing table's target base URLs. The facade carries and adds no
-// credential, so a base URL carrying user information is rejected at start-up and on reload, and no
-// validation failure, rejected-reload log entry or /admin/info body quotes a configured base URL, or a
-// target name that may hold one. A failure names the entry by its configuration path and the rule the
-// value breaks; the start-up error log, the line Program.cs writes to standard error and the
-// rejected-reload log entry are all built from those failures.
-//
-// Every case runs in-process against RoutingOptionsValidator, OperationRouter and
-// AdminEndpoints.DisplayBaseUrl directly: a table the validator rejects never starts a host, and the
-// sanitiser is the only part of /admin/info that a URL passes through.
-//
-// Facade test failures are identified across runs by a signature over the exception type, the failing
-// line and the assertion message, so every value here is a fixed literal: the URLs are synthetic, use
-// no live port and hold no real credential.
+// Credential handling of the routing table's target base URLs (class BaseUrlCredentialTests). The
+// facade carries and adds no credential. A failure names the entry by its configuration path and the
+// rule the value breaks; the start-up error log, the line Program.cs writes to standard error and the
+// rejected-reload log entry are all built from those failures. Every case runs in-process against
+// RoutingOptionsValidator, OperationRouter and AdminEndpoints.DisplayBaseUrl directly: a table the
+// validator rejects never starts a host, and the sanitiser is the only part of /admin/info that a URL
+// passes through. The URLs are synthetic, use no live port and hold no real credential.
 /// <summary>
 /// Proves that a base URL carrying user information is rejected without being echoed, that a target
 /// name holding an at-sign is never quoted, that a rejected reload logs no credential while routing keeps
@@ -2914,33 +2858,11 @@ public sealed class BaseUrlCredentialTests
     }
 }
 
-// Routing configuration lifecycle (class RoutingConfigurationLifecycleTests) sits here, beside the
-// routing checks whose table it starts and reloads, as a class of its own: the results report counts
-// test classes whose names end in "RoutingTests" as the two-case per-operation routing check, and this
-// name matches none.
-//
-// The routing table from start-up through reloads. On the facade hosted on real loopback Kestrel
-// listeners: a table with a key that names no catalogue operation, an entry that names an undefined
-// target or a target without its surface's base URL, a timeout that is not an integer greater than 0,
-// or a key outside the section's shape stops start-up with exactly one failure naming that entry;
-// changing one operation's key in the running facade's configuration moves that operation alone; and a
-// reload rejected before the first request leaves the table published while the facade started serving
-// every request, logged once, until a valid reload replaces it. In-process, over OperationRouter and
-// options monitors the test drives: an initialised router moves one operation on reload and its routing
-// snapshot shows the move; a reload rejected before the first resolution, by the validator or by the
-// configuration binder, keeps the start-up table until a valid reload, while before any table is
-// published the same rejection propagates unchanged; and a resolution that read older options before a
-// newer table was published never replaces that table.
-//
-// A reload of the hosted facade sets each key on every provider of its configuration root and then
-// reloads the root, as a changed settings file or environment does. The test's in-memory source is the
-// last provider and keeps its values when reloaded, so the keys win over appsettings.json.
-//
-// Facade test failures are identified across runs by a signature over the exception type, the failing
-// line and the assertion message, so every message here is a fixed literal or built from operation ids,
-// target names, stub ids, configuration paths and status codes: no port, URL, elapsed time or GUID. The
-// base URLs of the start-up cases, which never start, and of the in-process cases are synthetic and
-// never contacted.
+// Routing configuration lifecycle (class RoutingConfigurationLifecycleTests). A reload of the hosted
+// facade sets each key on every provider of its configuration root and then reloads the root, as a
+// changed settings file or environment does. The test's in-memory source is the last provider and keeps
+// its values when reloaded, so the keys win over appsettings.json. The base URLs of the start-up cases,
+// which never start, and of the in-process cases are synthetic and never contacted.
 /// <summary>
 /// Proves that an invalid routing table stops the facade's start-up with a failure naming the entry, that
 /// one changed key moves one operation in the running facade, that a rejected reload keeps the last valid
@@ -3539,23 +3461,15 @@ public sealed class RoutingConfigurationLifecycleTests
     }
 }
 
-// Invoker lifecycle (class InvokerLifecycleTests) sits here, beside the routing checks whose reloads
-// it follows, as a class of its own: the results report counts test classes whose names end in
-// "RoutingTests" as the two-case per-operation routing check, and this name matches none.
-//
-// Lifecycle of BackendForwarder's per-target invokers across routing reloads and disposal. A target in
-// service keeps one pooled invoker. A reload that supersedes the target, or Dispose, retires its invoker,
-// which is disposed once the calls still using it have ended: the cache keeps no invoker the routing
-// table no longer names, and no call loses its invoker while it runs.
-//
-// The forwarder is built directly over the real OperationRouter, PassThroughTransformer and
-// SoapFaultWriter and over a recording IHttpForwarder, so each test sees the exact invoker every call
-// was given and can hold a call in flight. A reload is an options monitor returning a new options
-// instance. Whether an invoker has been disposed is read from a request it sends to a closed loopback
-// port: a disposed invoker throws ObjectDisposedException, a live one HttpRequestException.
-//
-// Facade test failures are identified across runs by a signature over the exception type, the failing
-// line and the assertion message, so every message here is a fixed literal: no port, URL or elapsed time.
+// Invoker lifecycle (class InvokerLifecycleTests). A target in service keeps one pooled invoker. A
+// reload that supersedes the target, or Dispose, retires its invoker, which is disposed once the calls
+// still using it have ended: the cache keeps no invoker the routing table no longer names, and no call
+// loses its invoker while it runs. The forwarder is built directly over the real OperationRouter,
+// PassThroughTransformer and SoapFaultWriter and over a recording IHttpForwarder, so each test sees the
+// exact invoker every call was given and can hold a call in flight. A reload is an options monitor
+// returning a new options instance. Whether an invoker has been disposed is read from a request it sends
+// to a closed loopback port: a disposed invoker throws ObjectDisposedException, a live one
+// HttpRequestException.
 /// <summary>
 /// Reuse, retirement and disposal of the facade's per-target <see cref="HttpMessageInvoker"/>s across
 /// routing reloads and <see cref="BackendForwarder.Dispose"/>.
@@ -3727,8 +3641,9 @@ public sealed class InvokerLifecycleTests
                 break;
 
             case DisposedDuringResolution:
-                // Dispose runs after the call's own disposal check, while the call resolves its target,
-                // which is the window in which a call used to create an invoker nothing would dispose.
+                // Dispose runs after the call's own disposal check, while the call resolves its target.
+                // The call must still throw ObjectDisposedException, never reaching the forwarder or
+                // acquiring an invoker, which after Dispose would be owned by nothing and never disposed.
                 facade.Routing.OnNextRead(facade.Instance.Dispose);
                 break;
 

@@ -1,9 +1,13 @@
 // Host and composition root of the Erewhon strangler facade. It owns the caller addresses of the JADE
 // ErewhonREST (REST, 65000) and WebServiceHTTP (SOAP, 21001) applications of
 // Erewhon/ErehwhonExternalInterfacesSchema.ddx, plus an internal admin listener (9090), and forwards
-// every REST and SOAP request unchanged to the target its routing entry names. The only responses the
-// facade builds itself are the backend-unavailable and backend-timed-out failures and the published
-// WSDL's address.
+// every REST and SOAP request unchanged to the target its routing entry names. On the REST and SOAP
+// listeners the facade builds only the backend-unavailable and backend-timed-out failure responses
+// (REST 502 or 504 problem+json, SOAP Fault) and the published WSDL's soap:address. Every other failed
+// call is aborted rather than answered, except that an exception escaping request handling gets the
+// server's own 500 for an unhandled exception. The admin listener's own responses (health, admin info,
+// the OpenAPI document, shutdown and its 404 catch-all) are internal and never served on the REST or
+// SOAP listeners.
 //
 // Nothing that could rewrite or reject a forwarded request or response is registered: no
 // authentication, authorization, HTTPS redirection, HSTS, CORS, antiforgery, response compression,

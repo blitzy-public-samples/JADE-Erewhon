@@ -251,7 +251,11 @@ public sealed class HttpComponentShutdown : IComponentShutdown, IDisposable
     // Opening the watch connection is bounded by this and by the time left.
     private static readonly TimeSpan WatchConnectTimeout = TimeSpan.FromSeconds(1);
 
-    // CancelAfter needs a positive delay even when almost no time is left.
+    // The least budget Bound gives a step, a floor this client sets rather than one an API requires: once
+    // the shutdown limit is nearly or already spent, each request, watch connect and wait still gets 1 ms.
+    // A remaining time of zero or below therefore never becomes an immediate cancellation before the
+    // attempt, a delay below -1 ms that CancelAfter and Task.Delay reject, or -1 ms, which they treat as
+    // infinite.
     private static readonly TimeSpan MinimumWait = TimeSpan.FromMilliseconds(1);
 
     private readonly HttpClient _client;

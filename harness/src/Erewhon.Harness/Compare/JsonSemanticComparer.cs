@@ -46,7 +46,7 @@ namespace Erewhon.Harness.Compare;
 /// </para>
 /// <para>
 /// The instance holds only its two immutable constructor arguments and performs no I/O, so concurrent
-/// <see cref="Compare"/> calls are safe.
+/// <see cref="Compare(string, string, string)"/> calls are safe.
 /// </para>
 /// </remarks>
 /// <param name="catalogue">The operation catalogue the bodies are typed by.</param>

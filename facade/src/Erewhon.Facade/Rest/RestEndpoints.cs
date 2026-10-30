@@ -162,9 +162,6 @@ public static class RestEndpoints
         return queryStart < 0 ? originForm : originForm[..queryStart];
     }
 
-    // Every REST endpoint resolves the operation through the shared matcher, so a request is the same
-    // operation here as in the stand-in and the harness, and a suffixed form of a catalogue operation
-    // follows that operation's routing entry. The forwarder owns every error and every response.
     private static Task ForwardMatchedAsync(HttpContext context, RestOperationMatcher matcher, BackendForwarder forwarder)
     {
         var rawPath = GetRawPath(context);

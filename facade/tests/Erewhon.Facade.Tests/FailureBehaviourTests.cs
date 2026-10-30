@@ -1,7 +1,11 @@
 // Facade-only failure behaviour: what a caller receives when the backend its operation is routed to
-// cannot be reached, or does not answer within Backend:TimeoutSeconds. These are the only responses the
-// facade builds itself (BackendForwarder's problem+json and SoapFaultWriter's Fault), so the equivalence
-// replay excludes them and they are proven here, against the facade on real loopback Kestrel listeners.
+// cannot be reached, or does not answer within Backend:TimeoutSeconds. These are the only failure
+// responses the facade builds (BackendForwarder's problem+json and SoapFaultWriter's Fault), and with
+// the published WSDL's soap:address the only content it builds on the REST and SOAP listeners: every
+// other failed call is aborted rather than answered, or gets the server's own 500 for an exception that
+// escapes request handling (class BackendForwarderTests), and the admin listener's own responses are
+// internal to it. The equivalence replay excludes these failure responses, so they are proven here,
+// against the facade on real loopback Kestrel listeners.
 // The expected texts are the plan's literals, held here independently of the facade's own constants,
 // which are asserted to match the same wire values. Each payload is held to its complete fixed form:
 // the problem body byte for byte against JSON composed here, with its exact Content-Type and member
@@ -10,14 +14,16 @@
 // The facade-tests container runs with network_mode none, so the unreachable targets are a closed
 // loopback port and a name under the reserved .invalid domain, which never resolves.
 //
-// The log level floors (class LogLevelFloorsTests), which bound what the framework logs for each failed
-// call and keep request data out of the framework logs, are tested here, without a socket, as a class
-// of their own: the results report counts every test class whose name ends in "FailureBehaviourTests"
-// as the unreachable and timeout check.
+// The other test classes here, LogLevelFloorsTests (the framework log floors, without a socket),
+// BackendErrorPassThroughTests, ForwardingTransportTests and BackendForwarderTests, are classes of their
+// own whose names do not end in "FailureBehaviourTests": the results report counts every test class with
+// that suffix as the unreachable and timeout check.
 //
-// Failures are identified across runs by a signature over the exception type, the failing line and the
-// assertion message, so every message and Assert.Equal operand here is run-invariant: no port, URL,
-// elapsed time or GUID. Timing bounds are Assert.True calls with fixed messages.
+// A failing test is identified across runs by its class, its TRX display name, which holds its theory
+// arguments, and a signature over the exception type, the failing line and the assertion message. So
+// every message, Assert.Equal operand and theory datum in this file is run-invariant: no port, URL,
+// elapsed time or GUID. Timing bounds are Assert.True calls with fixed messages, and log entries are
+// never passed to Assert.Single or Assert.Equal, because their dump holds durations.
 
 using System.Collections.Concurrent;
 using System.Diagnostics;
@@ -461,19 +467,13 @@ public sealed class FailureBehaviourTests
         Assert.True(container.Nodes().OfType<XText>().All(text => text.Value.Trim(XmlWhitespace).Length == 0), message);
 }
 
-// The log level floors the facade applies in Program.cs to the framework categories whose lines print
-// what a caller sent: Microsoft.AspNetCore.Hosting.Diagnostics, Microsoft.AspNetCore.Routing and
-// Microsoft.AspNetCore.Server.Kestrel.BadRequests at Warning, and Yarp at Error. REST path segments
-// carry agent and client names, and YARP's forwarder writes a stack trace for every failed call. A floor
-// must hold whatever the Logging configuration says, a configured setting stricter than the floor must
-// stay as strict, and every category outside the floors must log exactly as configured.
-//
-// Each case builds only the logging services, from an in-memory Logging section, the console provider
-// and the facade's floors, and asks a logger of the category whether a level is enabled. No socket is
-// opened and nothing is written.
-//
-// Facade test failures are identified across runs by a signature over the exception type, the failing
-// line and the assertion message, so every message and Assert.Equal operand here is a fixed literal.
+// Log level floors (class LogLevelFloorsTests). Program.cs floors the framework categories whose lines
+// print what a caller sent, because REST path segments carry agent and client names and YARP's forwarder
+// writes a stack trace for every failed call: Microsoft.AspNetCore.Hosting.Diagnostics,
+// Microsoft.AspNetCore.Routing and Microsoft.AspNetCore.Server.Kestrel.BadRequests at Warning, and Yarp
+// at Error. Every category outside the floors must log exactly as configured. Each case builds only the
+// logging services, from an in-memory Logging section, the console provider and the floors, and asks a
+// logger of the category whether a level is enabled; nothing is written.
 /// <summary>
 /// Shows that the facade's log level floors keep every category under them at the floor's minimum level
 /// or above for any <c>Logging</c> configuration, a configuration reload included, while a stricter
@@ -491,8 +491,9 @@ public sealed class LogLevelFloorsTests
     private const string HostingLifetime = "Microsoft.Hosting.Lifetime";
     private const string OtherDfaMatcher = "Microsoft.Other.Matching.DfaMatcher";
 
-    // The QA reproduction: every framework category raised to Trace, also through the console provider's
-    // own rule and through a rule longer than the Yarp floor's prefix.
+    // Default, Microsoft.AspNetCore, Yarp and System at Trace, with Trace rules that outrank a
+    // provider-less rule on a floor's prefix: the console provider's own Microsoft.AspNetCore rule and
+    // an HttpForwarder category rule longer than the Yarp floor's prefix. The floors must still hold.
     private const string RaisedToTrace = "raised-to-trace";
 
     // A rule shorter than the Routing floor's prefix that matches only a category under it.
@@ -689,22 +690,12 @@ public sealed class LogLevelFloorsTests
     }
 }
 
-// Backend error pass-through (class BackendErrorPassThroughTests) sits here, beside the facade's own
-// 502, 504 and Fault responses it must never be mistaken for, as a class of its own: the results report
-// counts test classes whose names end in "FailureBehaviourTests" as the unreachable and timeout check,
-// and this name matches none.
-//
-// A backend that is reached and answers with an error of its own, 502 and 504 included, with a body or
-// without, makes a forwarded call, not a failed one: the caller gets the backend's status, Content-Type,
-// end-to-end headers and body bytes unchanged, on the REST and SOAP listeners alike, and never the
-// facade's problem+json or SOAP Fault. Each case points the facade at a stub backend on real loopback
-// Kestrel listeners and calls the facade's real socket. The backend's bodies, content types and headers
-// are literals authored here, independently of BackendForwarder and SoapFaultWriter; the SOAP bodies are
-// backend Faults whose faultstring is neither of the facade's.
-//
-// Failures are identified across runs by a signature over the exception type, the failing line and the
-// assertion message, and the TRX display name holds the theory arguments, so the theory data, every
-// message and every Assert.Equal operand here are fixed literals: no port, URL or elapsed time.
+// Backend error pass-through (class BackendErrorPassThroughTests): a backend's own error answer, 502 and
+// 504 included, is forwarded and never replaced by the facade's problem+json or Fault. Each case points
+// the facade at a stub backend on real loopback Kestrel listeners and calls the facade's real socket.
+// The backend's bodies, content types and headers are literals authored here, independently of
+// BackendForwarder and SoapFaultWriter; the SOAP bodies are backend Faults whose faultstring is neither
+// of the facade's.
 /// <summary>
 /// Shows that a backend's own error responses (400, 404, 500, and 502 and 504 with and without a body)
 /// reach the caller unchanged through the facade's REST and SOAP listeners, and that each is logged as
@@ -857,31 +848,12 @@ public sealed class BackendErrorPassThroughTests
     }
 }
 
-// Forwarding transport (class ForwardingTransportTests) sits here, because its single-delivery cases
-// end in the facade's unreachable-backend 502 or SOAP Fault, as a class of its own: the results
-// report counts test classes whose names end in "FailureBehaviourTests" as the unreachable and
-// timeout check, and this name matches none.
-//
-// Transport fidelity of forwarding, observed as raw bytes on both sides of the facade: a body-less write,
-// and a write sent with Expect: 100-continue with or without a body, reaches a backend that closes the
-// connection without answering exactly once, a body-less request keeps the wire form the HTTP stack gives
-// it, and header values outside ASCII pass byte for byte in both directions. A backend's response head
-// larger than the HTTP stack's 64 KiB default reaches the caller unchanged. A backend that receives the
-// whole request and then gives no usable response head gets the facade's unavailable answer on every
-// operation. An upload reaches the backend without an Expect header the caller did not send, and a
-// caller's own Expect cannot hold the body back for the whole of a short deadline. A backend that answers
-// an upload the caller has paused, on a new or a reused connection, with or without the caller's own
-// Expect, has its answer reach the caller at once and unchanged, one that drops such an upload gets the
-// unavailable answer at once, and an interim response during an upload does not end it. The backends are
-// raw TcpListener sockets and the caller is a raw socket where bytes matter, because HttpClient adds
-// Content-Length: 0 to a body-less write, refuses non-ASCII header values and response heads over 64 KiB
-// on the test's own side, sends a whole body before it reads any response, and a Kestrel stub would
-// decode the bytes it is meant to record.
-//
-// Failures are identified across runs by a signature over the exception type, the failing line and the
-// assertion message, so every message and Assert.Equal operand here is run-invariant: the backend's
-// authority is replaced by a fixed token before request heads are compared, and no port, URL or elapsed
-// time appears in a message.
+// Forwarding transport (class ForwardingTransportTests), observed as raw bytes on both sides of the
+// facade. The backends are raw TcpListener sockets and the caller is a raw socket where bytes matter,
+// because HttpClient adds Content-Length: 0 to a body-less write, refuses non-ASCII header values and
+// response heads over 64 KiB on the test's own side, sends a whole body before it reads any response,
+// and a Kestrel stub would decode the bytes it is meant to record. The backend's authority is replaced
+// by a fixed token before request heads are compared.
 /// <summary>
 /// Raw-byte checks of what the facade sends to a backend and returns to a caller: single delivery of
 /// body-less writes and of writes sent with <c>Expect: 100-continue</c>, the unchanged wire form of
@@ -2682,12 +2654,9 @@ public sealed class ForwardingTransportTests
     }
 }
 
-// The facade's unavailable answer as a caller receives it (class UnavailableAnswers) sits here, between
-// the two test classes whose real-socket cases end in it: a backend that breaks its reply and a backend
-// that drops an upload without answering. It holds assertions only and no tests.
-//
-// Every expected value is the plan's literal, authored here rather than taken from the facade's
-// constants, and every assertion message is fixed.
+// The facade's unavailable answer (class UnavailableAnswers) holds assertions only and sits between the
+// two test classes whose real-socket cases end in it, ForwardingTransportTests and BackendForwarderTests.
+// Its expected values are the plan's literals, authored here, not taken from the facade's constants.
 /// <summary>
 /// Asserts the facade's unavailable answer exactly as the plan states it: REST 502 with the fixed
 /// problem+json body, SOAP HTTP 500 with the SOAP 1.1 "Backend unavailable" Fault.
@@ -2769,22 +2738,12 @@ internal static class UnavailableAnswers
     }
 }
 
-// BackendForwarder's own handling of every other failure (class BackendForwarderTests) sits here,
-// beside the unreachable and timeout cases it completes, as a class of its own: the results report
-// counts test classes whose names end in "FailureBehaviourTests" as the unreachable and timeout check,
-// and this name matches none.
-//
-// BackendForwarder's handling of every call that is neither an unreachable backend nor an expired
-// deadline, which FailureBehaviourTests proves: the one per-call line (event 1001, BackendCall) with the
-// outcome, level and status of each failure kind, exceptions, the bounded failure-response write, caller
-// aborts and the backend's own answers to uploads. The classification and write cases construct the
-// forwarder directly over a fake IHttpForwarder that reports each YARP error as YARP does; the caller and
-// upload cases run the facade on real loopback Kestrel listeners.
-//
-// Failures are identified across runs by a signature over the exception type, the failing line and the
-// assertion message, so every message and Assert.Equal operand here is run-invariant: no port, URL,
-// elapsed time or GUID. Log entries are never passed to Assert.Single or Assert.Equal, because their dump
-// holds durations; timing bounds are Assert.True calls with fixed messages.
+// BackendForwarder's handling of every other way a call ends (class BackendForwarderTests): the one
+// per-call line (event 1001, BackendCall) with the outcome, level and status of each failure kind,
+// exceptions, the bounded failure-response write, caller aborts and the backend's own answers to uploads.
+// The classification and write cases construct the forwarder directly over a fake IHttpForwarder that
+// reports each YARP error as YARP does; the caller and upload cases run the facade on real loopback
+// Kestrel listeners.
 /// <summary>
 /// The per-call line, the caller's response and the connection for every way a forwarded call can end
 /// besides an unreachable backend or an expired deadline.
@@ -2818,6 +2777,7 @@ public sealed class BackendForwarderTests
     private const string TruncatedUploadCause = "truncated-upload";
     private const string CallerResetCause = "caller-reset";
     private const string TempSpaceFullCause = "temp-space-full";
+    private const string UploadReadTimeoutCause = "upload-read-timeout";
     private const string BackendResetCause = "backend-reset";
     private const string ConnectFailedCause = "connect-failed";
     private const string NameNotResolvedCause = "name-not-resolved";
@@ -2857,6 +2817,8 @@ public sealed class BackendForwarderTests
     // The limit of a backend that rejects an upload the caller never completes, well before its end.
     private const long SmallBackendBodyLimit = 1024 * 1024;
 
+    private static readonly XNamespace SoapEnvelope = "http://schemas.xmlsoap.org/soap/envelope/";
+
     private static readonly TimeSpan SlowBackendDelay = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan CallerPatience = TimeSpan.FromMilliseconds(500);
     private static readonly TimeSpan LogWaitBound = TimeSpan.FromSeconds(5);
@@ -2867,10 +2829,10 @@ public sealed class BackendForwarderTests
 
     /// <summary>
     /// Every YARP error kind ends in exactly one line whose outcome, level and status say what happened,
-    /// and the caller gets the facade response, the bare 500, nothing, or an aborted connection that
-    /// outcome stands for. Caller aborts never report YARP's placeholder status; a backend that dropped
-    /// the upload or sent a head the facade cannot relay, before its response was taken over, gets the
-    /// unavailable answer, and one that failed after it is aborted.
+    /// and the caller gets the facade response, nothing, or an aborted connection that outcome stands
+    /// for. Caller aborts never report YARP's placeholder status; a backend that dropped the upload or
+    /// sent a head the facade cannot relay, before its response was taken over, gets the unavailable
+    /// answer, and one that failed after it is aborted.
     /// </summary>
     [Theory]
     [InlineData(ForwarderError.None, NoCause, false, true, Forwarded, LogLevel.Information, 200, false, null)]
@@ -2881,11 +2843,9 @@ public sealed class BackendForwarderTests
     [InlineData(ForwarderError.RequestBodyClient, CallerResetCause, false, false, Aborted, LogLevel.Information, 0, false, null)]
     [InlineData(ForwarderError.ResponseBodyCanceled, CallerCancelledCause, true, true, Aborted, LogLevel.Information, 200, false, null)]
     [InlineData(ForwarderError.ResponseHeaders, CallerCancelledCause, true, false, Aborted, LogLevel.Information, 0, false, null)]
-    [InlineData(ForwarderError.RequestBodyClient, TempSpaceFullCause, false, false, Failed, LogLevel.Warning, 500, false, null)]
     [InlineData(ForwarderError.RequestBodyDestination, BackendResetCause, false, false, Unavailable, LogLevel.Warning, 502, false, UnavailableTitle)]
     [InlineData(ForwarderError.ResponseBodyDestination, BackendResetCause, true, true, Failed, LogLevel.Warning, 200, true, null)]
     [InlineData(ForwarderError.ResponseHeaders, InvalidResponseHeadCause, false, false, Unavailable, LogLevel.Warning, 502, false, UnavailableTitle)]
-    [InlineData(ForwarderError.RequestCreation, InvalidRequestCause, false, false, Failed, LogLevel.Warning, 500, false, null)]
     public async Task CallEndIsLoggedOnceWithItsOutcomeLevelAndStatus(
         ForwarderError error,
         string cause,
@@ -2946,13 +2906,80 @@ public sealed class BackendForwarderTests
         }
 
         Assert.True(call.Body.Length == 0, "facade wrote a body for a call it does not answer with one");
-        if (expectedStatus == StatusCodes.Status500InternalServerError)
+    }
+
+    /// <summary>
+    /// A failure on the facade's side of a call, before any response, gets no response the facade makes
+    /// up, on either surface. A client-side copy error the caller did not cause, such as a full temporary
+    /// store for a buffered body, and an outgoing request YARP could not create each end in one
+    /// <c>failed</c> line at Warning with status 0 and an aborted connection, with nothing written: no
+    /// 500, no problem+json and no Fault. A client-side copy error that carries a timeout is that timeout,
+    /// answered with REST 504 or the "Backend timed out" Fault and never aborted.
+    /// </summary>
+    [Theory]
+    [InlineData("Rest", ForwarderError.RequestBodyClient, TempSpaceFullCause, Failed, 0, true, null)]
+    [InlineData("Soap", ForwarderError.RequestBodyClient, TempSpaceFullCause, Failed, 0, true, null)]
+    [InlineData("Rest", ForwarderError.RequestCreation, InvalidRequestCause, Failed, 0, true, null)]
+    [InlineData("Soap", ForwarderError.RequestCreation, InvalidRequestCause, Failed, 0, true, null)]
+    [InlineData("Rest", ForwarderError.RequestBodyClient, UploadReadTimeoutCause, TimedOut, 504, false, TimedOutTitle)]
+    [InlineData("Soap", ForwarderError.RequestBodyClient, UploadReadTimeoutCause, TimedOut, 500, false, TimedOutTitle)]
+    public async Task FacadeSideFailureIsAbortedUnlessItCarriesATimeout(
+        string surface,
+        ForwarderError error,
+        string cause,
+        string expectedOutcome,
+        int expectedStatus,
+        bool expectedConnectionAbort,
+        string? expectedText)
+    {
+        using var call = new UnitCall();
+        using var harness = new ForwarderHarness(
+            (context, _) =>
+            {
+                // YARP's own placeholder for a failure, never the backend's status.
+                context.Response.StatusCode = StatusCodes.Status502BadGateway;
+                context.Features.Set<IForwarderErrorFeature>(new ErrorFeature(error, CauseOf(cause)));
+                return ValueTask.FromResult(error);
+            });
+
+        Surface parsed = Enum.Parse<Surface>(surface);
+        OperationDescriptor operation = Operation(parsed == Surface.Rest ? RestOperationId : SoapOperationId);
+        await harness.Forwarder.ForwardAsync(call.Context, parsed, operation);
+
+        IReadOnlyList<CapturedLog> calls = harness.Logs.BackendCalls;
+        Assert.True(calls.Count == 1, "facade-side failure did not write exactly one backend call line");
+        Assert.Equal(expectedOutcome, calls[0].Value("Outcome"));
+        Assert.Equal(LogLevel.Warning, calls[0].Level);
+        Assert.Equal(expectedStatus, calls[0].Value("Status"));
+        Assert.Equal(BackendTarget, calls[0].Value("Target"));
+        Assert.Equal(expectedConnectionAbort, call.Lifetime.AbortCalled);
+
+        HttpResponse response = call.Context.Response;
+        if (expectedText is null)
         {
-            // The facade's own failure: a bare 500 on a connection that closes after it.
-            Assert.Equal(StatusCodes.Status500InternalServerError, call.Context.Response.StatusCode);
-            Assert.Equal(0L, call.Context.Response.ContentLength);
-            Assert.Equal("close", call.Context.Response.Headers.Connection.ToString());
+            // The abort discards the response, and the facade put nothing of its own into it.
+            Assert.True(call.Body.Length == 0, "facade wrote a body for a call it aborts");
+            Assert.True(response.StatusCode != StatusCodes.Status500InternalServerError, "facade set a 500 on a call it aborts");
+            Assert.True(response.ContentLength is null, "facade set a Content-Length on a call it aborts");
+            Assert.True(response.ContentType is null, "facade set a Content-Type on a call it aborts");
+            Assert.True(response.Headers.Connection.Count == 0, "facade set a Connection header on a call it aborts");
+            return;
         }
+
+        Assert.Equal(expectedStatus, response.StatusCode);
+        if (parsed == Surface.Rest)
+        {
+            using JsonDocument problem = JsonDocument.Parse(call.Body.ToArray());
+            Assert.True(problem.RootElement.TryGetProperty("title", out JsonElement title), "problem body has no title member");
+            Assert.Equal(expectedText, title.GetString());
+            return;
+        }
+
+        XElement envelope = XDocument.Parse(Encoding.UTF8.GetString(call.Body.ToArray())).Root
+            ?? throw new InvalidOperationException("fault document has no root element");
+        XElement[] faultStrings = [.. envelope.Elements(SoapEnvelope + "Body").Elements(SoapEnvelope + "Fault").Elements("faultstring")];
+        Assert.True(faultStrings.Length == 1, "Fault body does not hold exactly one faultstring");
+        Assert.Equal(expectedText, faultStrings[0].Value);
     }
 
     /// <summary>
@@ -3506,6 +3533,12 @@ public sealed class BackendForwarderTests
         TempSpaceFullCause => new AggregateException(
             new IOException(
                 "An error occurred when reading the request body from the client.", new IOException("No space left on device")),
+            new HttpRequestException("An error occurred while sending the request.")),
+        // A failed read of the caller's upload whose chain holds a timeout and no cancellation.
+        UploadReadTimeoutCause => new AggregateException(
+            new IOException(
+                "An error occurred when reading the request body from the client.",
+                new TimeoutException("The read did not complete in time.")),
             new HttpRequestException("An error occurred while sending the request.")),
         BackendResetCause => new AggregateException(
             new IOException(

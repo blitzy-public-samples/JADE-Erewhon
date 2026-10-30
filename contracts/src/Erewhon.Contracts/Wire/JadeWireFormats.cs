@@ -14,9 +14,17 @@ namespace Erewhon.Contracts.Wire;
 /// </summary>
 /// <remarks>
 /// Every formatter writes UTC with the invariant culture, because the JADE applications run with
-/// <c>_webDefaultTimeZone Etc/UTC</c>. Every <c>Try*</c> and <c>Is*</c> member accepts <see langword="null"/>,
-/// never throws, never trims, and decides validity by lexical form alone, so a lookalike such as
-/// <c>{generated-guid}</c> or <c>{timestamp}</c> is always invalid.
+/// <c>_webDefaultTimeZone Etc/UTC</c>. No <c>Try*</c> or <c>Is*</c> member trims, and each returns
+/// <see langword="false"/>, never throwing, for invalid wire data: a <see langword="null"/> string, malformed
+/// or out-of-range text, a JSON value of the wrong kind, or a default <see cref="JsonElement"/>. A lookalike
+/// such as <c>{generated-guid}</c> or <c>{timestamp}</c> is therefore always invalid. The
+/// <see langword="string"/> overloads accept <see langword="null"/>. The <see cref="JsonElement"/> overloads
+/// take a value type, and a caller error such as passing an element of a disposed <see cref="JsonDocument"/>
+/// still throws <see cref="ObjectDisposedException"/>. GUID, byte-array and base64 validity is a matter of
+/// form alone. Date validity also covers the values: a Microsoft JSON date needs milliseconds inside the
+/// <see cref="DateTimeOffset"/> range and a local time representable at its offset, an <c>xsd:date</c> a real
+/// calendar date, and an <c>xsd:dateTime</c> real calendar and clock values inside that range. Every zone
+/// offset has minutes at most 59 and is at most 14:00 in total.
 /// </remarks>
 public static partial class JadeWireFormats
 {

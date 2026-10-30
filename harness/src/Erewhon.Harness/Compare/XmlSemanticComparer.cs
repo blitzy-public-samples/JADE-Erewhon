@@ -170,7 +170,8 @@ public abstract record XmlComparisonContext
 /// <c>/Envelope/Body/getAgentNamesResponse/getAgentNamesResult/DTOName[2]/name/text()</c> or
 /// <c>/definitions/service/port/address/@location</c>. The returned list is in
 /// <see cref="Discrepancy.CanonicalOrder"/>, so attribute and sibling order never change it. The instance
-/// holds only immutable state and performs no I/O, so concurrent <see cref="Compare"/> calls are safe.
+/// holds only immutable state and performs no I/O, so concurrent
+/// <see cref="Compare(string, string, XmlComparisonContext)"/> calls are safe.
 /// </para>
 /// </remarks>
 /// <param name="catalogue">The operation catalogue that types SOAP bodies.</param>

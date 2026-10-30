@@ -107,7 +107,7 @@ public sealed class CaptureMode(HarnessOptions options, OperationCatalogue catal
     /// cancelled, counted from the later of the cancellation and the restoration's start, before it is
     /// abandoned as unconfirmed; 15 s unless a test shortens it.
     /// </summary>
-    /// <exception cref="ArgumentOutOfRangeException">The value is not positive or is longer than a finite delay allows.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">The value is not positive or is longer than <see cref="int.MaxValue"/> milliseconds.</exception>
     internal TimeSpan CancelledRestorationLimit
     {
         get => _cancelledRestorationLimit;

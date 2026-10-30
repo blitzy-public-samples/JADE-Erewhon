@@ -62,15 +62,12 @@ public sealed class RoutingOptionsValidator(OperationCatalogue catalogue) : IVal
     // and U+FE6B, which NFKC folds to '@'. No other character folds to it.
     private const string AtSignCharacters = "@\uFF20\uFE6B";
 
-    // The two surfaces the routing table has sections for, in catalogue order, with the base URL each
-    // surface's operations are forwarded to.
     private static readonly SurfaceRoute[] Surfaces =
     [
         new(Surface.Rest, nameof(RoutingOperations.Rest), "REST", nameof(RoutingTarget.RestBaseUrl), static target => target.RestBaseUrl),
         new(Surface.Soap, nameof(RoutingOperations.Soap), "SOAP", nameof(RoutingTarget.SoapBaseUrl), static target => target.SoapBaseUrl),
     ];
 
-    // The keys each section of the raw Routing configuration may hold, as written in messages.
     private const string RoutingSettings =
         $"{nameof(RoutingOptions.DefaultTarget)}, {nameof(RoutingOptions.Targets)} or {nameof(RoutingOptions.Operations)}";
     private const string OperationSections = $"{nameof(RoutingOperations.Rest)} or {nameof(RoutingOperations.Soap)}";
@@ -421,7 +418,6 @@ public sealed class RoutingOptionsValidator(OperationCatalogue catalogue) : IVal
         }
     }
 
-    // Rule 5.
     private static void ValidateTimeouts(KeyValuePair<string, RoutingTarget>[] targets, List<string> failures)
     {
         foreach (var (name, target) in targets)
@@ -435,7 +431,6 @@ public sealed class RoutingOptionsValidator(OperationCatalogue catalogue) : IVal
         }
     }
 
-    // A null, empty or whitespace-only URL counts as not configured.
     private static bool IsAbsent(string? url) => string.IsNullOrWhiteSpace(url);
 
     // The configuration binder turns a target section with no values, only empty values, or an empty

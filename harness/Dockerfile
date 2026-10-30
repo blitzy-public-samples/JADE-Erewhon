@@ -9,6 +9,15 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0.403-noble AS build
 ENV DOTNET_NOLOGO=1 \
     DOTNET_CLI_TELEMETRY_OPTOUT=1
 
+# The pinned SDK image ships the native libbrotli1 1.1.0-2build2, which USN-8956-1 (CVE-2026-111497)
+# fixes in 1.1.0-2ubuntu0.1. Only that package is upgraded, so the SDK and every other package stay
+# as pinned. The version check fails the build rather than ship a vulnerable libbrotli1, and the apt
+# lists are removed in the same layer.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --only-upgrade libbrotli1 \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libbrotli1)" ge 1.1.0-2ubuntu0.1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # This layout reproduces the repository's relative paths: the project's
 # ../../../contracts/src/Erewhon.Contracts reference and the contracts project's embedded
 # ../../operation-catalogue.json resolve only when contracts/ and harness/ sit side by side under
@@ -23,8 +32,8 @@ COPY harness/ /src/harness/
 # pins (SDK 10.0.403, rollForward disable) apply only to commands run from here.
 WORKDIR /src/harness
 
-# Locked mode fails on any drift from the committed packages.lock.json files of the harness and
-# the contracts library.
+# Locked mode rejects a restore whose dependencies or requested versions disagree with the committed
+# packages.lock.json files of the harness and the contracts library.
 RUN dotnet restore --locked-mode src/Erewhon.Harness/Erewhon.Harness.csproj
 
 # Framework-dependent and RID-less: the app runs on the pinned shared framework 10.0.14

@@ -12,6 +12,15 @@ FROM mcr.microsoft.com/dotnet/sdk:10.0.403-noble AS build
 ENV DOTNET_NOLOGO=1 \
     DOTNET_CLI_TELEMETRY_OPTOUT=1
 
+# The pinned SDK image ships the native libbrotli1 1.1.0-2build2, which USN-8956-1 (CVE-2026-111497)
+# fixes in 1.1.0-2ubuntu0.1. Only that package is upgraded, so the SDK and every other package stay
+# as pinned, and the test stage inherits the upgrade. The version check fails the build rather than
+# ship a vulnerable libbrotli1, and the apt lists are removed in the same layer.
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --only-upgrade libbrotli1 \
+    && dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libbrotli1)" ge 1.1.0-2ubuntu0.1 \
+    && rm -rf /var/lib/apt/lists/*
+
 # This layout reproduces the repository's relative paths: the facade's
 # ../../../contracts/src/Erewhon.Contracts reference and the contracts project's embedded
 # ../../operation-catalogue.json resolve only when contracts/ and facade/ sit side by side under
@@ -25,9 +34,9 @@ COPY facade/ /src/facade/
 # run from here.
 WORKDIR /src/facade
 
-# Locked mode fails on any drift from the committed packages.lock.json files of the facade, its tests
-# and the contracts library. The test project is restored here as well, because the test stage runs
-# under network_mode none and can never restore.
+# Locked mode rejects a restore whose dependencies or requested versions disagree with the committed
+# packages.lock.json files of the facade, its tests and the contracts library. The test project is
+# restored here as well, because the test stage runs under network_mode none and can never restore.
 RUN dotnet restore --locked-mode src/Erewhon.Facade/Erewhon.Facade.csproj
 RUN dotnet restore --locked-mode tests/Erewhon.Facade.Tests/Erewhon.Facade.Tests.csproj
 
@@ -80,10 +89,10 @@ ENV ASPNETCORE_HTTP_PORTS=
 # Temporary storage of SOAP bodies. A SOAP request without a matching SOAPAction is buffered whole
 # (Request.EnableBuffering, with no limit) so that its first 64 KiB can be inspected and the full body
 # still forwarded; a body over 30 KiB is buffered in a file here. This location must hold the largest
-# SOAP bodies sent concurrently without a matching SOAPAction: when it fills, the call fails with a
-# bare 500 and a "failed" log line. For larger bodies, mount a volume of the needed size and point
-# ASPNETCORE_TEMP at it. /tmp is the image's world-writable default, named here so the requirement is
-# visible.
+# SOAP bodies sent concurrently without a matching SOAPAction: when it fills, the connection is
+# aborted without a response and the call is logged as "failed" with status 0. For larger bodies,
+# mount a volume of the needed size and point ASPNETCORE_TEMP at it. /tmp is the image's
+# world-writable default, named here so the requirement is visible.
 ENV ASPNETCORE_TEMP=/tmp
 
 # REST (ErewhonREST 0.0.0.0:65000), SOAP (WebServiceHTTP 0.0.0.0:21001), admin (AdminRoutes.DefaultPort).

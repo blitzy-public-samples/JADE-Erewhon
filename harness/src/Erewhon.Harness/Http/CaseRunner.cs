@@ -103,8 +103,9 @@ public sealed class CaseRunner : IDisposable
 
     private const string NotHttpUrlProblem = "The URL is not an absolute http or https URL.";
 
-    // CancellationTokenSource.CancelAfter and SocketsHttpHandler.ConnectTimeout both reject a finite
-    // duration beyond int.MaxValue milliseconds, so it is rejected where the value enters.
+    // SocketsHttpHandler.ConnectTimeout rejects a finite duration beyond int.MaxValue milliseconds. The
+    // runner holds every limit it takes, the per-request deadline included, to that one bound, although
+    // CancelAfter alone would accept a longer one, and rejects a longer value where it enters.
     private static readonly TimeSpan MaximumFiniteTimeout = TimeSpan.FromMilliseconds(int.MaxValue);
 
     // Without this option Uri unescapes and re-escapes the path and query and removes dot segments, so a
@@ -145,7 +146,10 @@ public sealed class CaseRunner : IDisposable
     }
 
     /// <summary>Creates a runner whose connection attempts are limited to <paramref name="connectTimeout"/>.</summary>
-    /// <param name="connectTimeout">A positive duration, or <see cref="Timeout.InfiniteTimeSpan"/>.</param>
+    /// <param name="connectTimeout">
+    /// A positive duration of at most <see cref="int.MaxValue"/> milliseconds, or
+    /// <see cref="Timeout.InfiniteTimeSpan"/>.
+    /// </param>
     /// <exception cref="ArgumentOutOfRangeException">
     /// <paramref name="connectTimeout"/> is zero, negative other than infinite, or beyond
     /// <see cref="int.MaxValue"/> milliseconds.
@@ -247,11 +251,17 @@ public sealed class CaseRunner : IDisposable
     /// <summary>Sends <paramref name="request"/> to the listener at <paramref name="baseUrl"/>.</summary>
     /// <param name="baseUrl">The listener's absolute base URL, for example <c>http://standin:65000</c>.</param>
     /// <param name="request">The case request, sent exactly as it is.</param>
-    /// <param name="timeout">The deadline for the whole call, body read included; positive or infinite.</param>
+    /// <param name="timeout">
+    /// The deadline for the whole call, body read included; positive and at most <see cref="int.MaxValue"/>
+    /// milliseconds, or <see cref="Timeout.InfiniteTimeSpan"/>.
+    /// </param>
     /// <param name="ct">The caller's cancellation, which propagates as <see cref="OperationCanceledException"/>.</param>
     /// <returns>The raw response, or the reason none was obtained.</returns>
     /// <exception cref="ArgumentException">The base URL, target, headers or body cannot be sent unchanged.</exception>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="timeout"/> is not positive or infinite.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="timeout"/> is zero, negative other than <see cref="Timeout.InfiniteTimeSpan"/>, or longer
+    /// than <see cref="int.MaxValue"/> milliseconds.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
     public Task<CaseResponse> SendAsync(Uri baseUrl, CaseRequest request, TimeSpan timeout, CancellationToken ct)
     {
@@ -272,13 +282,19 @@ public sealed class CaseRunner : IDisposable
     /// Sends a <c>GET</c> with no header and no body, as used for WSDL, OpenAPI and admin fetches.
     /// </summary>
     /// <param name="absoluteUri">The target, preferably made by <see cref="Combine(Uri, string)"/>.</param>
-    /// <param name="timeout">The deadline for the whole call; positive or infinite.</param>
+    /// <param name="timeout">
+    /// The deadline for the whole call; positive and at most <see cref="int.MaxValue"/> milliseconds, or
+    /// <see cref="Timeout.InfiniteTimeSpan"/>.
+    /// </param>
     /// <param name="ct">The caller's cancellation.</param>
     /// <returns>The raw response, or the reason none was obtained.</returns>
     /// <exception cref="ArgumentException">
     /// <paramref name="absoluteUri"/> is not an absolute http or https URI without user information.
     /// </exception>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="timeout"/> is not positive or infinite.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="timeout"/> is zero, negative other than <see cref="Timeout.InfiniteTimeSpan"/>, or longer
+    /// than <see cref="int.MaxValue"/> milliseconds.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
     public Task<CaseResponse> GetAsync(Uri absoluteUri, TimeSpan timeout, CancellationToken ct) =>
         SendRawAsync(absoluteUri, "GET", null, null, timeout, ct);
@@ -302,12 +318,18 @@ public sealed class CaseRunner : IDisposable
     /// <param name="method">The HTTP method, for example <c>GET</c> or <c>POST</c>.</param>
     /// <param name="headers">The headers to send, or null for none.</param>
     /// <param name="bodyText">The exact body text, or null for no body.</param>
-    /// <param name="timeout">The deadline for connect, headers and body read together; positive or infinite.</param>
+    /// <param name="timeout">
+    /// The deadline for connect, headers and body read together; positive and at most <see cref="int.MaxValue"/>
+    /// milliseconds, or <see cref="Timeout.InfiniteTimeSpan"/>.
+    /// </param>
     /// <param name="ct">The caller's cancellation, which propagates as <see cref="OperationCanceledException"/>.</param>
     /// <returns>The raw response, or the reason none was obtained.</returns>
     /// <exception cref="ArgumentNullException"><paramref name="absoluteUri"/> or <paramref name="method"/> is null.</exception>
     /// <exception cref="ArgumentException">The target, method, headers or body cannot be sent unchanged.</exception>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="timeout"/> is not positive or infinite.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="timeout"/> is zero, negative other than <see cref="Timeout.InfiniteTimeSpan"/>, or longer
+    /// than <see cref="int.MaxValue"/> milliseconds.
+    /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="ct"/> was cancelled.</exception>
     public async Task<CaseResponse> SendRawAsync(
         Uri absoluteUri,

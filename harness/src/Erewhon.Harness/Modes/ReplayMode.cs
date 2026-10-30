@@ -408,7 +408,8 @@ public sealed class ReplayMode
     internal const int CancelledRestorationLimitSeconds = 15;
     internal const int CancelledShutdownLimitSeconds = 15;
 
-    // The longest wait Task.Delay accepts as a finite delay.
+    // The harness's own ceiling on a report-write limit, int.MaxValue milliseconds (just under 25 days): a
+    // conservative choice below the longest timed wait Task.Delay accepts, not the framework's maximum.
     private static readonly TimeSpan MaximumReportWriteLimit = TimeSpan.FromMilliseconds(int.MaxValue);
 
     /// <summary>
@@ -483,13 +484,16 @@ public sealed class ReplayMode
     /// How long one report write may take before the mode abandons it and records <c>CHK-REPORT</c>
     /// (<c>write-failed</c>); 30 s unless a test shortens it.
     /// </summary>
-    /// <exception cref="ArgumentOutOfRangeException">The value is not positive or is longer than a finite delay allows.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">The value is not positive or is longer than <see cref="int.MaxValue"/> milliseconds.</exception>
     internal TimeSpan ReportWriteLimit
     {
         get => _reportWriteLimit;
         init => _reportWriteLimit = value > TimeSpan.Zero && value <= MaximumReportWriteLimit
             ? value
-            : throw new ArgumentOutOfRangeException(nameof(value), value, "The report-write limit must be positive and finite.");
+            : throw new ArgumentOutOfRangeException(
+                nameof(value),
+                value,
+                "The report-write limit must be positive and at most int.MaxValue milliseconds.");
     }
 
     /// <summary>
@@ -498,7 +502,7 @@ public sealed class ReplayMode
     /// <c>CHK-SHUTDOWN</c> (<c>still-running</c>); 15 s unless a test shortens it. It applies only when the
     /// configured shutdown limit is longer: a shorter one runs as configured, on a token nothing cancels.
     /// </summary>
-    /// <exception cref="ArgumentOutOfRangeException">The value is not positive or is longer than a finite delay allows.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">The value is not positive or is longer than <see cref="int.MaxValue"/> milliseconds.</exception>
     internal TimeSpan CancelledShutdownLimit
     {
         get => _cancelledShutdownLimit;
@@ -976,7 +980,7 @@ public sealed class ReplayBody(
     /// counted from the later of the cancellation and the restoration's start, before it is abandoned and
     /// recorded as <c>CHK-EXCEPTION</c>; 15 s unless a test shortens it.
     /// </summary>
-    /// <exception cref="ArgumentOutOfRangeException">The value is not positive or is longer than a finite delay allows.</exception>
+    /// <exception cref="ArgumentOutOfRangeException">The value is not positive or is longer than <see cref="int.MaxValue"/> milliseconds.</exception>
     internal TimeSpan CancelledRestorationLimit
     {
         get => _cancelledRestorationLimit;
@@ -2030,7 +2034,8 @@ public sealed class ReplayBody(
 /// <remarks>Create one per step and dispose it when the step ends; the step owns it alone.</remarks>
 internal sealed class CancellationGrace : IDisposable
 {
-    // The longest delay CancelAfter accepts as finite.
+    // The harness's own ceiling on a grace, int.MaxValue milliseconds (just under 25 days): a conservative
+    // choice below the longest countdown CancelAfter accepts, not the framework's maximum.
     private static readonly TimeSpan MaximumLimit = TimeSpan.FromMilliseconds(int.MaxValue);
 
     private readonly CancellationTokenSource _source = new();
@@ -2040,7 +2045,7 @@ internal sealed class CancellationGrace : IDisposable
     /// <summary>Creates the grace of one step.</summary>
     /// <param name="run">The run's token; one that can never be cancelled gives a token that never is.</param>
     /// <param name="limit">How long the step may still run once the run is cancelled.</param>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="limit"/> is not positive or is longer than a finite delay allows.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="limit"/> is not positive or is longer than <see cref="int.MaxValue"/> milliseconds.</exception>
     internal CancellationGrace(CancellationToken run, TimeSpan limit)
     {
         _limit = RequireLimit(limit);
@@ -2052,14 +2057,20 @@ internal sealed class CancellationGrace : IDisposable
     /// <summary>The step's token: cancelled the limit after the run's cancellation, and never before it.</summary>
     internal CancellationToken Token => _source.Token;
 
-    /// <summary>Returns <paramref name="limit"/> when it is a usable grace: positive and finite.</summary>
+    /// <summary>
+    /// Returns <paramref name="limit"/> when it is a usable grace: positive and at most <see cref="int.MaxValue"/>
+    /// milliseconds.
+    /// </summary>
     /// <param name="limit">The limit to check.</param>
     /// <returns><paramref name="limit"/>.</returns>
-    /// <exception cref="ArgumentOutOfRangeException"><paramref name="limit"/> is not positive or is longer than a finite delay allows.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="limit"/> is not positive or is longer than <see cref="int.MaxValue"/> milliseconds.</exception>
     internal static TimeSpan RequireLimit(TimeSpan limit) =>
         limit > TimeSpan.Zero && limit <= MaximumLimit
             ? limit
-            : throw new ArgumentOutOfRangeException(nameof(limit), limit, "A cancelled-run limit must be positive and finite.");
+            : throw new ArgumentOutOfRangeException(
+                nameof(limit),
+                limit,
+                "A cancelled-run limit must be positive and at most int.MaxValue milliseconds.");
 
     /// <summary>Ends the grace: the run's cancellation no longer reaches it, and its timer is released.</summary>
     public void Dispose()

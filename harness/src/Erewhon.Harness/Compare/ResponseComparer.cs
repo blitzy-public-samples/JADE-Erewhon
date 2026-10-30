@@ -350,7 +350,12 @@ public sealed record ResponseComparison(
 /// </para>
 /// <para>
 /// The instance holds only immutable state and performs no I/O, so concurrent <see cref="Compare"/>
-/// calls are safe, and no observed body makes <see cref="Compare"/> throw.
+/// calls are safe. A malformed or undecodable body never makes <see cref="Compare"/> throw: it is compared
+/// exactly as above and, against a well-formed baseline, also reported as <c>malformed</c>. A JSON body
+/// nested beyond the reader's depth limit does not parse, so it is handled the same way. A SOAP body that
+/// loads as XML but is nested deeply enough to run short of execution stack is the one exception: the XML
+/// comparer's depth guard throws <see cref="InsufficientExecutionStackException"/> instead of letting a
+/// stack overflow end the process, and <see cref="Compare"/> lets it propagate for the caller to report.
 /// </para>
 /// </remarks>
 /// <param name="catalogue">The operation catalogue the semantic comparers type bodies by.</param>
@@ -385,6 +390,11 @@ public sealed class ResponseComparer(OperationCatalogue catalogue, Normaliser no
     /// <exception cref="ArgumentException">
     /// <paramref name="baseline"/> holds a no-response reason, or <paramref name="observed"/> holds one that
     /// is not a <see cref="NoResponseReasons"/> value.
+    /// </exception>
+    /// <exception cref="InsufficientExecutionStackException">
+    /// A SOAP body loads as XML but is nested deeply enough to run short of execution stack, so the XML
+    /// comparer's depth guard throws it instead of letting a stack overflow end the process. A malformed or
+    /// undecodable body never throws; it is compared as the class remarks describe.
     /// </exception>
     public ResponseComparison Compare(OperationDescriptor operation, ResponseSnapshot baseline, ResponseSnapshot observed)
     {
