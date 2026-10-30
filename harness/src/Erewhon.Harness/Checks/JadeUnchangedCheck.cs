@@ -229,14 +229,18 @@ public static class Git
 }
 
 /// <summary>The outcome of <see cref="JadeUnchangedCheck.RunAsync"/>.</summary>
-/// <param name="Result">The check's report row: name <c>jade-unchanged</c>, outcome <c>pass</c>, <c>fail</c> or <c>not-run</c>.</param>
+/// <param name="Result">
+/// The check's report row: name <c>jade-unchanged</c>, outcome <c>pass</c>, <c>fail</c> or <c>not-run</c>;
+/// its cases are the paths checked and its passed count the paths left unchanged.
+/// </param>
 /// <param name="Failures">
 /// One <c>CHK-JADE-UNCHANGED:&lt;path&gt;</c> item per changed path, sorted by item id; or the single
 /// <c>CHK-JADE-UNCHANGED</c> <c>not-run</c> item; empty on a pass.
 /// </param>
 /// <param name="Summary">
-/// Paths checked and paths changed; null when the check did not run, so the report shows "not run"
-/// rather than zero counts that were never observed.
+/// Paths checked, which are the paths under <c>Erewhon/</c> at the starting commit plus the paths added
+/// since, and paths changed; null when the check did not run, so the report shows "not run" rather than
+/// zero counts that were never observed.
 /// </param>
 public sealed record JadeUnchangedResult(CheckResult Result, IReadOnlyList<FailureItem> Failures, JadeUnchangedSummary? Summary);
 
@@ -385,18 +389,22 @@ public sealed class JadeUnchangedCheck(HarnessOptions options)
 
         failures.Sort(static (x, y) => string.CompareOrdinal(x.ItemId, y.ItemId));
 
-        var unchangedTracked = trackedPaths.Count(path => !changes.ContainsKey(path));
+        // A path added since the starting commit is changed but absent from that commit's tree, so the
+        // paths checked are the tree's paths together with every changed path, and each changed path is
+        // one that failed.
+        var checkedPaths = new HashSet<string>(trackedPaths, StringComparer.Ordinal);
+        checkedPaths.UnionWith(changes.Keys);
         return new JadeUnchangedResult(
             new CheckResult(
                 CheckNames.JadeUnchanged,
                 CheckOutcomes.Fail,
-                trackedPaths.Count,
-                unchangedTracked,
+                checkedPaths.Count,
+                checkedPaths.Count - changes.Count,
                 string.Create(
                     CultureInfo.InvariantCulture,
                     $"{changes.Count} path(s) under {JadePathspec} changed since starting commit {commit}")),
             failures,
-            new JadeUnchangedSummary(trackedPaths.Count, changes.Count));
+            new JadeUnchangedSummary(checkedPaths.Count, changes.Count));
     }
 
     // `diff --name-status --no-renames -z` prints <status>NUL<path>NUL per path; without rename

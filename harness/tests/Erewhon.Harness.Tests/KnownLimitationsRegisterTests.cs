@@ -5611,10 +5611,12 @@ public sealed partial class KnownLimitationsRegisterTests
             new(FailureItemIds.JadeUnchangedPath("Erewhon/c.txt"), FailureItemIds.Added(AddedBlob)),
         ];
         Assert.Equal(expected, result.Failures);
+
+        // The three tracked paths and the added c.txt are checked; only the tracked z.mul is unchanged.
         Assert.Equal(
-            new CheckResult(CheckNames.JadeUnchanged, CheckOutcomes.Fail, 3, 1, $"3 path(s) under Erewhon/ changed since starting commit {StartingCommit}"),
+            new CheckResult(CheckNames.JadeUnchanged, CheckOutcomes.Fail, 4, 1, $"3 path(s) under Erewhon/ changed since starting commit {StartingCommit}"),
             result.Result with { Detail = Redacted(result.Result.Detail) });
-        Assert.Equal(new JadeUnchangedSummary(3, 3), result.Summary);
+        Assert.Equal(new JadeUnchangedSummary(4, 3), result.Summary);
 
         // A deleted path has no content to hash; the other two are hashed once each.
         string[] hashedPaths = ["Erewhon/b.scm", "Erewhon/c.txt"];
@@ -5666,10 +5668,11 @@ public sealed partial class KnownLimitationsRegisterTests
         Assert.Equal(hashArgs, git.Calls[^1].Args);
     }
 
+    // pathsChecked counts the tracked Erewhon/b.scm, plus Erewhon/c.txt when that is the added path.
     [Theory]
-    [InlineData("modified")]
-    [InlineData("added")]
-    public async Task Sha256HashObjectAnswer_GivesItsBlobId(string change)
+    [InlineData("modified", 1)]
+    [InlineData("added", 2)]
+    public async Task Sha256HashObjectAnswer_GivesItsBlobId(string change, int pathsChecked)
     {
         Directory.CreateDirectory(Temp.PathOf(".git"));
         var git = OneChange(change, ScriptedGit.Ok(Sha256Blob + "\n"));
@@ -5679,17 +5682,20 @@ public sealed partial class KnownLimitationsRegisterTests
         var nature = change == "added" ? FailureItemIds.Added(Sha256Blob) : FailureItemIds.Modified(Sha256Blob);
         Assert.Equal(new FailureItem(FailureItemIds.JadeUnchangedPath(ChangedPath(change)), nature), Assert.Single(result.Failures));
         Assert.Equal(CheckOutcomes.Fail, result.Result.Outcome);
-        Assert.Equal(new JadeUnchangedSummary(1, 1), result.Summary);
+        Assert.Equal(pathsChecked, result.Result.Cases);
+        Assert.Equal(pathsChecked - 1, result.Result.Passed);
+        Assert.Equal(new JadeUnchangedSummary(pathsChecked, 1), result.Summary);
     }
 
     // ---- Symbolic links ------------------------------------------------------------------------
 
+    // pathsChecked counts the tracked Erewhon/b.scm, plus Erewhon/c.txt when that is the added path.
     [Theory]
-    [InlineData("modified", "sha1\n", LinkSha1Blob)]
-    [InlineData("added", "sha1\n", LinkSha1Blob)]
-    [InlineData("modified", "sha256\n", LinkSha256Blob)]
-    [InlineData("added", "sha256\n", LinkSha256Blob)]
-    public async Task SymbolicLink_IsHashedFromItsLinkTextInTheRepositoryObjectFormat(string change, string objectFormat, string expectedBlob)
+    [InlineData("modified", "sha1\n", LinkSha1Blob, 1)]
+    [InlineData("added", "sha1\n", LinkSha1Blob, 2)]
+    [InlineData("modified", "sha256\n", LinkSha256Blob, 1)]
+    [InlineData("added", "sha256\n", LinkSha256Blob, 2)]
+    public async Task SymbolicLink_IsHashedFromItsLinkTextInTheRepositoryObjectFormat(string change, string objectFormat, string expectedBlob, int pathsChecked)
     {
         Directory.CreateDirectory(Temp.PathOf(".git"));
         CreateSymbolicLink(ChangedPath(change), LinkText);
@@ -5700,7 +5706,9 @@ public sealed partial class KnownLimitationsRegisterTests
         var nature = change == "added" ? FailureItemIds.Added(expectedBlob) : FailureItemIds.Modified(expectedBlob);
         Assert.Equal(new FailureItem(FailureItemIds.JadeUnchangedPath(ChangedPath(change)), nature), Assert.Single(result.Failures));
         Assert.Equal(CheckOutcomes.Fail, result.Result.Outcome);
-        Assert.Equal(new JadeUnchangedSummary(1, 1), result.Summary);
+        Assert.Equal(pathsChecked, result.Result.Cases);
+        Assert.Equal(pathsChecked - 1, result.Result.Passed);
+        Assert.Equal(new JadeUnchangedSummary(pathsChecked, 1), result.Summary);
 
         // diff, status and ls-tree, then the object format lookup; hash-object never runs for a link.
         Assert.Equal(4, git.Calls.Count);
@@ -5829,9 +5837,39 @@ public sealed partial class KnownLimitationsRegisterTests
         ];
         Assert.Equal(expected, result.Failures);
         Assert.Equal(CheckOutcomes.Fail, result.Result.Outcome);
-        Assert.Equal(3, result.Result.Cases);
+
+        // The three paths of the starting commit and the untracked New.txt are checked.
+        Assert.Equal(4, result.Result.Cases);
         Assert.Equal(1, result.Result.Passed);
-        Assert.Equal(new JadeUnchangedSummary(3, 3), result.Summary);
+        Assert.Equal(new JadeUnchangedSummary(4, 3), result.Summary);
+    }
+
+    // A path committed after the starting commit is absent from that commit's tree: diff reports it as
+    // added while it is in the working tree, and status alone reports it as deleted once it is removed
+    // from the working tree. Either way it is checked on top of the three starting paths, and fails.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RealGit_PathCommittedSinceTheStartingCommit_IsCheckedAndFails(bool deletedFromWorkingTree)
+    {
+        var ct = TestContext.Current.CancellationToken;
+        var commit = await JadeRepositoryAsync(ct);
+        Temp.Write("Erewhon/DataFiles/Later.txt", "committed later\n");
+        await TestGit.CommitAllAsync(Temp.Root, "a JADE file committed after the starting commit", ct);
+        var nature = FailureItemIds.Added(await TestGit.HashObjectAsync(Temp.Root, "Erewhon/DataFiles/Later.txt", ct));
+        if (deletedFromWorkingTree)
+        {
+            File.Delete(Temp.PathOf("Erewhon/DataFiles/Later.txt"));
+            nature = FailureItemIds.Deleted;
+        }
+
+        var result = await new JadeUnchangedCheck(new HarnessOptions { RepoRoot = Temp.Root, StartingCommit = commit }).RunAsync(ct);
+
+        Assert.Equal(new FailureItem(FailureItemIds.JadeUnchangedPath("Erewhon/DataFiles/Later.txt"), nature), Assert.Single(result.Failures));
+        Assert.Equal(CheckOutcomes.Fail, result.Result.Outcome);
+        Assert.Equal(4, result.Result.Cases);
+        Assert.Equal(3, result.Result.Passed);
+        Assert.Equal(new JadeUnchangedSummary(4, 1), result.Summary);
     }
 
     [Fact]
