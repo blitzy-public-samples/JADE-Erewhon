@@ -128,8 +128,13 @@ public static class SeedLoader
     /// <exception cref="DirectoryNotFoundException">The seed directory does not exist.</exception>
     /// <exception cref="FileNotFoundException">A seed file does not exist.</exception>
     /// <exception cref="IOException">
-    /// A seed file is not a regular file (the message names the file, not its directory), or it
-    /// cannot be read.
+    /// A seed file is not a regular file (the message names the file, not its directory), or an I/O
+    /// error occurs while its path is resolved or it is opened or read.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// A seed file is a directory or a symbolic link to one, or permission to read it, or to
+    /// search a directory on its path, is denied. An image file that is a directory or cannot be
+    /// read is an <see cref="InvalidDataException"/> instead.
     /// </exception>
     /// <exception cref="InvalidDataException">
     /// A seed row cannot be loaded: a seed value does not convert, an image file is missing, or an
@@ -152,8 +157,12 @@ public static class SeedLoader
     /// leaves the database after the committed deletion of the previous company.
     /// </para>
     /// <para>
-    /// A seed file or image file of length 0 is read as empty without being opened. A FIFO or a
-    /// device also reports length 0, so none can block the load waiting for a writer.
+    /// A seed file or image file whose length is 0, once any symbolic link is resolved to its final
+    /// target, is read as empty without being opened. A FIFO or a device also reports length 0, so
+    /// one found at that check does not block the load waiting for a writer. The check and the open
+    /// are separate steps: an entry replaced by a FIFO between them can still block the open, which
+    /// no cancellation interrupts, as
+    /// <see cref="State.StandInState.ResetAsync(State.ResetKind, CancellationToken)"/> describes.
     /// </para>
     /// </remarks>
     public static SeedLoadResult Load(

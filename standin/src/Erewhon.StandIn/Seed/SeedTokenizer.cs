@@ -90,7 +90,11 @@ public static class SeedTokenizer
     /// <exception cref="DirectoryNotFoundException">The file's directory does not exist.</exception>
     /// <exception cref="IOException">
     /// The opened entry is not a regular file (the message names the file, not its directory), or
-    /// the file cannot be read.
+    /// an I/O error occurs while the path is resolved or the file is opened or read.
+    /// </exception>
+    /// <exception cref="UnauthorizedAccessException">
+    /// The path is a directory or a symbolic link to one, or permission to read the file, or to
+    /// search a directory on its path, is denied.
     /// </exception>
     /// <exception cref="OperationCanceledException"><paramref name="cancellationToken"/> was cancelled.</exception>
     public static IReadOnlyList<SeedLine> ReadLines(string path, CancellationToken cancellationToken = default)
@@ -102,7 +106,7 @@ public static class SeedTokenizer
 
         // A FileInfo describes a symbolic link itself, whose length is that of its target's path, so
         // the final target is the entry whose length decides. A missing file, a dangling link and a
-        // directory do not exist as files; the open below then throws as it always has.
+        // directory do not exist as files, so they skip the length check and the open below throws.
         var entry = new FileInfo(path);
         if (entry.LinkTarget != null && entry.ResolveLinkTarget(returnFinalTarget: true) is FileInfo target)
         {
@@ -114,7 +118,9 @@ public static class SeedTokenizer
             return lines;
         }
 
-        // The stream StreamReader(path, ...) opens, so the bytes read and their decoding are unchanged.
+        // The file is opened read-only, sharing reads, with the buffer size StreamReader uses for a
+        // path it opens itself (FileStreamBufferSize) and a sequential-scan hint. The reader below
+        // decodes it as Windows-1252 (SeedEncoding) and interprets no byte-order mark.
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, FileStreamBufferSize, FileOptions.SequentialScan);
         if (!stream.CanSeek)
         {

@@ -276,7 +276,8 @@ namespace Erewhon.StandIn
     /// <para>
     /// The line is operational logging, not an audit record: it commits and stores nothing. It changes no
     /// response: no header, status or body is touched, and the duration is measured only for the log. An
-    /// exception that leaves a handler is logged and rethrown, so the host answers it exactly as before.
+    /// exception that leaves a handler is logged and rethrown unchanged, so the host's handling of it, and
+    /// the response sent for it, are not altered.
     /// </para>
     /// </remarks>
     public static partial class RequestLogging
@@ -404,7 +405,6 @@ namespace Erewhon.StandIn
                 ? route
                 : RequestLogEntry.Unmatched;
 
-        // An undefined value is written as its number.
         private static string OutcomeText(RequestOutcome outcome) => outcome switch
         {
             RequestOutcome.Completed => "completed",

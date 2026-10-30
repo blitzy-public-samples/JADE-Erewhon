@@ -15,12 +15,19 @@ namespace Erewhon.StandIn.Model;
 /// from the seed file, so item guids are never generated.
 /// </para>
 /// <para>
-/// <see cref="CodeNumber"/> and the category prefix key <see cref="Company.AllItems"/> and every
-/// item dictionary; both are set once, when the item is created. <see cref="MySale"/> is the
-/// inverse of <c>Sale.MyItem</c> and keys <see cref="Company.AllTenderItemsBySaleDate"/>; the sale
-/// transaction agents in <c>Validation.cs</c> set it, re-key that dictionary and add the item to
-/// <see cref="Agent.AllSoldItems"/>, so its setter has no side effects. Dictionary membership is
-/// likewise maintained by <c>ItemTA</c>, the counterpart of the JADE automatic inverses.
+/// <see cref="CodeNumber"/> alone keys <see cref="Company.AllItems"/> and
+/// <see cref="ItemCategory.AllItems"/>, and <see cref="PersistentModel.Guid"/> keys
+/// <see cref="Company.AllRetailItems"/> and <see cref="Company.AllTenderItems"/>. The category
+/// prefix and code number end the key of every other item dictionary: they are the whole key of
+/// <see cref="Region.AllItems"/>, follow the category of <see cref="Agent.AllItems"/> and
+/// <see cref="Agent.AllSoldItems"/>, and follow the sale and closure date of
+/// <see cref="Company.AllTenderItemsBySaleDate"/>. The code number, category and guid are each
+/// set once, when the item is created and before it is indexed, so no dictionary needs
+/// re-keying for them. <see cref="MySale"/> is the inverse of <c>Sale.MyItem</c>; the sale
+/// transaction agents in <c>Validation.cs</c> set it, re-key
+/// <see cref="Company.AllTenderItemsBySaleDate"/> and add the item to
+/// <see cref="Agent.AllSoldItems"/>, so its setter has no side effects. Dictionary membership
+/// is likewise maintained by <c>ItemTA</c>, the counterpart of the JADE automatic inverses.
 /// </para>
 /// <para>
 /// The JADE getters <c>getCodeNumber</c>, <c>getName</c> and <c>getSale</c> are the properties
@@ -128,7 +135,8 @@ public sealed class RetailItem : Item
 
 /// <summary>
 /// JADE <c>TenderItem subclassOf Item</c>: an item whose <see cref="Item.Price"/> is the reserve,
-/// sold to the highest tender once its closure date has passed.
+/// sold to its highest tender when it is due for closure, that is, when a closure run
+/// (<see cref="Company.CloseTendersAtDate"/>) is for its closure date or a later date.
 /// </summary>
 /// <remarks>
 /// <see cref="ClosureDate"/> keys <see cref="Company.AllTenderItemsBySaleDate"/> and is set once,
